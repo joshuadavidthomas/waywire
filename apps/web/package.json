@@ -1,0 +1,30 @@
+{
+  "name": "@sprite-desktop/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "deploy": "wrangler deploy",
+    "dev": "vite dev",
+    "preview": "vite preview",
+    "typegen": "wrangler types --env-file .dev.vars.example"
+  },
+  "dependencies": {
+    "@lucide/svelte": "1.41.0",
+    "@novnc/novnc": "1.7.0",
+    "@sprite-desktop/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-cloudflare": "7.2.9",
+    "@sveltejs/kit": "2.70.3",
+    "@sveltejs/vite-plugin-svelte": "7.0.0",
+    "@tailwindcss/vite": "4.3.3",
+    "svelte": "5.57.0",
+    "svelte-check": "4.7.6",
+    "tailwindcss": "4.3.3",
+    "vite": "8.2.2",
+    "wrangler": "4.129.0"
+  }
+}

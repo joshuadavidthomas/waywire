@@ -1,0 +1,57 @@
+{
+  "sprite": "sprite-desktop-v1-probe",
+  "origin": "https://sprite-desktop-v1-probe-6ra.sprites.app",
+  "checkedAt": "2026-09-04T21:53:47.063Z",
+  "sdk": "@fly/sprites 0.2.2 read/update/read URLSettings passed",
+  "spriteEnv": "sprite_url matches getSprite().url",
+  "restarts": [
+    {
+      "trial": 1,
+      "restartReturnedMs": 17887,
+      "recovered": true,
+      "totalMs": 36764,
+      "requests": [
+        {
+          "error": "TimeoutError",
+          "elapsedMs": 12001
+        },
+        {
+          "status": 200,
+          "elapsedMs": 5875
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "restartReturnedMs": 2717,
+      "recovered": true,
+      "totalMs": 21579,
+      "requests": [
+        {
+          "error": "TimeoutError",
+          "elapsedMs": 12005
+        },
+        {
+          "status": 200,
+          "elapsedMs": 5856
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "restartReturnedMs": 2324,
+      "recovered": true,
+      "totalMs": 21175,
+      "requests": [
+        {
+          "error": "TimeoutError",
+          "elapsedMs": 12002
+        },
+        {
+          "status": 200,
+          "elapsedMs": 5848
+        }
+      ]
+    }
+  ]
+}

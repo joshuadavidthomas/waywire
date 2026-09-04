@@ -1,0 +1,13 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  workerd: true
+
+minimumReleaseAgeExclude:
+  - "@cloudflare/workers-types@5.20260904.1"
+  - "@lucide/svelte@1.41.0"
+  - miniflare@5.20260903.0-alpha
+  - wrangler@4.129.0

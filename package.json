@@ -1,0 +1,33 @@
+{
+  "name": "sprite-desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "check": "pnpm -r --if-present check",
+    "dev": "pnpm --parallel --filter @sprite-desktop/web --filter @sprite-desktop/gateway dev",
+    "dev:web": "pnpm --filter @sprite-desktop/web dev",
+    "dev:gateway": "pnpm --filter @sprite-desktop/gateway dev",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "provision": "pnpm --filter @sprite-desktop/provision provision",
+    "setup:local": "tsx scripts/setup-local.ts",
+    "test": "pnpm -r --if-present test",
+    "tunnel": "tsx scripts/tunnel-sanity.ts",
+    "typegen": "pnpm -r --if-present typegen"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/ws": "8.18.1",
+    "prettier": "3.6.2",
+    "prettier-plugin-svelte": "3.4.0",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3",
+    "ws": "8.19.0"
+  }
+}

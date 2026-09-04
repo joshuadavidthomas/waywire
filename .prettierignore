@@ -1,0 +1,9 @@
+node_modules
+.svelte-kit
+build
+dist
+coverage
+.wrangler
+pnpm-lock.yaml
+worker-configuration.d.ts
+SPEC.v0.md

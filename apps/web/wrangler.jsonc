@@ -1,0 +1,19 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "sprite-desktop-web",
+  "main": ".svelte-kit/cloudflare/_worker.js",
+  "compatibility_date": "2026-09-04",
+  "compatibility_flags": ["nodejs_als"],
+  "assets": {
+    "directory": ".svelte-kit/cloudflare",
+    "binding": "ASSETS",
+  },
+  "vars": {
+    "SPRITE_NAME": "josh-desktop",
+    "GATEWAY_WS_URL": "ws://localhost:8788/vnc",
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 },
+  },
+}
