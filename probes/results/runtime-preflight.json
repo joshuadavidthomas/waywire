@@ -1,0 +1,39 @@
+{
+  "sprite": "sprite-desktop-v1-conflicts",
+  "release": "v1.0.0-dev.9",
+  "at": "2026-09-05T00:38:20.084Z",
+  "results": [
+    {
+      "reason": "only Ubuntu 26.04",
+      "passed": true
+    },
+    {
+      "reason": "only amd64",
+      "passed": true
+    },
+    {
+      "reason": "service name is foreign",
+      "passed": true
+    },
+    {
+      "reason": "service name is foreign",
+      "passed": true
+    },
+    {
+      "reason": "foreign HTTP service",
+      "passed": true
+    },
+    {
+      "reason": "port 5900 is occupied by an unmanaged process",
+      "passed": true
+    },
+    {
+      "reason": "port 8080 is occupied by an unmanaged process",
+      "passed": true
+    },
+    {
+      "reason": "apt source is unreachable: https:\\/\\/packages.mozilla.org",
+      "passed": true
+    }
+  ]
+}

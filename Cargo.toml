@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.0"
+version = "0.1.0-dev"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.22.1"
+calloop = { version = "0.14.4", features = ["signals"] }
+calloop-wayland-source = "0.4.1"
+clap = { version = "4.5.54", features = ["derive", "env"] }
+memmap2 = "0.9.9"
+nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "time"] }
+png = "0.18.0"
+rust-embed = "8.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+socket2 = "0.6.1"
+thiserror = "2.0.17"
+tokio = { version = "1.49.0", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+url = "2.5.8"
+wayland-client = "=0.31.15"
+wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"] }
+wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
+xkbcommon = "0.9.0"

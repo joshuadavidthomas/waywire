@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "recordCount": 14679,
+  "overflowCount": 0,
+  "matchedBrowserFrames": 1553,
+  "intervals": {
+    "protocolReadyToCallback": {
+      "milliseconds": {
+        "count": 1631,
+        "p50": 0.52998,
+        "p95": 1.02132,
+        "p99": 1.182,
+        "max": 1.48498
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "callbackToNextRequest": {
+      "milliseconds": {
+        "count": 1631,
+        "p50": 0.00682,
+        "p95": 0.00858,
+        "p99": 0.01666,
+        "max": 0.59807
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "callbackToFlush": {
+      "milliseconds": {
+        "count": 1631,
+        "p50": 0.01644,
+        "p95": 0.02368,
+        "p99": 0.03824,
+        "max": 0.61558
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "submit": {
+      "milliseconds": {
+        "count": 1631,
+        "p50": 0.63122,
+        "p95": 0.75475,
+        "p99": 0.84758,
+        "max": 1.15393
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "pipeWrite": {
+      "milliseconds": {
+        "count": 1631,
+        "p50": 3.75609,
+        "p95": 7.31984,
+        "p99": 9.59929,
+        "max": 12.95494
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "notificationPublishToMetadataDispatch": {
+      "milliseconds": {
+        "count": 1631,
+        "p50": 0.0471,
+        "p95": 2.61559,
+        "p99": 4.33147,
+        "max": 5.66591
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    }
+  },
+  "cadence": {
+    "captureReadySpacingMs": {
+      "count": 1630,
+      "p50": 16.64563,
+      "p95": 32.86502,
+      "p99": 33.32033,
+      "max": 34.0867
+    },
+    "metadataDeliverySpacingMs": {
+      "count": 1630,
+      "p50": 16.90794,
+      "p95": 33.85772,
+      "p99": 36.69578,
+      "max": 39.89158
+    }
+  }
+}

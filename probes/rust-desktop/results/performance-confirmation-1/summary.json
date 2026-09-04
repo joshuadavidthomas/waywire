@@ -1,0 +1,415 @@
+{
+  "schema": 1,
+  "status": "PASSED",
+  "sprite": "sprite-desktop-rust",
+  "runId": "5febb145-856b-4d13-a2dd-2adb25c106cf",
+  "startedAt": "2026-09-06T05:05:01.449Z",
+  "workload": {
+    "name": "continuous motion",
+    "generator": "ffplay renders FFmpeg lavfi testsrc2 at native 1824x848 and 60 Hz in a fullscreen Wayland window. The browser only observes and decodes that native application.",
+    "command": "ffplay -f lavfi -i testsrc2=size=1824x848:rate=60 -fs -autoexit (fixed owned process; no caller-supplied command)",
+    "nativeTarget": {
+      "width": 1824,
+      "height": 848,
+      "refreshHz": 60
+    },
+    "browserViewport": {
+      "width": 1867,
+      "height": 986
+    },
+    "recordSeconds": 30
+  },
+  "thresholds": {
+    "minimumCanvasUpdateFps": 45,
+    "maximumP95FrameGapMs": 50,
+    "maximumFrameGapMs": 250,
+    "maximumP95LatenessMs": 100,
+    "maximumP95DecoderQueue": 4,
+    "minimumClockConfidentSamples": 20,
+    "minimumClockConfidentFraction": 0.8
+  },
+  "topologyAtStart": {
+    "servicePid": 8155,
+    "gatewayPid": 6724,
+    "daemonPid": 6740,
+    "ffmpegPid": 6894,
+    "labwcPid": 6706,
+    "ffmpegCommand": "ffmpeg -hide_banner -loglevel warning -nostdin -f rawvideo -pixel_format bgra -video_size 1824x848 -framerate 60 -re -i pipe:0 -an -c:v libx264 -preset superfast -tune zerolatency -profile:v high444 -level:v 5.2 -pix_fmt yuv444p -b:v 8000k -maxrate 16000k -bufsize 16000k -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 -x264-params aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on -vf scale=1824:848:out_color_matrix=bt709:out_range=pc -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range pc -payload_type 96 -ssrc 2 -rtpflags skip_rtcp -f rtp rtp://127.0.0.1:56303?pkt_size=60000"
+  },
+  "nativeOutputBefore": "HEADLESS-1 \"Headless output 1\"\n  Make: (null)\n  Model: (null)\n  Serial: (null)\n  Enabled: yes\n  Modes:\n    1824x848 px, 60.000000 Hz (current)\n  Position: 0,0\n  Transform: normal\n  Scale: 1.000000\n  Adaptive Sync: disabled\n",
+  "ffplay": {
+    "pid": 7078,
+    "title": "sprite-rust-performance-5febb145-856b-4d13-a2dd-2adb25c106cf"
+  },
+  "warmup": [
+    {
+      "colors": 49,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 51 fps · 0 kbps @ 100% · 57.1 ms RTT · clock syncing · target 60 ms · late 0.0 ms · input 0 · decode 0 · dropped 1 · resize presented 1824×848 in 66 ms",
+      "recorderReady": true,
+      "sampleHash": 3985803100,
+      "width": 1824
+    },
+    {
+      "colors": 43,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 49 fps · 8000 kbps @ 100% · 57.2 ms RTT · clock ±28.5 ms · target 60 ms · late 15.0 ms · input 0 · decode 0 · dropped 0 · resize presented 1824×848 in 66 ms",
+      "recorderReady": true,
+      "sampleHash": 128324474,
+      "width": 1824
+    },
+    {
+      "colors": 42,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 51 fps · 8000 kbps @ 100% · 60.7 ms RTT · clock ±28.5 ms · target 60 ms · late 4.0 ms · input 0 · decode 0 · dropped 0 · resize presented 1824×848 in 66 ms",
+      "recorderReady": true,
+      "sampleHash": 2421124410,
+      "width": 1824
+    },
+    {
+      "colors": 44,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 49 fps · 8000 kbps @ 100% · 59.1 ms RTT · clock ±28.5 ms · target 60 ms · late 4.4 ms · input 0 · decode 0 · dropped 0 · resize presented 1824×848 in 66 ms",
+      "recorderReady": true,
+      "sampleHash": 4096366504,
+      "width": 1824
+    },
+    {
+      "colors": 40,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 51 fps · 8000 kbps @ 100% · 59.4 ms RTT · clock ±28.5 ms · target 60 ms · late 4.4 ms · input 0 · decode 0 · dropped 0 · resize presented 1824×848 in 66 ms",
+      "recorderReady": true,
+      "sampleHash": 905190328,
+      "width": 1824
+    }
+  ],
+  "topologyBefore": {
+    "servicePid": 8155,
+    "gatewayPid": 6724,
+    "daemonPid": 6740,
+    "ffmpegPid": 6894,
+    "labwcPid": 6706,
+    "ffmpegCommand": "ffmpeg -hide_banner -loglevel warning -nostdin -f rawvideo -pixel_format bgra -video_size 1824x848 -framerate 60 -re -i pipe:0 -an -c:v libx264 -preset superfast -tune zerolatency -profile:v high444 -level:v 5.2 -pix_fmt yuv444p -b:v 8000k -maxrate 16000k -bufsize 16000k -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 -x264-params aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on -vf scale=1824:848:out_color_matrix=bt709:out_range=pc -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range pc -payload_type 96 -ssrc 2 -rtpflags skip_rtcp -f rtp rtp://127.0.0.1:56303?pkt_size=60000"
+  },
+  "before": {
+    "native": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/before-native.png",
+      "bytes": 188398,
+      "sha256": "b3512f4b0825adc49c475cf2a5738e33a5c1644dae124dc3b72bb2da7a284c8f",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=32\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=125.491\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=215\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=126.343\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=125.483\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=112\nlavfi.signalstats.SATAVG=112.722\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=171\nlavfi.signalstats.HUEAVG=190.382\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "browser": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/before-browser.png",
+      "bytes": 396526,
+      "sha256": "00c1f97eff644ebd23497b6e7432ee89b5a089de71c576e6f4742014ab426118"
+    }
+  },
+  "pipeline": {
+    "decoderResets": [],
+    "discontinuities": 0,
+    "receivedVideoFrames": 1544,
+    "receivedVideoFps": 51.46666666666667,
+    "captureSequenceRate": 51.46570715020674,
+    "captureSequencesNotReceived": 0,
+    "scope": "Video headers from this browser's stream, without payload. Missing capture sequences do not distinguish encoder replacement from transport or gateway loss."
+  },
+  "recording": {
+    "actualRecordingDimensions": {
+      "initial": {
+        "width": 1824,
+        "height": 848,
+        "cssWidth": 1833,
+        "cssHeight": 825,
+        "devicePixelRatio": 1
+      },
+      "final": {
+        "width": 1824,
+        "height": 848,
+        "cssWidth": 1833,
+        "cssHeight": 825,
+        "devicePixelRatio": 1
+      },
+      "sdkMinimum": {
+        "width": 1824,
+        "height": 848
+      },
+      "sdkMaximum": {
+        "width": 1824,
+        "height": 848
+      }
+    },
+    "canvasUpdateFps": 50.56396992161422,
+    "canvasFrameGapMs": {
+      "count": 1516,
+      "p50": 16.69999998807907,
+      "p95": 33.400000005960464,
+      "p99": 33.5,
+      "max": 100.10000002384186
+    },
+    "sdkRenderedFps": {
+      "count": 1518,
+      "p50": 51.00510050974696,
+      "p95": 53,
+      "p99": 53.00530053131688,
+      "max": 54
+    },
+    "clock": {
+      "confidentSamples": 1518,
+      "totalSamples": 1518,
+      "confidentFraction": 1,
+      "uncertaintyMs": {
+        "count": 1518,
+        "p50": 28.399999991059303,
+        "p95": 28.549999997019768,
+        "p99": 28.549999997019768,
+        "max": 28.549999997019768
+      }
+    },
+    "latenessMs": {
+      "count": 1518,
+      "p50": 9.138918776272476,
+      "p95": 16.045285521031474,
+      "p99": 16.571218794109882,
+      "max": 144.34506590318597
+    },
+    "decoderQueue": {
+      "count": 1518,
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 6
+    },
+    "droppedFrames": {
+      "first": 0,
+      "last": 0
+    },
+    "generations": [
+      2
+    ],
+    "payload": {
+      "bytes": 25807536,
+      "megabitsPerSecond": 6.881642579063818
+    },
+    "recorderWarnings": []
+  },
+  "checks": [
+    {
+      "name": "30-second recording completed",
+      "passed": true,
+      "actual": 30001.59999999404,
+      "requirement": ">= 29500 ms"
+    },
+    {
+      "name": "continuous-motion canvas update rate",
+      "passed": true,
+      "actual": 50.56396992161422,
+      "requirement": ">= 45 FPS"
+    },
+    {
+      "name": "canvas update frame-gap p95",
+      "passed": true,
+      "actual": 33.400000005960464,
+      "requirement": "<= 50 ms"
+    },
+    {
+      "name": "longest canvas freeze",
+      "passed": true,
+      "actual": 100.10000002384186,
+      "requirement": "<= 250 ms"
+    },
+    {
+      "name": "clock confidence",
+      "passed": true,
+      "actual": "1518/1518",
+      "requirement": ">= 20 and >= 0.8"
+    },
+    {
+      "name": "clock-confident lateness p95",
+      "passed": true,
+      "actual": 16.045285521031474,
+      "requirement": "<= 100 ms"
+    },
+    {
+      "name": "decoder queue p95",
+      "passed": true,
+      "actual": 0,
+      "requirement": "<= 4"
+    },
+    {
+      "name": "stable current generation",
+      "passed": true,
+      "actual": [
+        2
+      ],
+      "requirement": "one positive generation"
+    },
+    {
+      "name": "native-size canvas throughout",
+      "passed": true,
+      "actual": {
+        "initial": {
+          "width": 1824,
+          "height": 848,
+          "cssWidth": 1833,
+          "cssHeight": 825,
+          "devicePixelRatio": 1
+        },
+        "final": {
+          "width": 1824,
+          "height": 848,
+          "cssWidth": 1833,
+          "cssHeight": 825,
+          "devicePixelRatio": 1
+        },
+        "sdkMinimum": {
+          "width": 1824,
+          "height": 848
+        },
+        "sdkMaximum": {
+          "width": 1824,
+          "height": 848
+        }
+      },
+      "requirement": "1824x848 throughout"
+    },
+    {
+      "name": "live WebSocket payload",
+      "passed": true,
+      "actual": {
+        "bytes": 25807536,
+        "megabitsPerSecond": 6.881642579063818
+      },
+      "requirement": "> 0 bytes"
+    },
+    {
+      "name": "paused-frame RGB fidelity",
+      "passed": true,
+      "actual": 35.755619,
+      "requirement": ">= 35 dB PSNR; native screenshots identical"
+    }
+  ],
+  "cpu": {
+    "scope": "Whole-Sprite /proc/stat plus read-only per-process /proc samples. Per-process CPU uses one logical core as 100%. ffplay workload cost is separate from the gateway, streamd, encoder FFmpeg, and labwc.",
+    "sampleCount": 30,
+    "wholeSpriteCpuPercentAllCpus": {
+      "count": 30,
+      "p50": 45.64943253467844,
+      "p95": 47.601010101010104,
+      "p99": 48.1203007518797,
+      "max": 48.1203007518797
+    },
+    "processes": {
+      "gateway": {
+        "count": 30,
+        "p50": 1.9989303523775743,
+        "p95": 1.9990122680489624,
+        "p99": 1.9991182289329994,
+        "max": 1.9991182289329994
+      },
+      "streamd": {
+        "count": 30,
+        "p50": 17.99037317139817,
+        "p95": 19.989460157342428,
+        "p99": 19.98983956434925,
+        "max": 19.98983956434925
+      },
+      "encoderFfmpeg": {
+        "count": 30,
+        "p50": 100.94922455908073,
+        "p95": 106.94714030634898,
+        "p99": 107.94223902838901,
+        "max": 107.94223902838901
+      },
+      "labwc": {
+        "count": 30,
+        "p50": 6.996913801265498,
+        "p95": 8.995475455759669,
+        "p99": 8.995809392158346,
+        "max": 8.995809392158346
+      },
+      "workloadFfplay": {
+        "count": 30,
+        "p50": 233.89683278516094,
+        "p95": 240.87082338587663,
+        "p99": 242.8675934456772,
+        "max": 242.8675934456772
+      }
+    }
+  },
+  "after": {
+    "native": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/after-native.png",
+      "bytes": 190046,
+      "sha256": "ab64fbf7b0c14563eb5988f9dbd7947d6588e22d28d29f3abf5934887fda7318",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=32\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=125.481\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=217\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=126.456\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=125.776\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=112\nlavfi.signalstats.SATAVG=112.328\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=161\nlavfi.signalstats.HUEAVG=190.181\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "browser": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/after-browser.png",
+      "bytes": 401396,
+      "sha256": "e08a4520fbbec6a241e0c5b4ed787a0d49a22f57bb65a3afcbb18903bab412fc"
+    }
+  },
+  "contentEvidence": {
+    "nativeScreenshotsChanged": true,
+    "browserScreenshotsChanged": true,
+    "warmupMinimumSampledColors": 40,
+    "warmupDistinctSampleHashes": 5
+  },
+  "fidelity": {
+    "scope": "Browser p key paused the native application. Two identical native screenshots bracket the decoded-canvas capture. RGB PSNR measures this static test chart, not all desktop text or motion quality.",
+    "native": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/paused-native.png",
+      "bytes": 190664,
+      "sha256": "a7926f2b62c32aa2e01a8e70525dab44a59f17754e0dc7ea9dcde831d8b613b3",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=32\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=125.006\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=218\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=128.454\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=128.198\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=112\nlavfi.signalstats.SATAVG=109.195\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=167\nlavfi.signalstats.HUEAVG=189.294\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "stillNative": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/paused-still-native.png",
+      "bytes": 190664,
+      "sha256": "a7926f2b62c32aa2e01a8e70525dab44a59f17754e0dc7ea9dcde831d8b613b3",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=32\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=125.006\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=218\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=128.454\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=128.198\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=112\nlavfi.signalstats.SATAVG=109.195\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=167\nlavfi.signalstats.HUEAVG=189.294\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "browser": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/paused-browser.png",
+      "bytes": 387262,
+      "sha256": "43dc18c7faf2c2cc8f76dd58354433ca117db8185415e4cfd6aed25355eb7d83"
+    },
+    "decodedPath": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-confirmation-1/paused-decoded.png",
+    "rgbPsnrDb": 35.755619
+  },
+  "topologyAfter": {
+    "servicePid": 8155,
+    "gatewayPid": 6724,
+    "daemonPid": 6740,
+    "ffmpegPid": 6894,
+    "labwcPid": 6706,
+    "ffmpegCommand": "ffmpeg -hide_banner -loglevel warning -nostdin -f rawvideo -pixel_format bgra -video_size 1824x848 -framerate 60 -re -i pipe:0 -an -c:v libx264 -preset superfast -tune zerolatency -profile:v high444 -level:v 5.2 -pix_fmt yuv444p -b:v 8000k -maxrate 16000k -bufsize 16000k -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 -x264-params aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on -vf scale=1824:848:out_color_matrix=bt709:out_range=pc -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range pc -payload_type 96 -ssrc 2 -rtpflags skip_rtcp -f rtp rtp://127.0.0.1:56303?pkt_size=60000"
+  },
+  "cleanup": {
+    "browserSession": "sprite-rust-performance-220932-5febb145",
+    "browserClosed": true,
+    "proxyClosed": true,
+    "ffplay": {
+      "status": "terminated",
+      "pid": 7078,
+      "signal": "SIGTERM"
+    },
+    "remoteLogRemoved": true
+  },
+  "endedAt": "2026-09-06T05:05:46.949Z"
+}

@@ -1,0 +1,70 @@
+{
+  "sprite": "sprite-desktop-v1",
+  "release": "v1.0.0-dev.13",
+  "at": "2026-09-05T01:45:30.861Z",
+  "results": [
+    {
+      "test": "corrupt archive changes no runtime state",
+      "passed": true
+    },
+    {
+      "test": "after-pending",
+      "interruptedPIDs": {
+        "sprite-desktop": 2506,
+        "sprite-desktop-bridge": 2807
+      },
+      "repairedPIDs": {
+        "sprite-desktop": 4010,
+        "sprite-desktop-bridge": 3379
+      },
+      "passed": true
+    },
+    {
+      "test": "after-service-1",
+      "interruptedPIDs": {
+        "sprite-desktop": 3950
+      },
+      "repairedPIDs": {
+        "sprite-desktop": 4521,
+        "sprite-desktop-bridge": 4514
+      },
+      "passed": true
+    },
+    {
+      "test": "after-service-2",
+      "interruptedPIDs": {
+        "sprite-desktop": 5084,
+        "sprite-desktop-bridge": 5366
+      },
+      "repairedPIDs": {
+        "sprite-desktop": 6418,
+        "sprite-desktop-bridge": 5675
+      },
+      "passed": true
+    },
+    {
+      "test": "before-commit",
+      "interruptedPIDs": {
+        "sprite-desktop": 6246,
+        "sprite-desktop-bridge": 6527
+      },
+      "repairedPIDs": {
+        "sprite-desktop": 6863,
+        "sprite-desktop-bridge": 6855
+      },
+      "passed": true
+    },
+    {
+      "test": "rerun repairs managed file owner/mode without rewriting unchanged metadata",
+      "passed": true
+    },
+    {
+      "test": "same-version rerun keeps both service PIDs and metadata",
+      "passed": true
+    },
+    {
+      "test": "origin change restarts only bridge; canonical origin restored",
+      "passed": true
+    }
+  ]
+}

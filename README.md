@@ -2,7 +2,7 @@
 
 A single-user prototype that renders an XFCE desktop from a Fly Sprite in a browser. A SvelteKit Worker owns the UI and short-lived tickets. A plain gateway Worker adds the Sprites token to a WebSocket upgrade and then leaves the RFB bytes alone.
 
-The current implementation follows the completed [v0 spike spec](./SPEC.v0.md). [SPEC.v1.md](./SPEC.v1.md) plans the self-contained Sprite runtime that will replace the gateway path. The [v1 platform probe record](./probes/M0.md) contains the automated M0 results; browser cookie authentication is still pending, so the v0 path remains in place.
+The self-contained [v1 runtime](./SPEC.v1.md) is now installed on disposable Sprites. [Runtime acceptance](./probes/RUNTIME.md) records what passed and what remains. The [M0 platform gate](./probes/M0.md) passed, including Fly browser-cookie authentication to the echo probe. Josh also confirmed that the full desktop works through the private Sprite URL. The v0 path remains until the remaining lifecycle checks and cutover are complete. The instructions below describe that preserved [v0 spike](./SPEC.v0.md).
 
 ## Security boundary
 
@@ -14,6 +14,7 @@ Never make the sprite public or expose port 5900. Do not treat `url_settings.aut
 
 - `apps/web` — SvelteKit 2/Svelte 5 UI on `@sveltejs/adapter-cloudflare`
 - `apps/gateway` — framework-free Worker that verifies a 60-second HMAC ticket and passes through the Sprites WebSocket
+- `apps/stream-viewer` — strict TypeScript and Effect Vite viewer for the owned H.264 stream protocol
 - `packages/shared` — Zod contracts and WebCrypto ticket signing
 - `packages/sprite-provision` — idempotent `@fly/sprites` provisioning CLI
 - `sprite` — the package installer and foreground desktop service
@@ -57,6 +58,43 @@ Open <http://localhost:5173>. The gateway listens on port 8788. `pnpm dev:web` a
 After connecting, Xvnc matches the viewer frame and changes resolution again when the browser window changes.
 
 `setup:local` copies `SPRITES_TOKEN` from the shell and creates a shared random `TICKET_SECRET`. Set `TICKET_SECRET` first if you need a stable value.
+
+## Stream viewer
+
+The owned stream viewer derives from the patched Waymote browser SDK, with responsive remote sizing, a 60 ms default presentation target, remote cursor shapes, and pointer lock behind its named button. Audio is disabled. Recording is opt-in with `?record` and loads the existing comparison recorder from `probes/compare/` only in that mode.
+
+Build and test it from the workspace root:
+
+```sh
+pnpm install
+pnpm --filter @sprite-desktop/stream-viewer check
+pnpm --filter @sprite-desktop/stream-viewer test
+pnpm --filter @sprite-desktop/stream-viewer build
+```
+
+Vite writes the browser files to `apps/stream-viewer/dist/`.
+
+The private Rust trial uses H.264 High 4:4:4 Predictive (`avc1.F40034`) to retain
+color detail. Chrome 152 on Linux is the tested browser. Other browsers and
+hardware decoders may not support this profile; no baseline-profile fallback is
+provided. [Measured performance and support limits](./probes/rust-desktop/PERFORMANCE.md)
+record roughly 50 delivered FPS at 1824×848, rather than a claim of sustained 60 FPS.
+The [persistent-capture experiment](./probes/rust-desktop/PERFORMANCE-ROUND3.md)
+reached 54.53 FPS once but failed repeat acceptance. Current source builds that
+candidate; the private deployment uses WLR capture with the encoder changes
+retained in [round six](./probes/rust-desktop/PERFORMANCE-ROUND6.md).
+[Delivery diagnostics](./probes/rust-desktop/PERFORMANCE-ROUND4.md) found stalls
+both before the local proxy and inside a CPU-busy browser host. Neither diagnostic
+run passed full acceptance. A later [route comparison](./probes/rust-desktop/PERFORMANCE-ROUND5.md)
+passed on both public HTTPS and a Sprite tunnel at 8 Mbps, without a tunnel
+improvement. Round six reduced controlled decoder recovery from about 1.16 s to
+0.31 s with more frequent keyframes, and cut daemon CPU from 17% to 12% of one
+core with a larger FFmpeg pipe. [Round seven](./probes/rust-desktop/PERFORMANCE-ROUND7.md)
+counted distinct displayed images: persistent capture reached 55.06 FPS, but
+neither capture variant passed both recordings. The round-six WLR build remains
+deployed. No transport fix has been deployed.
+
+The viewer frontend and SDK derive from Waymote commit `90564cfb02030c494939c6fdf29cae9c4d689c67` plus the saved comparison patch. The root [LICENSE](./LICENSE) preserves the upstream core/example and SDK notices for those named derivative files only; it makes no licensing claim about unrelated repository code.
 
 ## Checks
 

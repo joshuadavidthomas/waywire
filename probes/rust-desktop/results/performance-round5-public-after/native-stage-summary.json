@@ -1,0 +1,147 @@
+{
+  "schema": 2,
+  "recordCount": 17798,
+  "overflowCount": 0,
+  "matchedBrowserFrames": 1533,
+  "repeatedSessionRequests": 0,
+  "repeatedConstraintBatches": 0,
+  "repeatedRequests": 0,
+  "repeatedCopyAuthorizations": 0,
+  "repeatedCopyFlushes": 0,
+  "replacedSubmissions": 0,
+  "intervals": {
+    "protocolReadyToCallback": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.57224,
+        "p95": 1.04768,
+        "p99": 1.18669,
+        "max": 1.57273
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "callbackToNextRequest": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.00613,
+        "p95": 0.00773,
+        "p99": 0.01737,
+        "max": 0.07227
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "initialConstraintDelay": {
+      "milliseconds": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "callbackToFlush": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.69426,
+        "p95": 0.82453,
+        "p99": 0.91688,
+        "max": 1.76374
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "requestToCopyAuthorization": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.68061,
+        "p95": 0.80605,
+        "p99": 0.89678,
+        "max": 1.73982
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "copyAuthorizationToFlush": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.00743,
+        "p95": 0.0125,
+        "p99": 0.02643,
+        "max": 0.08401
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "submit": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.64032,
+        "p95": 0.7594,
+        "p99": 0.84856,
+        "max": 1.3011
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "pipeWrite": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 3.8118,
+        "p95": 7.55833,
+        "p99": 9.80613,
+        "max": 13.35548
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    },
+    "notificationPublishToMetadataDispatch": {
+      "milliseconds": {
+        "count": 1618,
+        "p50": 0.04744,
+        "p95": 2.28904,
+        "p99": 4.44048,
+        "max": 5.96941
+      },
+      "boundaryMissing": {
+        "start": 0,
+        "end": 0
+      }
+    }
+  },
+  "cadence": {
+    "captureReadySpacingMs": {
+      "count": 1617,
+      "p50": 16.68143,
+      "p95": 32.92851,
+      "p99": 33.3795,
+      "max": 34.14425
+    },
+    "metadataDeliverySpacingMs": {
+      "count": 1617,
+      "p50": 17.12252,
+      "p95": 33.33705,
+      "p99": 37.98632,
+      "max": 41.1285
+    }
+  }
+}

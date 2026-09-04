@@ -1,0 +1,783 @@
+{
+  "schema": 1,
+  "status": "PASSED",
+  "sprite": "sprite-desktop-rust",
+  "runId": "a9f87dd0-8378-4e4a-b24e-1f8290d9933f",
+  "startedAt": "2026-09-06T16:55:15.982Z",
+  "workload": {
+    "name": "continuous motion",
+    "generator": "ffplay renders FFmpeg lavfi testsrc2 at native 1824x848 and 60 Hz in a fullscreen Wayland window. The browser only observes and decodes that native application.",
+    "command": "ffplay -f lavfi -i testsrc2=size=1824x848:rate=60 -fs -autoexit (fixed owned process; no caller-supplied command)",
+    "nativeTarget": {
+      "width": 1824,
+      "height": 848,
+      "refreshHz": 60
+    },
+    "browserViewport": {
+      "width": 1867,
+      "height": 986
+    },
+    "recordSeconds": 30
+  },
+  "thresholds": {
+    "minimumCanvasUpdateFps": 45,
+    "maximumP95FrameGapMs": 50,
+    "maximumFrameGapMs": 250,
+    "maximumP95LatenessMs": 100,
+    "maximumP95DecoderQueue": 4,
+    "minimumClockConfidentSamples": 20,
+    "minimumClockConfidentFraction": 0.8
+  },
+  "deployment": {
+    "sprite": "sprite-desktop-rust",
+    "suite": "video",
+    "servicePid": 10821,
+    "gatewayPid": 10855,
+    "daemonPid": 10864,
+    "ffmpegPid": 10881,
+    "labwcPid": 10842,
+    "health": "ok",
+    "listener": "LISTEN 0      128    0.0.0.0:8080 0.0.0.0:*",
+    "binaries": [
+      "0c771df4c0fb48d99971efc3133b52a7b3f0dd0474812bd8cd3ba72ddaa6abb4  /home/sprite/rust-desktop/bin/sprite-desktop-gateway",
+      "4cf81cb1a9aaad9fb2e78de41a0fc3e9cffb657ae36d987f6893ea22dd1c76db  /home/sprite/rust-desktop/bin/sprite-desktop-streamd",
+      "0c771df4c0fb48d99971efc3133b52a7b3f0dd0474812bd8cd3ba72ddaa6abb4  /proc/10855/exe",
+      "4cf81cb1a9aaad9fb2e78de41a0fc3e9cffb657ae36d987f6893ea22dd1c76db  /proc/10864/exe"
+    ],
+    "checkedAt": "2026-09-06T16:55:18.040Z"
+  },
+  "topologyAtStart": {
+    "servicePid": 10821,
+    "gatewayPid": 10855,
+    "daemonPid": 10864,
+    "ffmpegPid": 10881,
+    "labwcPid": 10842,
+    "ffmpegCommand": "ffmpeg -hide_banner -loglevel warning -nostdin -f rawvideo -pixel_format bgra -video_size 1280x720 -framerate 60 -re -i pipe:0 -an -c:v libx264 -preset superfast -tune zerolatency -profile:v high444 -level:v 5.2 -pix_fmt yuv444p -b:v 8000k -maxrate 16000k -bufsize 16000k -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 -x264-params aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on -vf scale=1280:720:out_color_matrix=bt709:out_range=pc -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range pc -payload_type 96 -ssrc 1 -rtpflags skip_rtcp -f rtp rtp://127.0.0.1:38948?pkt_size=60000"
+  },
+  "nativeOutputBefore": "HEADLESS-1 \"Headless output 1\"\n  Make: (null)\n  Model: (null)\n  Serial: (null)\n  Enabled: yes\n  Modes:\n    1280x720 px, 60.000000 Hz (current)\n  Position: 0,0\n  Transform: normal\n  Scale: 1.000000\n  Adaptive Sync: disabled\n",
+  "ffplay": {
+    "pid": 10990,
+    "title": "sprite-rust-performance-a9f87dd0-8378-4e4a-b24e-1f8290d9933f"
+  },
+  "warmup": [
+    {
+      "colors": 42,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 47 fps · 8000 kbps @ 100% · 56.5 ms RTT · clock ±28.1 ms · target 60 ms · late 2.2 ms · input 0 · decode 0 · dropped 10 · resize presented 1824×848 in 236 ms",
+      "recorderReady": true,
+      "sampleHash": 3479808784,
+      "width": 1824
+    },
+    {
+      "colors": 42,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 58 fps · 8000 kbps @ 100% · 56.4 ms RTT · clock ±28.1 ms · target 60 ms · late 7.8 ms · input 0 · decode 0 · dropped 11 · resize presented 1824×848 in 236 ms",
+      "recorderReady": true,
+      "sampleHash": 2367768653,
+      "width": 1824
+    },
+    {
+      "colors": 52,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 56 fps · 8000 kbps @ 100% · 56.7 ms RTT · clock ±28.1 ms · target 60 ms · late 10.9 ms · input 0 · decode 0 · dropped 12 · resize presented 1824×848 in 236 ms",
+      "recorderReady": true,
+      "sampleHash": 2064003457,
+      "width": 1824
+    },
+    {
+      "colors": 50,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 56 fps · 8000 kbps @ 100% · 57.2 ms RTT · clock ±28.1 ms · target 60 ms · late 5.3 ms · input 0 · decode 0 · dropped 15 · resize presented 1824×848 in 236 ms",
+      "recorderReady": true,
+      "sampleHash": 3305509971,
+      "width": 1824
+    },
+    {
+      "colors": 40,
+      "connected": true,
+      "cssHeight": 825,
+      "cssWidth": 1833,
+      "height": 848,
+      "metrics": "1824×848 · 57 fps · 8000 kbps @ 100% · 56.6 ms RTT · clock ±28.1 ms · target 60 ms · late 6.1 ms · input 0 · decode 0 · dropped 16 · resize presented 1824×848 in 236 ms",
+      "recorderReady": true,
+      "sampleHash": 2297782208,
+      "width": 1824
+    }
+  ],
+  "topologyBefore": {
+    "servicePid": 10821,
+    "gatewayPid": 10855,
+    "daemonPid": 10864,
+    "ffmpegPid": 11038,
+    "labwcPid": 10842,
+    "ffmpegCommand": "ffmpeg -hide_banner -loglevel warning -nostdin -f rawvideo -pixel_format bgra -video_size 1824x848 -framerate 60 -re -i pipe:0 -an -c:v libx264 -preset superfast -tune zerolatency -profile:v high444 -level:v 5.2 -pix_fmt yuv444p -b:v 8000k -maxrate 16000k -bufsize 16000k -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 -x264-params aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on -vf scale=1824:848:out_color_matrix=bt709:out_range=pc -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range pc -payload_type 96 -ssrc 2 -rtpflags skip_rtcp -f rtp rtp://127.0.0.1:38948?pkt_size=60000"
+  },
+  "before": {
+    "native": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/before-native.png",
+      "bytes": 191777,
+      "sha256": "6ca0d54e293ceaef7bebda7c6a9adf0d2d7944d6c878de1cbcee07e39dd2417e",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=31\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=125.55\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=212\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=126.309\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=125.514\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=112\nlavfi.signalstats.SATAVG=112.577\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=174\nlavfi.signalstats.HUEAVG=190.49\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "browser": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/before-browser.png",
+      "bytes": 372977,
+      "sha256": "59bd116553a66ec7f625adff8f7a5a19636f944664a1c6a0fda1a8d1dda75a4d"
+    }
+  },
+  "gatewayStages": {
+    "schema": 1,
+    "scope": "Header-only gateway timings on the same host CLOCK_MONOTONIC as the native v2 trace. Hub enqueue marks enqueue start before any subscriber can observe the frame. Socket write completion means the async socket accepted the message; it does not prove network delivery. Native pipe-write to RTP AU completion includes encoding and pipe delivery.",
+    "recordCount": 8845,
+    "overflowCount": 0,
+    "intervals": {
+      "nativePipeWriteToRtpAu": {
+        "count": 1769,
+        "p50": 4.61794,
+        "p95": 9.28755,
+        "p99": 10.69728,
+        "max": 12.25407
+      },
+      "rtpAuToMetadataMatch": {
+        "count": 1769,
+        "p50": 0.00676,
+        "p95": 0.01596,
+        "p99": 0.0253,
+        "max": 3.42888
+      },
+      "metadataMatchToHubEnqueue": {
+        "count": 1769,
+        "p50": 0.00044,
+        "p95": 0.00077,
+        "p99": 0.01406,
+        "max": 0.08133
+      },
+      "hubEnqueueToSocketWriteStart": {
+        "count": 1769,
+        "p50": 0.02883,
+        "p95": 0.04791,
+        "p99": 0.08059,
+        "max": 4.33205
+      },
+      "socketWrite": {
+        "count": 1769,
+        "p50": 0.06673,
+        "p95": 0.23154,
+        "p99": 0.66181,
+        "max": 6.04484
+      }
+    }
+  },
+  "pipeline": {
+    "browserTimings": {
+      "schema": 2,
+      "scope": "Browser timings share the window performance clock. Decoder stages and SDK draws are joined exactly by WebCodecs media timestamp. Native capture timestamps use a different clock and are retained without subtraction.",
+      "counts": {
+        "headers": 1682,
+        "decodeSubmissions": 1682,
+        "decoderOutputs": 1682,
+        "recorderDraws": 1636,
+        "exactMatchedDraws": 1635,
+        "decoderOutputsNotDrawn": 47,
+        "recorderDrawsWithoutDecoderOutput": 1,
+        "longTasks": 0,
+        "decoderResets": 0
+      },
+      "overflow": {
+        "headers": 0,
+        "decodeSubmissions": 0,
+        "decoderOutputs": 0,
+        "resets": 0,
+        "longTasks": 0
+      },
+      "auBytes": {
+        "count": 1682,
+        "p50": 16363,
+        "p95": 17730,
+        "p99": 36655,
+        "max": 39046
+      },
+      "receiveToDecodeSubmissionMs": {
+        "count": 1682,
+        "p50": 0.09999999403953552,
+        "p95": 0.20000001787957444,
+        "p99": 0.20000001788139343,
+        "max": 0.4000000059604627
+      },
+      "decodeSubmissionToOutputMs": {
+        "count": 1682,
+        "p50": 3,
+        "p95": 9.200000017881848,
+        "p99": 21.69999998808089,
+        "max": 37.200000017879574
+      },
+      "decoderOutputToDrawMs": {
+        "count": 1635,
+        "p50": 28.899999976158142,
+        "p95": 41.39999997615814,
+        "p99": 43,
+        "max": 45.69999998807907
+      },
+      "longTaskDurationMs": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      }
+    },
+    "decoderResets": [],
+    "discontinuities": 0,
+    "receivedVideoFrames": 1682,
+    "receivedVideoFps": 56.06666666666667,
+    "captureSequenceRate": 56.15746320971831,
+    "captureSequencesNotReceived": 0,
+    "scope": "Video headers from this browser's stream, without payload. Missing capture sequences do not distinguish encoder replacement from transport or gateway loss."
+  },
+  "nativeStages": {
+    "schema": 2,
+    "recordCount": 17700,
+    "overflowCount": 0,
+    "matchedBrowserFrames": 1682,
+    "repeatedSessionRequests": 0,
+    "repeatedConstraintBatches": 0,
+    "repeatedRequests": 0,
+    "repeatedCopyAuthorizations": 0,
+    "repeatedCopyFlushes": 0,
+    "replacedSubmissions": 0,
+    "intervals": {
+      "protocolReadyToCallback": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.57968,
+          "p95": 1.06419,
+          "p99": 1.17775,
+          "max": 1.95644
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "callbackToNextRequest": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.63203,
+          "p95": 0.68459,
+          "p99": 0.74501,
+          "max": 0.96571
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "initialConstraintDelay": {
+        "milliseconds": {
+          "count": 0,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "callbackToFlush": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.64237,
+          "p95": 0.69742,
+          "p99": 0.75642,
+          "max": 0.97499
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "requestToCopyAuthorization": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.00007,
+          "p95": 0.00017,
+          "p99": 0.01364,
+          "max": 0.02514
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "copyAuthorizationToFlush": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.00992,
+          "p95": 0.01369,
+          "p99": 0.01932,
+          "max": 0.04009
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "submit": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.624,
+          "p95": 0.67545,
+          "p99": 0.73891,
+          "max": 0.95779
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "pipeWrite": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 4.17787,
+          "p95": 5.25042,
+          "p99": 9.34774,
+          "max": 15.95824
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      },
+      "notificationPublishToMetadataDispatch": {
+        "milliseconds": {
+          "count": 1770,
+          "p50": 0.04356,
+          "p95": 0.06045,
+          "p99": 0.08479,
+          "max": 4.53423
+        },
+        "boundaryMissing": {
+          "start": 0,
+          "end": 0
+        }
+      }
+    },
+    "cadence": {
+      "captureReadySpacingMs": {
+        "count": 1769,
+        "p50": 17.71168,
+        "p95": 19.65668,
+        "p99": 20.59111,
+        "max": 25.65698
+      },
+      "metadataDeliverySpacingMs": {
+        "count": 1769,
+        "p50": 17.74526,
+        "p95": 19.97814,
+        "p99": 21.75613,
+        "max": 29.70401
+      }
+    }
+  },
+  "recording": {
+    "actualRecordingDimensions": {
+      "initial": {
+        "width": 1824,
+        "height": 848,
+        "cssWidth": 1833,
+        "cssHeight": 825,
+        "devicePixelRatio": 1
+      },
+      "final": {
+        "width": 1824,
+        "height": 848,
+        "cssWidth": 1833,
+        "cssHeight": 825,
+        "devicePixelRatio": 1
+      },
+      "sdkMinimum": {
+        "width": 1824,
+        "height": 848
+      },
+      "sdkMaximum": {
+        "width": 1824,
+        "height": 848
+      }
+    },
+    "canvasUpdateFps": 54.52715358924905,
+    "canvasFrameGapMs": {
+      "count": 1635,
+      "p50": 16.69999998807907,
+      "p95": 33.30000001192093,
+      "p99": 33.5,
+      "max": 133.30000001192093
+    },
+    "longestFreezeMs": 133.30000001192093,
+    "sdkRenderedFps": {
+      "count": 1636,
+      "p50": 55.01650495214149,
+      "p95": 58.00580057971223,
+      "p99": 59.00590058970727,
+      "max": 59.02360944412946
+    },
+    "clock": {
+      "confidentSamples": 1636,
+      "totalSamples": 1636,
+      "confidentFraction": 1,
+      "uncertaintyMs": {
+        "count": 1636,
+        "p50": 27.799999997019768,
+        "p95": 27.799999997019768,
+        "p99": 27.799999997019768,
+        "max": 27.799999997019768
+      }
+    },
+    "latenessMs": {
+      "count": 1636,
+      "p50": 8.33743639588647,
+      "p95": 15.958675454854529,
+      "p99": 43.436645063638935,
+      "max": 206.79995515608607
+    },
+    "decoderQueue": {
+      "count": 1636,
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 8
+    },
+    "monotonicFrameCounters": {
+      "received": {
+        "first": 530,
+        "last": 2212,
+        "intervalDelta": 1682
+      },
+      "decoded": {
+        "first": 530,
+        "last": 2212,
+        "intervalDelta": 1682
+      },
+      "presented": {
+        "first": 514,
+        "last": 2149,
+        "intervalDelta": 1635
+      },
+      "dropped": {
+        "first": 16,
+        "last": 63,
+        "intervalDelta": 47
+      },
+      "dropCauses": {
+        "overdue": {
+          "first": 16,
+          "last": 63,
+          "intervalDelta": 47
+        },
+        "decodedOverflow": {
+          "first": 0,
+          "last": 0,
+          "intervalDelta": 0
+        },
+        "decoderReset": {
+          "first": 0,
+          "last": 0,
+          "intervalDelta": 0
+        }
+      },
+      "scope": "Deltas span the first and last recorder samples, not the exact 30-second edges. They are strict session-monotonic counters; frames before the first sample or after the last sample are excluded."
+    },
+    "generations": [
+      2
+    ],
+    "payload": {
+      "bytes": 28216474,
+      "megabitsPerSecond": 7.523540398753314
+    },
+    "recorderWarnings": []
+  },
+  "checks": [
+    {
+      "name": "30-second recording completed",
+      "passed": true,
+      "actual": 30003.40000000596,
+      "requirement": ">= 29500 ms"
+    },
+    {
+      "name": "continuous-motion canvas update rate",
+      "passed": true,
+      "actual": 54.52715358924905,
+      "requirement": ">= 45 FPS"
+    },
+    {
+      "name": "canvas update frame-gap p95",
+      "passed": true,
+      "actual": 33.30000001192093,
+      "requirement": "<= 50 ms"
+    },
+    {
+      "name": "longest canvas freeze",
+      "passed": true,
+      "actual": 133.30000001192093,
+      "requirement": "<= 250 ms"
+    },
+    {
+      "name": "clock confidence",
+      "passed": true,
+      "actual": "1636/1636",
+      "requirement": ">= 20 and >= 0.8"
+    },
+    {
+      "name": "clock-confident lateness p95",
+      "passed": true,
+      "actual": 15.958675454854529,
+      "requirement": "<= 100 ms"
+    },
+    {
+      "name": "decoder queue p95",
+      "passed": true,
+      "actual": 0,
+      "requirement": "<= 4"
+    },
+    {
+      "name": "stable current generation",
+      "passed": true,
+      "actual": [
+        2
+      ],
+      "requirement": "one positive generation"
+    },
+    {
+      "name": "native-size canvas throughout",
+      "passed": true,
+      "actual": {
+        "initial": {
+          "width": 1824,
+          "height": 848,
+          "cssWidth": 1833,
+          "cssHeight": 825,
+          "devicePixelRatio": 1
+        },
+        "final": {
+          "width": 1824,
+          "height": 848,
+          "cssWidth": 1833,
+          "cssHeight": 825,
+          "devicePixelRatio": 1
+        },
+        "sdkMinimum": {
+          "width": 1824,
+          "height": 848
+        },
+        "sdkMaximum": {
+          "width": 1824,
+          "height": 848
+        }
+      },
+      "requirement": "1824x848 throughout"
+    },
+    {
+      "name": "live WebSocket payload",
+      "passed": true,
+      "actual": {
+        "bytes": 28216474,
+        "megabitsPerSecond": 7.523540398753314
+      },
+      "requirement": "> 0 bytes"
+    },
+    {
+      "name": "native stage trace did not overflow",
+      "passed": true,
+      "actual": 0,
+      "requirement": "exactly 0 dropped records"
+    },
+    {
+      "name": "gateway stages are complete and did not overflow",
+      "passed": true,
+      "actual": {
+        "schema": 1,
+        "scope": "Header-only gateway timings on the same host CLOCK_MONOTONIC as the native v2 trace. Hub enqueue marks enqueue start before any subscriber can observe the frame. Socket write completion means the async socket accepted the message; it does not prove network delivery. Native pipe-write to RTP AU completion includes encoding and pipe delivery.",
+        "recordCount": 8845,
+        "overflowCount": 0,
+        "intervals": {
+          "nativePipeWriteToRtpAu": {
+            "count": 1769,
+            "p50": 4.61794,
+            "p95": 9.28755,
+            "p99": 10.69728,
+            "max": 12.25407
+          },
+          "rtpAuToMetadataMatch": {
+            "count": 1769,
+            "p50": 0.00676,
+            "p95": 0.01596,
+            "p99": 0.0253,
+            "max": 3.42888
+          },
+          "metadataMatchToHubEnqueue": {
+            "count": 1769,
+            "p50": 0.00044,
+            "p95": 0.00077,
+            "p99": 0.01406,
+            "max": 0.08133
+          },
+          "hubEnqueueToSocketWriteStart": {
+            "count": 1769,
+            "p50": 0.02883,
+            "p95": 0.04791,
+            "p99": 0.08059,
+            "max": 4.33205
+          },
+          "socketWrite": {
+            "count": 1769,
+            "p50": 0.06673,
+            "p95": 0.23154,
+            "p99": 0.66181,
+            "max": 6.04484
+          }
+        }
+      },
+      "requirement": "0 dropped records and >= 1000 spans for each gateway interval"
+    },
+    {
+      "name": "native stages correlate with delivered browser frames",
+      "passed": true,
+      "actual": 1682,
+      "requirement": ">= 1000 matching sequence and generation pairs"
+    },
+    {
+      "name": "no decoder resets during steady motion",
+      "passed": true,
+      "actual": 0,
+      "requirement": "0 resets"
+    },
+    {
+      "name": "paused-frame RGB fidelity",
+      "passed": true,
+      "actual": 35.477658,
+      "requirement": ">= 35 dB PSNR; native screenshots identical"
+    }
+  ],
+  "cpu": {
+    "scope": "Whole-Sprite /proc/stat plus read-only per-process /proc samples. Per-process CPU uses one logical core as 100%. ffplay workload cost is separate from the gateway, streamd, encoder FFmpeg, and labwc.",
+    "sampleCount": 30,
+    "wholeSpriteCpuPercentAllCpus": {
+      "count": 30,
+      "p50": 49.67989756722151,
+      "p95": 51.01010101010101,
+      "p99": 52.95629820051414,
+      "max": 52.95629820051414
+    },
+    "processes": {
+      "gateway": {
+        "count": 30,
+        "p50": 1.9988958698916832,
+        "p95": 2.9984772832755984,
+        "p99": 2.9986913710920957,
+        "max": 2.9986913710920957
+      },
+      "streamd": {
+        "count": 30,
+        "p50": 19.98939882224088,
+        "p95": 23.98736825194805,
+        "p99": 26.988222339828862,
+        "max": 26.988222339828862
+      },
+      "encoderFfmpeg": {
+        "count": 30,
+        "p50": 114.93907194764061,
+        "p95": 120.93320012844684,
+        "p99": 120.93398939155006,
+        "max": 120.93398939155006
+      },
+      "labwc": {
+        "count": 30,
+        "p50": 7.995567577143201,
+        "p95": 8.995263094480519,
+        "p99": 8.995479052120704,
+        "max": 8.995479052120704
+      },
+      "workloadFfplay": {
+        "count": 30,
+        "p50": 250.87391578692183,
+        "p95": 256.77200186837314,
+        "p99": 256.8695179903767,
+        "max": 256.8695179903767
+      }
+    }
+  },
+  "after": {
+    "native": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/after-native.png",
+      "bytes": 189119,
+      "sha256": "e30f2bc49366e2def2e54ee15bc336fe7614ca420558c283119df651eae60377",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=31\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=125.419\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=216\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=126.775\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=125.995\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=112\nlavfi.signalstats.SATAVG=111.989\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=177\nlavfi.signalstats.HUEAVG=190.353\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "browser": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/after-browser.png",
+      "bytes": 392190,
+      "sha256": "002060e1cef0fadfa3d014b4b69d114a55e8702945aa3cd004f6157a0aaccd5c"
+    }
+  },
+  "contentEvidence": {
+    "nativeScreenshotsChanged": true,
+    "browserScreenshotsChanged": true,
+    "warmupMinimumSampledColors": 40,
+    "warmupDistinctSampleHashes": 5
+  },
+  "fidelity": {
+    "scope": "Browser p key paused the native application. Two identical native screenshots bracket the decoded-canvas capture. RGB PSNR measures this static test chart, not all desktop text or motion quality.",
+    "native": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/paused-native.png",
+      "bytes": 190080,
+      "sha256": "b0e5deb256877853ca7041a8709e7d8eae147d6e2f4beb8f27332625157ef4b7",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=31\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=123.768\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=216\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=133.273\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=131.035\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=28\nlavfi.signalstats.SATAVG=101.642\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=175\nlavfi.signalstats.HUEAVG=185.195\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "stillNative": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/paused-still-native.png",
+      "bytes": 190080,
+      "sha256": "b0e5deb256877853ca7041a8709e7d8eae147d6e2f4beb8f27332625157ef4b7",
+      "signal": "frame:0    pts:0       pts_time:0\nlavfi.signalstats.YMIN=31\nlavfi.signalstats.YLOW=41\nlavfi.signalstats.YAVG=123.768\nlavfi.signalstats.YHIGH=208\nlavfi.signalstats.YMAX=216\nlavfi.signalstats.UMIN=17\nlavfi.signalstats.ULOW=17\nlavfi.signalstats.UAVG=133.273\nlavfi.signalstats.UHIGH=239\nlavfi.signalstats.UMAX=239\nlavfi.signalstats.VMIN=16\nlavfi.signalstats.VLOW=16\nlavfi.signalstats.VAVG=131.035\nlavfi.signalstats.VHIGH=239\nlavfi.signalstats.VMAX=239\nlavfi.signalstats.SATMIN=1\nlavfi.signalstats.SATLOW=28\nlavfi.signalstats.SATAVG=101.642\nlavfi.signalstats.SATHIGH=118\nlavfi.signalstats.SATMAX=119\nlavfi.signalstats.HUEMED=175\nlavfi.signalstats.HUEAVG=185.195\nlavfi.signalstats.YDIF=0\nlavfi.signalstats.UDIF=0\nlavfi.signalstats.VDIF=0\nlavfi.signalstats.YBITDEPTH=8\nlavfi.signalstats.UBITDEPTH=8\nlavfi.signalstats.VBITDEPTH=8"
+    },
+    "browser": {
+      "path": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/paused-browser.png",
+      "bytes": 401053,
+      "sha256": "6212efaa45858f33d9a912ca8fa7dfda61f08c3c3e2081f78d3c39c0bc67d917"
+    },
+    "decodedPath": "/home/josh/projects/joshuadavidthomas/sprite-desktop/probes/rust-desktop/results/performance-round3-ext-single/paused-decoded.png",
+    "rgbPsnrDb": 35.477658
+  },
+  "topologyAfter": {
+    "servicePid": 10821,
+    "gatewayPid": 10855,
+    "daemonPid": 10864,
+    "ffmpegPid": 11038,
+    "labwcPid": 10842,
+    "ffmpegCommand": "ffmpeg -hide_banner -loglevel warning -nostdin -f rawvideo -pixel_format bgra -video_size 1824x848 -framerate 60 -re -i pipe:0 -an -c:v libx264 -preset superfast -tune zerolatency -profile:v high444 -level:v 5.2 -pix_fmt yuv444p -b:v 8000k -maxrate 16000k -bufsize 16000k -g 60 -keyint_min 60 -sc_threshold 0 -bf 0 -x264-params aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on -vf scale=1824:848:out_color_matrix=bt709:out_range=pc -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range pc -payload_type 96 -ssrc 2 -rtpflags skip_rtcp -f rtp rtp://127.0.0.1:38948?pkt_size=60000"
+  },
+  "cleanup": {
+    "browserSession": "sprite-rust-performance-1361767-a9f87dd0",
+    "browserClosed": true,
+    "proxyClosed": true,
+    "ffplay": {
+      "status": "terminated",
+      "pid": 10990,
+      "signal": "SIGTERM"
+    },
+    "remoteLogRemoved": true
+  },
+  "endedAt": "2026-09-06T16:56:19.954Z"
+}

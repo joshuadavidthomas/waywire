@@ -1,0 +1,816 @@
+{
+  "schema": 1,
+  "scope": "Whole-Sprite /proc/stat plus read-only per-process /proc samples. Per-process CPU uses one logical core as 100%. ffplay workload cost is separate from the gateway, streamd, encoder FFmpeg, and labwc.",
+  "samples": [
+    {
+      "atEpochMs": 1788672116571.581,
+      "intervalSeconds": 1.0006694900002913,
+      "wholeSpriteCpuPercentAllCpus": 47.146401985111666,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9986619158333865,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 19.986619158333866,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 105.92908153916949,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.995316705416853,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 227.84745840500608,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672117572.2263,
+      "intervalSeconds": 1.0007487200000469,
+      "wholeSpriteCpuPercentAllCpus": 45.67430025445292,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9985036803243739,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 19.985036803243737,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 105.92069505719181,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.994762881135308,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 229.827923237303,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672118572.7766,
+      "intervalSeconds": 1.0006629500003328,
+      "wholeSpriteCpuPercentAllCpus": 46.103896103896105,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9993374892111949,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.988737316590313,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 106.92911134559785,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 5.996024935267169,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 239.84099741068678,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672119574.179,
+      "intervalSeconds": 1.0013813200002915,
+      "wholeSpriteCpuPercentAllCpus": 45.038167938931295,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9972411708253335,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.975170537428,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 100.86067912667934,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.990344097888667,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 229.68273464491335,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672120574.8638,
+      "intervalSeconds": 1.000543430000107,
+      "wholeSpriteCpuPercentAllCpus": 44.629156010230176,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.998913730311323,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.990766707646245,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 103.9435139761888,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.99619805608963,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 228.87562212064648,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672121575.411,
+      "intervalSeconds": 1.0006972599985602,
+      "wholeSpriteCpuPercentAllCpus": 44.70284237726098,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9993032258341936,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.987458065015485,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 100.92962580925357,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.995122580839356,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 232.83765161936714,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672122576.009,
+      "intervalSeconds": 1.0005163100013306,
+      "wholeSpriteCpuPercentAllCpus": 42.595019659239846,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9989679128742441,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.9907112158682,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 98.94891168727509,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.9958716514969765,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 225.88337415478958,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672123576.6482,
+      "intervalSeconds": 1.0005903399996896,
+      "wholeSpriteCpuPercentAllCpus": 45.65217391304348,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9994100082960128,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.989970141032217,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 100.94041083789729,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.995280066368102,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 234.861351949563,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672124577.1875,
+      "intervalSeconds": 1.0006426599993574,
+      "wholeSpriteCpuPercentAllCpus": 46.74329501915709,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9987155054945231,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 18.987797302197972,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 104.93256403846247,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 8.994219774725355,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 238.84650290659553,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672125578.1812,
+      "intervalSeconds": 1.0009507899994787,
+      "wholeSpriteCpuPercentAllCpus": 47.34177215189873,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9981002262868903,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 18.98195214972546,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 107.89741221949207,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.992400905147561,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 236.7748768149965,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672126579.3594,
+      "intervalSeconds": 1.0011670800013235,
+      "wholeSpriteCpuPercentAllCpus": 46.7680608365019,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9988342804866077,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 19.976685609732154,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 103.87876517060721,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.991839963406254,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 239.72022731678587,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672127579.9094,
+      "intervalSeconds": 1.0005731799992645,
+      "wholeSpriteCpuPercentAllCpus": 46.192259675405744,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9988542966956901,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.990261521913364,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 101.9415691314802,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.995990038434915,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 228.8688169716565,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672128580.48,
+      "intervalSeconds": 1.000547630001165,
+      "wholeSpriteCpuPercentAllCpus": 46.20253164556962,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.998905339466619,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.990148055199572,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 104.9425303219975,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.996168688133166,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 233.87192471759442,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672129581.019,
+      "intervalSeconds": 1.0005587399991782,
+      "wholeSpriteCpuPercentAllCpus": 45.85427135678392,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9994415720168727,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 15.991065152269963,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 99.94415720168726,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.995532576134981,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 232.8698862799313,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672130581.5671,
+      "intervalSeconds": 1.0005401800008258,
+      "wholeSpriteCpuPercentAllCpus": 45.90163934426229,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9989202232721421,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.99082189781321,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 98.94655105197104,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.9956808930885686,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 233.87366612284063,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672131582.1492,
+      "intervalSeconds": 1.0005632199990941,
+      "wholeSpriteCpuPercentAllCpus": 45.96977329974811,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.999437097039111,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.989867746703997,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 99.9437097039111,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.995496776312888,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 233.86828070715197,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672132582.654,
+      "intervalSeconds": 1.0005515100001503,
+      "wholeSpriteCpuPercentAllCpus": 47.022332506203476,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9988975879909467,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.990629497923045,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 101.94377698753829,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.995590351963787,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 233.87101779494077,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672133583.8357,
+      "intervalSeconds": 1.0010143399995286,
+      "wholeSpriteCpuPercentAllCpus": 46.97156983930779,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9979733756870475,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.982773693339904,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 103.89461553572647,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.992906814904666,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 230.76592489185398,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672134584.436,
+      "intervalSeconds": 1.000686700001097,
+      "wholeSpriteCpuPercentAllCpus": 46.683673469387756,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9986275424643971,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.988334110947374,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 110.92382860677404,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 5.9958826273931916,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 235.83805001079887,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672135585.2334,
+      "intervalSeconds": 1.0008525499997631,
+      "wholeSpriteCpuPercentAllCpus": 45.8974358974359,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9982963524451962,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.984667172006766,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 109.90629938448579,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.994037233558187,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 232.80152505986536,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672136585.9426,
+      "intervalSeconds": 1.0005149799999344,
+      "wholeSpriteCpuPercentAllCpus": 47.36842105263158,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9994852850679612,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.99124984615534,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 106.94492550227186,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.996396995475728,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 234.87904199097088,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672137586.4536,
+      "intervalSeconds": 1.000707709999915,
+      "wholeSpriteCpuPercentAllCpus": 45.23506988564168,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9992927904993205,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.98797743848845,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 101.9278646309307,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.995049533495244,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 232.8352201863417,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672138586.9978,
+      "intervalSeconds": 1.0005122000002302,
+      "wholeSpriteCpuPercentAllCpus": 45.35175879396985,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 2.998464186642911,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.991297057643163,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 98.94931815921606,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.996416435500126,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 228.88276624707555,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672139587.5457,
+      "intervalSeconds": 1.0005428899985418,
+      "wholeSpriteCpuPercentAllCpus": 46.24203821656051,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9994574045710898,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 17.99023328227962,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 101.94465526625116,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 8.99511664113981,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 235.8719474787772,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672140588.1052,
+      "intervalSeconds": 1.0005549200013775,
+      "wholeSpriteCpuPercentAllCpus": 44.38642297650131,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9994453877640452,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.99057159198877,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 101.94342955193262,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 7.995563102112362,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 234.86966612455063,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672141588.6123,
+      "intervalSeconds": 1.0005378599998949,
+      "wholeSpriteCpuPercentAllCpus": 45.103092783505154,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9989248582759378,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 18.98978615362141,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 105.9430174886247,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 5.996774574827813,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 230.87582113087083,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672142589.9624,
+      "intervalSeconds": 1.001102379999793,
+      "wholeSpriteCpuPercentAllCpus": 45.16539440203562,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9977976678073763,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.9812801763627,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 105.88327639379094,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.9922918373258165,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 228.74783296394457,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672143590.5186,
+      "intervalSeconds": 1.0007432399997924,
+      "wholeSpriteCpuPercentAllCpus": 44.02597402597402,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9992573119956398,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 16.987374303925876,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 101.92424582355525,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.994801183969479,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 231.82769638298842,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672144591.117,
+      "intervalSeconds": 1.000622289999228,
+      "wholeSpriteCpuPercentAllCpus": 46.4735516372796,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 1.9987561940095726,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 18.98818384309094,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 104.93470018550256,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 6.995646679033504,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 230.85634040810564,
+          "rssBytes": 343965696
+        }
+      }
+    },
+    {
+      "atEpochMs": 1788672145591.5947,
+      "intervalSeconds": 1.000522809999893,
+      "wholeSpriteCpuPercentAllCpus": 44.70284237726098,
+      "processes": {
+        "gateway": {
+          "cpuPercentOneCore": 0.9994774631875778,
+          "rssBytes": 8417280
+        },
+        "streamd": {
+          "cpuPercentOneCore": 15.991639411001245,
+          "rssBytes": 28966912
+        },
+        "encoderFfmpeg": {
+          "cpuPercentOneCore": 105.94461109788324,
+          "rssBytes": 181075968
+        },
+        "labwc": {
+          "cpuPercentOneCore": 5.996864779125467,
+          "rssBytes": 79945728
+        },
+        "workloadFfplay": {
+          "cpuPercentOneCore": 231.87877145951805,
+          "rssBytes": 343965696
+        }
+      }
+    }
+  ]
+}

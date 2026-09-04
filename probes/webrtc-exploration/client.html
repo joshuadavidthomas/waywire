@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sprite WebRTC test</title>
+  <style>
+    body {
+      margin: 16px;
+      font:
+        16px system-ui,
+        sans-serif;
+      background: #151719;
+      color: #eee;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 8px;
+    }
+    button {
+      font: inherit;
+      padding: 6px 14px;
+      margin-right: 8px;
+    }
+    video {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      background: #000;
+      margin-top: 12px;
+    }
+    pre {
+      white-space: pre-wrap;
+      font-size: 13px;
+    }
+  </style>
+  <h1>Sprite WebRTC test</h1>
+  <p id="description">
+    Connect to the test stream. The server supplies its source and connection
+    settings.
+  </p>
+  <button id="connect" type="button">Connect</button>
+  <button id="stop" type="button" disabled>Stop</button>
+  <button id="fullscreen" type="button">Full screen</button>
+  <span id="status" role="status">Ready</span>
+  <span id="control-status" role="status"></span>
+  <video
+    id="video"
+    autoplay
+    muted
+    playsinline
+    width="1824"
+    height="848"
+  ></video>
+  <details>
+    <summary>Connection details</summary>
+    <pre id="stats"></pre>
+  </details>
+  <script type="module" src="/client.js"></script>
+</html>

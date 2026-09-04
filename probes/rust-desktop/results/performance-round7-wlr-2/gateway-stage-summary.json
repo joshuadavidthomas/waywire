@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "scope": "Header-only gateway timings on the same host CLOCK_MONOTONIC as the native v2 trace. Hub enqueue marks enqueue start before any subscriber can observe the frame. Socket write completion means the async socket accepted the message; it does not prove network delivery. Native pipe-write to RTP AU completion includes encoding and pipe delivery.",
+  "recordCount": 8370,
+  "overflowCount": 0,
+  "intervals": {
+    "nativePipeWriteToRtpAu": {
+      "count": 1674,
+      "p50": 6.61212,
+      "p95": 10.19836,
+      "p99": 11.7552,
+      "max": 56.10251
+    },
+    "rtpAuToMetadataMatch": {
+      "count": 1674,
+      "p50": 0.00669,
+      "p95": 0.01507,
+      "p99": 0.02068,
+      "max": 0.04176
+    },
+    "metadataMatchToHubEnqueue": {
+      "count": 1674,
+      "p50": 0.00045,
+      "p95": 0.00496,
+      "p99": 0.00974,
+      "max": 0.02283
+    },
+    "hubEnqueueToSocketWriteStart": {
+      "count": 1674,
+      "p50": 0.02788,
+      "p95": 0.04078,
+      "p99": 0.05794,
+      "max": 0.44216
+    },
+    "socketWrite": {
+      "count": 1674,
+      "p50": 0.0649,
+      "p95": 0.22599,
+      "p99": 0.42666,
+      "max": 5.50261
+    }
+  }
+}

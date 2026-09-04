@@ -1,0 +1,8 @@
+webrtc-exploration: listening on http://127.0.0.1:3220
+webrtc-exploration: peer state=Connecting
+webrtc-exploration: ICE state=Checking
+webrtc-exploration: ICE candidate type=Host protocol=Udp
+webrtc-exploration: ICE candidate type=Srflx protocol=Udp
+webrtc-exploration: ICE gathering=Complete
+webrtc-exploration: negotiated VP9 profile 1 payload type 35
+webrtc-exploration: session actor complete, shutting down

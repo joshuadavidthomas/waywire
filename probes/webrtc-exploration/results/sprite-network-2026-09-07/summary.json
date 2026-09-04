@@ -1,0 +1,26 @@
+{
+  "status": "BLOCKED_NO_DIRECT_ICE_ROUTE",
+  "sprite": "sprite-desktop-rust",
+  "service": "running",
+  "udpStunBindingSucceededAtBothEnds": true,
+  "browserIceResponsesReceived": 0,
+  "desktopCaptureStarted": false,
+  "playbackObserved": false,
+  "installedWlrPairUnchanged": true,
+  "spriteTestPortEmpty": true,
+  "originalModeRestored": {
+    "width": 1280,
+    "height": 720,
+    "refresh": 60,
+    "preferred": false,
+    "current": true
+  },
+  "packageInstalled": "wf-recorder 0.6.0-1build1",
+  "turnRelayProvisioned": false,
+  "attempts": [
+    1788792684300,
+    1788792804803,
+    1788793023915,
+    1788793548108
+  ]
+}

@@ -1,4 +1,5 @@
 node_modules
+target
 .svelte-kit
 build
 dist

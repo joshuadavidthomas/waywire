@@ -1,0 +1,6 @@
+webrtc-exploration: listening on http://127.0.0.1:3220
+webrtc-exploration: negotiated VP9 profile 1 payload type 35
+webrtc-exploration: RTP receive buffer bytes Ok(8388608)
+webrtc-exploration: ffmpeg started (pid 3814332, source Motion)
+webrtc-exploration: SIGINT received, shutting down
+webrtc-exploration: loopback RTP ingress gaps 0, reorders 0

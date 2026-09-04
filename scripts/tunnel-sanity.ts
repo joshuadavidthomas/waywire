@@ -138,7 +138,11 @@ await new Promise<void>((resolve, reject) => {
     socket.send(JSON.stringify({ host: "localhost", port: 5900 }));
   });
   socket.on("message", (data: RawData, isBinary: boolean) => {
-    const bytes = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data);
+    const bytes = Array.isArray(data)
+      ? Buffer.concat(data)
+      : Buffer.isBuffer(data)
+        ? data
+        : Buffer.from(data);
 
     if (!isBinary && !acknowledgementSeen) {
       const text = bytes.toString("utf8");

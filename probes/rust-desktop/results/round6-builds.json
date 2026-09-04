@@ -1,0 +1,39 @@
+{
+  "sourceRevision": "3f54ee99c5af84f8150a78066b5ef2b55f013c5f",
+  "sourceDirectory": "target/keyframe-trial-20260906/source",
+  "targetDirectory": "target/keyframe-trial-20260906/build",
+  "retainedPatch": "probes/rust-desktop/round6-wlr.patch",
+  "retainedVariant": "pipe1m",
+  "gatewayPath": "target/performance-round3-ext/sprite-desktop-gateway",
+  "gatewaySha256": "0c771df4c0fb48d99971efc3133b52a7b3f0dd0474812bd8cd3ba72ddaa6abb4",
+  "rollbackStreamdPath": "target/performance-round3-wlr/sprite-desktop-streamd",
+  "rollbackStreamdSha256": "9d3260f9e2cca22a8aba464f5267602de5edf50080afc1fb76a94abbaef7c19f",
+  "variants": [
+    {
+      "name": "gop60",
+      "streamdPath": "target/performance-round6-gop60/sprite-desktop-streamd",
+      "streamdSha256": "6416a403e835d42a01d12909eb8f38b776e9c332657b84d712e6bf00bb570593"
+    },
+    {
+      "name": "gop30",
+      "streamdPath": "target/performance-round6-gop30/sprite-desktop-streamd",
+      "streamdSha256": "4d90efd040be7eb0713d36e84fb714e4405f77b60ee04f843cb3bf2e5da0ab04"
+    },
+    {
+      "name": "gop15",
+      "streamdPath": "target/performance-round6-gop15/sprite-desktop-streamd",
+      "streamdSha256": "44b13fcaf8f75110acd0b25d1d76903f723149507a30fc391372157c26d2e0a2"
+    },
+    {
+      "name": "pipe1m",
+      "streamdPath": "target/performance-round6-pipe1m/sprite-desktop-streamd",
+      "streamdSha256": "3341878c62241739569ec6b9b0e435afea1fba12050da5914040f5bca92bab14"
+    },
+    {
+      "name": "no-re",
+      "streamdPath": "target/performance-round6-no-re/sprite-desktop-streamd",
+      "streamdSha256": "d93c9d949389ef2c7ad0944b696cced7a90bc418b4383733afb2ee3be6d81f83"
+    }
+  ],
+  "reproducedRetainedSha256": "3341878c62241739569ec6b9b0e435afea1fba12050da5914040f5bca92bab14"
+}

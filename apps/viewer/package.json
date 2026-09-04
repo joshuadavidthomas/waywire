@@ -1,0 +1,25 @@
+{
+  "name": "@sprite-desktop/viewer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "dev": "vite",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@lucide/svelte": "1.41.0",
+    "@novnc/novnc": "1.7.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.0.0",
+    "@tailwindcss/vite": "4.3.3",
+    "svelte": "5.57.0",
+    "svelte-check": "4.7.6",
+    "tailwindcss": "4.3.3",
+    "vite": "8.2.2",
+    "vitest": "5.0.0"
+  }
+}

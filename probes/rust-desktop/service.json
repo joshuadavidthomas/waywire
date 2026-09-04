@@ -1,0 +1,7 @@
+{
+  "cmd": "/usr/bin/dbus-run-session",
+  "args": ["--", "bash", "/home/sprite/rust-desktop/run.sh"],
+  "http_port": 8080,
+  "needs": [],
+  "dir": "/home/sprite"
+}

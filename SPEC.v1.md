@@ -1,6 +1,6 @@
 # Sprite Desktop v1: self-contained desktop runtime
 
-**Status:** implementation underway; M0 platform gate passed ([record](./probes/M0.md)); M1 in progress  
+**Status:** runtime installed; M0 passed ([record](./probes/M0.md)); M1–M4 acceptance in progress ([runtime evidence](./probes/RUNTIME.md)); M5 not started  
 **Baseline:** v0 spike at change `xrkyqoky` / commit `c37e7760`  
 **Prior spec:** [SPEC.v0.md](./SPEC.v0.md)
 
@@ -195,7 +195,7 @@ Fly pauses a Sprite after about 30 idle seconds. Two mechanisms prevent an attac
 1. **Transport pings.** The bridge sends a WebSocket ping every 20 seconds on every attached `/vnc` connection. Browsers answer pings automatically. This keeps bytes flowing through the router on a static screen and is always on.
 2. **Task hold.** When `keepalive.task` is enabled in `/etc/sprite-desktop/config.json`, the bridge upserts the task `sprite-desktop-viewer` with a 90 second expiry every 30 seconds while `attached > 0`, and deletes it when the last viewer disconnects. The socket at `/.sprite/api.sock` is world-writable, so the bridge needs no privilege. If the bridge dies with the task held, the task expires on its own.
 
-M0 decides the default for `keepalive.task`. If an attached WebSocket with ping traffic and no exec session holds the Sprite active by itself, the default is off, and the pings alone carry the session. If it does not, the default is on. Either way the setting is recorded in the M0 test record and the installer writes it. The 2026-09-04 pings-only trials passed for five and thirty minutes without exec sessions or a task; the selected default is off. Josh also verified cookie-authenticated browser echoes at 22:46 UTC; SameSite metadata remains unrecorded.
+M0 decides the default for `keepalive.task`. If an attached WebSocket with ping traffic and no exec session holds the Sprite active by itself, the default is off, and the pings alone carry the session. If it does not, the default is on. Either way the setting is recorded in the M0 test record and the installer writes it. The 2026-09-04 pings-only trials passed for five and thirty minutes without exec sessions or a task; the selected default is off. Josh also verified cookie-authenticated browser echoes at 22:46 UTC; he subsequently inspected the cookie and reported `SameSite=Lax`.
 
 Disconnect must let the Sprite idle. With the task hold enabled, idle begins at most 90 seconds after the last viewer leaves. The acceptance test records the observed delay.
 
@@ -352,11 +352,13 @@ A release contains:
 
 ```text
 install.sh
-sprite-desktop-<version>-linux-amd64.tar.zst
+sprite-desktop-<version>-linux-amd64.tar.gz
 SHA256SUMS
 ```
 
 `install.sh` embeds its release identifier, archive URL, expected byte size, and archive SHA-256, and verifies the archive against those values whether it downloaded it or received it through `--archive`. A checksum file beside the archive is for inspection, not a separate trust anchor. The release process publishes the source revision through the repository's release channel.
+
+The archive uses gzip, which is present on a fresh supported Sprite. M1 found that zstd was absent; installing an archive decoder before inspecting the source lock would violate preflight ordering.
 
 The archive contains the bridge binary, the desktop service script, `manifest.json`, and `sources.lock`. It never contains a Sprite hostname or generated configuration.
 

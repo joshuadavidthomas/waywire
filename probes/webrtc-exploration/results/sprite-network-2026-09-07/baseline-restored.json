@@ -1,0 +1,9 @@
+{
+  "previousHealth": "connection refused after restoring original output size",
+  "binariesUploaded": false,
+  "operation": "recreate identical owned service definition",
+  "restored": {
+    "healthWaitMs": 1539.4788119999998,
+    "attempts": 4
+  }
+}
