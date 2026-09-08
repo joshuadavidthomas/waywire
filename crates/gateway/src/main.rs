@@ -1,6 +1,5 @@
 mod cursor;
 mod daemon;
-mod gateway_timings;
 mod http;
 mod protocol;
 mod session;
@@ -8,7 +7,6 @@ mod video;
 
 use crate::{
     daemon::{AppEvents, Config, Daemon},
-    gateway_timings::GatewayTimings,
     http::{AppState, SocketConnections},
     session::Sessions,
     video::VideoHub,
@@ -17,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::serve::ListenerExt;
 use clap::Parser;
 use socket2::SockRef;
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::watch,
@@ -33,7 +31,6 @@ enum Stop {
     Signal(Result<()>),
     Daemon(TaskResult),
     Server(TaskResult),
-    Timings(TaskResult),
 }
 
 #[derive(Debug, Parser)]
@@ -55,8 +52,6 @@ struct Options {
     bitrate: u32,
     #[arg(long,default_value="us",value_parser=parse_layout)]
     xkb_layout: String,
-    #[arg(long, env = "SPRITE_DESKTOP_GATEWAY_STAGE_TIMINGS")]
-    gateway_stage_timings: Option<PathBuf>,
 }
 fn parse_origin(raw: &str) -> Result<String, String> {
     let url = Url::parse(raw).map_err(|e| e.to_string())?;
@@ -98,10 +93,6 @@ async fn http_listener(
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = Options::parse();
-    let timings = GatewayTimings::open(options.gateway_stage_timings.as_deref())
-        .context("open gateway stage timing file")?;
-    // Register these handlers before the listener can report service readiness.
-    let timing_signals = timing_signals(timings.is_some())?;
     let listener = http_listener(&options.listen).await?;
     let rtp = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -109,7 +100,7 @@ async fn main() -> Result<()> {
     SockRef::from(&rtp)
         .set_recv_buffer_size(4 << 20)
         .context("set loopback RTP receive buffer to 4 MiB")?;
-    let hub = VideoHub::new(timings.clone());
+    let hub = VideoHub::new();
     let events = AppEvents::new();
     let (daemon, mut daemon_task) = Daemon::start(
         Config {
@@ -136,14 +127,7 @@ async fn main() -> Result<()> {
         hub,
         options.public_url,
         options.frame_rate,
-        timings.clone(),
         connections.clone(),
-    ));
-    let (timing_shutdown, timing_shutdown_rx) = watch::channel(false);
-    let mut timing_task = tokio::spawn(run_timing_signals(
-        timings.clone(),
-        timing_signals,
-        timing_shutdown_rx,
     ));
     let (tx, rx) = watch::channel(false);
     let mut server = tokio::spawn(async move {
@@ -163,7 +147,6 @@ async fn main() -> Result<()> {
         signal = shutdown_signal() => Stop::Signal(signal),
         result = &mut daemon_task => Stop::Daemon(result),
         result = &mut server => Stop::Server(result),
-        result = &mut timing_task => Stop::Timings(result),
     };
 
     connections.begin_shutdown();
@@ -173,48 +156,29 @@ async fn main() -> Result<()> {
         .await
         .map_err(|_| anyhow!("WebSocket shutdown exceeded eight seconds"));
     daemon.shutdown().await;
-    let _ = timing_shutdown.send(true);
 
     match stop {
         Stop::Signal(signal) => {
             let daemon_result = join_task(deadline, "daemon supervisor", &mut daemon_task).await;
             let server_result = join_task(deadline, "HTTP server", &mut server).await;
-            let timing_result =
-                join_task(deadline, "gateway timing signal worker", &mut timing_task).await;
             signal
                 .and(sockets_result)
                 .and(daemon_result)
                 .and(server_result)
-                .and(timing_result)
         }
         Stop::Daemon(daemon_result) => {
             let server_result = join_task(deadline, "HTTP server", &mut server).await;
-            let timing_result =
-                join_task(deadline, "gateway timing signal worker", &mut timing_task).await;
             sockets_result?;
             server_result?;
-            timing_result?;
             daemon_result??;
             Err(anyhow!("daemon supervisor stopped"))
         }
         Stop::Server(server_result) => {
             let daemon_result = join_task(deadline, "daemon supervisor", &mut daemon_task).await;
-            let timing_result =
-                join_task(deadline, "gateway timing signal worker", &mut timing_task).await;
             sockets_result?;
             daemon_result?;
-            timing_result?;
             server_result??;
             Err(anyhow!("HTTP server stopped"))
-        }
-        Stop::Timings(timing_result) => {
-            let daemon_result = join_task(deadline, "daemon supervisor", &mut daemon_task).await;
-            let server_result = join_task(deadline, "HTTP server", &mut server).await;
-            sockets_result?;
-            daemon_result?;
-            server_result?;
-            timing_result.context("join gateway timing signal worker")??;
-            Err(anyhow!("gateway timing signal worker stopped"))
         }
     }
 }
@@ -224,55 +188,6 @@ async fn join_task(deadline: Instant, name: &str, task: &mut JoinHandle<Result<(
         .await
         .map_err(|_| anyhow!("{name} did not stop before the shutdown deadline"))?
         .with_context(|| format!("join {name}"))?
-}
-
-type TimingSignals = (tokio::signal::unix::Signal, tokio::signal::unix::Signal);
-
-fn timing_signals(enabled: bool) -> Result<Option<TimingSignals>> {
-    if !enabled {
-        return Ok(None);
-    }
-    Ok(Some((
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?,
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?,
-    )))
-}
-
-async fn run_timing_signals(
-    timings: Option<GatewayTimings>,
-    signals: Option<TimingSignals>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    if let (Some(timings), Some((mut start, mut stop))) = (timings, signals) {
-        loop {
-            tokio::select! {
-                value = start.recv() => {
-                    value.context("gateway timing start signal stream closed")?;
-                    timings.start();
-                }
-                value = stop.recv() => {
-                    value.context("gateway timing stop signal stream closed")?;
-                    let dump = timings.clone();
-                    // Await each blocking dump before accepting another signal.
-                    // This limits the process to one filesystem write at a time;
-                    // filesystem completion itself has no hard time bound.
-                    tokio::task::spawn_blocking(move || dump.stop_and_dump())
-                        .await
-                        .context("join gateway timing dump")??;
-                }
-                changed = shutdown.changed() => {
-                    changed.context("gateway timing shutdown sender closed")?;
-                    if *shutdown.borrow() { return Ok(()); }
-                }
-            }
-        }
-    }
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 async fn shutdown_signal() -> Result<()> {

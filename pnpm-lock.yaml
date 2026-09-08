@@ -17,9 +17,6 @@ importers:
       '@types/semver':
         specifier: 7.8.0
         version: 7.8.0
-      '@types/ws':
-        specifier: 8.18.1
-        version: 8.18.1
       prettier:
         specifier: 3.6.2
         version: 3.6.2
@@ -32,9 +29,6 @@ importers:
       typescript:
         specifier: 6.0.3
         version: 6.0.3
-      ws:
-        specifier: 8.19.0
-        version: 8.19.0
 
   apps/web:
     dependencies:
@@ -502,9 +496,6 @@ packages:
   '@types/semver@7.8.0':
     resolution: {integrity: sha512-1mAINjtQCXXeLkJ9ehXkwOcBpqtLxiVtKhpUf83DdRNdQKV0iXZpaHYqRr7nj+wvxuJzoAmAwXI+sCNMv1CzLQ==}
 
-  '@types/ws@8.18.1':
-    resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
-
   detect-libc@2.1.2:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
     engines: {node: '>=8'}
@@ -723,18 +714,6 @@ packages:
       tsx:
         optional: true
       yaml:
-        optional: true
-
-  ws@8.19.0:
-    resolution: {integrity: sha512-blAT2mjOEIi0ZzruJfIhb3nps74PRWTCz1IjglWEEpQl5XS/UNama6u2/rjFkDDouqr4L67ry+1aGIALViWjDg==}
-    engines: {node: '>=10.0.0'}
-    peerDependencies:
-      bufferutil: ^4.0.1
-      utf-8-validate: '>=5.0.2'
-    peerDependenciesMeta:
-      bufferutil:
-        optional: true
-      utf-8-validate:
         optional: true
 
 snapshots:
@@ -958,10 +937,6 @@ snapshots:
 
   '@types/semver@7.8.0': {}
 
-  '@types/ws@8.18.1':
-    dependencies:
-      '@types/node': 26.0.0
-
   detect-libc@2.1.2: {}
 
   effect@3.22.1:
@@ -1169,5 +1144,3 @@ snapshots:
       fsevents: 2.3.3
       jiti: 2.7.0
       tsx: 4.21.0
-
-  ws@8.19.0: {}

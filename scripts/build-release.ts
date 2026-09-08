@@ -20,14 +20,12 @@ const { values } = parseArgs({
   options: {
     version: { type: "string" },
     source: { type: "string" },
-    "base-url": { type: "string" },
   },
   strict: true,
 });
 
 const version = values.version;
 const source = values.source;
-const baseURL = values["base-url"];
 if (
   !version ||
   !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(version) ||
@@ -37,20 +35,6 @@ if (
 }
 if (!source || !/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(source)) {
   throw new Error("--source must name the release source revision");
-}
-if (!baseURL) throw new Error("--base-url is required");
-const parsedBaseURL = new URL(baseURL);
-if (
-  parsedBaseURL.protocol !== "https:" ||
-  parsedBaseURL.username ||
-  parsedBaseURL.password ||
-  parsedBaseURL.search ||
-  parsedBaseURL.hash ||
-  baseURL.includes("'")
-) {
-  throw new Error(
-    "--base-url must be an HTTPS release directory without credentials, a query, fragment, or single quote",
-  );
 }
 
 const root = resolve(import.meta.dirname, "..");
@@ -194,13 +178,8 @@ try {
   await writeFile(join(output, "SHA256SUMS"), `${digest}  ${archiveName}\n`);
 
   const template = await readFile(join(root, "installer/install.sh"), "utf8");
-  const archiveURL = new URL(
-    `${version}/${archiveName}`,
-    `${baseURL.replace(/\/*$/u, "")}/`,
-  ).href;
   const installer = template
     .replaceAll("@SPRITE_DESKTOP_VERSION@", version)
-    .replaceAll("@SPRITE_DESKTOP_ARCHIVE_URL@", archiveURL)
     .replaceAll("@SPRITE_DESKTOP_ARCHIVE_SIZE@", String(size))
     .replaceAll("@SPRITE_DESKTOP_ARCHIVE_SHA256@", digest);
   if (installer.includes("@SPRITE_DESKTOP_"))

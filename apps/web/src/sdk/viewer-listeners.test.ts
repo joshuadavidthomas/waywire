@@ -53,7 +53,7 @@ function stats(width: number): WaymoteStats {
   };
 }
 
-test("viewer listeners render latest metrics at 4 Hz, record every frame, and clean up", () => {
+test("viewer listeners render latest metrics at 4 Hz and clean up", () => {
   let now = 0;
   let nextTimer = 1;
   const timers = new Map<number, () => void>();
@@ -120,14 +120,12 @@ test("viewer listeners render latest metrics at 4 Hz, record every frame, and cl
     for (const listener of listeners.get(type) ?? []) listener(value as never);
   };
   let focusCalls = 0;
-  const recorded: WaymoteStats[] = [];
   const remove = installViewerListeners(
     elements,
     session as unknown as Parameters<typeof installViewerListeners>[1],
     { focusTextInput: () => focusCalls++ } as unknown as Parameters<
       typeof installViewerListeners
     >[2],
-    { recordStats: (value) => recorded.push(value) },
   );
 
   emit("stats", stats(1));
@@ -135,7 +133,6 @@ test("viewer listeners render latest metrics at 4 Hz, record every frame, and cl
   emit("stats", stats(2));
   now = 100;
   emit("stats", stats(3));
-  assert.equal(recorded.length, 3, "the recorder receives each frame event");
   assert.match(rawElements.metrics.textContent, /^1×720/);
   assert.equal(timers.size, 1);
 

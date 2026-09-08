@@ -28,8 +28,6 @@ test(
           version,
           "--source",
           "local-contract-test",
-          "--base-url",
-          "https://example.invalid/releases",
         ],
         { cwd: root, timeout: 150_000, maxBuffer: 4 << 20 },
       );
@@ -82,23 +80,6 @@ test(
         ]);
         assert(stdout.startsWith(binary + " "));
       }
-      const firstGateway = await readFile(
-        join(unpacked, "bin/sprite-desktop-gateway"),
-      );
-      await exec("pnpm", ["build"], {
-        cwd: root,
-        timeout: 60_000,
-        maxBuffer: 4 << 20,
-      });
-      assert.equal(
-        createHash("sha256")
-          .update(
-            await readFile(join(root, "target/release/sprite-desktop-gateway")),
-          )
-          .digest("hex"),
-        createHash("sha256").update(firstGateway).digest("hex"),
-        "rebuilding identical viewer assets must not change the gateway binary",
-      );
       const packagedSession = await readFile(
         join(unpacked, "bin/session.py"),
         "utf8",

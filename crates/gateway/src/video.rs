@@ -1,6 +1,5 @@
 use crate::{
     daemon::{CommandSink, Readiness},
-    gateway_timings::{GatewayTimings, TimingRecord},
     protocol::{DaemonCommand, FrameMetadata, VideoSample},
 };
 use anyhow::{Result, anyhow};
@@ -26,7 +25,6 @@ const UNMATCHED_DEADLINE: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct VideoHub {
     inner: Arc<Mutex<Hub>>,
-    timings: Option<GatewayTimings>,
 }
 struct Hub {
     subscribers: HashMap<u64, Subscriber>,
@@ -66,7 +64,7 @@ impl VideoSubscription {
     }
 }
 impl VideoHub {
-    pub fn new(timings: Option<GatewayTimings>) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Hub {
                 subscribers: HashMap::new(),
@@ -74,7 +72,6 @@ impl VideoHub {
                 gop: Vec::new(),
                 gop_bytes: 0,
             })),
-            timings,
         }
     }
     pub fn subscribe(&self) -> (u64, Vec<VideoSample>, VideoSubscription) {
@@ -98,8 +95,6 @@ impl VideoHub {
         self.inner.lock().unwrap().subscribers.remove(&id);
     }
     fn broadcast(&self, sample: VideoSample) -> bool {
-        let sequence = sample.metadata.sequence;
-        let generation = sample.metadata.generation;
         let mut hub = self.inner.lock().unwrap();
         let stream_reset = sample.discontinuity
             || hub
@@ -123,15 +118,6 @@ impl VideoHub {
                 hub.gop.clear();
                 hub.gop_bytes = 0;
             }
-        }
-        // This is enqueue-start: record the publication boundary before any
-        // subscriber queue can expose this frame to a socket task.
-        if let Some(timings) = &self.timings {
-            timings.record(|timestamp_nanos| TimingRecord::HubEnqueue {
-                timestamp_nanos,
-                sequence,
-                generation,
-            });
         }
         for subscriber in hub.subscribers.values_mut() {
             let mut queue = subscriber.queue.lock().unwrap();
@@ -395,11 +381,6 @@ struct PendingUnit {
     unit: Unit,
     _bytes: OwnedSemaphorePermit,
 }
-struct CorrelatedSample {
-    sample: VideoSample,
-    rtp_timestamp: u32,
-    ssrc: u32,
-}
 struct Correlator {
     metadata: VecDeque<Pending<FrameMetadata>>,
     units: VecDeque<Pending<PendingUnit>>,
@@ -419,7 +400,7 @@ impl Correlator {
             ready_generation: 0,
         }
     }
-    fn push_metadata(&mut self, value: FrameMetadata) -> Result<Vec<CorrelatedSample>> {
+    fn push_metadata(&mut self, value: FrameMetadata) -> Result<Vec<VideoSample>> {
         if value.generation == 0 {
             return Err(anyhow!("frame generation must be positive"));
         }
@@ -435,7 +416,7 @@ impl Correlator {
         });
         self.drain()
     }
-    fn push_unit(&mut self, value: PendingUnit) -> Result<Vec<CorrelatedSample>> {
+    fn push_unit(&mut self, value: PendingUnit) -> Result<Vec<VideoSample>> {
         if value.unit.ssrc == 0 {
             return Err(anyhow!("RTP SSRC generation must be positive"));
         }
@@ -451,7 +432,7 @@ impl Correlator {
         });
         self.drain()
     }
-    fn drain(&mut self) -> Result<Vec<CorrelatedSample>> {
+    fn drain(&mut self) -> Result<Vec<VideoSample>> {
         let mut samples = Vec::new();
         loop {
             while self
@@ -521,15 +502,11 @@ impl Correlator {
             self.last_timestamp = Some(unit.timestamp);
             self.last_generation = metadata.generation;
             self.last_fps = metadata.fps;
-            samples.push(CorrelatedSample {
-                sample: VideoSample {
-                    data: unit.data,
-                    key: unit.key,
-                    discontinuity,
-                    metadata,
-                },
-                rtp_timestamp: unit.timestamp,
-                ssrc: unit.ssrc,
+            samples.push(VideoSample {
+                data: unit.data,
+                key: unit.key,
+                discontinuity,
+                metadata,
             });
         }
         Ok(samples)
@@ -566,7 +543,6 @@ enum PipelineMessage {
 pub struct VideoPipeline {
     tx: mpsc::Sender<PipelineMessage>,
     unit_budget: Arc<Semaphore>,
-    timings: Option<GatewayTimings>,
 }
 pub struct VideoWorker {
     rx: mpsc::Receiver<PipelineMessage>,
@@ -578,13 +554,8 @@ impl VideoPipeline {
     pub fn new(hub: VideoHub, commands: CommandSink, readiness: Readiness) -> (Self, VideoWorker) {
         let (tx, rx) = mpsc::channel(MAX_PENDING_RECORDS);
         let unit_budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
-        let timings = hub.timings.clone();
         (
-            Self {
-                tx,
-                unit_budget,
-                timings,
-            },
+            Self { tx, unit_budget },
             VideoWorker {
                 rx,
                 hub,
@@ -629,14 +600,6 @@ impl VideoPipeline {
                 Err(_) => continue,
             };
             if let Ok(Some(unit)) = assembler.consume(packet) {
-                if let Some(timings) = &self.timings {
-                    timings.record(|timestamp_nanos| TimingRecord::RtpAuComplete {
-                        timestamp_nanos,
-                        rtp_timestamp: unit.timestamp,
-                        ssrc: unit.ssrc,
-                        byte_length: unit.data.len(),
-                    });
-                }
                 self.unit(unit).await?;
             }
         }
@@ -663,18 +626,8 @@ impl VideoWorker {
                 PipelineMessage::Metadata(value) => state.push_metadata(value)?,
                 PipelineMessage::Unit(value) => state.push_unit(value)?,
             };
-            for correlated in frames {
-                let frame = correlated.sample;
+            for frame in frames {
                 let generation = frame.metadata.generation;
-                if let Some(timings) = &self.hub.timings {
-                    timings.record(|timestamp_nanos| TimingRecord::MetadataMatch {
-                        timestamp_nanos,
-                        sequence: frame.metadata.sequence,
-                        generation,
-                        rtp_timestamp: correlated.rtp_timestamp,
-                        ssrc: correlated.ssrc,
-                    });
-                }
                 let ready = self.hub.broadcast(frame);
                 if ready {
                     self.readiness.mark_video_ready();
@@ -805,8 +758,8 @@ mod tests {
 
         let samples = correlator.push_unit(pending(unit(1, 2), &budget)).unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.metadata.sequence, 2);
-        assert_eq!(samples[0].sample.metadata.generation, 2);
+        assert_eq!(samples[0].metadata.sequence, 2);
+        assert_eq!(samples[0].metadata.generation, 2);
 
         assert!(
             correlator
@@ -830,8 +783,8 @@ mod tests {
 
         let samples = correlator.push_unit(pending(unit(1, 3), &budget)).unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.metadata.sequence, 3);
-        assert_eq!(samples[0].sample.metadata.generation, 3);
+        assert_eq!(samples[0].metadata.sequence, 3);
+        assert_eq!(samples[0].metadata.generation, 3);
 
         assert!(
             correlator
@@ -876,7 +829,7 @@ mod tests {
         assert!(!current.discontinuity);
         let samples = correlator.push_unit(pending(current, &budget)).unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.metadata.sequence, 3);
+        assert_eq!(samples[0].metadata.sequence, 3);
         assert!(correlator.units.is_empty());
     }
 
@@ -895,8 +848,8 @@ mod tests {
             .push_unit(pending(unit(u32::MAX, 2), &budget))
             .unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.metadata.sequence, 3);
-        assert!(samples[0].sample.discontinuity);
+        assert_eq!(samples[0].metadata.sequence, 3);
+        assert!(samples[0].discontinuity);
         assert!(correlator.metadata.is_empty());
     }
 
@@ -915,7 +868,7 @@ mod tests {
 
     #[test]
     fn viewer_queue_keeps_exact_frame_and_byte_bounds() {
-        let hub = VideoHub::new(None);
+        let hub = VideoHub::new();
         hub.broadcast(sample(0, 1, true));
         let (_, _, frames) = hub.subscribe();
         for sequence in 1..=MAX_VIEWER_FRAMES as u64 {
@@ -923,7 +876,7 @@ mod tests {
         }
         assert_eq!(frames.queue.lock().unwrap().frames.len(), MAX_VIEWER_FRAMES);
 
-        let hub = VideoHub::new(None);
+        let hub = VideoHub::new();
         hub.broadcast(sample(0, 1, true));
         let (_, _, bytes) = hub.subscribe();
         hub.broadcast(sample(1, MAX_VIEWER_BYTES, true));
@@ -932,7 +885,7 @@ mod tests {
 
     #[test]
     fn overflow_keeps_arriving_keyframe_and_discards_delta() {
-        let hub = VideoHub::new(None);
+        let hub = VideoHub::new();
         hub.broadcast(sample(0, 1, true));
         let (_, _, slow) = hub.subscribe();
         let (_, _, independent) = hub.subscribe();
@@ -951,51 +904,9 @@ mod tests {
         assert!(slow_queue.frames[0].key && slow_queue.frames[0].discontinuity);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hub_enqueue_is_recorded_before_concurrent_subscriber_write() {
-        let path = std::env::temp_dir().join(format!(
-            "gateway-hub-order-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let timings = GatewayTimings::open(Some(&path)).unwrap().unwrap();
-        timings.start();
-        let hub = VideoHub::new(Some(timings.clone()));
-        let (_, _, subscription) = hub.subscribe();
-        let writer_timings = timings.clone();
-        let writer = tokio::spawn(async move {
-            let frame = subscription.next().await;
-            writer_timings.record(|timestamp_nanos| TimingRecord::SocketWriteStart {
-                timestamp_nanos,
-                sequence: frame.metadata.sequence,
-                generation: frame.metadata.generation,
-                connection_id: 1,
-                byte_length: frame.data.len(),
-            });
-        });
-        let publisher = hub.clone();
-        tokio::task::spawn_blocking(move || publisher.broadcast(sample(7, 1, true)))
-            .await
-            .unwrap();
-        writer.await.unwrap();
-
-        let records = timings.records();
-        let enqueue = records
-            .iter()
-            .position(|record| matches!(record, TimingRecord::HubEnqueue { sequence: 7, .. }));
-        let write = records.iter().position(|record| {
-            matches!(record, TimingRecord::SocketWriteStart { sequence: 7, .. })
-        });
-        assert!(enqueue.is_some_and(|enqueue| write.is_some_and(|write| enqueue < write)));
-        std::fs::remove_file(path).unwrap();
-    }
-
     #[tokio::test]
     async fn viewer_starts_and_recovers_only_at_keyframe() {
-        let hub = VideoHub::new(None);
+        let hub = VideoHub::new();
         let (_, bootstrap, subscription) = hub.subscribe();
         assert!(bootstrap.is_empty());
         for n in 0..10 {

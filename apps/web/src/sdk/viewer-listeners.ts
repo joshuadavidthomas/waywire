@@ -1,9 +1,5 @@
 import type { SurfaceHandle, WaymoteSession, WaymoteStats } from "./waymote.ts";
 
-export type ComparisonRecorder = {
-  readonly recordStats: (stats: WaymoteStats) => void;
-};
-
 export type ViewerElements = {
   readonly display: HTMLCanvasElement;
   readonly empty: HTMLElement;
@@ -24,7 +20,6 @@ export function installViewerListeners(
   elements: ViewerElements,
   session: WaymoteSession,
   surface: SurfaceHandle,
-  recorder: ComparisonRecorder | null,
 ): () => void {
   let resizeSummary = "resize idle";
   let pendingMetrics: WaymoteStats | null = null;
@@ -93,7 +88,6 @@ export function installViewerListeners(
   };
   cleanup.push(
     session.on("stats", (stats) => {
-      recorder?.recordStats(stats);
       elements.empty.classList.add("hidden");
       pendingMetrics = stats;
       const remaining = 250 - (performance.now() - lastMetricsUpdate);

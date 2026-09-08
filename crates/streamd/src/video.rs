@@ -16,10 +16,7 @@ use nix::{
 };
 use thiserror::Error;
 
-use crate::{
-    protocol::{FrameMetadata, MAX_RAW_PIXELS},
-    stage_timings::{StageTimings, SubmissionOutcome, TimingRecord},
-};
+use crate::protocol::{FrameMetadata, MAX_RAW_PIXELS};
 
 const SLOT_COUNT: usize = 3;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
@@ -163,7 +160,6 @@ struct Pool {
 struct Shared {
     pool: Mutex<Pool>,
     work: Condvar,
-    stage_timings: Option<StageTimings>,
 }
 
 pub struct VideoEncoder {
@@ -174,15 +170,10 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    pub fn start(
-        ffmpeg: String,
-        rtp_port: u16,
-        stage_timings: Option<StageTimings>,
-    ) -> Result<Self, VideoError> {
+    pub fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
         Self::start_with_spawner(
             ffmpeg,
             rtp_port,
-            stage_timings,
             RESTART_DELAY_MIN,
             RESTART_DELAY_MAX,
             spawn_ffmpeg,
@@ -192,7 +183,6 @@ impl VideoEncoder {
     fn start_with_spawner<F>(
         ffmpeg: String,
         rtp_port: u16,
-        stage_timings: Option<StageTimings>,
         restart_delay_min: Duration,
         restart_delay_max: Duration,
         spawn: F,
@@ -212,7 +202,6 @@ impl VideoEncoder {
                 child_pid: None,
             }),
             work: Condvar::new(),
-            stage_timings,
         });
         let (notifications_tx, notifications) = mpsc::sync_channel(64);
         let (notification_wake, notification_source) = make_ping()?;
@@ -242,15 +231,6 @@ impl VideoEncoder {
     }
 
     pub(crate) fn submit(&self, frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
-        let sequence = frame.metadata.sequence;
-        let generation = frame.metadata.generation;
-        if let Some(timings) = &self.shared.stage_timings {
-            timings.record_now(|timestamp_nanos| TimingRecord::SubmitStart {
-                timestamp_nanos,
-                sequence,
-                generation,
-            });
-        }
         frame.validate()?;
         let mut pool = self.shared.pool.lock().unwrap();
         if pool.stopping {
@@ -281,19 +261,6 @@ impl VideoEncoder {
             SubmitResult::Queued
         };
         self.shared.work.notify_one();
-        drop(pool);
-        if let Some(timings) = &self.shared.stage_timings {
-            let outcome = match result {
-                SubmitResult::Queued => SubmissionOutcome::Queued,
-                SubmitResult::ReplacedPending => SubmissionOutcome::ReplacedPending,
-            };
-            timings.record_now(|timestamp_nanos| TimingRecord::SubmitEnd {
-                timestamp_nanos,
-                sequence,
-                generation,
-                outcome,
-            });
-        }
         Ok(result)
     }
 
@@ -560,14 +527,6 @@ fn worker_main<F>(
 
         let active = process.as_mut().unwrap();
         let frame_generation = frame.metadata.generation;
-        let frame_sequence = frame.metadata.sequence;
-        if let Some(timings) = &shared.stage_timings {
-            timings.record_now(|timestamp_nanos| TimingRecord::PipeWriteStart {
-                timestamp_nanos,
-                sequence: frame_sequence,
-                generation: frame_generation,
-            });
-        }
         if let Err(error) = write_frame(&shared, &mut active.input, &frame.pixels, frame_generation)
         {
             let generation = active.generation;
@@ -586,13 +545,6 @@ fn worker_main<F>(
             retry_at = Some(Instant::now() + restart_delay);
             restart_delay = (restart_delay * 2).min(restart_backoff.max);
             continue;
-        }
-        if let Some(timings) = &shared.stage_timings {
-            timings.record_now(|timestamp_nanos| TimingRecord::PipeWriteEnd {
-                timestamp_nanos,
-                sequence: frame_sequence,
-                generation: frame_generation,
-            });
         }
 
         // Correlation metadata follows only a complete raw-frame pipe write.
@@ -674,30 +626,8 @@ fn send_notification_until(
 ) -> bool {
     let started = Instant::now();
     loop {
-        let correlation = match &notification {
-            Notification::Submitted(metadata) => Some((metadata.sequence, metadata.generation)),
-            Notification::RestartRequired { .. } | Notification::Fatal(_) => None,
-        };
-        // Capture the publication boundary before try_send. Once try_send
-        // succeeds, the event-loop thread may dispatch this metadata at once;
-        // sampling afterward could invent a negative queue delay.
-        let publication_sample = correlation
-            .and(shared.stage_timings.as_ref())
-            .and_then(StageTimings::sample);
         match notifications.try_send(notification) {
             Ok(()) => {
-                if let Some(timings) = &shared.stage_timings
-                    && let Some((sequence, generation)) = correlation
-                    && let Some(sample) = publication_sample
-                {
-                    timings.record_sample(sample, |timestamp_nanos| {
-                        TimingRecord::NotificationEnqueue {
-                            timestamp_nanos,
-                            sequence,
-                            generation,
-                        }
-                    });
-                }
                 notification_wake.ping();
                 return true;
             }
@@ -1112,7 +1042,6 @@ mod tests {
                 child_pid: None,
             }),
             work: Condvar::new(),
-            stage_timings: None,
         })
     }
 
@@ -1167,7 +1096,6 @@ mod tests {
         VideoEncoder::start_with_spawner(
             "test-encoder".into(),
             0,
-            None,
             restart_delay,
             restart_delay,
             spawn,
@@ -2166,7 +2094,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let port = socket.local_addr().unwrap().port();
-        let encoder = VideoEncoder::start("ffmpeg".into(), port, None).unwrap();
+        let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
         submit_frame(&encoder, &real_frame(1, 1)).unwrap();
         assert!(matches!(
             wait_for_notification(&encoder),
@@ -2212,8 +2140,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let encoder =
-            VideoEncoder::start("ffmpeg".into(), socket.local_addr().unwrap().port(), None)
-                .unwrap();
+            VideoEncoder::start("ffmpeg".into(), socket.local_addr().unwrap().port()).unwrap();
         let generation = MAX_MEDIA_GENERATION;
         encoder.shared.pool.lock().unwrap().generation = generation - 1;
         encoder.set_generation(generation).unwrap();
@@ -2250,7 +2177,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let port = socket.local_addr().unwrap().port();
-        let encoder = VideoEncoder::start("ffmpeg".into(), port, None).unwrap();
+        let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
         submit_frame(&encoder, &real_frame(1, 1)).unwrap();
         assert!(matches!(
             wait_for_notification(&encoder),
@@ -2275,7 +2202,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
             let port = socket.local_addr().unwrap().port();
-            let encoder = VideoEncoder::start("ffmpeg".into(), port, None).unwrap();
+            let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
 
             for (sequence, idle) in [
                 (1, Duration::ZERO),
@@ -2310,7 +2237,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let port = socket.local_addr().unwrap().port();
-        let encoder = VideoEncoder::start("ffmpeg".into(), port, None).unwrap();
+        let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
         submit_frame(&encoder, &real_frame(1, 1)).unwrap();
         assert!(matches!(
             wait_for_notification(&encoder),
@@ -2355,7 +2282,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let port = socket.local_addr().unwrap().port();
-        let encoder = VideoEncoder::start("ffmpeg".into(), port, None).unwrap();
+        let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
         submit_frame(&encoder, &real_frame(1, 1)).unwrap();
         assert!(matches!(
             wait_for_notification(&encoder),

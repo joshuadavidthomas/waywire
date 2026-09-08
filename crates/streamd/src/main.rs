@@ -1,12 +1,10 @@
 mod event_writer;
 mod protocol;
-mod stage_timings;
 mod video;
 mod wayland;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -25,8 +23,6 @@ struct Options {
     rtp_port: u16,
     #[arg(long, default_value = "us", value_parser = parse_layout)]
     xkb_layout: String,
-    #[arg(long, env = "SPRITE_DESKTOP_STAGE_TIMINGS")]
-    stage_timings: Option<PathBuf>,
 }
 
 fn parse_layout(value: &str) -> Result<String, String> {

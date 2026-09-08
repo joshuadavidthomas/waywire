@@ -3,7 +3,6 @@ import { Effect } from "effect";
 import { acquireWaymoteSession } from "./sdk/effect.ts";
 import {
   installViewerListeners,
-  type ComparisonRecorder,
   type ViewerElements,
 } from "./sdk/viewer-listeners.ts";
 
@@ -57,21 +56,6 @@ function waitForEvent(target: EventTarget, type: string): Effect.Effect<Event> {
     const listener = (event: Event): void => resume(Effect.succeed(event));
     target.addEventListener(type, listener, { once: true });
     return Effect.sync(() => target.removeEventListener(type, listener));
-  });
-}
-
-function loadRecorder(
-  display: HTMLCanvasElement,
-): Effect.Effect<ComparisonRecorder | null, Error> {
-  if (!new URLSearchParams(location.search).has("record"))
-    return Effect.succeed(null);
-  return Effect.tryPromise({
-    try: async () => {
-      const { installRecorder } = await import("comparison-recorder");
-      return installRecorder({ transport: "rust", canvas: () => display });
-    },
-    catch: (cause) =>
-      cause instanceof Error ? cause : new Error(String(cause)),
   });
 }
 
@@ -162,11 +146,10 @@ function permissionTasks(
 export const viewerProgram: Effect.Effect<void, Error> = Effect.scoped(
   Effect.gen(function* () {
     const elements = viewerElements();
-    const recorder = yield* loadRecorder(elements.display);
     const { session, surface } = yield* acquireWaymoteSession(
       {
         latency: Number(elements.latency.value),
-        statsIntervalMs: recorder ? 0 : 250,
+        statsIntervalMs: 250,
         remoteDisplay: {
           mode: "observe",
           element: elements.display,
@@ -183,7 +166,7 @@ export const viewerProgram: Effect.Effect<void, Error> = Effect.scoped(
     );
     yield* Effect.acquireRelease(
       Effect.sync(() =>
-        installViewerListeners(elements, session, surface, recorder),
+        installViewerListeners(elements, session, surface),
       ),
       (removeListeners) => Effect.sync(removeListeners),
     );

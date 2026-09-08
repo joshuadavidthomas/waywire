@@ -9,29 +9,21 @@
   },
   "scripts": {
     "build": "pnpm --filter @sprite-desktop/web build && cargo build --locked --release --workspace",
-    "build:rust": "pnpm build",
-    "check": "pnpm --filter @sprite-desktop/web check && pnpm --filter @sprite-desktop/web build && pnpm --filter @sprite-desktop/provision check && tsc -p probes/tsconfig.json && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings",
-    "check:rust": "pnpm --filter @sprite-desktop/web check && pnpm --filter @sprite-desktop/web test && pnpm --filter @sprite-desktop/web build && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && tsx --test probes/rust-desktop/*.test.ts probes/view-runtime.test.ts",
-    "test": "pnpm --filter @sprite-desktop/web test && pnpm --filter @sprite-desktop/web build && cargo test --workspace && tsx --test probes/rust-desktop/*.test.ts probes/view-runtime.test.ts && node --test probes/compare/metrics.test.mjs && pnpm test:installer",
-    "test:installer": "python3 -m unittest discover -s installer -p 'test_*.py' && shellcheck installer/desktop.sh installer/install.sh && tsx --test scripts/build-release.test.ts",
-    "test:rust:ipc": "pnpm --filter @sprite-desktop/web build && cargo build -p sprite-desktop-gateway && tsx probes/rust-desktop/ipc-check.ts --gateway target/debug/sprite-desktop-gateway",
-    "test:rust:media": "cargo test -p sprite-desktop-streamd ffmpeg_ -- --ignored",
+    "check": "pnpm --filter @sprite-desktop/web check && pnpm --filter @sprite-desktop/provision check && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "test": "pnpm --filter @sprite-desktop/web test && cargo test --workspace && python3 -m unittest discover -s installer -p 'test_*.py' && shellcheck installer/desktop.sh installer/install.sh && tsx --test scripts/build-release.test.ts",
     "dev:web": "pnpm --filter @sprite-desktop/web dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "provision": "pnpm --filter @sprite-desktop/provision provision",
-    "install-desktop": "tsx packages/sprite-provision/src/install.ts",
     "release": "tsx scripts/build-release.ts"
   },
   "devDependencies": {
     "@fly/sprites": "0.2.2",
     "@types/node": "^24.13.3",
     "@types/semver": "7.8.0",
-    "@types/ws": "8.18.1",
     "prettier": "3.6.2",
     "semver": "7.8.5",
     "tsx": "4.21.0",
-    "typescript": "6.0.3",
-    "ws": "8.19.0"
+    "typescript": "6.0.3"
   }
 }

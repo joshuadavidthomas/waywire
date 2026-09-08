@@ -58,7 +58,6 @@ use crate::{
     Options,
     event_writer::{EventSink, EventWriter},
     protocol::{Command, CommandDecoder, Event},
-    stage_timings::{StageTimings, TimingRecord, monotonic_nanos},
     video::{Notification, VideoEncoder},
 };
 
@@ -89,30 +88,18 @@ pub struct State {
     fps: u32,
     bitrate_kbps: u32,
     encoded_scale: u32,
-    stage_timings: Option<StageTimings>,
 }
 
 pub fn run(options: Options) -> Result<()> {
-    let stage_timings = StageTimings::open(options.stage_timings.as_deref())
-        .context("create stage timings output")?;
-    let signal_kinds = if stage_timings.is_some() {
-        vec![
-            Signal::SIGINT,
-            Signal::SIGTERM,
-            Signal::SIGUSR1,
-            Signal::SIGUSR2,
-        ]
-    } else {
-        vec![Signal::SIGINT, Signal::SIGTERM]
-    };
     // Signals::new blocks these signals in this thread. Do this before any
     // native worker starts so every worker inherits the blocked mask.
-    let signal_source = Signals::new(&signal_kinds).context("register process signals")?;
+    let signal_source =
+        Signals::new(&[Signal::SIGINT, Signal::SIGTERM]).context("register process signals")?;
     let connection = Connection::connect_to_env().context("connect to Wayland compositor")?;
     let mut event_queue = connection.new_event_queue();
     let qh = event_queue.handle();
     let (event_writer, event_sink) = EventWriter::start().context("start stdout event writer")?;
-    let mut video = VideoEncoder::start(options.ffmpeg, options.rtp_port, stage_timings.clone())?;
+    let mut video = VideoEncoder::start(options.ffmpeg, options.rtp_port)?;
     let notification_source = video
         .take_notification_source()
         .context("encoder notification source is already registered")?;
@@ -137,7 +124,6 @@ pub fn run(options: Options) -> Result<()> {
         fps: options.frame_rate,
         bitrate_kbps: options.bitrate,
         encoded_scale: 100,
-        stage_timings,
     };
 
     connection.display().get_registry(&qh, ());
@@ -223,18 +209,6 @@ pub fn run(options: Options) -> Result<()> {
         .map_err(|_| anyhow!("register encoder notification source"))?;
     handle.insert_source(signal_source, |event, _, state| match event.signal() {
         Signal::SIGINT | Signal::SIGTERM => state.stop(),
-        Signal::SIGUSR1 => {
-            if let Some(timings) = &state.stage_timings {
-                timings.start();
-            }
-        }
-        Signal::SIGUSR2 => {
-            if let Some(timings) = &state.stage_timings
-                && let Err(error) = timings.stop_and_dump()
-            {
-                state.fail(error.into());
-            }
-        }
         _ => {}
     })?;
 
@@ -296,20 +270,8 @@ impl State {
     }
 
     fn request_capture(&mut self) -> Result<()> {
-        self.request_capture_for(self.capture.sequence)
-    }
-
-    fn request_capture_for(&mut self, sequence: u64) -> Result<()> {
         let output = self.output.as_ref().context("output disappeared")?;
         self.capture.request(output, &self.qh)?;
-        if let Some(timings) = &self.stage_timings {
-            let generation = self.generation;
-            timings.record_now(|timestamp_nanos| TimingRecord::CaptureRequestComplete {
-                timestamp_nanos,
-                sequence,
-                generation,
-            });
-        }
         Ok(())
     }
 
@@ -436,13 +398,6 @@ impl State {
                     // drained. Its RTP access unit may already be queued at the
                     // gateway; dropping the record lets that old unit consume
                     // metadata from the replacement encoder.
-                    if let Some(timings) = &self.stage_timings {
-                        timings.record_now(|timestamp_nanos| TimingRecord::MetadataDispatch {
-                            timestamp_nanos,
-                            sequence: metadata.sequence,
-                            generation: metadata.generation,
-                        });
-                    }
                     if let Err(error) = self.event_sink.send(Event::Frame(metadata)) {
                         self.fail(error.into());
                         return;
@@ -591,18 +546,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum CaptureFlush {
-    Complete,
-    Pending,
-}
-
-fn capture_flush(result: std::result::Result<(), WaylandError>) -> Result<CaptureFlush> {
+fn capture_flush(result: std::result::Result<(), WaylandError>) -> Result<()> {
     match result {
-        Ok(()) => Ok(CaptureFlush::Complete),
-        Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
-            Ok(CaptureFlush::Pending)
-        }
+        Ok(()) => Ok(()),
+        Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
         Err(error) => Err(error).context("flush next Wayland capture request"),
     }
 }
@@ -635,26 +582,7 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                 let wait = state.capture.damage_baseline_available
                     && state.acknowledged_generation == state.generation;
                 state.capture.begin_copy(wait)?;
-                let sequence = state.capture.sequence;
-                let generation = state.generation;
-                if let Some(timings) = &state.stage_timings {
-                    timings.record_now(|timestamp_nanos| TimingRecord::CopyAuthorized {
-                        timestamp_nanos,
-                        sequence,
-                        generation,
-                    });
-                }
-                let flush = capture_flush(connection.flush())?;
-                if flush == CaptureFlush::Complete
-                    && let Some(timings) = &state.stage_timings
-                {
-                    timings.record_now(|timestamp_nanos| TimingRecord::CopyFlushComplete {
-                        timestamp_nanos,
-                        sequence,
-                        generation,
-                    });
-                }
-                Ok(())
+                capture_flush(connection.flush())
             })(),
             zwlr_screencopy_frame_v1::Event::Flags { flags } => {
                 if flags == WEnum::Value(zwlr_screencopy_frame_v1::Flags::empty()) {
@@ -668,46 +596,18 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                 tv_sec_lo,
                 tv_nsec,
             } => {
-                // Mark when this readiness callback runs, before scheduling the
-                // next capture or copying this frame's pixels. The protocol field
-                // separately carries the compositor-provided ready timestamp.
-                let timing_guard = state.stage_timings.as_ref().and_then(StageTimings::guard);
+                // Frame metadata uses local callback time, not the compositor's clock.
                 let capture_nanos = monotonic_nanos().context("read monotonic capture time");
-                let protocol_ready_nanos = protocol_ready_nanos(tv_sec_hi, tv_sec_lo, tv_nsec)
-                    .context("invalid screencopy ready timestamp");
                 capture_nanos.and_then(|capture_nanos| {
-                    let protocol_ready_nanos = protocol_ready_nanos?;
+                    protocol_ready_nanos(tv_sec_hi, tv_sec_lo, tv_nsec)
+                        .context("invalid screencopy ready timestamp")?;
                     let sequence = state.capture.sequence;
-                    let generation = state.generation;
-                    if let Some(timings) = &state.stage_timings
-                        && let Some(timing_guard) = timing_guard
-                    {
-                        timings.record_at(timing_guard, capture_nanos, |timestamp_nanos| {
-                            TimingRecord::WaylandReady {
-                                timestamp_nanos,
-                                sequence,
-                                generation,
-                                protocol_ready_nanos,
-                            }
-                        });
-                    }
                     state.capture.cancel();
-                    let next_sequence = sequence
+                    sequence
                         .checked_add(1)
                         .context("frame sequence exhausted")?;
-                    state.request_capture_for(next_sequence)?;
-                    let flush = capture_flush(connection.flush())?;
-                    if flush == CaptureFlush::Complete
-                        && let Some(timings) = &state.stage_timings
-                    {
-                        timings.record_now(|timestamp_nanos| {
-                            TimingRecord::CaptureRequestFlushComplete {
-                                timestamp_nanos,
-                                sequence: next_sequence,
-                                generation,
-                            }
-                        });
-                    }
+                    state.request_capture()?;
+                    capture_flush(connection.flush())?;
                     // capture_output only announces the next frame's constraints.
                     // Its BufferDone cannot dispatch until this callback returns, so
                     // the current single SHM mapping remains stable during submit.
@@ -1027,6 +927,13 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
     }
 }
 
+fn monotonic_nanos() -> Option<u64> {
+    let timestamp = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).ok()?;
+    let seconds = u64::try_from(timestamp.tv_sec()).ok()?;
+    let nanos = u64::try_from(timestamp.tv_nsec()).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
 fn protocol_ready_nanos(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) -> Option<u64> {
     if tv_nsec >= 1_000_000_000 {
         return None;
@@ -1039,15 +946,12 @@ fn protocol_ready_nanos(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureFlush, WaylandError, capture_flush, io, protocol_ready_nanos};
+    use super::{WaylandError, capture_flush, io, protocol_ready_nanos};
 
     #[test]
-    fn only_a_completed_flush_gets_a_completion_timestamp() {
-        assert_eq!(capture_flush(Ok(())).unwrap(), CaptureFlush::Complete);
-        assert_eq!(
-            capture_flush(Err(WaylandError::Io(io::ErrorKind::WouldBlock.into()))).unwrap(),
-            CaptureFlush::Pending,
-        );
+    fn capture_flush_accepts_backpressure_but_rejects_broken_connections() {
+        assert!(capture_flush(Ok(())).is_ok());
+        assert!(capture_flush(Err(WaylandError::Io(io::ErrorKind::WouldBlock.into()))).is_ok());
         assert!(capture_flush(Err(WaylandError::Io(io::ErrorKind::BrokenPipe.into()))).is_err());
     }
 

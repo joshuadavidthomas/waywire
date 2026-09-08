@@ -1,6 +1,5 @@
 use crate::{
     daemon::RuntimeState,
-    gateway_timings::{GatewayTimings, TimingRecord},
     protocol::{self, JsonInput, TextAction, VideoSample},
     session::{LeaseState, Sessions},
     video::VideoHub,
@@ -90,7 +89,6 @@ pub struct AppState {
     pub hub: VideoHub,
     pub origin: Arc<str>,
     pub frame_rate: u32,
-    pub timings: Option<GatewayTimings>,
     connections: SocketConnections,
     next_id: Arc<AtomicU64>,
 }
@@ -101,7 +99,6 @@ impl AppState {
         hub: VideoHub,
         origin: String,
         frame_rate: u32,
-        timings: Option<GatewayTimings>,
         connections: SocketConnections,
     ) -> Self {
         Self {
@@ -110,7 +107,6 @@ impl AppState {
             hub,
             origin: origin.into(),
             frame_rate,
-            timings,
             connections,
             next_id: Arc::new(AtomicU64::new(1)),
         }
@@ -173,15 +169,9 @@ async fn stream_socket(mut socket: WebSocket, s: AppState, _admission: SocketAdm
     }
     let (id, bootstrap, subscription) = s.hub.subscribe();
     for frame in bootstrap {
-        if send_video(
-            &mut socket,
-            &frame,
-            id,
-            s.timings.as_ref(),
-            &s.connections.cancellation,
-        )
-        .await
-        .is_err()
+        if send_video(&mut socket, &frame, &s.connections.cancellation)
+            .await
+            .is_err()
         {
             s.hub.unsubscribe(id);
             return;
@@ -197,13 +187,7 @@ async fn stream_socket(mut socket: WebSocket, s: AppState, _admission: SocketAdm
                 }
             }
             frame = subscription.next() => {
-                if send_video(
-                    &mut socket,
-                    &frame,
-                    id,
-                    s.timings.as_ref(),
-                    &s.connections.cancellation,
-                )
+                if send_video(&mut socket, &frame, &s.connections.cancellation)
                 .await
                 .is_err()
                 {
@@ -414,34 +398,10 @@ async fn handle_text(outbound: &Outbound, s: &AppState, id: u64, text: &str) -> 
 async fn send_video(
     socket: &mut WebSocket,
     frame: &VideoSample,
-    connection_id: u64,
-    timings: Option<&GatewayTimings>,
     cancellation: &CancellationToken,
 ) -> Result<(), ()> {
     let bytes = protocol::encode_video(frame);
-    let byte_length = bytes.len();
-    let timing_span = timings.and_then(|timings| {
-        let sample = timings.sample()?;
-        timings
-            .publish(sample, |timestamp_nanos| TimingRecord::SocketWriteStart {
-                timestamp_nanos,
-                sequence: frame.metadata.sequence,
-                generation: frame.metadata.generation,
-                connection_id,
-                byte_length,
-            })
-            .then_some(sample)
-    });
     send(socket, Message::Binary(bytes.into()), cancellation).await?;
-    if let (Some(timings), Some(span)) = (timings, timing_span) {
-        timings.record_in_epoch(span, |timestamp_nanos| TimingRecord::SocketWriteEnd {
-            timestamp_nanos,
-            sequence: frame.metadata.sequence,
-            generation: frame.metadata.generation,
-            connection_id,
-            byte_length,
-        });
-    }
     Ok(())
 }
 

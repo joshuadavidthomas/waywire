@@ -2,7 +2,6 @@
 set -euo pipefail
 
 readonly RELEASE='@SPRITE_DESKTOP_VERSION@'
-readonly ARCHIVE_URL='@SPRITE_DESKTOP_ARCHIVE_URL@'
 readonly ARCHIVE_SIZE='@SPRITE_DESKTOP_ARCHIVE_SIZE@'
 readonly ARCHIVE_SHA256='@SPRITE_DESKTOP_ARCHIVE_SHA256@'
 readonly OWNER_ID='dev.sprite-desktop.runtime'
@@ -55,9 +54,7 @@ if [ -n "$archive_path" ]; then
   [ -f "$archive_path" ] || fail "archive does not exist: $archive_path"
   archive=$archive_path
 else
-  archive=$temporary/archive.tar.gz
-  notice "downloading $ARCHIVE_URL"
-  curl -fL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 -o "$archive" "$ARCHIVE_URL" || fail 'release download failed'
+  fail '--archive is required'
 fi
 actual_size=$(stat -c %s "$archive")
 [ "$actual_size" = "$ARCHIVE_SIZE" ] || fail "archive size mismatch: expected $ARCHIVE_SIZE, got $actual_size"
