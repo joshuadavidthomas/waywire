@@ -1,8 +1,6 @@
 # Spike: Agent Desktop on Sprites, rendered through Cloudflare
 
-> Archived v0 plan. Its assumptions record what was known before implementation.
-> [README.md](./README.md) records the result, and [SPEC.v1.md](./SPEC.v1.md)
-> defines the next design.
+> **HISTORICAL:** This document records the discarded v0 Cloudflare/VNC design. Its commands and requirements are not instructions for the current Socket implementation. See [README.md](./README.md) for the current project.
 
 **Status:** spec for a throwaway-quality prototype. Optimize for "does this work end to end," not for polish.
 **Owner:** Josh (single user for the spike; no multi-tenancy).

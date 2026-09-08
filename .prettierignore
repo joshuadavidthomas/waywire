@@ -8,3 +8,5 @@ coverage
 pnpm-lock.yaml
 worker-configuration.d.ts
 SPEC.v0.md
+probes/**/results
+probes/compare/*.md

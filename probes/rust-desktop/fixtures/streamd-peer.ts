@@ -120,7 +120,8 @@ function sendKeyframe(): void {
   packet.set([0x80, 0xe0]); // version 2, payload 96, marker set
   packet.writeUInt16BE(1, 2);
   packet.writeUInt32BE(3_000, 4);
-  packet.writeUInt32BE(7, 8);
+  // Socket RTP uses SSRC as the exact frame generation.
+  packet.writeUInt32BE(4, 8);
   packet.set([0x65, 0x88], 12); // one IDR NAL; marker completes the access unit
   const socket = dgram.createSocket("udp4");
   socket.send(packet, port, "127.0.0.1", (error) => {

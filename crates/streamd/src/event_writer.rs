@@ -106,22 +106,6 @@ impl Drop for EventWriter {
 }
 
 impl EventSink {
-    /// Exercise real encoding and queue bounds without a stdout writer thread.
-    #[cfg(test)]
-    pub(crate) fn test_sink() -> Self {
-        Self {
-            shared: Arc::new(Shared {
-                queue: Mutex::new(Queue {
-                    records: VecDeque::new(),
-                    bytes: 0,
-                    stopping: false,
-                    failure: None,
-                }),
-                ready: Condvar::new(),
-            }),
-        }
-    }
-
     pub fn send(&self, event: Event) -> Result<(), EventWriterError> {
         let bytes = event.encode()?;
         let replaceable_kind = matches!(bytes.get(1), Some(4 | 5)).then(|| bytes[1]);

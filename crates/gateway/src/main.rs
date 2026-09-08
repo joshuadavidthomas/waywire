@@ -51,7 +51,7 @@ struct Options {
     public_url: String,
     #[arg(long,default_value_t=60,value_parser=clap::value_parser!(u32).range(10..=120))]
     frame_rate: u32,
-    #[arg(long,default_value_t=8_000,value_parser=clap::value_parser!(u32).range(300..=50_000))]
+    #[arg(long,default_value_t=16_000,value_parser=clap::value_parser!(u32).range(300..=50_000))]
     bitrate: u32,
     #[arg(long,default_value="us",value_parser=parse_layout)]
     xkb_layout: String,
@@ -287,6 +287,20 @@ async fn shutdown_signal() -> Result<()> {
 mod tests {
     use super::*;
     use axum::serve::Listener;
+
+    #[test]
+    fn desktop_defaults_use_sixty_fps_and_sixteen_megabit_video() {
+        let options = Options::try_parse_from([
+            "sprite-desktop-gateway",
+            "--streamd",
+            "sprite-desktop-streamd",
+            "--public-url",
+            "https://example.test",
+        ])
+        .unwrap();
+        assert_eq!(options.frame_rate, 60);
+        assert_eq!(options.bitrate, 16_000);
+    }
 
     #[test]
     fn canonical_origin_strips_path_and_rejects_foreign_shapes() {

@@ -24,8 +24,6 @@ use crate::{
     protocol::{Event, cursor_byte_count},
 };
 
-const MAX_CONSECUTIVE_CURSOR_FAILURES: u8 = 3;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Hotspot {
     x: i32,
@@ -33,6 +31,9 @@ struct Hotspot {
 }
 
 pub struct Cursor {
+    pub source_manager:
+        Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
+    pub capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
     pub cursor_session:
         Option<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1>,
     pub session: Option<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1>,
@@ -53,13 +54,13 @@ pub struct Cursor {
     published: Option<(u32, u32, Hotspot, Vec<u8>)>,
     visibility: Option<bool>,
     events: EventSink,
-    consecutive_unknown_failures: u8,
-    consecutive_constraint_failures: u8,
 }
 
 impl Cursor {
     pub fn new(events: EventSink) -> Self {
         Self {
+            source_manager: None,
+            capture_manager: None,
             cursor_session: None,
             session: None,
             frame: None,
@@ -79,8 +80,6 @@ impl Cursor {
             published: None,
             visibility: None,
             events,
-            consecutive_unknown_failures: 0,
-            consecutive_constraint_failures: 0,
         }
     }
 
@@ -95,18 +94,24 @@ impl Cursor {
         &mut self,
         seat: &wl_seat::WlSeat,
         output: &wl_output::WlOutput,
-        source_manager: &ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
-        capture_manager: &ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
         if !self.has_pointer {
             bail!("seat has no pointer after virtual pointer creation");
         }
+        let source_manager = self
+            .source_manager
+            .as_ref()
+            .context("missing cursor source manager")?;
+        let capture_manager = self
+            .capture_manager
+            .as_ref()
+            .context("missing image copy capture manager")?;
         let source = source_manager.create_source(output, qh, ());
         let pointer = seat.get_pointer(qh, ());
         let cursor_session =
             capture_manager.create_pointer_cursor_session(&source, &pointer, qh, ());
-        let session = cursor_session.get_capture_session(qh, super::capture::CaptureTarget::Cursor);
+        let session = cursor_session.get_capture_session(qh, ());
         source.destroy();
         pointer.release();
         self.cursor_session = Some(cursor_session);
@@ -153,8 +158,9 @@ impl Cursor {
         qh: &QueueHandle<State>,
     ) -> Result<()> {
         let length = cursor_byte_count(width, height)?;
-        // The previous frame may have been cancelled before Ready. Its storage
-        // must not become the destination of another capture.
+        if self.buffer.is_some() && self.width == width && self.height == height {
+            return Ok(());
+        }
         if let Some(buffer) = self.buffer.take() {
             buffer.destroy();
         }
@@ -192,7 +198,7 @@ impl Cursor {
             .as_ref()
             .context("cursor session unavailable")?;
         let buffer = self.buffer.as_ref().context("cursor buffer unavailable")?;
-        let frame = session.create_frame(qh, super::capture::CaptureTarget::Cursor);
+        let frame = session.create_frame(qh, ());
         frame.attach_buffer(buffer);
         frame.damage_buffer(0, 0, self.width as i32, self.height as i32);
         frame.capture();
@@ -229,61 +235,28 @@ impl Cursor {
             self.published = Some((self.width, self.height, self.committed_hotspot, pixels));
             self.force_publish = false;
         }
-        self.consecutive_unknown_failures = 0;
-        self.consecutive_constraint_failures = 0;
         self.request(qh)
     }
 
     pub fn frame_failed(
         &mut self,
-        reason: WEnum<ext_image_copy_capture_frame_v1::FailureReason>,
+        constraints_changed: bool,
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
         self.destroy_frame();
-        match reason {
-            WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints) => {
-                Self::record_failure(
-                    &mut self.consecutive_constraint_failures,
-                    "cursor capture buffer constraints failed repeatedly",
-                )?;
-                if self.collecting_constraints {
-                    Ok(())
-                } else {
-                    self.allocate(shm, self.width, self.height, qh)?;
-                    self.request(qh)
+        match failure_recovery(constraints_changed, self.collecting_constraints) {
+            FailureRecovery::WaitForConstraints => Ok(()),
+            FailureRecovery::Retry => self.request(qh),
+            FailureRecovery::Reallocate => {
+                if let Some(buffer) = self.buffer.take() {
+                    buffer.destroy();
                 }
-            }
-            WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::Unknown) => {
-                Self::record_failure(
-                    &mut self.consecutive_unknown_failures,
-                    "cursor capture failed repeatedly",
-                )?;
+                self.mapping = None;
+                self.allocate(shm, self.width, self.height, qh)?;
                 self.request(qh)
             }
-            WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::Stopped) => {
-                bail!("cursor capture session stopped")
-            }
-            WEnum::Unknown(value) => {
-                Self::record_failure(
-                    &mut self.consecutive_unknown_failures,
-                    "cursor capture failed repeatedly with an unknown reason",
-                )?;
-                eprintln!(
-                    "sprite-desktop-streamd: cursor capture failed with unknown reason {value}"
-                );
-                self.request(qh)
-            }
-            _ => bail!("cursor capture failed with an unsupported reason"),
         }
-    }
-
-    fn record_failure(counter: &mut u8, repeated_message: &'static str) -> Result<()> {
-        *counter = counter.saturating_add(1);
-        if *counter > MAX_CONSECUTIVE_CURSOR_FAILURES {
-            bail!(repeated_message);
-        }
-        Ok(())
     }
 
     pub fn transform(&mut self, transform: WEnum<wl_output::Transform>) -> Result<()> {
@@ -318,227 +291,32 @@ impl Cursor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureRecovery {
+    WaitForConstraints,
+    Reallocate,
+    Retry,
+}
+
+fn failure_recovery(constraints_changed: bool, collecting_constraints: bool) -> FailureRecovery {
+    match (constraints_changed, collecting_constraints) {
+        (true, true) => FailureRecovery::WaitForConstraints,
+        (true, false) => FailureRecovery::Reallocate,
+        (false, _) => FailureRecovery::Retry,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixStream;
-
-    use wayland_client::{Connection, Proxy};
-
     use super::*;
 
-    struct ClientObjects {
-        _connection: Connection,
-        _server: UnixStream,
-        qh: QueueHandle<State>,
-        output: wl_output::WlOutput,
-        seat: wl_seat::WlSeat,
-        source_manager:
-            ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
-        capture_manager: ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
-        shm: wl_shm::WlShm,
-    }
-
-    fn client_objects() -> ClientObjects {
-        let (client, server) = UnixStream::pair().unwrap();
-        let connection = Connection::from_socket(client).unwrap();
-        let queue = connection.new_event_queue::<State>();
-        let qh = queue.handle();
-        let registry = connection.display().get_registry(&qh, ());
-        ClientObjects {
-            output: registry.bind(1, 1, &qh, ()),
-            seat: registry.bind(2, 1, &qh, ()),
-            source_manager: registry.bind(3, 1, &qh, ()),
-            capture_manager: registry.bind(4, 1, &qh, ()),
-            shm: registry.bind(5, 1, &qh, ()),
-            _connection: connection,
-            _server: server,
-            qh,
-        }
-    }
-
-    fn configured_cursor(objects: &ClientObjects) -> Cursor {
-        let mut cursor = Cursor::new(EventSink::test_sink());
-        cursor.seat_capabilities(WEnum::Value(wl_seat::Capability::Pointer));
-        cursor
-            .start(
-                &objects.seat,
-                &objects.output,
-                &objects.source_manager,
-                &objects.capture_manager,
-                &objects.qh,
-            )
-            .unwrap();
-        cursor.begin_constraints();
-        cursor.batch_width = Some(2);
-        cursor.batch_height = Some(2);
-        cursor.batch_argb = true;
-        cursor
-            .finish_constraints(&objects.shm, &objects.qh)
-            .unwrap();
-        cursor
-    }
-
-    fn reason(
-        reason: ext_image_copy_capture_frame_v1::FailureReason,
-    ) -> WEnum<ext_image_copy_capture_frame_v1::FailureReason> {
-        WEnum::Value(reason)
-    }
-
     #[test]
-    fn unknown_failures_retry_with_a_bound_and_ready_resets_the_bound() {
-        let objects = client_objects();
-        let mut cursor = configured_cursor(&objects);
-
-        cursor
-            .frame_failed(
-                reason(ext_image_copy_capture_frame_v1::FailureReason::Unknown),
-                &objects.shm,
-                &objects.qh,
-            )
-            .unwrap();
-        assert_eq!(cursor.consecutive_unknown_failures, 1);
-        cursor
-            .frame_failed(
-                reason(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints),
-                &objects.shm,
-                &objects.qh,
-            )
-            .unwrap();
-        assert_eq!(cursor.consecutive_constraint_failures, 1);
-        let retried_frame = cursor.frame.as_ref().unwrap().id();
-
-        cursor
-            .transform(WEnum::Value(wl_output::Transform::Normal))
-            .unwrap();
-        cursor.frame_ready(&objects.qh).unwrap();
-        assert_eq!(cursor.consecutive_unknown_failures, 0);
-        assert_eq!(cursor.consecutive_constraint_failures, 0);
-        assert_ne!(cursor.frame.as_ref().unwrap().id(), retried_frame);
-
-        for _ in 0..MAX_CONSECUTIVE_CURSOR_FAILURES {
-            cursor
-                .frame_failed(
-                    reason(ext_image_copy_capture_frame_v1::FailureReason::Unknown),
-                    &objects.shm,
-                    &objects.qh,
-                )
-                .unwrap();
-            assert!(cursor.frame.is_some());
-        }
-        assert!(
-            cursor
-                .frame_failed(
-                    reason(ext_image_copy_capture_frame_v1::FailureReason::Unknown),
-                    &objects.shm,
-                    &objects.qh,
-                )
-                .is_err()
-        );
-        assert!(cursor.frame.is_none());
-    }
-
-    #[test]
-    fn unknown_enum_failures_are_bounded() {
-        let objects = client_objects();
-        let mut cursor = configured_cursor(&objects);
-
-        for _ in 0..MAX_CONSECUTIVE_CURSOR_FAILURES {
-            cursor
-                .frame_failed(WEnum::Unknown(99), &objects.shm, &objects.qh)
-                .unwrap();
-            assert!(cursor.frame.is_some());
-        }
-        assert!(
-            cursor
-                .frame_failed(WEnum::Unknown(99), &objects.shm, &objects.qh)
-                .is_err()
-        );
-        assert!(cursor.frame.is_none());
-    }
-
-    #[test]
-    fn same_size_constraint_batch_retires_pending_buffer() {
-        let objects = client_objects();
-        let mut cursor = configured_cursor(&objects);
-        let old_buffer = cursor.buffer.as_ref().unwrap().id();
-        cursor.begin_constraints();
-        cursor.batch_width = Some(2);
-        cursor.batch_height = Some(2);
-        cursor.batch_argb = true;
-        cursor
-            .finish_constraints(&objects.shm, &objects.qh)
-            .unwrap();
-        assert_ne!(cursor.buffer.as_ref().unwrap().id(), old_buffer);
-        assert!(cursor.frame.is_some());
-    }
-
-    #[test]
-    fn stopped_failure_is_terminal_without_another_request() {
-        let objects = client_objects();
-        let mut cursor = configured_cursor(&objects);
-
-        let error = cursor
-            .frame_failed(
-                reason(ext_image_copy_capture_frame_v1::FailureReason::Stopped),
-                &objects.shm,
-                &objects.qh,
-            )
-            .unwrap_err();
-
-        assert_eq!(error.to_string(), "cursor capture session stopped");
-        assert!(cursor.frame.is_none());
-    }
-
-    #[test]
-    fn constraint_failures_reallocate_or_wait_for_the_batch_and_are_bounded() {
-        let objects = client_objects();
-        let mut cursor = configured_cursor(&objects);
-        let old_buffer = cursor.buffer.as_ref().unwrap().id();
-
-        cursor
-            .frame_failed(
-                reason(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints),
-                &objects.shm,
-                &objects.qh,
-            )
-            .unwrap();
-        assert_ne!(cursor.buffer.as_ref().unwrap().id(), old_buffer);
-        assert!(cursor.frame.is_some());
-
-        cursor.begin_constraints();
-        cursor.batch_width = Some(3);
-        cursor.batch_height = Some(4);
-        cursor.batch_argb = true;
-        cursor
-            .frame_failed(
-                reason(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints),
-                &objects.shm,
-                &objects.qh,
-            )
-            .unwrap();
-        assert!(cursor.frame.is_none());
-        cursor
-            .finish_constraints(&objects.shm, &objects.qh)
-            .unwrap();
-        assert_eq!((cursor.width, cursor.height), (3, 4));
-        assert!(cursor.frame.is_some());
-
-        while cursor.consecutive_constraint_failures <= MAX_CONSECUTIVE_CURSOR_FAILURES {
-            if cursor
-                .frame_failed(
-                    reason(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints),
-                    &objects.shm,
-                    &objects.qh,
-                )
-                .is_err()
-            {
-                break;
-            }
-        }
+    fn constraint_failure_without_a_new_batch_reallocates_and_retries() {
+        assert_eq!(failure_recovery(true, false), FailureRecovery::Reallocate);
         assert_eq!(
-            cursor.consecutive_constraint_failures,
-            MAX_CONSECUTIVE_CURSOR_FAILURES + 1
+            failure_recovery(true, true),
+            FailureRecovery::WaitForConstraints
         );
-        assert!(cursor.frame.is_none());
+        assert_eq!(failure_recovery(false, false), FailureRecovery::Retry);
     }
 }

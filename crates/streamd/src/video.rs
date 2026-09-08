@@ -22,6 +22,9 @@ use crate::{
 };
 
 const SLOT_COUNT: usize = 3;
+// FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
+// rather than changing the RTP identity or retrying an encoder that cannot start.
+const MAX_MEDIA_GENERATION: u32 = i32::MAX as u32;
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NOTIFICATION_STALL_LIMIT: Duration = Duration::from_secs(2);
 const PIPE_WRITE_STALL_LIMIT: Duration = Duration::from_secs(5);
@@ -77,6 +80,7 @@ impl<'a> CapturedFrame<'a> {
     fn validate(&self) -> Result<(), VideoError> {
         if self.pixels.len() != self.config.validate()?
             || self.metadata.generation == 0
+            || self.metadata.generation > MAX_MEDIA_GENERATION
             || self.metadata.width != self.config.encoded_width
             || self.metadata.height != self.config.encoded_height
             || self.metadata.fps != self.config.fps
@@ -194,7 +198,7 @@ impl VideoEncoder {
         spawn: F,
     ) -> Result<Self, VideoError>
     where
-        F: FnMut(&str, u16, EncoderConfig, u32, u32) -> io::Result<EncoderProcess> + Send + 'static,
+        F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess> + Send + 'static,
     {
         let shared = Arc::new(Shared {
             pool: Mutex::new(Pool {
@@ -294,12 +298,12 @@ impl VideoEncoder {
     }
 
     pub fn set_generation(&self, generation: u32) -> Result<(), VideoError> {
-        if generation == 0 {
-            return Err(VideoError::InvalidFrame);
-        }
         let mut pool = self.shared.pool.lock().unwrap();
         if pool.stopping {
             return Err(VideoError::Stopped);
+        }
+        if generation > MAX_MEDIA_GENERATION || pool.generation.checked_add(1) != Some(generation) {
+            return Err(VideoError::InvalidFrame);
         }
         pool.generation = generation;
         if let Some(slot) = pool.pending {
@@ -427,10 +431,9 @@ fn worker_main<F>(
     restart_backoff: RestartBackoff,
     mut spawn: F,
 ) where
-    F: FnMut(&str, u16, EncoderConfig, u32, u32) -> io::Result<EncoderProcess>,
+    F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess>,
 {
     let mut process: Option<EncoderProcess> = None;
-    let mut next_ssrc = 1_u32;
     let mut restart_delay = restart_backoff.min;
     let mut retry_at: Option<Instant> = None;
     let mut consecutive_spawn_failures = 0_u8;
@@ -526,17 +529,10 @@ fn worker_main<F>(
         }
 
         if process.is_none() {
-            match spawn(
-                &ffmpeg,
-                rtp_port,
-                frame.config,
-                frame.metadata.generation,
-                next_ssrc,
-            ) {
+            match spawn(&ffmpeg, rtp_port, frame.config, frame.metadata.generation) {
                 Ok(started) => {
                     shared.pool.lock().unwrap().child_pid = Some(started.child.id());
                     process = Some(started);
-                    next_ssrc = next_ssrc.wrapping_add(1).max(1);
                     consecutive_spawn_failures = 0;
                 }
                 Err(error) => {
@@ -795,9 +791,10 @@ fn spawn_ffmpeg(
     rtp_port: u16,
     config: EncoderConfig,
     generation: u32,
-    ssrc: u32,
 ) -> io::Result<EncoderProcess> {
-    let args = ffmpeg_args(rtp_port, config, ssrc);
+    // The local RTP contract uses SSRC as the frame generation. The gateway
+    // can correlate reordered replacement traffic by identity.
+    let args = ffmpeg_args(rtp_port, config, generation);
     let mut command = Command::new(ffmpeg);
     command
         .args(args)
@@ -850,7 +847,7 @@ fn reset_signal_mask_before_exec(command: &mut Command) {
     }
 }
 
-fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, ssrc: u32) -> Vec<String> {
+fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: u32) -> Vec<String> {
     let rate = config.fps.to_string();
     let keyframe_interval = config.fps.div_ceil(4).to_string();
     let bitrate = format!("{}k", config.bitrate_kbps);
@@ -920,7 +917,7 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, ssrc: u32) -> Vec<String> {
         "-payload_type".into(),
         "96".into(),
         "-ssrc".into(),
-        ssrc.to_string(),
+        generation.to_string(),
         "-rtpflags".into(),
         "skip_rtcp".into(),
         "-f".into(),
@@ -1075,12 +1072,16 @@ mod tests {
     }
 
     fn real_frame(sequence: u64, generation: u32) -> RawFrame {
+        real_frame_at_fps(sequence, generation, 60)
+    }
+
+    fn real_frame_at_fps(sequence: u64, generation: u32, fps: u32) -> RawFrame {
         let config = EncoderConfig {
             raw_width: 320,
             raw_height: 180,
             encoded_width: 320,
             encoded_height: 180,
-            fps: 60,
+            fps,
             bitrate_kbps: 8_000,
         };
         RawFrame {
@@ -1161,7 +1162,7 @@ mod tests {
 
     fn encoder_with_spawner<F>(restart_delay: Duration, spawn: F) -> VideoEncoder
     where
-        F: FnMut(&str, u16, EncoderConfig, u32, u32) -> io::Result<EncoderProcess> + Send + 'static,
+        F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess> + Send + 'static,
     {
         VideoEncoder::start_with_spawner(
             "test-encoder".into(),
@@ -1453,7 +1454,7 @@ mod tests {
         let spawn_attempts = Arc::clone(&attempts);
         let encoder = encoder_with_spawner(
             Duration::from_millis(10),
-            move |_, _, config, generation, _| {
+            move |_, _, config, generation| {
                 if spawn_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     Err(io::Error::other("injected spawn failure"))
                 } else {
@@ -1478,7 +1479,7 @@ mod tests {
         let spawn_attempts = Arc::clone(&attempts);
         let encoder = encoder_with_spawner(
             Duration::from_millis(200),
-            move |_, _, config, generation, _| {
+            move |_, _, config, generation| {
                 if spawn_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     Err(io::Error::other("injected spawn failure"))
                 } else {
@@ -1511,7 +1512,7 @@ mod tests {
     fn repeated_spawn_failures_publish_fatal_at_the_attempt_bound() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let spawn_attempts = Arc::clone(&attempts);
-        let encoder = encoder_with_spawner(Duration::from_millis(1), move |_, _, _, _, _| {
+        let encoder = encoder_with_spawner(Duration::from_millis(1), move |_, _, _, _| {
             spawn_attempts.fetch_add(1, Ordering::SeqCst);
             Err(io::Error::other("injected persistent spawn failure"))
         });
@@ -1670,6 +1671,46 @@ mod tests {
             panic!("old-generation pending storage was not released");
         };
         assert_eq!(storage.as_ptr(), pending_pointer);
+    }
+
+    #[test]
+    fn generation_changes_are_positive_checked_increments() {
+        let shared = shared();
+        let encoder = VideoEncoder {
+            shared: Arc::clone(&shared),
+            notifications: mpsc::sync_channel(1).1,
+            notification_source: None,
+            worker: None,
+        };
+
+        assert!(matches!(
+            encoder.set_generation(0),
+            Err(VideoError::InvalidFrame)
+        ));
+        assert!(matches!(
+            encoder.set_generation(1),
+            Err(VideoError::InvalidFrame)
+        ));
+        assert!(matches!(
+            encoder.set_generation(3),
+            Err(VideoError::InvalidFrame)
+        ));
+        encoder.set_generation(2).unwrap();
+        assert!(matches!(
+            encoder.set_generation(2),
+            Err(VideoError::InvalidFrame)
+        ));
+        shared.pool.lock().unwrap().generation = MAX_MEDIA_GENERATION;
+        assert!(matches!(
+            encoder.set_generation(MAX_MEDIA_GENERATION + 1),
+            Err(VideoError::InvalidFrame)
+        ));
+        assert_eq!(shared.pool.lock().unwrap().generation, MAX_MEDIA_GENERATION);
+        shared.pool.lock().unwrap().generation = u32::MAX;
+        assert!(matches!(
+            encoder.set_generation(1),
+            Err(VideoError::InvalidFrame)
+        ));
     }
 
     #[test]
@@ -2165,13 +2206,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
+    fn ffmpeg_preserves_largest_supported_generation_in_ssrc() {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let encoder =
+            VideoEncoder::start("ffmpeg".into(), socket.local_addr().unwrap().port(), None)
+                .unwrap();
+        let generation = MAX_MEDIA_GENERATION;
+        encoder.shared.pool.lock().unwrap().generation = generation - 1;
+        encoder.set_generation(generation).unwrap();
+        submit_frame(&encoder, &real_frame(1, generation)).unwrap();
+        assert!(matches!(
+            wait_for_notification(&encoder),
+            Notification::Submitted(_)
+        ));
+        assert_eq!(receive_frame_ssrc(&socket), generation);
+        encoder.stop();
+    }
+
+    #[test]
+    #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
     fn ffmpeg_stdin_has_one_mib_capacity() {
         let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let process = spawn_ffmpeg(
             "ffmpeg",
             socket.local_addr().unwrap().port(),
             real_frame(1, 1).config,
-            1,
             1,
         )
         .unwrap();
@@ -2202,6 +2264,42 @@ mod tests {
         assert_eq!(receive_frame_ssrc(&socket), 1);
         assert!(encoder.child_pid().is_some());
         encoder.stop();
+    }
+
+    #[test]
+    #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
+    fn ffmpeg_sparse_frames_resume_after_idle_at_thirty_and_sixty_fps() {
+        for fps in [30, 60] {
+            let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let encoder = VideoEncoder::start("ffmpeg".into(), port, None).unwrap();
+
+            for (sequence, idle) in [
+                (1, Duration::ZERO),
+                (2, Duration::from_millis(250)),
+                (3, Duration::from_secs(1)),
+            ] {
+                thread::sleep(idle);
+                let frame = real_frame_at_fps(sequence, 1, fps);
+                submit_frame(&encoder, &frame).unwrap();
+                assert!(matches!(
+                    wait_for_notification(&encoder),
+                    Notification::Submitted(FrameMetadata {
+                        generation: 1,
+                        sequence: submitted,
+                        fps: submitted_fps,
+                        ..
+                    }) if submitted == sequence && submitted_fps == fps
+                ));
+                assert_eq!(receive_frame_ssrc(&socket), 1);
+                assert!(encoder.child_pid().is_some());
+            }
+
+            encoder.stop();
+        }
     }
 
     #[test]
@@ -2244,7 +2342,8 @@ mod tests {
             })
         ));
         let new_ssrc = receive_frame_ssrc(&socket);
-        assert_ne!(new_ssrc, old_ssrc);
+        assert_eq!(old_ssrc, 1);
+        assert_eq!(new_ssrc, 2);
         encoder.stop();
     }
 
@@ -2290,7 +2389,8 @@ mod tests {
             })
         ));
         let new_ssrc = receive_frame_ssrc(&socket);
-        assert_ne!(new_ssrc, old_ssrc);
+        assert_eq!(old_ssrc, 1);
+        assert_eq!(new_ssrc, 2);
         encoder.stop();
     }
 }

@@ -4,5 +4,11 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["*.ts", "rust-desktop/**/*.ts", "../scripts/*.ts"]
+  "include": [
+    "rust-desktop/**/*.ts",
+    "socket-local/*.ts",
+    "view-runtime.ts",
+    "view-runtime.test.ts",
+    "../scripts/*.ts"
+  ]
 }

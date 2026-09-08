@@ -1,0 +1,352 @@
+{
+  "rate": 60,
+  "attached": {
+    "submitted": 7,
+    "decoded": 7,
+    "generation": 2,
+    "latestGeneration": 2,
+    "drawCallbacks": 3,
+    "putCallbacks": 0,
+    "outputs": [
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      }
+    ],
+    "errors": [],
+    "canvas": {
+      "width": 1280,
+      "height": 720,
+      "css": {
+        "x": 17,
+        "y": 80,
+        "width": 1280,
+        "height": 720
+      }
+    },
+    "status": "Receiving video · 7 chunks · 1 keyframes",
+    "control": "Input ready · click stream",
+    "hidden": false
+  },
+  "quietCpu": {
+    "kind": "quiet",
+    "seconds": 45.006555111,
+    "before": {
+      "browser": 1553505,
+      "container": 870301
+    },
+    "after": {
+      "browser": 2454243,
+      "container": 1352073
+    },
+    "decodedFrames": 0,
+    "drawnFrames": 0,
+    "browserCpuSeconds": 0.900738,
+    "containerCpuSeconds": 0.481772,
+    "browserOneCorePercent": 2.0013484653035616,
+    "containerOneCorePercent": 1.0704485131372579
+  },
+  "motionCpu": {
+    "kind": "motion",
+    "seconds": 45.007063207,
+    "before": {
+      "browser": 2965505,
+      "container": 2768511
+    },
+    "after": {
+      "browser": 16019644,
+      "container": 31405429
+    },
+    "decodedFrames": 1101,
+    "drawnFrames": 1101,
+    "browserCpuSeconds": 13.054139,
+    "containerCpuSeconds": 28.636918,
+    "browserOneCorePercent": 29.0046452041547,
+    "containerOneCorePercent": 63.627608556218945
+  },
+  "quality": {
+    "1280x720": [
+      {
+        "crop": "whole",
+        "rgbAverageDb": 36.811012,
+        "identical": false
+      },
+      {
+        "crop": "top-left",
+        "rgbAverageDb": 36.761229,
+        "identical": false
+      },
+      {
+        "crop": "top-right",
+        "rgbAverageDb": 37.973151,
+        "identical": false
+      },
+      {
+        "crop": "bottom-left",
+        "rgbAverageDb": 36.1625,
+        "identical": false
+      },
+      {
+        "crop": "bottom-right",
+        "rgbAverageDb": 36.548948,
+        "identical": false
+      }
+    ],
+    "1920x1080": [
+      {
+        "crop": "whole",
+        "rgbAverageDb": 39.698755,
+        "identical": false
+      },
+      {
+        "crop": "top-left",
+        "rgbAverageDb": 33.959376,
+        "identical": false
+      },
+      {
+        "crop": "top-right",
+        "rgbAverageDb": null,
+        "identical": true
+      },
+      {
+        "crop": "bottom-left",
+        "rgbAverageDb": 45.705371,
+        "identical": false
+      },
+      {
+        "crop": "bottom-right",
+        "rgbAverageDb": null,
+        "identical": true
+      }
+    ]
+  },
+  "source1280Hash": "1e76b677261cd9b31b5a93bced9dddda163b419b41baf1894e1546916a0bd7d1",
+  "decoded1280Hash": "d858c7d6b0c0950c974eae70cb61b4c8c2fcfa8968dc6613650b2e66d8d9e6e4",
+  "source1920Hash": "232039bc030ed23f9cf8ab9e4706be3e748589e9e9f2d52e19af167bca535602",
+  "decoded1920Hash": "a70a9870c952c261d27db39d4a336fc6a96c063eb895478941edb3277d168410",
+  "beforeBackground": {
+    "decoded": 1157
+  },
+  "hidden": {
+    "hidden": true,
+    "decoded": 1167,
+    "durationSeconds": 35
+  },
+  "afterBackground": {
+    "decoded": 1167
+  },
+  "reconnected": {
+    "decoded": 1201,
+    "status": "Connected",
+    "control": "Input active"
+  },
+  "fixture": {
+    "keys": "a",
+    "frames": 2038
+  },
+  "finalStats": {
+    "submitted": 1230,
+    "decoded": 1228,
+    "generation": 7,
+    "latestGeneration": 7,
+    "drawCallbacks": 1202,
+    "putCallbacks": 0,
+    "outputs": [
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 7,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      }
+    ],
+    "errors": [],
+    "canvas": {
+      "width": 1920,
+      "height": 1080,
+      "css": {
+        "x": 17,
+        "y": 80,
+        "width": 1920,
+        "height": 1080
+      }
+    },
+    "status": "Connected",
+    "control": "Input active",
+    "hidden": false
+  },
+  "log": [
+    "console:warning",
+    "console:warning",
+    "console:warning"
+  ]
+}

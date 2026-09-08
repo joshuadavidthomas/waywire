@@ -1,5 +1,7 @@
 # M0 platform probe
 
+> **HISTORICAL:** This probe belongs to the former Go/VNC design. The commands below are preserved evidence, not current project instructions. See [`socket-local`](./socket-local/) for the active local probe.
+
 Disposable HTTP/WebSocket echo service for the M0 checks in `SPEC.v1.md`. This is test code, not the desktop runtime. See [M0.md](./M0.md) for measured results, commands, and the remaining browser-auth gate.
 
 Build and run:

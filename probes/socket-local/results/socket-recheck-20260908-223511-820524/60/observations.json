@@ -1,0 +1,329 @@
+{
+  "rate": 60,
+  "bitrate": 16000,
+  "attached": {
+    "submitted": 5,
+    "decoded": 5,
+    "generation": 2,
+    "latestGeneration": 2,
+    "drawCallbacks": 2,
+    "putCallbacks": 0,
+    "outputs": [
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 2,
+        "width": 1280,
+        "height": 720,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      }
+    ],
+    "errors": [],
+    "canvas": {
+      "width": 1280,
+      "height": 720,
+      "css": {
+        "x": 17,
+        "y": 80,
+        "width": 1280,
+        "height": 720
+      }
+    },
+    "status": "Receiving video · 5 chunks · 1 keyframes",
+    "control": "Input ready · click stream",
+    "hidden": false
+  },
+  "quietCpu": {
+    "kind": "quiet",
+    "seconds": 45.00690936200001,
+    "before": {
+      "browser": 1505798,
+      "container": 737918
+    },
+    "after": {
+      "browser": 2386388,
+      "container": 1228017
+    },
+    "decodedFrames": 0,
+    "drawnFrames": 0,
+    "browserCpuSeconds": 0.88059,
+    "containerCpuSeconds": 0.490099,
+    "browserOneCorePercent": 1.9565662527884995,
+    "containerOneCorePercent": 1.0889416912812897
+  },
+  "motionCpu": {
+    "kind": "motion",
+    "seconds": 45.00845790600001,
+    "before": {
+      "browser": 2926690,
+      "container": 2598159
+    },
+    "after": {
+      "browser": 15151835,
+      "container": 29395341
+    },
+    "decodedFrames": 1101,
+    "drawnFrames": 1102,
+    "browserCpuSeconds": 12.225145,
+    "containerCpuSeconds": 26.797182,
+    "browserOneCorePercent": 27.16188371868276,
+    "containerOneCorePercent": 59.538102940486894
+  },
+  "quality": {
+    "1280x720": [
+      {
+        "crop": "whole",
+        "rgbAverageDb": 43.267963,
+        "identical": false
+      },
+      {
+        "crop": "top-left",
+        "rgbAverageDb": 43.55765,
+        "identical": false
+      },
+      {
+        "crop": "top-right",
+        "rgbAverageDb": 43.632372,
+        "identical": false
+      },
+      {
+        "crop": "bottom-left",
+        "rgbAverageDb": 43.393993,
+        "identical": false
+      },
+      {
+        "crop": "bottom-right",
+        "rgbAverageDb": 42.57271,
+        "identical": false
+      }
+    ],
+    "1920x1080": [
+      {
+        "crop": "whole",
+        "rgbAverageDb": 47.392151,
+        "identical": false
+      },
+      {
+        "crop": "top-left",
+        "rgbAverageDb": 41.653961,
+        "identical": false
+      },
+      {
+        "crop": "top-right",
+        "rgbAverageDb": null,
+        "identical": true
+      },
+      {
+        "crop": "bottom-left",
+        "rgbAverageDb": 53.381035,
+        "identical": false
+      },
+      {
+        "crop": "bottom-right",
+        "rgbAverageDb": null,
+        "identical": true
+      }
+    ]
+  },
+  "source1280Hash": "1e76b677261cd9b31b5a93bced9dddda163b419b41baf1894e1546916a0bd7d1",
+  "decoded1280Hash": "45dbebb7e5375c88b03461be871c9c7728d8e65e4301e4689bf75cc879b3f040",
+  "source1920Hash": "232039bc030ed23f9cf8ab9e4706be3e748589e9e9f2d52e19af167bca535602",
+  "decoded1920Hash": "2dc936ed2b2ed6e5264eb926b60051ebf26797a691bda90d773c6dc21f7d5b70",
+  "beforeBackground": {
+    "decoded": 1156
+  },
+  "hidden": {
+    "hidden": true,
+    "decoded": 1156,
+    "durationSeconds": 35
+  },
+  "afterBackground": {
+    "decoded": 1171
+  },
+  "reconnected": {
+    "decoded": 1194,
+    "status": "Connected",
+    "control": "Input active"
+  },
+  "fixture": {
+    "keys": "a",
+    "frames": 2055
+  },
+  "finalStats": {
+    "submitted": 1213,
+    "decoded": 1213,
+    "generation": 6,
+    "latestGeneration": 6,
+    "drawCallbacks": 1201,
+    "putCallbacks": 0,
+    "outputs": [
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1080,
+        "format": "I444",
+        "colorSpace": {
+          "fullRange": true,
+          "matrix": "bt709",
+          "primaries": "bt709",
+          "transfer": "iec61966-2-1"
+        }
+      }
+    ],
+    "errors": [],
+    "canvas": {
+      "width": 1920,
+      "height": 1080,
+      "css": {
+        "x": 17,
+        "y": 80,
+        "width": 1920,
+        "height": 1080
+      }
+    },
+    "status": "Connected",
+    "control": "Input active",
+    "hidden": false
+  },
+  "log": [
+    "console:warning",
+    "console:warning",
+    "console:warning"
+  ]
+}

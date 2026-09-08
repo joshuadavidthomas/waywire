@@ -4,12 +4,10 @@ node_modules/
 
 # Build output
 /target/
-/bridge/web/
-.svelte-kit/
 build/
 dist/
 coverage/
-.wrangler/
+__pycache__/
 
 # Local secrets
 .env
@@ -21,3 +19,4 @@ coverage/
 
 # Logs
 *.log
+!probes/socket-local/results/**/*.log

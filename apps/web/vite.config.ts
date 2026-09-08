@@ -1,7 +1,18 @@
-import tailwindcss from "@tailwindcss/vite";
-import { sveltekit } from "@sveltejs/kit/vite";
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  plugins: [tailwindcss(), sveltekit()],
+  base: "/",
+  resolve: {
+    alias: {
+      "comparison-recorder": new URL(
+        "../../probes/compare/recorder.mjs",
+        import.meta.url,
+      ).pathname,
+    },
+  },
+  build: {
+    assetsDir: "assets",
+    emptyOutDir: true,
+    outDir: "dist",
+  },
 });

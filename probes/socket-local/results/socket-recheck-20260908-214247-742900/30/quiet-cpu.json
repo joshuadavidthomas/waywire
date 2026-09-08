@@ -1,0 +1,18 @@
+{
+  "kind": "quiet",
+  "seconds": 45.00452186,
+  "before": {
+    "browser": 1870003,
+    "container": 914199
+  },
+  "after": {
+    "browser": 2384145,
+    "container": 1420596
+  },
+  "decodedFrames": 0,
+  "drawnFrames": 0,
+  "browserCpuSeconds": 0.514142,
+  "containerCpuSeconds": 0.506397,
+  "browserOneCorePercent": 1.1424229805160295,
+  "containerOneCorePercent": 1.125213598703035
+}

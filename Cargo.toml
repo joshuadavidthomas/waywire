@@ -18,7 +18,7 @@ clap = { version = "4.5.54", features = ["derive", "env"] }
 memmap2 = "0.9.9"
 nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "time"] }
 png = "0.18.0"
-rust-embed = "8.11.0"
+rust-embed = { version = "8.11.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 socket2 = "0.6.1"

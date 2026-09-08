@@ -43,7 +43,7 @@ const OUTBOUND_MESSAGE_LIMIT: usize = 32;
 const OUTBOUND_BYTE_LIMIT: usize = 2 * MAX_CONTROL_MESSAGE_BYTES;
 const MAX_UPGRADED_CONNECTIONS: usize = 32;
 #[derive(Embed)]
-#[folder = "../../apps/stream-viewer/dist/"]
+#[folder = "../../apps/web/dist/"]
 struct Assets;
 #[derive(Clone)]
 pub struct SocketConnections {

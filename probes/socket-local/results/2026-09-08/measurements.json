@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "dateUtc": "2026-09-08",
+  "owner": "pi-20260908-complete",
+  "image": "sha256:dabf5b2ce90794021bbfb8e0e391088acef6f630412fd7f215a55edb2d2ea24f",
+  "binaries": {
+    "gatewaySha256": "46d797860f8a8e2037d3d10cd09a1da2315aeb67bc6cb71f64e5c30ec70d6a1f",
+    "streamdSha256": "916c7bf93fc854c4d3bbc4b62ca1f64f5aa75756f581f239dcd1617715364d7a"
+  },
+  "rates": {
+    "60": {
+      "containerId": "45ea01f831076bbce7d21296936b2662842b08d71ef02bade9accd81680c9c22",
+      "idleAttachAfterSeconds": 45,
+      "idleAttach": {"submitted": 6, "decoded": 6, "width": 1280, "height": 720, "format": "I444", "fullRange": true, "matrix": "bt709", "primaries": "bt709", "transfer": "iec61966-2-1"},
+      "physicalKeyStored": "z",
+      "backgroundSeconds": 35,
+      "decodedBeforeBackground": 11,
+      "decodedAfterReturnAndPointerMotion": 17,
+      "transportDisconnect": {"status": "Reconnecting · 1006", "control": "Input reconnecting · 1006"},
+      "transportReconnect": {"status": "Connected", "control": "Input active", "decoded": 24},
+      "resize1920Decoded": {"width": 1920, "height": 1080, "format": "I444", "fullRange": true},
+      "quietCpu": {"seconds": 45, "usageUsecBefore": 679208, "usageUsecAfter": 806751, "cpuSeconds": 0.127543, "meanOneCorePercent": 0.28343},
+      "motionCpu": {"seconds": 45, "usageUsecBefore": 8458790, "usageUsecAfter": 104954431, "cpuSeconds": 96.495641, "meanOneCorePercent": 214.43476, "includesFfplayWorkload": true},
+      "textSnapshotPsnrDb": 27.935506,
+      "terminalFailure": "video metadata/RTP correlation stalled"
+    },
+    "30": {
+      "containerId": "86d4569211abd89fda8040456f300ae42a055263ec1b948e6855a224821acaf3",
+      "idleAttachAfterSeconds": 45,
+      "idleAttach": {"submitted": 5, "decoded": 5, "width": 1280, "height": 720, "format": "I444", "fullRange": true, "matrix": "bt709", "primaries": "bt709", "transfer": "iec61966-2-1"},
+      "physicalKeyStored": "q",
+      "quietCpu": {"seconds": 45, "usageUsecBefore": 569056, "usageUsecAfter": 699910, "cpuSeconds": 0.130854, "meanOneCorePercent": 0.290787},
+      "motionCpu": {"valid45SecondWindow": false, "usageUsecBefore": 4115326, "lastDiagnosticUsageUsec": 88115729, "reason": "the timed sampler command was aborted before its fixed endpoint"},
+      "lastBrowserDiagnostic": {"submitted": 2377, "decoded": 2376, "width": 1232, "height": 448, "format": "I444", "reportedFps": 30}
+    }
+  },
+  "browserCpu": {"available": false, "reason": "agent-browser did not expose a dedicated whole-browser cgroup; no process-tree estimate was substituted"},
+  "heldKeyRelease": {"tested": false, "reason": "agent-browser exposes complete key presses but no separately held native key command"}
+}

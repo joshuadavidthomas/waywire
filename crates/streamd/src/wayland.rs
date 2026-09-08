@@ -43,11 +43,12 @@ use wayland_protocols_wlr::{
         zwlr_output_configuration_head_v1, zwlr_output_configuration_v1, zwlr_output_head_v1,
         zwlr_output_manager_v1, zwlr_output_mode_v1,
     },
+    screencopy::v1::client::{zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1},
     virtual_pointer::v1::client::{zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1},
 };
 
 use self::{
-    capture::{Capture, CaptureFailureRecovery, CaptureTarget},
+    capture::Capture,
     clipboard::Clipboard,
     cursor::Cursor,
     input::Input,
@@ -73,9 +74,6 @@ pub struct State {
     running: bool,
     failure: Option<anyhow::Error>,
     shm: Option<wl_shm::WlShm>,
-    source_manager:
-        Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
-    capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
     output: Option<wl_output::WlOutput>,
     output_name: Option<String>,
     capture: Capture,
@@ -124,8 +122,6 @@ pub fn run(options: Options) -> Result<()> {
         running: true,
         failure: None,
         shm: None,
-        source_manager: None,
-        capture_manager: None,
         output: None,
         output_name: None,
         capture: Capture::new(),
@@ -273,12 +269,10 @@ impl State {
             .clone()
             .context("compositor has no wl_seat")?;
         self.shm.as_ref().context("compositor has no wl_shm")?;
-        self.source_manager
+        self.capture
+            .manager
             .as_ref()
-            .context("compositor lacks ext output image capture source manager")?;
-        self.capture_manager
-            .as_ref()
-            .context("compositor lacks ext image copy capture manager")?;
+            .context("compositor lacks wlroots screencopy")?;
         self.input.start(&output, &self.qh)?;
         self.clipboard.start(&seat, &self.qh)?;
         Ok(())
@@ -287,13 +281,7 @@ impl State {
     fn start_cursor(&mut self) -> Result<()> {
         let output = self.output.clone().unwrap();
         let seat = self.input.seat.clone().unwrap();
-        self.cursor.start(
-            &seat,
-            &output,
-            self.source_manager.as_ref().unwrap(),
-            self.capture_manager.as_ref().unwrap(),
-            &self.qh,
-        )
+        self.cursor.start(&seat, &output, &self.qh)
     }
 
     fn stop(&mut self) {
@@ -308,51 +296,15 @@ impl State {
     }
 
     fn request_capture(&mut self) -> Result<()> {
-        let output = self.output.as_ref().context("output disappeared")?;
-        self.capture.start(
-            output,
-            self.source_manager
-                .as_ref()
-                .context("capture source manager disappeared")?,
-            self.capture_manager
-                .as_ref()
-                .context("capture manager disappeared")?,
-            &self.qh,
-        )?;
-        if let Some(timings) = &self.stage_timings {
-            let sequence = self.capture.sequence;
-            let generation = self.generation;
-            timings.record_now(
-                |timestamp_nanos| TimingRecord::CaptureSessionRequestComplete {
-                    timestamp_nanos,
-                    sequence,
-                    generation,
-                },
-            );
-        }
-        Ok(())
+        self.request_capture_for(self.capture.sequence)
     }
 
-    fn request_capture_frame(&mut self, connection: &Connection, sequence: u64) -> Result<()> {
-        let generation = self.generation;
-        self.capture.request(&self.qh)?;
+    fn request_capture_for(&mut self, sequence: u64) -> Result<()> {
+        let output = self.output.as_ref().context("output disappeared")?;
+        self.capture.request(output, &self.qh)?;
         if let Some(timings) = &self.stage_timings {
+            let generation = self.generation;
             timings.record_now(|timestamp_nanos| TimingRecord::CaptureRequestComplete {
-                timestamp_nanos,
-                sequence,
-                generation,
-            });
-            timings.record_now(|timestamp_nanos| TimingRecord::CopyAuthorized {
-                timestamp_nanos,
-                sequence,
-                generation,
-            });
-        }
-        let flush = capture_flush(connection.flush())?;
-        if flush == CaptureFlush::Complete
-            && let Some(timings) = &self.stage_timings
-        {
-            timings.record_now(|timestamp_nanos| TimingRecord::CopyFlushComplete {
                 timestamp_nanos,
                 sequence,
                 generation,
@@ -416,15 +368,14 @@ impl State {
                 }
             }
             Command::KeyframeReadiness { generation, ready } => {
-                if *generation == self.generation && *ready {
-                    self.acknowledged_generation = *generation;
-                } else if !*ready
-                    && *generation == self.generation
-                    && self.acknowledged_generation == self.generation
-                {
-                    self.acknowledged_generation = 0;
-                    self.capture.cancel();
-                    self.request_capture()?;
+                if *generation == self.generation {
+                    if *ready {
+                        self.acknowledged_generation = *generation;
+                    } else if self.acknowledged_generation == *generation {
+                        self.acknowledged_generation = 0;
+                        self.capture.cancel();
+                        self.request_capture()?;
+                    }
                 }
             }
             Command::PointerRelative { .. }
@@ -439,16 +390,12 @@ impl State {
                     command,
                     Command::PointerAbsolute { .. } | Command::ReleaseAll
                 );
-                let cursor_overlay = if overlay && !self.capture.cursor_overlay {
-                    Some(true)
-                } else if disables_overlay && self.capture.cursor_overlay {
-                    Some(false)
-                } else {
-                    None
-                };
-                if let Some(cursor_overlay) = cursor_overlay {
-                    self.capture.cursor_overlay = cursor_overlay;
+                if (overlay && !self.capture.cursor_overlay)
+                    || (disables_overlay && self.capture.cursor_overlay)
+                {
+                    self.capture.cursor_overlay = overlay;
                     self.capture.cancel();
+                    self.capture.damage_baseline_available = false;
                     self.request_capture()?;
                 }
                 self.input.apply(&command)?;
@@ -483,9 +430,12 @@ impl State {
         loop {
             let notification = self.video.as_ref().and_then(VideoEncoder::try_notification);
             match notification {
-                Some(Notification::Submitted(metadata))
-                    if metadata.generation == self.generation =>
-                {
+                Some(Notification::Submitted(metadata)) => {
+                    // A completed pipe write owns one correlation record even
+                    // if the Wayland generation changed before this queue was
+                    // drained. Its RTP access unit may already be queued at the
+                    // gateway; dropping the record lets that old unit consume
+                    // metadata from the replacement encoder.
                     if let Some(timings) = &self.stage_timings {
                         timings.record_now(|timestamp_nanos| TimingRecord::MetadataDispatch {
                             timestamp_nanos,
@@ -498,7 +448,6 @@ impl State {
                         return;
                     }
                 }
-                Some(Notification::Submitted(_)) => {}
                 Some(Notification::RestartRequired { generation })
                     if generation == self.generation =>
                 {
@@ -525,6 +474,7 @@ impl State {
         if applied.dimensions_changed {
             self.replace_media_generation()?;
         }
+        self.capture.damage_baseline_available = false;
         self.event_sink.send(Event::ResizeApplied {
             request_id: applied.request_id,
             width: applied.mode.width,
@@ -580,6 +530,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "wl_seat" if state.input.seat.is_none() => {
                 state.input.seat = Some(registry.bind(name, version.min(9), qh, ()));
             }
+            "zwlr_screencopy_manager_v1" if state.capture.manager.is_none() => {
+                state.capture.manager = Some(registry.bind(name, version.min(3), qh, ()));
+            }
             "zwlr_virtual_pointer_manager_v1" if state.input.pointer_manager.is_none() => {
                 state.input.pointer_manager = Some(registry.bind(name, version.min(2), qh, ()));
             }
@@ -595,11 +548,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "ext_data_control_manager_v1" if state.clipboard.manager.is_none() => {
                 state.clipboard.manager = Some(registry.bind(name, 1, qh, ()));
             }
-            "ext_output_image_capture_source_manager_v1" if state.source_manager.is_none() => {
-                state.source_manager = Some(registry.bind(name, 1, qh, ()));
+            "ext_output_image_capture_source_manager_v1"
+                if state.cursor.source_manager.is_none() =>
+            {
+                state.cursor.source_manager = Some(registry.bind(name, 1, qh, ()));
             }
-            "ext_image_copy_capture_manager_v1" if state.capture_manager.is_none() => {
-                state.capture_manager = Some(registry.bind(name, 1, qh, ()));
+            "ext_image_copy_capture_manager_v1" if state.cursor.capture_manager.is_none() => {
+                state.cursor.capture_manager = Some(registry.bind(name, 1, qh, ()));
             }
             _ => {}
         }
@@ -649,6 +604,133 @@ fn capture_flush(result: std::result::Result<(), WaylandError>) -> Result<Captur
             Ok(CaptureFlush::Pending)
         }
         Err(error) => Err(error).context("flush next Wayland capture request"),
+    }
+}
+
+impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        connection: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if state.capture.frame.as_ref() != Some(proxy) {
+            return;
+        }
+        let result = match event {
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => match (format, state.shm.clone()) {
+                (WEnum::Value(format), Some(shm)) => state
+                    .capture
+                    .set_constraints(&shm, width, height, stride, format, qh),
+                _ => Err(anyhow!("unsupported screencopy SHM format")),
+            },
+            zwlr_screencopy_frame_v1::Event::BufferDone => (|| -> Result<()> {
+                let wait = state.capture.damage_baseline_available
+                    && state.acknowledged_generation == state.generation;
+                state.capture.begin_copy(wait)?;
+                let sequence = state.capture.sequence;
+                let generation = state.generation;
+                if let Some(timings) = &state.stage_timings {
+                    timings.record_now(|timestamp_nanos| TimingRecord::CopyAuthorized {
+                        timestamp_nanos,
+                        sequence,
+                        generation,
+                    });
+                }
+                let flush = capture_flush(connection.flush())?;
+                if flush == CaptureFlush::Complete
+                    && let Some(timings) = &state.stage_timings
+                {
+                    timings.record_now(|timestamp_nanos| TimingRecord::CopyFlushComplete {
+                        timestamp_nanos,
+                        sequence,
+                        generation,
+                    });
+                }
+                Ok(())
+            })(),
+            zwlr_screencopy_frame_v1::Event::Flags { flags } => {
+                if flags == WEnum::Value(zwlr_screencopy_frame_v1::Flags::empty()) {
+                    Ok(())
+                } else {
+                    Err(anyhow!("screencopy transform is unsupported"))
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::Ready {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+            } => {
+                // Mark when this readiness callback runs, before scheduling the
+                // next capture or copying this frame's pixels. The protocol field
+                // separately carries the compositor-provided ready timestamp.
+                let timing_guard = state.stage_timings.as_ref().and_then(StageTimings::guard);
+                let capture_nanos = monotonic_nanos().context("read monotonic capture time");
+                let protocol_ready_nanos = protocol_ready_nanos(tv_sec_hi, tv_sec_lo, tv_nsec)
+                    .context("invalid screencopy ready timestamp");
+                capture_nanos.and_then(|capture_nanos| {
+                    let protocol_ready_nanos = protocol_ready_nanos?;
+                    let sequence = state.capture.sequence;
+                    let generation = state.generation;
+                    if let Some(timings) = &state.stage_timings
+                        && let Some(timing_guard) = timing_guard
+                    {
+                        timings.record_at(timing_guard, capture_nanos, |timestamp_nanos| {
+                            TimingRecord::WaylandReady {
+                                timestamp_nanos,
+                                sequence,
+                                generation,
+                                protocol_ready_nanos,
+                            }
+                        });
+                    }
+                    state.capture.cancel();
+                    let next_sequence = sequence
+                        .checked_add(1)
+                        .context("frame sequence exhausted")?;
+                    state.request_capture_for(next_sequence)?;
+                    let flush = capture_flush(connection.flush())?;
+                    if flush == CaptureFlush::Complete
+                        && let Some(timings) = &state.stage_timings
+                    {
+                        timings.record_now(|timestamp_nanos| {
+                            TimingRecord::CaptureRequestFlushComplete {
+                                timestamp_nanos,
+                                sequence: next_sequence,
+                                generation,
+                            }
+                        });
+                    }
+                    // capture_output only announces the next frame's constraints.
+                    // Its BufferDone cannot dispatch until this callback returns, so
+                    // the current single SHM mapping remains stable during submit.
+                    let frame = state.capture.completed_frame(
+                        capture_nanos,
+                        state.generation,
+                        state.latest_input_sequence,
+                        state.fps,
+                        state.bitrate_kbps,
+                        state.encoded_scale,
+                    )?;
+                    state.video.as_ref().unwrap().submit(frame)?;
+                    Ok(())
+                })
+            }
+            zwlr_screencopy_frame_v1::Event::Failed => Err(anyhow!("Wayland screencopy failed")),
+            zwlr_screencopy_frame_v1::Event::Damage { .. }
+            | zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => Ok(()),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            state.fail(error);
+        }
     }
 }
 
@@ -830,104 +912,46 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for State 
     }
 }
 
-impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, CaptureTarget>
-    for State
-{
+impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
         event: ext_image_copy_capture_session_v1::Event,
-        kind: &CaptureTarget,
-        connection: &Connection,
+        _: &(),
+        _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let owned = match kind {
-            CaptureTarget::Output => state.capture.session.as_ref() == Some(proxy),
-            CaptureTarget::Cursor => state.cursor.session.as_ref() == Some(proxy),
-        };
-        if !owned {
+        if state.cursor.session.as_ref() != Some(proxy) {
             return;
         }
-        let result = (|| -> Result<()> {
-            match (kind, event) {
-                (
-                    CaptureTarget::Output,
-                    ext_image_copy_capture_session_v1::Event::BufferSize { width, height },
-                ) => {
-                    state.capture.constraint_size(width, height);
-                    Ok(())
-                }
-                (
-                    CaptureTarget::Output,
-                    ext_image_copy_capture_session_v1::Event::ShmFormat { format },
-                ) => {
-                    state.capture.constraint_format(format);
-                    Ok(())
-                }
-                (
-                    CaptureTarget::Output,
-                    ext_image_copy_capture_session_v1::Event::DmabufDevice { .. }
-                    | ext_image_copy_capture_session_v1::Event::DmabufFormat { .. },
-                ) => {
-                    state.capture.begin_constraints();
-                    Ok(())
-                }
-                (CaptureTarget::Output, ext_image_copy_capture_session_v1::Event::Done) => {
-                    let shm = state.shm.clone().context("wl_shm disappeared")?;
-                    state.capture.finish_constraints(&shm, qh)?;
-                    if let Some(timings) = &state.stage_timings {
-                        let sequence = state.capture.sequence;
-                        let generation = state.generation;
-                        timings.record_now(|timestamp_nanos| {
-                            TimingRecord::ConstraintBatchComplete {
-                                timestamp_nanos,
-                                sequence,
-                                generation,
-                            }
-                        });
-                    }
-                    state.request_capture_frame(connection, state.capture.sequence)
-                }
-                (CaptureTarget::Output, ext_image_copy_capture_session_v1::Event::Stopped) => {
-                    Err(anyhow!("output capture stopped"))
-                }
-                (
-                    CaptureTarget::Cursor,
-                    ext_image_copy_capture_session_v1::Event::BufferSize { width, height },
-                ) => {
-                    state.cursor.begin_constraints();
-                    state.cursor.batch_width = Some(width);
-                    state.cursor.batch_height = Some(height);
-                    Ok(())
-                }
-                (
-                    CaptureTarget::Cursor,
-                    ext_image_copy_capture_session_v1::Event::ShmFormat { format },
-                ) => {
-                    state.cursor.begin_constraints();
-                    if format == WEnum::Value(wl_shm::Format::Argb8888) {
-                        state.cursor.batch_argb = true;
-                    }
-                    Ok(())
-                }
-                (
-                    CaptureTarget::Cursor,
-                    ext_image_copy_capture_session_v1::Event::DmabufDevice { .. }
-                    | ext_image_copy_capture_session_v1::Event::DmabufFormat { .. },
-                ) => {
-                    state.cursor.begin_constraints();
-                    Ok(())
-                }
-                (CaptureTarget::Cursor, ext_image_copy_capture_session_v1::Event::Done) => {
-                    let shm = state.shm.clone().context("wl_shm disappeared")?;
-                    state.cursor.finish_constraints(&shm, qh)
-                }
-                (CaptureTarget::Cursor, ext_image_copy_capture_session_v1::Event::Stopped) => {
-                    Err(anyhow!("cursor capture stopped"))
-                }
-                _ => Ok(()),
+        let result = match event {
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
+                state.cursor.begin_constraints();
+                state.cursor.batch_width = Some(width);
+                state.cursor.batch_height = Some(height);
+                Ok(())
             }
-        })();
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
+                state.cursor.begin_constraints();
+                if format == WEnum::Value(wl_shm::Format::Argb8888) {
+                    state.cursor.batch_argb = true;
+                }
+                Ok(())
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { .. }
+            | ext_image_copy_capture_session_v1::Event::DmabufFormat { .. } => {
+                state.cursor.begin_constraints();
+                Ok(())
+            }
+            ext_image_copy_capture_session_v1::Event::Done => match state.shm.clone() {
+                Some(shm) => state.cursor.finish_constraints(&shm, qh),
+                None => Err(anyhow!("wl_shm disappeared")),
+            },
+            ext_image_copy_capture_session_v1::Event::Stopped => {
+                Err(anyhow!("cursor capture stopped"))
+            }
+            _ => Ok(()),
+        };
         if let Err(error) = result {
             state.fail(error);
         }
@@ -966,109 +990,37 @@ impl Dispatch<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCurso
     }
 }
 
-impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, CaptureTarget>
-    for State
-{
+impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
         event: ext_image_copy_capture_frame_v1::Event,
-        kind: &CaptureTarget,
-        connection: &Connection,
+        _: &(),
+        _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let owned = match kind {
-            CaptureTarget::Output => state.capture.frame.as_ref() == Some(proxy),
-            CaptureTarget::Cursor => state.cursor.frame.as_ref() == Some(proxy),
-        };
-        if !owned {
+        if state.cursor.frame.as_ref() != Some(proxy) {
             return;
         }
-        let result = (|| -> Result<()> {
-            match (kind, event) {
-                (
-                    CaptureTarget::Output,
-                    ext_image_copy_capture_frame_v1::Event::Transform { transform },
-                ) => state.capture.transform(transform),
-                (
-                    CaptureTarget::Output,
-                    ext_image_copy_capture_frame_v1::Event::PresentationTime {
-                        tv_sec_hi,
-                        tv_sec_lo,
-                        tv_nsec,
-                    },
-                ) => state
-                    .capture
-                    .presentation_time(tv_sec_hi, tv_sec_lo, tv_nsec),
-                (CaptureTarget::Output, ext_image_copy_capture_frame_v1::Event::Ready) => {
-                    let timing_guard = state.stage_timings.as_ref().and_then(StageTimings::guard);
-                    let capture_nanos = monotonic_nanos().context("read monotonic capture time")?;
-                    let protocol_ready_nanos = state.capture.ready()?;
-                    let sequence = state.capture.sequence;
-                    let generation = state.generation;
-                    if let Some(timings) = &state.stage_timings
-                        && let Some(timing_guard) = timing_guard
-                    {
-                        timings.record_at(timing_guard, capture_nanos, |timestamp_nanos| {
-                            TimingRecord::WaylandReady {
-                                timestamp_nanos,
-                                sequence,
-                                generation,
-                                protocol_ready_nanos,
-                            }
-                        });
-                    }
-                    let frame = state.capture.completed_frame(
-                        capture_nanos,
-                        generation,
-                        state.latest_input_sequence,
-                        state.fps,
-                        state.bitrate_kbps,
-                        state.encoded_scale,
-                    )?;
-                    state.video.as_ref().unwrap().submit(frame)?;
-                    // submit copies all pixels out of the single SHM mapping. Do not
-                    // authorize the compositor to overwrite it until that copy ends.
-                    let next_sequence = sequence
-                        .checked_add(1)
-                        .context("frame sequence exhausted")?;
-                    state.request_capture_frame(connection, next_sequence)
-                }
-                (
-                    CaptureTarget::Output,
-                    ext_image_copy_capture_frame_v1::Event::Failed { reason },
-                ) => match state.capture.failed(reason)? {
-                    CaptureFailureRecovery::WaitForConstraints => Ok(()),
-                    CaptureFailureRecovery::RestartSession => {
-                        state.capture.cancel();
-                        state.request_capture()
-                    }
-                },
-                (CaptureTarget::Output, ext_image_copy_capture_frame_v1::Event::Damage { .. }) => {
-                    Ok(())
-                }
-                (
-                    CaptureTarget::Cursor,
-                    ext_image_copy_capture_frame_v1::Event::Transform { transform },
-                ) => state.cursor.transform(transform),
-                (CaptureTarget::Cursor, ext_image_copy_capture_frame_v1::Event::Ready) => {
-                    state.cursor.frame_ready(qh)
-                }
-                (
-                    CaptureTarget::Cursor,
-                    ext_image_copy_capture_frame_v1::Event::Failed { reason },
-                ) => {
-                    let shm = state.shm.clone().context("wl_shm disappeared")?;
-                    state.cursor.frame_failed(reason, &shm, qh)
-                }
-                (
-                    CaptureTarget::Cursor,
-                    ext_image_copy_capture_frame_v1::Event::Damage { .. }
-                    | ext_image_copy_capture_frame_v1::Event::PresentationTime { .. },
-                ) => Ok(()),
-                _ => Ok(()),
+        let result = match event {
+            ext_image_copy_capture_frame_v1::Event::Transform { transform } => {
+                state.cursor.transform(transform)
             }
-        })();
+            ext_image_copy_capture_frame_v1::Event::Ready => state.cursor.frame_ready(qh),
+            ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
+                let changed = reason
+                    == WEnum::Value(
+                        ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints,
+                    );
+                match state.shm.clone() {
+                    Some(shm) => state.cursor.frame_failed(changed, &shm, qh),
+                    None => Err(anyhow!("wl_shm disappeared")),
+                }
+            }
+            ext_image_copy_capture_frame_v1::Event::Damage { .. }
+            | ext_image_copy_capture_frame_v1::Event::PresentationTime { .. } => Ok(()),
+            _ => Ok(()),
+        };
         if let Err(error) = result {
             state.fail(error);
         }
@@ -1118,6 +1070,7 @@ delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore wl_pointer::WlPointer);
+delegate_noop!(State: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
 delegate_noop!(State: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
 delegate_noop!(State: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 delegate_noop!(State: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);

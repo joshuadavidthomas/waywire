@@ -1,7 +1,0 @@
-{
-  "cmd": "/opt/sprite-desktop/current/bin/sprite-desktop-bridge",
-  "args": ["--config", "/etc/sprite-desktop/config.json"],
-  "dir": "/home/sprite",
-  "needs": [],
-  "http_port": 8080
-}

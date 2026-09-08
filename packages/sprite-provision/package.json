@@ -8,7 +8,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "provision": "tsx src/index.ts"
+    "provision": "tsx src/install.ts"
   },
   "dependencies": {
     "@fly/sprites": "0.2.2"

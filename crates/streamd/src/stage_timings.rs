@@ -34,19 +34,13 @@ pub(crate) enum TimingRecord {
         #[serde(serialize_with = "serialize_u64_decimal")]
         protocol_ready_nanos: u64,
     },
-    CaptureSessionRequestComplete {
-        #[serde(serialize_with = "serialize_u64_decimal")]
-        timestamp_nanos: u64,
-        sequence: u64,
-        generation: u32,
-    },
-    ConstraintBatchComplete {
-        #[serde(serialize_with = "serialize_u64_decimal")]
-        timestamp_nanos: u64,
-        sequence: u64,
-        generation: u32,
-    },
     CaptureRequestComplete {
+        #[serde(serialize_with = "serialize_u64_decimal")]
+        timestamp_nanos: u64,
+        sequence: u64,
+        generation: u32,
+    },
+    CaptureRequestFlushComplete {
         #[serde(serialize_with = "serialize_u64_decimal")]
         timestamp_nanos: u64,
         sequence: u64,

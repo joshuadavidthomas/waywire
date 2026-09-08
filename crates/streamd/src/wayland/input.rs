@@ -265,6 +265,7 @@ impl Input {
             }
             self.send_modifiers();
         }
+        self.send_text(true, "");
         Ok(())
     }
 

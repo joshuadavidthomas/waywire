@@ -1,0 +1,13 @@
+[vist#0:0/rawvideo @ 0x5586f8bca640] Resumed reading at pts 0.000 with rate 1.050 after a lag of 0.500s
+[vist#0:0/rawvideo @ 0x559a53d23640] Resumed reading at pts 0.000 with rate 1.050 after a lag of 0.500s
+[vist#0:0/rawvideo @ 0x559a53d23640] Resumed reading at pts 0.083 with rate 1.050 after a lag of 75.035s
+[vist#0:0/rawvideo @ 0x559a53d23640] Resumed reading at pts 0.100 with rate 1.050 after a lag of 117.993s
+[vist#0:0/rawvideo @ 0x559a53d23640] Resumed reading at pts 0.117 with rate 1.050 after a lag of 136.204s
+[vist#0:0/rawvideo @ 0x55f605024640] Resumed reading at pts 0.000 with rate 1.050 after a lag of 0.500s
+[vist#0:0/rawvideo @ 0x558cedb4c640] Resumed reading at pts 0.000 with rate 1.050 after a lag of 0.500s
+Error: video pipeline
+
+Caused by:
+    video metadata/RTP correlation stalled
+dbus-run-session: ignoring unknown child process 22
+dbus-run-session: ignoring unknown child process 137

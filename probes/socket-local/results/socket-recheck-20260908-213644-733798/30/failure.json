@@ -1,0 +1,88 @@
+{
+  "message": "Error: resize 1920x1080 did not cross the browser control channel",
+  "stats": {
+    "submitted": 1906,
+    "decoded": 1906,
+    "generation": 6,
+    "latestGeneration": 6,
+    "drawCallbacks": 1896,
+    "putCallbacks": 0,
+    "outputs": [
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      },
+      {
+        "generation": 6,
+        "width": 1920,
+        "height": 1072,
+        "format": "I444",
+        "colorSpace": {}
+      }
+    ],
+    "errors": [],
+    "canvas": {
+      "width": 1920,
+      "height": 1072,
+      "css": {
+        "x": 17,
+        "y": 80,
+        "width": 1920,
+        "height": 1080
+      }
+    },
+    "status": "Connected",
+    "control": "Input active",
+    "hidden": false
+  },
+  "log": [
+    "console:warning",
+    "console:warning",
+    "console:warning"
+  ]
+}

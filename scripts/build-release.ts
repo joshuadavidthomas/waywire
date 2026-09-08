@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   copyFile,
@@ -9,7 +10,6 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
@@ -62,93 +62,81 @@ const archive = join(output, archiveName);
 let createdOutput = false;
 let completed = false;
 
-const services = [
-  {
-    name: "sprite-desktop",
-    cmd: "/opt/sprite-desktop/current/bin/desktop.sh",
-    args: [],
-    http_port: null,
-    needs: [],
-    env: {},
-    dir: "/home/sprite",
-  },
-  {
-    name: "sprite-desktop-bridge",
-    cmd: "/opt/sprite-desktop/current/bin/sprite-desktop-bridge",
-    args: ["--config", "/etc/sprite-desktop/config.json"],
-    http_port: 8080,
-    needs: [],
-    env: {},
-    dir: "/home/sprite",
-  },
-];
+const service = {
+  name: "sprite-desktop",
+  cmd: "/opt/sprite-desktop/current/bin/desktop.sh",
+  args: [],
+  http_port: 8080,
+  needs: [],
+  env: {},
+  dir: "/home/sprite",
+};
 const packages = [
-  "tigervnc-standalone-server",
-  "tigervnc-common",
-  "xfce4",
-  "xfce4-terminal",
+  "breeze-cursor-theme",
   "dbus-x11",
-  "xubuntu-wallpapers",
+  "ffmpeg",
+  "labwc",
+  "lxqt-core",
+  "lxqt-wayland-session",
+  "qt6-wayland",
+  "grim",
+  "python3",
+  "wayland-utils",
+  "wlr-randr",
   "fonts-dejavu-core",
   "xdg-utils",
   "curl",
   "ca-certificates",
   "firefox",
-  "libglycin-2-0",
-  "glycin-loaders",
-  "glycin-thumbnailers",
 ];
 
 try {
   await mkdir(join(root, "dist", "releases"), { recursive: true });
-  await mkdir(output); // Never replace an existing versioned release.
+  await mkdir(output);
   createdOutput = true;
   await mkdir(join(payload, "bin"), { recursive: true });
-  await exec("pnpm", ["--filter", "@sprite-desktop/viewer", "build"], {
+
+  await exec("pnpm", ["--filter", "@sprite-desktop/web", "build"], {
     cwd: root,
   });
-
-  await exec(
-    "go",
-    [
-      "build",
-      "-trimpath",
-      "-buildvcs=false",
-      "-ldflags",
-      `-s -w -X main.buildVersion=${version} -X main.buildSource=${source}`,
-      "-o",
-      join(payload, "bin", "sprite-desktop-bridge"),
-      "./bridge",
-    ],
-    {
-      cwd: root,
-      env: { ...process.env, CGO_ENABLED: "0", GOOS: "linux", GOARCH: "amd64" },
-    },
-  );
-  await copyFile(
-    join(root, "installer", "desktop.sh"),
-    join(payload, "bin", "desktop.sh"),
-  );
+  await exec("cargo", ["build", "--locked", "--release", "--workspace"], {
+    cwd: root,
+  });
   await Promise.all([
-    chmod(join(payload, "bin", "sprite-desktop-bridge"), 0o555),
-    chmod(join(payload, "bin", "desktop.sh"), 0o555),
+    copyFile(
+      join(root, "target/release/sprite-desktop-gateway"),
+      join(payload, "bin/sprite-desktop-gateway"),
+    ),
+    copyFile(
+      join(root, "target/release/sprite-desktop-streamd"),
+      join(payload, "bin/sprite-desktop-streamd"),
+    ),
+    copyFile(
+      join(root, "installer/desktop.sh"),
+      join(payload, "bin/desktop.sh"),
+    ),
+    copyFile(
+      join(root, "installer/session.py"),
+      join(payload, "bin/session.py"),
+    ),
   ]);
+  await Promise.all(
+    [
+      "sprite-desktop-gateway",
+      "sprite-desktop-streamd",
+      "desktop.sh",
+      "session.py",
+    ].map((name) => chmod(join(payload, "bin", name), 0o555)),
+  );
 
   const manifest = {
     schema: 1,
     release: version,
     source,
     os: { id: "ubuntu", codename: "resolute", architecture: "amd64" },
-    versions: {
-      novnc: "1.7.0",
-      websocket: "github.com/gorilla/websocket@v1.5.3",
-    },
-    ports: { rfb_loopback: 5900, http: 8080 },
-    sockets: {
-      rfb: "/tmp/sprite-desktop/rfb.sock",
-      sprite_api: "/.sprite/api.sock",
-    },
-    services,
+    artifacts: ["sprite-desktop-gateway", "sprite-desktop-streamd"],
+    ports: { http: 8080 },
+    services: [service],
   };
   const sources = {
     schema: 1,
@@ -156,12 +144,7 @@ try {
       {
         name: "ubuntu",
         url: "https://archive.ubuntu.com/ubuntu",
-        suites: [
-          "resolute",
-          "resolute-updates",
-          "resolute-security",
-          "resolute-proposed",
-        ],
+        suites: ["resolute", "resolute-updates", "resolute-security"],
         components: ["main", "universe"],
         keyring: "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
         key_fingerprints: ["F6ECB3762474EDA9D21B7022871920D1991BC93C"],
@@ -178,11 +161,6 @@ try {
         packages: ["firefox"],
       },
     ],
-    glycin: {
-      suite: "resolute-proposed",
-      version: "2.1.5+ds-0ubuntu0.1",
-      packages: ["libglycin-2-0", "glycin-loaders", "glycin-thumbnailers"],
-    },
   };
   await Promise.all([
     writeFile(
@@ -215,10 +193,7 @@ try {
   const size = (await stat(archive)).size;
   await writeFile(join(output, "SHA256SUMS"), `${digest}  ${archiveName}\n`);
 
-  const template = await readFile(
-    join(root, "installer", "install.sh"),
-    "utf8",
-  );
+  const template = await readFile(join(root, "installer/install.sh"), "utf8");
   const archiveURL = new URL(
     `${version}/${archiveName}`,
     `${baseURL.replace(/\/*$/u, "")}/`,

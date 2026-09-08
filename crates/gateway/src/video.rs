@@ -234,7 +234,6 @@ struct Assembler {
     next_sequence: Option<u16>,
     ssrc: Option<u32>,
     recovering: bool,
-    restart_pending: bool,
 }
 #[derive(Debug)]
 struct Unit {
@@ -243,15 +242,21 @@ struct Unit {
     discontinuity: bool,
     timestamp: u32,
     ssrc: u32,
-    restarted: bool,
 }
 impl Assembler {
     fn consume(&mut self, packet: Packet) -> Result<Option<Unit>> {
-        if self.ssrc.is_some_and(|ssrc| ssrc != packet.ssrc) {
+        if packet.ssrc == 0 {
+            return Err(anyhow!("RTP SSRC generation must be positive"));
+        }
+        if self.ssrc.is_some_and(|ssrc| packet.ssrc < ssrc) {
+            // SSRC is the monotonic frame generation. A packet from an older
+            // encoder must not alter access-unit or restart state.
+            return Ok(None);
+        }
+        if self.ssrc.is_some_and(|ssrc| packet.ssrc > ssrc) {
             self.clear_access_unit();
             self.next_sequence = None;
             self.recovering = true;
-            self.restart_pending = true;
         }
         self.ssrc = Some(packet.ssrc);
         if self
@@ -294,14 +299,12 @@ impl Assembler {
             return Ok(None);
         }
         let discontinuity = std::mem::take(&mut self.recovering);
-        let restarted = std::mem::take(&mut self.restart_pending);
         Ok(Some(Unit {
             data: data.into(),
             key,
             discontinuity,
             timestamp: packet.timestamp,
             ssrc: packet.ssrc,
-            restarted,
         }))
     }
     fn append_payload(&mut self, payload: &[u8]) -> Result<()> {
@@ -400,7 +403,7 @@ struct CorrelatedSample {
 struct Correlator {
     metadata: VecDeque<Pending<FrameMetadata>>,
     units: VecDeque<Pending<PendingUnit>>,
-    last_timestamp: Option<(u32, u32)>,
+    last_timestamp: Option<u32>,
     last_generation: u32,
     last_fps: u32,
     ready_generation: u32,
@@ -417,6 +420,12 @@ impl Correlator {
         }
     }
     fn push_metadata(&mut self, value: FrameMetadata) -> Result<Vec<CorrelatedSample>> {
+        if value.generation == 0 {
+            return Err(anyhow!("frame generation must be positive"));
+        }
+        if value.generation < self.last_generation {
+            return self.drain();
+        }
         if self.metadata.len() == MAX_PENDING_RECORDS {
             return Err(anyhow!("metadata count limit exceeded"));
         }
@@ -427,6 +436,12 @@ impl Correlator {
         self.drain()
     }
     fn push_unit(&mut self, value: PendingUnit) -> Result<Vec<CorrelatedSample>> {
+        if value.unit.ssrc == 0 {
+            return Err(anyhow!("RTP SSRC generation must be positive"));
+        }
+        if value.unit.ssrc < self.last_generation {
+            return self.drain();
+        }
         if self.units.len() == MAX_PENDING_RECORDS {
             return Err(anyhow!("RTP unit count limit exceeded"));
         }
@@ -438,25 +453,61 @@ impl Correlator {
     }
     fn drain(&mut self) -> Result<Vec<CorrelatedSample>> {
         let mut samples = Vec::new();
-        while let Some(pending) = self.units.front() {
+        loop {
+            while self
+                .metadata
+                .front()
+                .is_some_and(|item| item.value.generation < self.last_generation)
+            {
+                self.metadata.pop_front();
+            }
+            let Some(pending) = self.units.front() else {
+                break;
+            };
             let unit = &pending.value.unit;
-            let consume = match (unit.restarted, self.last_timestamp) {
-                (true, _) | (false, None) => 1,
-                (false, Some((_, ssrc))) if ssrc != unit.ssrc => 1,
-                (false, Some((timestamp, _))) => {
-                    metadata_gap(unit.timestamp.wrapping_sub(timestamp), self.last_fps)?
-                }
-            };
-            let metadata_index = if unit.restarted && self.last_generation != 0 {
-                self.metadata
-                    .iter()
-                    .position(|item| item.value.generation != self.last_generation)
-            } else if self.metadata.len() >= consume {
-                Some(consume - 1)
+            if unit.ssrc < self.last_generation {
+                self.units.pop_front();
+                continue;
+            }
+
+            let same_generation = unit.ssrc == self.last_generation;
+            let consume = if same_generation {
+                metadata_gap(
+                    unit.timestamp.wrapping_sub(self.last_timestamp.unwrap()),
+                    self.last_fps,
+                )?
             } else {
-                None
+                1
             };
-            let Some(index) = metadata_index else { break };
+            let mut matches = 0;
+            let mut metadata_index = None;
+            let mut passed_generation = false;
+            for (index, item) in self.metadata.iter().enumerate() {
+                match item.value.generation.cmp(&unit.ssrc) {
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => {
+                        matches += 1;
+                        if matches == consume {
+                            metadata_index = Some(index);
+                            break;
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        passed_generation = true;
+                        break;
+                    }
+                }
+            }
+            let Some(index) = metadata_index else {
+                if passed_generation {
+                    // Metadata is ordered by generation. This unit's record can
+                    // no longer arrive, so it cannot be correlated safely.
+                    self.units.pop_front();
+                    continue;
+                }
+                break;
+            };
+
             let pending = self.units.pop_front().unwrap();
             let unit = pending.value.unit;
             let mut metadata = None;
@@ -464,10 +515,10 @@ impl Correlator {
                 metadata = self.metadata.pop_front().map(|item| item.value);
             }
             let metadata = metadata.unwrap();
-            let discontinuity = unit.discontinuity
-                || index > 0
-                || (self.last_generation != 0 && metadata.generation != self.last_generation);
-            self.last_timestamp = Some((unit.timestamp, unit.ssrc));
+            debug_assert_eq!(metadata.generation, unit.ssrc);
+            let generation_changed = metadata.generation != self.last_generation;
+            let discontinuity = unit.discontinuity || index > 0 || generation_changed;
+            self.last_timestamp = Some(unit.timestamp);
             self.last_generation = metadata.generation;
             self.last_fps = metadata.fps;
             samples.push(CorrelatedSample {
@@ -671,14 +722,13 @@ mod tests {
             fps: 30,
         }
     }
-    fn unit(timestamp: u32, ssrc: u32, restarted: bool) -> Unit {
+    fn unit(timestamp: u32, generation: u32) -> Unit {
         Unit {
             data: vec![1].into(),
             key: true,
-            discontinuity: restarted,
+            discontinuity: false,
             timestamp,
-            ssrc,
-            restarted,
+            ssrc: generation,
         }
     }
     #[test]
@@ -697,7 +747,7 @@ mod tests {
         assert_eq!(&*value.data, [0, 0, 0, 1, 0x65, 1, 2]);
     }
     #[test]
-    fn ssrc_restart_stays_sticky_across_fragments() {
+    fn generation_restart_stays_sticky_across_fragments() {
         let mut a = Assembler::default();
         a.consume(packet(1, 1, 1, true, &[5, 1])).unwrap();
         assert!(
@@ -709,7 +759,7 @@ mod tests {
             .consume(packet(3, 2, 2, true, &[0x7c, 0x45, 3]))
             .unwrap()
             .unwrap();
-        assert!(value.restarted && value.discontinuity);
+        assert!(value.discontinuity);
     }
     #[test]
     fn rejects_invalid_fu_boundaries() {
@@ -739,37 +789,117 @@ mod tests {
                 .discontinuity
         );
     }
-    #[test]
-    fn restarted_unit_discards_stale_metadata() {
-        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
-        let mut c = Correlator::new();
-        c.push_metadata(metadata(1, 1)).unwrap();
-        let permit = budget.clone().try_acquire_many_owned(1).unwrap();
-        assert_eq!(
-            c.push_unit(PendingUnit {
-                unit: unit(3000, 1, false),
-                _bytes: permit
-            })
-            .unwrap()[0]
-                .sample
-                .metadata
-                .sequence,
-            1
-        );
-        c.push_metadata(metadata(2, 1)).unwrap();
-        c.push_metadata(metadata(3, 2)).unwrap();
-        let permit = budget.try_acquire_many_owned(1).unwrap();
-        let sample = c
-            .push_unit(PendingUnit {
-                unit: unit(1, 2, true),
-                _bytes: permit,
-            })
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(sample.sample.metadata.generation, 2);
-        assert_eq!(sample.sample.metadata.sequence, 3);
+    fn pending(unit: Unit, budget: &Arc<Semaphore>) -> PendingUnit {
+        PendingUnit {
+            unit,
+            _bytes: budget.clone().try_acquire_many_owned(1).unwrap(),
+        }
     }
+
+    #[test]
+    fn first_unit_uses_only_metadata_with_its_generation() {
+        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
+        let mut correlator = Correlator::new();
+        correlator.push_metadata(metadata(1, 1)).unwrap();
+        correlator.push_metadata(metadata(2, 2)).unwrap();
+
+        let samples = correlator.push_unit(pending(unit(1, 2), &budget)).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].sample.metadata.sequence, 2);
+        assert_eq!(samples[0].sample.metadata.generation, 2);
+
+        assert!(
+            correlator
+                .push_unit(pending(unit(2, 1), &budget))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(correlator.units.is_empty());
+    }
+
+    #[test]
+    fn reordered_replacements_never_exchange_metadata() {
+        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
+        let mut correlator = Correlator::new();
+        correlator.push_metadata(metadata(1, 1)).unwrap();
+        correlator
+            .push_unit(pending(unit(3_000, 1), &budget))
+            .unwrap();
+        correlator.push_metadata(metadata(2, 2)).unwrap();
+        correlator.push_metadata(metadata(3, 3)).unwrap();
+
+        let samples = correlator.push_unit(pending(unit(1, 3), &budget)).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].sample.metadata.sequence, 3);
+        assert_eq!(samples[0].sample.metadata.generation, 3);
+
+        assert!(
+            correlator
+                .push_unit(pending(unit(1, 2), &budget))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(correlator.units.is_empty());
+    }
+
+    #[test]
+    fn old_packet_cannot_poison_current_assembler_state() {
+        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
+        let mut assembler = Assembler::default();
+        let mut correlator = Correlator::new();
+
+        correlator.push_metadata(metadata(1, 1)).unwrap();
+        let first = assembler
+            .consume(packet(1, 3_000, 1, true, &[5, 1]))
+            .unwrap()
+            .unwrap();
+        correlator.push_unit(pending(first, &budget)).unwrap();
+
+        correlator.push_metadata(metadata(2, 2)).unwrap();
+        let replacement = assembler
+            .consume(packet(1, 3_000, 2, true, &[5, 2]))
+            .unwrap()
+            .unwrap();
+        correlator.push_unit(pending(replacement, &budget)).unwrap();
+        correlator.push_metadata(metadata(3, 2)).unwrap();
+
+        assert!(
+            assembler
+                .consume(packet(2, 6_000, 1, true, &[5, 3]))
+                .unwrap()
+                .is_none()
+        );
+        let current = assembler
+            .consume(packet(2, 6_000, 2, true, &[5, 4]))
+            .unwrap()
+            .unwrap();
+        assert!(!current.discontinuity);
+        let samples = correlator.push_unit(pending(current, &budget)).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].sample.metadata.sequence, 3);
+        assert!(correlator.units.is_empty());
+    }
+
+    #[test]
+    fn generation_change_does_not_apply_timestamp_gap_across_ssrcs() {
+        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
+        let mut correlator = Correlator::new();
+        correlator.push_metadata(metadata(1, 1)).unwrap();
+        correlator
+            .push_unit(pending(unit(3_000, 1), &budget))
+            .unwrap();
+        correlator.push_metadata(metadata(2, 1)).unwrap();
+        correlator.push_metadata(metadata(3, 2)).unwrap();
+
+        let samples = correlator
+            .push_unit(pending(unit(u32::MAX, 2), &budget))
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].sample.metadata.sequence, 3);
+        assert!(samples[0].sample.discontinuity);
+        assert!(correlator.metadata.is_empty());
+    }
+
     #[test]
     fn huge_timestamp_gap_fails_instead_of_guessing() {
         assert!(metadata_gap(u32::MAX, 60).is_err());

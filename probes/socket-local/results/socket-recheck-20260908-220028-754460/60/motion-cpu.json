@@ -1,0 +1,18 @@
+{
+  "kind": "motion",
+  "seconds": 45.005768989,
+  "before": {
+    "browser": 3009121,
+    "container": 2692502
+  },
+  "after": {
+    "browser": 14395882,
+    "container": 29684938
+  },
+  "decodedFrames": 1102,
+  "drawnFrames": 1103,
+  "browserCpuSeconds": 11.386761,
+  "containerCpuSeconds": 26.992436,
+  "browserOneCorePercent": 25.300669793650393,
+  "containerOneCorePercent": 59.97550226638123
+}

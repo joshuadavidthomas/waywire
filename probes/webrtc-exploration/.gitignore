@@ -1,6 +1,0 @@
-/target/
-/dist/
-/chart.png
-!/results/**/server.log
-!/results/**/*-server.log
-!/results/**/psnr.log

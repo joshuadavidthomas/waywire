@@ -85,7 +85,7 @@ Build the viewer and both binaries locally. After separate deployment approval,
 run the mutating command with explicit binary paths:
 
 ```sh
-pnpm --filter @sprite-desktop/stream-viewer build
+pnpm --filter @sprite-desktop/web build
 cargo build --release --workspace
 pnpm exec tsx probes/rust-desktop/deploy.ts \
   --sprite sprite-desktop-rust \
@@ -169,7 +169,7 @@ A cached FPS label cannot prove recovery; an initial version of the probe used
 that weak assertion and it was removed during parent review.
 
 Local checks passed on the same date: 40 Rust unit tests, all three explicitly
-selected real-FFmpeg tests, 17 stream-viewer tests, strict TypeScript, Clippy,
+selected real-FFmpeg tests, 17 web viewer tests, strict TypeScript, Clippy,
 Rust formatting, hostile-peer IPC/HTTP checks, the loopback proxy test,
 ShellCheck and release builds. Shared regressions also passed: seven VNC viewer
 tests, its check/build, and three recorder-metrics tests. Dependency and runtime

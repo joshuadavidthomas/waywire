@@ -6,9 +6,9 @@ Waymote core and example notice
 
 This notice applies to the Waymote-derived example frontend in:
 
-- apps/stream-viewer/index.html
-- apps/stream-viewer/src/client.js
-- apps/stream-viewer/src/style.css
+- apps/web/index.html
+- apps/web/src/client.ts
+- apps/web/src/style.css
 
 MIT License
 
@@ -36,7 +36,7 @@ Waymote browser SDK notice
 ==========================
 
 This notice applies to the Waymote-derived files in
-apps/stream-viewer/src/sdk/.
+apps/web/src/sdk/.
 
 MIT License
 

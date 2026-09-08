@@ -1,5 +1,7 @@
 # Sprite Desktop v1: self-contained desktop runtime
 
+> **HISTORICAL:** This specification records the former Go/VNC runtime. Its commands and acceptance plan are not instructions for the current Rust Socket implementation. See [README.md](./README.md) for the current project.
+
 **Status:** runtime installed; M0 passed ([record](./probes/M0.md)); M1–M4 acceptance in progress ([runtime evidence](./probes/RUNTIME.md)); M5 not started  
 **Baseline:** v0 spike at change `xrkyqoky` / commit `c37e7760`  
 **Prior spec:** [SPEC.v0.md](./SPEC.v0.md)
