@@ -57,11 +57,15 @@ const service = {
 };
 const packages = [
   "breeze-cursor-theme",
+  "breeze-icon-theme",
   "dbus-x11",
+  "featherpad",
   "ffmpeg",
   "labwc",
   "lxqt-core",
+  "lxqt-menu-data",
   "lxqt-wayland-session",
+  "qt6-svg-plugins",
   "qt6-wayland",
   "grim",
   "python3",
