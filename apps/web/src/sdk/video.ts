@@ -1,0 +1,657 @@
+import {
+  parseVideoConfiguration,
+  parseJson,
+  type VideoConfiguration,
+} from "./messages.ts";
+import type { WaymoteStats } from "./session.ts";
+
+export const videoPacketHeaderSize = 40;
+export const maximumPendingVideoFrames = 24;
+export const maximumVideoDecodeQueueSize = maximumPendingVideoFrames;
+const busyDecodeQueueSize = 5;
+const initialReconnectDelayMilliseconds = 250;
+const maximumReconnectDelayMilliseconds = 5000;
+const presentationLeadMilliseconds = 8;
+const presentationWakeMarginMilliseconds = 4;
+const maximumPresentationTimerMilliseconds = 1000;
+
+type Timer = ReturnType<typeof setTimeout>;
+type ConnectionAttempt = Readonly<{ generation: number }>;
+
+export type VideoFeedback = Readonly<{
+  received: number;
+  presented: number;
+  queuePeak: number;
+  queueBusyMs: number;
+  sampleMs: number;
+  dropped: number;
+}>;
+
+export type VideoStatsContext = Readonly<{
+  bitrateKbps: number;
+  scalePercent: number;
+  rttMs: number;
+  clockConfident: boolean;
+  clockUncertaintyMs: number | null;
+  pendingInputCount: number;
+  resizeState: WaymoteStats["resizeState"];
+}>;
+
+export interface VideoOwner {
+  createSocket(): Promise<WebSocket>;
+  connectionGeneration(): number;
+  shouldRun(): boolean;
+  disposed(): boolean;
+  setStatus(text: string, connected?: boolean): void;
+  updateState(changes: Partial<import("./session.ts").VideoState>): void;
+  emitError(error: Error): void;
+  expectedPresentationTime(
+    captureMicros: number,
+    latencyMilliseconds: number,
+  ): number | null;
+  statsContext(): VideoStatsContext;
+  setLatestAppliedInput(sequence: number): void;
+  presentResizeGeneration(
+    generation: number,
+    width: number,
+    height: number,
+  ): WaymoteStats["resizeState"];
+  refreshCursor(): void;
+  publishStats(stats: WaymoteStats): void;
+}
+
+export type VideoPacket = Readonly<{
+  buffer: ArrayBuffer;
+  keyframe: boolean;
+  discontinuity: boolean;
+  timestamp: number;
+  generation: number;
+  latestAppliedInput: number;
+  width: number;
+  height: number;
+}>;
+
+export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
+  if (
+    !(buffer instanceof ArrayBuffer) ||
+    buffer.byteLength < videoPacketHeaderSize
+  ) {
+    return null;
+  }
+  const view = new DataView(buffer);
+  if (view.getUint8(0) !== 2 || view.getUint8(1) !== 1) return null;
+  return {
+    buffer,
+    keyframe: (view.getUint8(2) & 1) !== 0,
+    discontinuity: (view.getUint8(2) & 2) !== 0,
+    timestamp: Number(view.getBigUint64(12, true)),
+    generation: view.getUint32(20, true),
+    latestAppliedInput: view.getUint32(36, true),
+    width: view.getUint16(24, true),
+    height: view.getUint16(26, true),
+  };
+}
+
+export class VideoRuntime {
+  private display: HTMLCanvasElement | null = null;
+  private context: CanvasRenderingContext2D | null = null;
+  private decoder: VideoDecoder | null = null;
+  private socket: WebSocket | null = null;
+  private readonly pendingFrames: VideoFrame[] = [];
+  private animationPending = false;
+  private animationFrame: number | null = null;
+  private presentationTimer: Timer | null = null;
+  private renderedFrames = 0;
+  private presentedFrames = 0;
+  private intervalPresentedFrames = 0;
+  private decodedFrames = 0;
+  private reconnectDelay = initialReconnectDelayMilliseconds;
+  private reconnectTimer: Timer | null = null;
+  private connectAttempt: ConnectionAttempt | null = null;
+  private decoderConfiguration: VideoDecoderConfig | null = null;
+  private waitingForKeyframe = true;
+  private decoderGeneration = 0;
+  private receivedChunks = 0;
+  private intervalReceivedFrames = 0;
+  private receivedKeyframes = 0;
+  private queuePeak = 0;
+  private queueBusyMilliseconds = 0;
+  private queueObservedSize = 0;
+  private queueObservedAt = 0;
+  private feedbackSampleStartedAt = 0;
+  private readonly renderedFrameTimes: number[] = [];
+  private targetLatencyMilliseconds: number;
+  private videoLateness = 0;
+  private readonly statsIntervalMilliseconds: number;
+  private lastStatsPublishedAt = Number.NEGATIVE_INFINITY;
+  private currentGeneration = 0;
+  private droppedFrames = 0;
+  private intervalDroppedFrames = 0;
+  private overdueDroppedFrames = 0;
+  private decodedOverflowDroppedFrames = 0;
+  private decoderResetDroppedFrames = 0;
+  private decoderResets = 0;
+
+  constructor(
+    private readonly owner: VideoOwner,
+    latency: number | undefined,
+    statsIntervalMs: number | undefined,
+  ) {
+    this.targetLatencyMilliseconds = Number(latency ?? 60);
+    this.statsIntervalMilliseconds = Number(statsIntervalMs ?? 0);
+    if (
+      !Number.isFinite(this.targetLatencyMilliseconds) ||
+      this.targetLatencyMilliseconds < 0
+    ) {
+      throw new RangeError("Latency must be a non-negative number");
+    }
+    if (
+      !Number.isFinite(this.statsIntervalMilliseconds) ||
+      this.statsIntervalMilliseconds < 0
+    ) {
+      throw new RangeError("Stats interval must be a non-negative number");
+    }
+  }
+
+  get hasSocket(): boolean {
+    return this.socket !== null;
+  }
+
+  get renderedFrameCount(): number {
+    return this.renderedFrames;
+  }
+
+  attach(display: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
+    this.display = display;
+    this.context = context;
+  }
+
+  detach(): void {
+    this.display = null;
+    this.context = null;
+  }
+
+  invalidateConnectionAttempt(): void {
+    this.connectAttempt = null;
+  }
+
+  closeForHiddenPage(): void {
+    this.connectAttempt = null;
+    this.socket?.close(1000, "page hidden");
+  }
+
+  async connect(): Promise<void> {
+    if (!this.owner.shouldRun()) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.connectAttempt) return;
+    this.owner.setStatus("Connecting");
+    const attempt = { generation: this.owner.connectionGeneration() };
+    this.connectAttempt = attempt;
+    let socket: WebSocket;
+    try {
+      socket = await this.owner.createSocket();
+    } catch (cause) {
+      if (this.connectAttempt !== attempt) return;
+      this.connectAttempt = null;
+      if (
+        !this.owner.shouldRun() ||
+        attempt.generation !== this.owner.connectionGeneration()
+      )
+        return;
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      this.owner.emitError(error);
+      this.owner.setStatus(`Reconnecting · ${error.message}`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        void this.connect();
+      }, this.reconnectDelay);
+      this.reconnectDelay = Math.min(
+        this.reconnectDelay * 2,
+        maximumReconnectDelayMilliseconds,
+      );
+      return;
+    }
+    if (
+      this.connectAttempt !== attempt ||
+      !this.owner.shouldRun() ||
+      attempt.generation !== this.owner.connectionGeneration()
+    ) {
+      if (this.connectAttempt === attempt) this.connectAttempt = null;
+      socket.close(1000, "stale connection attempt");
+      return;
+    }
+    this.connectAttempt = null;
+    this.socket = socket;
+    let decoderSetup = Promise.resolve();
+    socket.binaryType = "arraybuffer";
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
+      this.reconnectDelay = initialReconnectDelayMilliseconds;
+      this.owner.setStatus("Connected", true);
+    });
+    socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) return;
+      if (typeof event.data === "string") {
+        const message = parseVideoConfiguration(parseJson(event.data));
+        if (!message) {
+          socket.close(1003, "invalid video configuration");
+          return;
+        }
+        decoderSetup = this.configureDecoder(message).catch((error) => {
+          if (
+            this.socket !== socket ||
+            this.owner.disposed() ||
+            !this.owner.shouldRun()
+          )
+            return;
+          console.error("video decoder configuration failed", error);
+          this.owner.setStatus("Video decoder error");
+          socket.close(4001, "video decoder configuration failed");
+        });
+      } else if (event.data instanceof ArrayBuffer) {
+        const data = event.data;
+        void decoderSetup.then(() => {
+          if (
+            this.socket !== socket ||
+            this.owner.disposed() ||
+            !this.owner.shouldRun()
+          )
+            return;
+          this.decodeMessage(data);
+        });
+      }
+    });
+    socket.addEventListener("close", (event) =>
+      this.handleClose(socket, event),
+    );
+    socket.addEventListener("error", () => socket.close());
+  }
+
+  private handleClose(socket: WebSocket, event: CloseEvent): void {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    const reason = event.reason || `WebSocket code ${event.code}`;
+    console.warn("video WebSocket closed", event.code, event.reason);
+    this.owner.setStatus(
+      this.owner.shouldRun() ? `Reconnecting · ${event.code}` : "Disconnected",
+    );
+    if (this.renderedFrames === 0) {
+      this.owner.updateState({ message: `${reason}. Retrying…` });
+    }
+    this.decoderGeneration += 1;
+    this.decoder?.close();
+    this.decoder = null;
+    for (const frame of this.pendingFrames.splice(0)) frame.close();
+    if (this.presentationTimer !== null) clearTimeout(this.presentationTimer);
+    this.presentationTimer = null;
+    this.decoderConfiguration = null;
+    this.waitingForKeyframe = true;
+    if (this.owner.shouldRun()) {
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        void this.connect();
+      }, this.reconnectDelay);
+    }
+    this.reconnectDelay = Math.min(
+      this.reconnectDelay * 2,
+      maximumReconnectDelayMilliseconds,
+    );
+  }
+
+  disconnect(): void {
+    this.connectAttempt = null;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.socket?.close(1000, "client disconnect");
+    this.socket = null;
+    this.decoderGeneration += 1;
+    this.decoder?.close();
+    this.decoder = null;
+    this.resetFeedbackInterval();
+    for (const frame of this.pendingFrames.splice(0)) frame.close();
+    this.cancelPresentation();
+  }
+
+  setLatencyTarget(milliseconds: number): void {
+    milliseconds = Number(milliseconds);
+    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+      throw new RangeError("Latency must be a non-negative number");
+    }
+    this.targetLatencyMilliseconds = milliseconds;
+    if (this.presentationTimer !== null) clearTimeout(this.presentationTimer);
+    this.presentationTimer = null;
+    this.schedulePresentation();
+  }
+
+  resetFeedbackInterval(now = performance.now()): void {
+    this.intervalReceivedFrames = 0;
+    this.intervalPresentedFrames = 0;
+    this.intervalDroppedFrames = 0;
+    this.queueBusyMilliseconds = 0;
+    this.feedbackSampleStartedAt = now;
+    this.queueObservedAt = now;
+    this.queueObservedSize = this.decoder?.decodeQueueSize ?? 0;
+    this.queuePeak = this.queueObservedSize;
+  }
+
+  takeFeedback(now = performance.now()): VideoFeedback | null {
+    this.observeDecodeQueue(this.decoder?.decodeQueueSize ?? 0, now);
+    const sampleMs = now - this.feedbackSampleStartedAt;
+    const queueBusyMs = Math.min(
+      Math.max(0, this.queueBusyMilliseconds),
+      Math.max(0, sampleMs),
+    );
+    while ((this.renderedFrameTimes[0] ?? now) < now - 1000) {
+      this.renderedFrameTimes.shift();
+    }
+    const feedback =
+      Number.isFinite(sampleMs) && sampleMs > 0 && sampleMs <= 60_000
+        ? {
+            received: this.intervalReceivedFrames,
+            presented: this.intervalPresentedFrames,
+            queuePeak: this.queuePeak,
+            queueBusyMs,
+            sampleMs,
+            dropped: this.intervalDroppedFrames,
+          }
+        : null;
+    this.resetFeedbackInterval(now);
+    return feedback;
+  }
+
+  private async configureDecoder(
+    configuration: VideoConfiguration,
+  ): Promise<void> {
+    const generation = ++this.decoderGeneration;
+    this.decoder?.close();
+    this.decoder = null;
+    this.decoderConfiguration = {
+      codec: configuration.codec,
+      optimizeForLatency: true,
+    };
+    this.waitingForKeyframe = true;
+    this.renderedFrameTimes.length = 0;
+    let support: VideoDecoderSupport;
+    try {
+      support = await VideoDecoder.isConfigSupported(this.decoderConfiguration);
+    } catch (error) {
+      if (
+        generation !== this.decoderGeneration ||
+        this.owner.disposed() ||
+        !this.owner.shouldRun()
+      )
+        return;
+      throw error;
+    }
+    if (generation !== this.decoderGeneration) return;
+    if (!support.supported) {
+      this.decoderConfiguration = null;
+      this.owner.setStatus("Unsupported codec");
+      this.owner.updateState({
+        state: "error",
+        message: `This browser cannot decode ${configuration.codec}.`,
+        codec: configuration.codec,
+      });
+      return;
+    }
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        this.decodedFrames += 1;
+        this.pendingFrames.push(frame);
+        if (this.pendingFrames.length > maximumPendingVideoFrames) {
+          this.pendingFrames.shift()?.close();
+          this.droppedFrames += 1;
+          this.intervalDroppedFrames += 1;
+          this.decodedOverflowDroppedFrames += 1;
+        }
+        this.schedulePresentation();
+      },
+      error: (error) => {
+        console.error("video decoder error", error);
+        if (this.decoder === decoder) this.decoder = null;
+        this.owner.setStatus(
+          `Video decoder error · ${error.message || error.name}`,
+        );
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.socket.close(4001, "video decoder error");
+        }
+      },
+    });
+    decoder.addEventListener("dequeue", () => {
+      if (this.decoder === decoder && !this.owner.disposed()) {
+        this.observeDecodeQueue(decoder.decodeQueueSize);
+      }
+    });
+    decoder.configure(this.decoderConfiguration);
+    this.decoder = decoder;
+    this.observeDecodeQueue(decoder.decodeQueueSize);
+    this.owner.updateState({ codec: configuration.codec });
+  }
+
+  private decodeMessage(buffer: ArrayBuffer): void {
+    const packet = parseVideoPacket(buffer);
+    if (!packet) return;
+    this.receivedChunks += 1;
+    this.intervalReceivedFrames += 1;
+    if (packet.keyframe) this.receivedKeyframes += 1;
+    if (this.renderedFrames === 0) {
+      this.owner.updateState({
+        message: `Receiving video · ${this.receivedChunks} chunks · ${this.receivedKeyframes} keyframes`,
+      });
+    }
+    const decoder = this.decoder;
+    if (!decoder || decoder.state !== "configured") return;
+    this.owner.setLatestAppliedInput(packet.latestAppliedInput);
+    const generationChanged = packet.generation !== this.currentGeneration;
+    if (generationChanged) this.currentGeneration = packet.generation;
+    const resizeState = this.owner.presentResizeGeneration(
+      packet.generation,
+      packet.width,
+      packet.height,
+    );
+    const queuedBeforeDecode = decoder.decodeQueueSize;
+    this.observeDecodeQueue(queuedBeforeDecode);
+    if (
+      generationChanged ||
+      packet.discontinuity ||
+      queuedBeforeDecode >= maximumVideoDecodeQueueSize
+    )
+      this.resetDecoder(decoder);
+    if (
+      this.decoder !== decoder ||
+      decoder.state !== "configured" ||
+      (this.waitingForKeyframe && !packet.keyframe)
+    )
+      return;
+    this.waitingForKeyframe = false;
+    decoder.decode(
+      new EncodedVideoChunk({
+        type: packet.keyframe ? "key" : "delta",
+        timestamp: packet.timestamp,
+        data: new Uint8Array(buffer, videoPacketHeaderSize),
+      }),
+    );
+    this.observeDecodeQueue(decoder.decodeQueueSize);
+    void resizeState;
+  }
+
+  private observeDecodeQueue(size: number, now = performance.now()): void {
+    if (this.queueObservedSize >= busyDecodeQueueSize) {
+      this.queueBusyMilliseconds += Math.max(0, now - this.queueObservedAt);
+    }
+    this.queueObservedSize = size;
+    this.queueObservedAt = now;
+    this.queuePeak = Math.max(this.queuePeak, size);
+  }
+
+  private resetDecoder(decoder: VideoDecoder): void {
+    const resetFrames = decoder.decodeQueueSize + this.pendingFrames.length;
+    this.observeDecodeQueue(decoder.decodeQueueSize);
+    this.droppedFrames += resetFrames;
+    this.intervalDroppedFrames += resetFrames;
+    this.decoderResetDroppedFrames += resetFrames;
+    this.decoderResets += 1;
+    this.cancelPresentation();
+    for (const frame of this.pendingFrames.splice(0)) frame.close();
+    this.waitingForKeyframe = true;
+    decoder.reset();
+    this.observeDecodeQueue(decoder.decodeQueueSize);
+    if (this.decoderConfiguration) decoder.configure(this.decoderConfiguration);
+  }
+
+  private cancelPresentation(): void {
+    if (this.presentationTimer !== null) clearTimeout(this.presentationTimer);
+    if (this.animationFrame !== null) cancelAnimationFrame(this.animationFrame);
+    this.presentationTimer = null;
+    this.animationFrame = null;
+    this.animationPending = false;
+  }
+
+  private schedulePresentation(): void {
+    if (
+      this.pendingFrames.length === 0 ||
+      this.animationPending ||
+      this.presentationTimer !== null
+    )
+      return;
+    const next = this.pendingFrames[0];
+    if (!next) return;
+    const presentation = this.owner.expectedPresentationTime(
+      next.timestamp,
+      this.targetLatencyMilliseconds,
+    );
+    const delay = presentation === null ? 0 : presentation - performance.now();
+    if (delay > presentationLeadMilliseconds) {
+      this.presentationTimer = setTimeout(
+        () => {
+          this.presentationTimer = null;
+          this.schedulePresentation();
+        },
+        Math.min(
+          delay - presentationWakeMarginMilliseconds,
+          maximumPresentationTimerMilliseconds,
+        ),
+      );
+      return;
+    }
+    this.animationPending = true;
+    this.animationFrame = requestAnimationFrame(() => this.renderFrame());
+  }
+
+  private renderFrame(): void {
+    this.animationFrame = null;
+    this.animationPending = false;
+    if (this.pendingFrames.length === 0) return;
+    const display = this.display;
+    const context = this.context;
+    if (!display || !context) {
+      for (const frame of this.pendingFrames.splice(0)) frame.close();
+      return;
+    }
+    const now = performance.now();
+    let frame: VideoFrame | undefined;
+    const synchronized = this.owner.statsContext().clockConfident;
+    if (!synchronized) {
+      frame = this.pendingFrames.pop();
+      for (const stale of this.pendingFrames.splice(0)) {
+        stale.close();
+        this.recordOverdueDrop();
+      }
+    } else {
+      let due = 0;
+      while (due < this.pendingFrames.length) {
+        const candidate = this.pendingFrames[due];
+        if (!candidate) break;
+        const presentation = this.owner.expectedPresentationTime(
+          candidate.timestamp,
+          this.targetLatencyMilliseconds,
+        );
+        if (presentation !== null && presentation > now) break;
+        due += 1;
+      }
+      if (due === 0) {
+        this.schedulePresentation();
+        return;
+      }
+      const ready = this.pendingFrames.splice(0, due);
+      frame = ready.pop();
+      for (const stale of ready) {
+        stale.close();
+        this.recordOverdueDrop();
+      }
+    }
+    if (!frame) return;
+    const dimensionsChanged =
+      display.width !== frame.displayWidth ||
+      display.height !== frame.displayHeight;
+    if (dimensionsChanged) {
+      display.width = frame.displayWidth;
+      display.height = frame.displayHeight;
+    }
+    context.drawImage(frame, 0, 0, display.width, display.height);
+    const drawCompletedAtMs = performance.now();
+    this.renderedFrames += 1;
+    if (dimensionsChanged) this.owner.refreshCursor();
+    const presentation = this.owner.expectedPresentationTime(
+      frame.timestamp,
+      this.targetLatencyMilliseconds,
+    );
+    this.videoLateness = presentation === null ? 0 : now - presentation;
+    const renderedMediaTimestampMicros = frame.timestamp;
+    frame.close();
+    this.presentedFrames += 1;
+    this.intervalPresentedFrames += 1;
+    this.renderedFrameTimes.push(now);
+    const windowStart = now - 1000;
+    while (
+      this.renderedFrameTimes.length > 1 &&
+      (this.renderedFrameTimes[0] ?? now) < windowStart
+    )
+      this.renderedFrameTimes.shift();
+    if (now - this.lastStatsPublishedAt >= this.statsIntervalMilliseconds) {
+      this.lastStatsPublishedAt = now;
+      const elapsed = now - (this.renderedFrameTimes[0] ?? now);
+      const renderedFps =
+        elapsed > 0
+          ? ((this.renderedFrameTimes.length - 1) * 1000) / elapsed
+          : 0;
+      const contextStats = this.owner.statsContext();
+      this.owner.publishStats({
+        width: display.width,
+        height: display.height,
+        renderedFps,
+        renderedMediaTimestampMicros,
+        drawCompletedAtMs,
+        generation: this.currentGeneration,
+        bitrateKbps: contextStats.bitrateKbps,
+        scalePercent: contextStats.scalePercent,
+        rttMs: contextStats.rttMs,
+        clockConfident: contextStats.clockConfident,
+        clockUncertaintyMs: contextStats.clockUncertaintyMs,
+        latencyTargetMs: this.targetLatencyMilliseconds,
+        latenessMs: this.videoLateness,
+        pendingInputCount: contextStats.pendingInputCount,
+        decoderQueue: this.decoder?.decodeQueueSize || 0,
+        receivedFrames: this.receivedChunks,
+        decodedFrames: this.decodedFrames,
+        presentedFrames: this.presentedFrames,
+        droppedFrames: this.droppedFrames,
+        overdueDroppedFrames: this.overdueDroppedFrames,
+        decodedOverflowDroppedFrames: this.decodedOverflowDroppedFrames,
+        decoderResetDroppedFrames: this.decoderResetDroppedFrames,
+        decoderResets: this.decoderResets,
+        resizeState: contextStats.resizeState,
+      });
+    }
+    this.schedulePresentation();
+  }
+
+  private recordOverdueDrop(): void {
+    this.droppedFrames += 1;
+    this.intervalDroppedFrames += 1;
+    this.overdueDroppedFrames += 1;
+  }
+}

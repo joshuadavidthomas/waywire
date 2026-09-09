@@ -357,7 +357,7 @@ impl State {
                 {
                     self.capture.cursor_overlay = overlay;
                     self.capture.cancel();
-                    self.capture.damage_baseline_available = false;
+                    self.capture.can_wait_for_damage = false;
                     self.request_capture()?;
                 }
                 self.input.apply(&command)?;
@@ -429,7 +429,7 @@ impl State {
         if applied.dimensions_changed {
             self.replace_media_generation()?;
         }
-        self.capture.damage_baseline_available = false;
+        self.capture.can_wait_for_damage = false;
         self.event_sink.send(Event::ResizeApplied {
             request_id: applied.request_id,
             width: applied.mode.width,
@@ -458,6 +458,7 @@ impl State {
     }
 }
 
+// Core Wayland registry, output, and seat protocols.
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
@@ -554,6 +555,7 @@ fn capture_flush(result: std::result::Result<(), WaylandError>) -> Result<()> {
     }
 }
 
+// wlroots output screencopy protocol.
 impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -579,7 +581,7 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                 _ => Err(anyhow!("unsupported screencopy SHM format")),
             },
             zwlr_screencopy_frame_v1::Event::BufferDone => (|| -> Result<()> {
-                let wait = state.capture.damage_baseline_available
+                let wait = state.capture.can_wait_for_damage
                     && state.acknowledged_generation == state.generation;
                 state.capture.begin_copy(wait)?;
                 capture_flush(connection.flush())
@@ -634,6 +636,7 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
     }
 }
 
+// Input method protocol.
 impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for State {
     fn event(
         state: &mut Self,
@@ -647,6 +650,7 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for State {
     }
 }
 
+// wlroots output management protocols.
 impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -748,6 +752,7 @@ impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for S
     }
 }
 
+// External data control protocols.
 impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -812,6 +817,7 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for State 
     }
 }
 
+// External image-copy cursor capture protocols.
 impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -970,6 +976,7 @@ mod tests {
     }
 }
 
+// Protocol objects whose events streamd does not use.
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);

@@ -198,7 +198,7 @@ impl Quality {
         if now.duration_since(self.last) < Duration::from_secs(5) {
             return false;
         }
-        let before = self.values();
+        let previous_values = self.values();
         if self.bad >= 2 {
             let minimum = self.max_bitrate.saturating_div(2).max(300);
             if self.bitrate > minimum {
@@ -218,7 +218,7 @@ impl Quality {
             }
             self.good = 0;
         }
-        let changed = self.values() != before;
+        let changed = self.values() != previous_values;
         if changed {
             self.last = now;
         }

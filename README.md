@@ -37,7 +37,7 @@ pnpm format:check
 cargo test -p sprite-desktop-streamd -- --ignored
 ```
 
-The ignored stream daemon tests include ffmpeg/libx264 checks and frame-copy throughput tests.
+The ignored stream daemon tests require ffmpeg with libx264.
 
 ## Known Limits
 

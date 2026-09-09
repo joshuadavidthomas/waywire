@@ -171,10 +171,10 @@ impl OutputManager {
             return;
         };
         pending.configuration.destroy();
-        self.retain_cancelled_request(pending.request, pending.serial);
+        self.queue_cancelled_request(pending.request, pending.serial);
     }
 
-    fn retain_cancelled_request(&mut self, request: ResizeRequest, stale_serial: u32) {
+    fn queue_cancelled_request(&mut self, request: ResizeRequest, stale_serial: u32) {
         let request = self.queued.take().map_or(request, |queued| queued.request);
         self.queued = Some(QueuedResize {
             request,
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn applied_dimension_change_is_independent_of_capture_damage_baseline() {
+    fn applied_dimension_change_does_not_depend_on_capture_damage_state() {
         let previous = request(1, 1920, 1080).mode;
 
         assert!(!output_dimensions_changed(
@@ -251,7 +251,7 @@ mod tests {
         let mut outputs = OutputManager::new();
         outputs.serial = Some(7);
         outputs.queue_request(request(2, 1600, 900));
-        outputs.retain_cancelled_request(request(1, 1280, 720), 7);
+        outputs.queue_cancelled_request(request(1, 1280, 720), 7);
 
         assert!(outputs.take_ready_queued().is_none());
         assert!(!outputs.publish_serial(7));
@@ -264,7 +264,7 @@ mod tests {
     fn newer_request_inherits_cancelled_resizes_fresh_serial_wait() {
         let mut outputs = OutputManager::new();
         outputs.serial = Some(11);
-        outputs.retain_cancelled_request(request(1, 1280, 720), 11);
+        outputs.queue_cancelled_request(request(1, 1280, 720), 11);
         outputs.queue_request(request(2, 1920, 1080));
 
         assert!(outputs.take_ready_queued().is_none());

@@ -149,8 +149,27 @@ async fn main() -> Result<()> {
         result = &mut server => Stop::Server(result),
     };
 
+    finish_shutdown(
+        stop,
+        connections,
+        tx,
+        &daemon,
+        &mut daemon_task,
+        &mut server,
+    )
+    .await
+}
+
+async fn finish_shutdown(
+    stop: Stop,
+    connections: SocketConnections,
+    shutdown_server: watch::Sender<bool>,
+    daemon: &Daemon,
+    daemon_task: &mut JoinHandle<Result<()>>,
+    server: &mut JoinHandle<Result<()>>,
+) -> Result<()> {
     connections.begin_shutdown();
-    let _ = tx.send(true);
+    let _ = shutdown_server.send(true);
     let deadline = Instant::now() + SHUTDOWN_DEADLINE;
     let sockets_result = timeout_at(deadline, connections.wait())
         .await
@@ -159,22 +178,22 @@ async fn main() -> Result<()> {
 
     match stop {
         Stop::Signal(signal) => {
-            let daemon_result = join_task(deadline, "daemon supervisor", &mut daemon_task).await;
-            let server_result = join_task(deadline, "HTTP server", &mut server).await;
+            let daemon_result = join_task(deadline, "daemon supervisor", daemon_task).await;
+            let server_result = join_task(deadline, "HTTP server", server).await;
             signal
                 .and(sockets_result)
                 .and(daemon_result)
                 .and(server_result)
         }
         Stop::Daemon(daemon_result) => {
-            let server_result = join_task(deadline, "HTTP server", &mut server).await;
+            let server_result = join_task(deadline, "HTTP server", server).await;
             sockets_result?;
             server_result?;
             daemon_result??;
             Err(anyhow!("daemon supervisor stopped"))
         }
         Stop::Server(server_result) => {
-            let daemon_result = join_task(deadline, "daemon supervisor", &mut daemon_task).await;
+            let daemon_result = join_task(deadline, "daemon supervisor", daemon_task).await;
             sockets_result?;
             daemon_result?;
             server_result??;

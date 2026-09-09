@@ -1,0 +1,287 @@
+import type { SurfaceOptions, WaymoteSessionOptions } from "./session.ts";
+
+export class FakeTarget {
+  readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+  readonly style = {
+    cursor: "",
+    priority: "",
+    getPropertyValue: (): string => this.style.cursor,
+    getPropertyPriority: (): string => this.style.priority,
+    setProperty: (_name: string, value: string, priority = ""): void => {
+      this.style.cursor = value;
+      this.style.priority = priority;
+    },
+    removeProperty: (): void => {
+      this.style.cursor = "";
+      this.style.priority = "";
+    },
+  };
+  devicePixelRatio = 1;
+  VideoDecoder: unknown = true;
+  hidden = false;
+  pointerLockElement: unknown = null;
+  width = 1280;
+  height = 720;
+  rect = { width: 1280, height: 720, left: 0, top: 0 };
+  value = "";
+  getContext: (...values: unknown[]) => unknown = () => ({});
+  requestPointerLock: () => Promise<void> = () => Promise.resolve();
+  focus: (...values: unknown[]) => void = () => undefined;
+  getBoundingClientRect = () => ({ ...this.rect });
+  hasPointerCapture = (_pointerId: number): boolean => false;
+  setPointerCapture(_pointerId: number): void {}
+  releasePointerCapture(_pointerId: number): void {}
+
+  addEventListener(type: string, listener: (event: unknown) => void): void {
+    let listeners = this.listeners.get(type);
+    if (!listeners) this.listeners.set(type, (listeners = new Set()));
+    listeners.add(listener);
+  }
+
+  removeEventListener(type: string, listener: (event: unknown) => void): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  dispatch(type: string, event: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+
+  get listenerCount(): number {
+    return [...this.listeners.values()].reduce(
+      (count, listeners) => count + listeners.size,
+      0,
+    );
+  }
+}
+
+export class FakeWebSocket extends FakeTarget {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+  readyState = FakeWebSocket.CONNECTING;
+  binaryType = "";
+  closeCalls = 0;
+  readonly sent: unknown[] = [];
+
+  send(value: unknown): void {
+    this.sent.push(value);
+  }
+
+  close(): void {
+    this.closeCalls += 1;
+    this.readyState = FakeWebSocket.CLOSED;
+  }
+}
+
+export function installGlobal(name: string, value: unknown): void {
+  Object.defineProperty(globalThis, name, {
+    configurable: true,
+    writable: true,
+    value,
+  });
+}
+
+export function installBrowser(): {
+  window: FakeTarget;
+  document: FakeTarget;
+} {
+  const fakeWindow = new FakeTarget();
+  const fakeDocument = new FakeTarget();
+  installGlobal("window", fakeWindow);
+  installGlobal("document", fakeDocument);
+  installGlobal("WebSocket", FakeWebSocket);
+  installGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    queueMicrotask(() => callback(performance.now()));
+    return 1;
+  });
+  installGlobal("cancelAnimationFrame", () => undefined);
+  return { window: fakeWindow, document: fakeDocument };
+}
+
+export function surfaceOptions(
+  canvas = new FakeTarget(),
+  textInputElement = new FakeTarget(),
+): SurfaceOptions {
+  return {
+    canvas: canvas as unknown as HTMLCanvasElement,
+    textInputElement: textInputElement as unknown as HTMLInputElement,
+  };
+}
+
+export function socket(socket: FakeWebSocket): WebSocket {
+  return socket as unknown as WebSocket;
+}
+
+export type SocketAttempt = {
+  readonly path: string;
+  readonly resolve: (socket: WebSocket) => void;
+};
+
+export function deferredSocketOptions(
+  attempts: SocketAttempt[],
+): WaymoteSessionOptions {
+  return {
+    endpoint: "https://desktop.example.com",
+    createWebSocket(path) {
+      let resolve: (value: WebSocket) => void = () => undefined;
+      const pending = new Promise<WebSocket>((next) => {
+        resolve = next;
+      });
+      attempts.push({ path, resolve });
+      return pending;
+    },
+  };
+}
+
+export function installEncodedVideoChunk(): void {
+  installGlobal(
+    "EncodedVideoChunk",
+    class {
+      constructor(init: object) {
+        Object.assign(this, init);
+      }
+    },
+  );
+}
+
+export function videoPacket(
+  timestamp: number,
+  options: {
+    readonly keyframe?: boolean;
+    readonly discontinuity?: boolean;
+    readonly generation?: number;
+  } = {},
+): ArrayBuffer {
+  const packet = new ArrayBuffer(41);
+  const view = new DataView(packet);
+  view.setUint8(0, 2);
+  view.setUint8(1, 1);
+  view.setUint8(
+    2,
+    (options.keyframe ? 1 : 0) | (options.discontinuity ? 2 : 0),
+  );
+  view.setBigUint64(12, BigInt(timestamp), true);
+  view.setUint32(20, options.generation ?? 0, true);
+  view.setUint16(24, 1280, true);
+  view.setUint16(26, 720, true);
+  return packet;
+}
+
+export type QueueDecoder = {
+  readonly decodeQueueSize: number;
+  readonly resetCalls: number;
+  outputAll(): void;
+};
+
+export function installQueueVideoDecoder(): {
+  readonly decoder: () => QueueDecoder | undefined;
+} {
+  let decoder: QueueDecoder | undefined;
+  class FakeVideoFrame {
+    readonly displayWidth = 1280;
+    readonly displayHeight = 720;
+    constructor(readonly timestamp: number) {}
+    close(): void {}
+  }
+  installGlobal(
+    "VideoDecoder",
+    class {
+      static isConfigSupported() {
+        return Promise.resolve({ supported: true });
+      }
+      state = "unconfigured";
+      resetCalls = 0;
+      readonly queued: Array<{ timestamp: number }> = [];
+      readonly events = new FakeTarget();
+      constructor(readonly init: { output(frame: VideoFrame): void }) {
+        decoder = this;
+      }
+      get decodeQueueSize() {
+        return this.queued.length;
+      }
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        this.events.addEventListener(type, listener);
+      }
+      configure() {
+        this.state = "configured";
+      }
+      reset() {
+        this.resetCalls += 1;
+        this.queued.length = 0;
+        this.state = "unconfigured";
+      }
+      close() {
+        this.queued.length = 0;
+        this.state = "closed";
+      }
+      decode(chunk: { timestamp: number }) {
+        this.queued.push(chunk);
+      }
+      outputAll() {
+        const chunks = this.queued.splice(0);
+        this.events.dispatch("dequeue", {});
+        for (const chunk of chunks) {
+          this.init.output(
+            new FakeVideoFrame(chunk.timestamp) as unknown as VideoFrame,
+          );
+        }
+      }
+    },
+  );
+  installEncodedVideoChunk();
+  return { decoder: () => decoder };
+}
+
+export function installDelayedVideoDecoder(): {
+  readonly supportResolvers: Array<(value: { supported: boolean }) => void>;
+  readonly counts: { constructions: number; decoded: number };
+} {
+  const supportResolvers: Array<(value: { supported: boolean }) => void> = [];
+  const counts = { constructions: 0, decoded: 0 };
+  installGlobal(
+    "VideoDecoder",
+    class {
+      static isConfigSupported() {
+        return new Promise((resolve) => supportResolvers.push(resolve));
+      }
+      state = "unconfigured";
+      decodeQueueSize = 0;
+      readonly events = new FakeTarget();
+      constructor(
+        readonly init: {
+          output(frame: VideoFrame): void;
+        },
+      ) {
+        counts.constructions += 1;
+      }
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        this.events.addEventListener(type, listener);
+      }
+      configure() {
+        this.state = "configured";
+      }
+      reset() {
+        this.state = "unconfigured";
+      }
+      close() {
+        this.state = "closed";
+      }
+      decode(chunk: { timestamp: number }) {
+        counts.decoded += 1;
+        this.init.output({
+          timestamp: chunk.timestamp,
+          displayWidth: 1280,
+          displayHeight: 720,
+          close() {},
+        } as VideoFrame);
+      }
+    },
+  );
+  installEncodedVideoChunk();
+  return { supportResolvers, counts };
+}
+
+export async function flush(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}

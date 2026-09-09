@@ -28,7 +28,7 @@ pub struct Capture {
     stride: u32,
     format: Option<wl_shm::Format>,
     constraints: bool,
-    pub damage_baseline_available: bool,
+    pub can_wait_for_damage: bool,
     pub cursor_overlay: bool,
     pub sequence: u64,
 }
@@ -45,7 +45,7 @@ impl Capture {
             stride: 0,
             format: None,
             constraints: false,
-            damage_baseline_available: false,
+            can_wait_for_damage: false,
             cursor_overlay: false,
             sequence: 0,
         }
@@ -176,7 +176,7 @@ impl Capture {
             .sequence
             .checked_add(1)
             .context("frame sequence exhausted")?;
-        self.damage_baseline_available = true;
+        self.can_wait_for_damage = true;
         Ok(CapturedFrame::new(
             mapping,
             metadata,

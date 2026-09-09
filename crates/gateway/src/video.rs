@@ -97,10 +97,9 @@ impl VideoHub {
     fn broadcast(&self, sample: VideoSample) -> bool {
         let mut hub = self.inner.lock().unwrap();
         let stream_reset = sample.discontinuity
-            || hub
-                .gop
-                .first()
-                .is_some_and(|old| old.metadata.generation != sample.metadata.generation);
+            || hub.gop.first().is_some_and(|first_cached| {
+                first_cached.metadata.generation != sample.metadata.generation
+            });
         if stream_reset {
             hub.gop.clear();
             hub.gop_bytes = 0;
@@ -435,13 +434,7 @@ impl Correlator {
     fn drain(&mut self) -> Result<Vec<VideoSample>> {
         let mut samples = Vec::new();
         loop {
-            while self
-                .metadata
-                .front()
-                .is_some_and(|item| item.value.generation < self.last_generation)
-            {
-                self.metadata.pop_front();
-            }
+            self.discard_stale_metadata();
             let Some(pending) = self.units.front() else {
                 break;
             };
@@ -451,8 +444,7 @@ impl Correlator {
                 continue;
             }
 
-            let same_generation = unit.ssrc == self.last_generation;
-            let consume = if same_generation {
+            let metadata_count = if unit.ssrc == self.last_generation {
                 metadata_gap(
                     unit.timestamp.wrapping_sub(self.last_timestamp.unwrap()),
                     self.last_fps,
@@ -460,25 +452,8 @@ impl Correlator {
             } else {
                 1
             };
-            let mut matches = 0;
-            let mut metadata_index = None;
-            let mut passed_generation = false;
-            for (index, item) in self.metadata.iter().enumerate() {
-                match item.value.generation.cmp(&unit.ssrc) {
-                    std::cmp::Ordering::Less => {}
-                    std::cmp::Ordering::Equal => {
-                        matches += 1;
-                        if matches == consume {
-                            metadata_index = Some(index);
-                            break;
-                        }
-                    }
-                    std::cmp::Ordering::Greater => {
-                        passed_generation = true;
-                        break;
-                    }
-                }
-            }
+            let (metadata_index, passed_generation) =
+                self.find_nth_generation_metadata(unit.ssrc, metadata_count);
             let Some(index) = metadata_index else {
                 if passed_generation {
                     // Metadata is ordered by generation. This unit's record can
@@ -491,11 +466,7 @@ impl Correlator {
 
             let pending = self.units.pop_front().unwrap();
             let unit = pending.value.unit;
-            let mut metadata = None;
-            for _ in 0..=index {
-                metadata = self.metadata.pop_front().map(|item| item.value);
-            }
-            let metadata = metadata.unwrap();
+            let metadata = self.take_metadata_through(index);
             debug_assert_eq!(metadata.generation, unit.ssrc);
             let generation_changed = metadata.generation != self.last_generation;
             let discontinuity = unit.discontinuity || index > 0 || generation_changed;
@@ -510,6 +481,38 @@ impl Correlator {
             });
         }
         Ok(samples)
+    }
+    fn discard_stale_metadata(&mut self) {
+        while self
+            .metadata
+            .front()
+            .is_some_and(|item| item.value.generation < self.last_generation)
+        {
+            self.metadata.pop_front();
+        }
+    }
+    fn find_nth_generation_metadata(&self, generation: u32, count: usize) -> (Option<usize>, bool) {
+        let mut matches = 0;
+        for (index, item) in self.metadata.iter().enumerate() {
+            match item.value.generation.cmp(&generation) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    matches += 1;
+                    if matches == count {
+                        return (Some(index), false);
+                    }
+                }
+                std::cmp::Ordering::Greater => return (None, true),
+            }
+        }
+        (None, false)
+    }
+    fn take_metadata_through(&mut self, index: usize) -> FrameMetadata {
+        let mut metadata = None;
+        for _ in 0..=index {
+            metadata = self.metadata.pop_front().map(|item| item.value);
+        }
+        metadata.unwrap()
     }
     fn deadline(&self) -> Option<Instant> {
         self.metadata
@@ -653,277 +656,4 @@ impl VideoWorker {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn packet(sequence: u16, timestamp: u32, ssrc: u32, marker: bool, payload: &[u8]) -> Packet {
-        Packet {
-            marker,
-            sequence,
-            timestamp,
-            ssrc,
-            payload: payload.to_vec(),
-        }
-    }
-    fn metadata(sequence: u64, generation: u32) -> FrameMetadata {
-        FrameMetadata {
-            generation,
-            width: 1280,
-            height: 720,
-            capture_nanos: sequence,
-            sequence,
-            input_sequence: 0,
-            fps: 30,
-        }
-    }
-    fn unit(timestamp: u32, generation: u32) -> Unit {
-        Unit {
-            data: vec![1].into(),
-            key: true,
-            discontinuity: false,
-            timestamp,
-            ssrc: generation,
-        }
-    }
-    #[test]
-    fn emits_final_access_unit_at_marker() {
-        let mut a = Assembler::default();
-        assert!(
-            a.consume(packet(1, 90, 7, false, &[0x7c, 0x85, 1]))
-                .unwrap()
-                .is_none()
-        );
-        let value = a
-            .consume(packet(2, 90, 7, true, &[0x7c, 0x45, 2]))
-            .unwrap()
-            .unwrap();
-        assert!(value.key);
-        assert_eq!(&*value.data, [0, 0, 0, 1, 0x65, 1, 2]);
-    }
-    #[test]
-    fn generation_restart_stays_sticky_across_fragments() {
-        let mut a = Assembler::default();
-        a.consume(packet(1, 1, 1, true, &[5, 1])).unwrap();
-        assert!(
-            a.consume(packet(2, 2, 2, false, &[0x7c, 0x85, 2]))
-                .unwrap()
-                .is_none()
-        );
-        let value = a
-            .consume(packet(3, 2, 2, true, &[0x7c, 0x45, 3]))
-            .unwrap()
-            .unwrap();
-        assert!(value.discontinuity);
-    }
-    #[test]
-    fn rejects_invalid_fu_boundaries() {
-        let mut a = Assembler::default();
-        assert!(a.consume(packet(1, 1, 1, true, &[0x7c, 0xc5, 1])).is_err());
-        assert!(
-            a.consume(packet(2, 2, 1, false, &[0x7c, 0x85, 1]))
-                .unwrap()
-                .is_none()
-        );
-        assert!(a.consume(packet(3, 2, 1, true, &[0x7c, 0x41, 2])).is_err());
-    }
-    #[test]
-    fn loss_and_sequence_wrap_recover_at_keyframe() {
-        let mut a = Assembler::default();
-        assert!(
-            a.consume(packet(u16::MAX, 1, 1, true, &[1, 1]))
-                .unwrap()
-                .is_some()
-        );
-        assert!(a.consume(packet(0, 2, 1, true, &[1, 2])).unwrap().is_some());
-        assert!(a.consume(packet(2, 3, 1, true, &[1, 3])).unwrap().is_none());
-        assert!(
-            a.consume(packet(3, 4, 1, true, &[5, 4]))
-                .unwrap()
-                .unwrap()
-                .discontinuity
-        );
-    }
-    fn pending(unit: Unit, budget: &Arc<Semaphore>) -> PendingUnit {
-        PendingUnit {
-            unit,
-            _bytes: budget.clone().try_acquire_many_owned(1).unwrap(),
-        }
-    }
-
-    #[test]
-    fn first_unit_uses_only_metadata_with_its_generation() {
-        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
-        let mut correlator = Correlator::new();
-        correlator.push_metadata(metadata(1, 1)).unwrap();
-        correlator.push_metadata(metadata(2, 2)).unwrap();
-
-        let samples = correlator.push_unit(pending(unit(1, 2), &budget)).unwrap();
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 2);
-        assert_eq!(samples[0].metadata.generation, 2);
-
-        assert!(
-            correlator
-                .push_unit(pending(unit(2, 1), &budget))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(correlator.units.is_empty());
-    }
-
-    #[test]
-    fn reordered_replacements_never_exchange_metadata() {
-        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
-        let mut correlator = Correlator::new();
-        correlator.push_metadata(metadata(1, 1)).unwrap();
-        correlator
-            .push_unit(pending(unit(3_000, 1), &budget))
-            .unwrap();
-        correlator.push_metadata(metadata(2, 2)).unwrap();
-        correlator.push_metadata(metadata(3, 3)).unwrap();
-
-        let samples = correlator.push_unit(pending(unit(1, 3), &budget)).unwrap();
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 3);
-        assert_eq!(samples[0].metadata.generation, 3);
-
-        assert!(
-            correlator
-                .push_unit(pending(unit(1, 2), &budget))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(correlator.units.is_empty());
-    }
-
-    #[test]
-    fn old_packet_cannot_poison_current_assembler_state() {
-        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
-        let mut assembler = Assembler::default();
-        let mut correlator = Correlator::new();
-
-        correlator.push_metadata(metadata(1, 1)).unwrap();
-        let first = assembler
-            .consume(packet(1, 3_000, 1, true, &[5, 1]))
-            .unwrap()
-            .unwrap();
-        correlator.push_unit(pending(first, &budget)).unwrap();
-
-        correlator.push_metadata(metadata(2, 2)).unwrap();
-        let replacement = assembler
-            .consume(packet(1, 3_000, 2, true, &[5, 2]))
-            .unwrap()
-            .unwrap();
-        correlator.push_unit(pending(replacement, &budget)).unwrap();
-        correlator.push_metadata(metadata(3, 2)).unwrap();
-
-        assert!(
-            assembler
-                .consume(packet(2, 6_000, 1, true, &[5, 3]))
-                .unwrap()
-                .is_none()
-        );
-        let current = assembler
-            .consume(packet(2, 6_000, 2, true, &[5, 4]))
-            .unwrap()
-            .unwrap();
-        assert!(!current.discontinuity);
-        let samples = correlator.push_unit(pending(current, &budget)).unwrap();
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 3);
-        assert!(correlator.units.is_empty());
-    }
-
-    #[test]
-    fn generation_change_does_not_apply_timestamp_gap_across_ssrcs() {
-        let budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
-        let mut correlator = Correlator::new();
-        correlator.push_metadata(metadata(1, 1)).unwrap();
-        correlator
-            .push_unit(pending(unit(3_000, 1), &budget))
-            .unwrap();
-        correlator.push_metadata(metadata(2, 1)).unwrap();
-        correlator.push_metadata(metadata(3, 2)).unwrap();
-
-        let samples = correlator
-            .push_unit(pending(unit(u32::MAX, 2), &budget))
-            .unwrap();
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 3);
-        assert!(samples[0].discontinuity);
-        assert!(correlator.metadata.is_empty());
-    }
-
-    #[test]
-    fn huge_timestamp_gap_fails_instead_of_guessing() {
-        assert!(metadata_gap(u32::MAX, 60).is_err());
-    }
-    fn sample(sequence: u64, bytes: usize, key: bool) -> VideoSample {
-        VideoSample {
-            data: vec![1; bytes].into(),
-            key,
-            discontinuity: false,
-            metadata: metadata(sequence, 1),
-        }
-    }
-
-    #[test]
-    fn viewer_queue_keeps_exact_frame_and_byte_bounds() {
-        let hub = VideoHub::new();
-        hub.broadcast(sample(0, 1, true));
-        let (_, _, frames) = hub.subscribe();
-        for sequence in 1..=MAX_VIEWER_FRAMES as u64 {
-            hub.broadcast(sample(sequence, 1, sequence == MAX_VIEWER_FRAMES as u64));
-        }
-        assert_eq!(frames.queue.lock().unwrap().frames.len(), MAX_VIEWER_FRAMES);
-
-        let hub = VideoHub::new();
-        hub.broadcast(sample(0, 1, true));
-        let (_, _, bytes) = hub.subscribe();
-        hub.broadcast(sample(1, MAX_VIEWER_BYTES, true));
-        assert_eq!(bytes.queue.lock().unwrap().bytes, MAX_VIEWER_BYTES);
-    }
-
-    #[test]
-    fn overflow_keeps_arriving_keyframe_and_discards_delta() {
-        let hub = VideoHub::new();
-        hub.broadcast(sample(0, 1, true));
-        let (_, _, slow) = hub.subscribe();
-        let (_, _, independent) = hub.subscribe();
-        for sequence in 1..=MAX_VIEWER_FRAMES as u64 {
-            hub.broadcast(sample(sequence, 1, false));
-        }
-        independent.queue.lock().unwrap().frames.clear();
-        independent.queue.lock().unwrap().bytes = 0;
-
-        hub.broadcast(sample(20, 1, false));
-        assert!(slow.queue.lock().unwrap().frames.is_empty());
-        assert_eq!(independent.queue.lock().unwrap().frames.len(), 1);
-        hub.broadcast(sample(21, 1, true));
-        let slow_queue = slow.queue.lock().unwrap();
-        assert_eq!(slow_queue.frames.len(), 1);
-        assert!(slow_queue.frames[0].key && slow_queue.frames[0].discontinuity);
-    }
-
-    #[tokio::test]
-    async fn viewer_starts_and_recovers_only_at_keyframe() {
-        let hub = VideoHub::new();
-        let (_, bootstrap, subscription) = hub.subscribe();
-        assert!(bootstrap.is_empty());
-        for n in 0..10 {
-            hub.broadcast(VideoSample {
-                data: vec![1].into(),
-                key: false,
-                discontinuity: false,
-                metadata: metadata(n, 1),
-            });
-        }
-        hub.broadcast(VideoSample {
-            data: vec![1].into(),
-            key: true,
-            discontinuity: false,
-            metadata: metadata(11, 1),
-        });
-        let value = subscription.next().await;
-        assert!(value.key && value.discontinuity);
-    }
-}
+mod tests;

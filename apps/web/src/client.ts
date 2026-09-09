@@ -1,6 +1,4 @@
-import { Effect } from "effect";
-
-import { acquireWaymoteSession } from "./sdk/effect.ts";
+import { WaymoteSession, type SurfaceHandle } from "./sdk/waymote.ts";
 import {
   installViewerListeners,
   type ViewerElements,
@@ -51,132 +49,134 @@ function viewerElements(): ViewerElements {
   };
 }
 
-function waitForEvent(target: EventTarget, type: string): Effect.Effect<Event> {
-  return Effect.async<Event>((resume) => {
-    const listener = (event: Event): void => resume(Effect.succeed(event));
-    target.addEventListener(type, listener, { once: true });
-    return Effect.sync(() => target.removeEventListener(type, listener));
+function startViewer(): void {
+  const elements = viewerElements();
+  const session = new WaymoteSession({
+    latency: Number(elements.latency.value),
+    statsIntervalMs: 250,
+    remoteDisplay: {
+      mode: "observe",
+      element: elements.display,
+      devicePixelRatio: 1,
+    },
   });
-}
+  const listeners = new AbortController();
+  let surface: SurfaceHandle | undefined;
+  let removeViewerListeners: (() => void) | undefined;
+  let disposed = false;
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    listeners.abort();
+    removeViewerListeners?.();
+    surface?.dispose();
+    void session
+      .dispose()
+      .catch((error: unknown) => console.error("Viewer stopped", error));
+  }
 
-function permissionTasks(
-  elements: ViewerElements,
-  session: import("./sdk/waymote.ts").WaymoteSession,
-  surface: import("./sdk/waymote.ts").SurfaceHandle,
-): Effect.Effect<never> {
-  const pointerLock = Effect.forever(
-    Effect.flatMap(waitForEvent(elements.pointerLockButton, "click"), () =>
-      document.pointerLockElement === elements.display
-        ? Effect.sync(() => surface.exitPointerLock())
-        : Effect.tryPromise({
-            try: () => surface.requestPointerLock(),
-            catch: (cause) =>
-              cause instanceof Error ? cause : new Error(String(cause)),
-          }).pipe(
-            Effect.catchAll((error) =>
-              Effect.sync(() => console.warn("pointer lock failed", error)),
-            ),
-          ),
-    ),
-  );
-  const sendClipboard = Effect.forever(
-    Effect.flatMap(waitForEvent(elements.sendClipboardButton, "click"), () =>
-      Effect.tryPromise({
-        try: () => navigator.clipboard.readText(),
-        catch: (cause) =>
-          cause instanceof Error ? cause : new Error(String(cause)),
-      }).pipe(
-        Effect.tap((text) =>
-          Effect.sync(() => {
-            session.clipboard.sendText(text);
-          }),
-        ),
-        Effect.catchAll((error) =>
-          Effect.sync(() => {
-            console.warn("local clipboard read failed", error);
-            elements.clipboardStatus.textContent =
-              "Local clipboard unavailable";
-          }),
-        ),
-      ),
-    ),
-  );
-  const copyClipboard = Effect.forever(
-    Effect.flatMap(waitForEvent(elements.copyClipboardButton, "click"), () => {
+  // Each permission request keeps its user gesture and ignores repeated clicks
+  // until it settles. Page teardown cancels listeners and late continuations.
+  function onPermissionClick(
+    button: HTMLButtonElement,
+    action: () => Promise<void>,
+  ): void {
+    let pending = false;
+    button.addEventListener(
+      "click",
+      () => {
+        if (pending || disposed) return;
+        pending = true;
+        void action()
+          .catch((error: unknown) => {
+            if (!disposed) {
+              dispose();
+              console.error("Viewer stopped", error);
+            }
+          })
+          .finally(() => {
+            pending = false;
+          });
+      },
+      { signal: listeners.signal },
+    );
+  }
+
+  try {
+    const attachedSurface = session.attachSurface({
+      canvas: elements.display,
+      inputElement: elements.display,
+      textInputElement: elements.imeProxy,
+      controlOnFocus: true,
+      clipboardAutoSync: true,
+    });
+    surface = attachedSurface;
+    removeViewerListeners = installViewerListeners(
+      elements,
+      session,
+      attachedSurface,
+    );
+    onPermissionClick(elements.pointerLockButton, async () => {
+      if (document.pointerLockElement === elements.display) {
+        attachedSurface.exitPointerLock();
+        return;
+      }
+      try {
+        await attachedSurface.requestPointerLock();
+      } catch (error) {
+        if (!disposed) console.warn("pointer lock failed", error);
+      }
+    });
+    onPermissionClick(elements.sendClipboardButton, async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!disposed) session.clipboard.sendText(text);
+      } catch (error) {
+        if (disposed) return;
+        console.warn("local clipboard read failed", error);
+        elements.clipboardStatus.textContent = "Local clipboard unavailable";
+      }
+    });
+    onPermissionClick(elements.copyClipboardButton, async () => {
       const text = session.clipboard.latestRemoteText;
-      if (text === null) return Effect.void;
-      return Effect.tryPromise({
-        try: () => navigator.clipboard.writeText(text),
-        catch: (cause) =>
-          cause instanceof Error ? cause : new Error(String(cause)),
-      }).pipe(
-        Effect.tap(() =>
-          Effect.sync(() => {
-            elements.clipboardStatus.textContent = "Remote clipboard copied";
-          }),
-        ),
-        Effect.catchAll((error) =>
-          Effect.sync(() => {
-            let copied = false;
-            const handleCopy = (event: ClipboardEvent): void => {
-              event.clipboardData?.setData("text/plain", text);
-              event.preventDefault();
-              copied = true;
-            };
-            document.addEventListener("copy", handleCopy);
-            document.execCommand("copy");
-            document.removeEventListener("copy", handleCopy);
-            elements.clipboardStatus.textContent = copied
-              ? "Remote clipboard copied"
-              : "Clipboard write unavailable";
-            if (!copied) console.warn("remote clipboard write failed", error);
-          }),
-        ),
-      );
-    }),
-  );
-  return Effect.andThen(
-    Effect.all([pointerLock, sendClipboard, copyClipboard], {
-      concurrency: "unbounded",
-    }),
-    Effect.never,
-  );
+      if (text === null) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        if (!disposed)
+          elements.clipboardStatus.textContent = "Remote clipboard copied";
+      } catch (error) {
+        if (disposed) return;
+        let copied = false;
+        const handleCopy = (event: ClipboardEvent): void => {
+          event.clipboardData?.setData("text/plain", text);
+          event.preventDefault();
+          copied = true;
+        };
+        document.addEventListener("copy", handleCopy);
+        try {
+          document.execCommand("copy");
+        } finally {
+          document.removeEventListener("copy", handleCopy);
+        }
+        elements.clipboardStatus.textContent = copied
+          ? "Remote clipboard copied"
+          : "Clipboard write unavailable";
+        if (!copied) console.warn("remote clipboard write failed", error);
+      }
+    });
+    window.addEventListener("pagehide", dispose, {
+      once: true,
+      signal: listeners.signal,
+    });
+    session.connect();
+  } catch (error) {
+    dispose();
+    throw error;
+  }
 }
 
-export const viewerProgram: Effect.Effect<void, Error> = Effect.scoped(
-  Effect.gen(function* () {
-    const elements = viewerElements();
-    const { session, surface } = yield* acquireWaymoteSession(
-      {
-        latency: Number(elements.latency.value),
-        statsIntervalMs: 250,
-        remoteDisplay: {
-          mode: "observe",
-          element: elements.display,
-          devicePixelRatio: 1,
-        },
-      },
-      {
-        canvas: elements.display,
-        inputElement: elements.display,
-        textInputElement: elements.imeProxy,
-        controlOnFocus: true,
-        clipboardAutoSync: true,
-      },
-    );
-    yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        installViewerListeners(elements, session, surface),
-      ),
-      (removeListeners) => Effect.sync(removeListeners),
-    );
-    yield* Effect.race(
-      waitForEvent(window, "pagehide"),
-      permissionTasks(elements, session, surface),
-    );
-  }),
-);
-
-Effect.runPromise(viewerProgram).catch((error: unknown) => {
+try {
+  startViewer();
+} catch (error) {
   console.error("Viewer stopped", error);
-});
+}

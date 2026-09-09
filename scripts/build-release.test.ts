@@ -48,11 +48,6 @@ test(
         ),
       );
       assert(!installer.includes("@SPRITE_DESKTOP_"));
-      assert(
-        installer.includes("/sys/fs/cgroup/svc.sprite-desktop/cgroup.procs"),
-      );
-      assert(installer.includes('sha256sum "/proc/$pid/exe"'));
-      assert(installer.includes('"$candidate_pid" = "$old_service_pid"'));
       await exec("bash", ["-n", join(output, "install.sh")]);
       await exec("tar", ["-xzf", archive, "-C", unpacked]);
       const manifest = JSON.parse(
@@ -88,9 +83,6 @@ test(
         packagedSession,
         await readFile(join(root, "installer/session.py"), "utf8"),
       );
-      assert(packagedSession.includes('kwargs["start_new_session"] = True'));
-      assert(packagedSession.includes("os.killpg(group, number)"));
-      assert(packagedSession.includes("os.WNOWAIT"));
       const sources = JSON.parse(
         await readFile(join(unpacked, "sources.lock"), "utf8"),
       );

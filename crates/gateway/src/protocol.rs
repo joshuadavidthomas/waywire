@@ -431,7 +431,7 @@ mod tests {
         assert!(parse_browser_record(&record(4, 2, 30, 0, 7)).is_ok());
     }
     #[test]
-    fn feedback_accepts_exact_contract_and_rejects_old_shape() {
+    fn feedback_requires_current_fields_and_rejects_unknown_fields() {
         assert!(matches!(
             parse_json(br#"{"type":"feedback","received":40,"presented":42,"queuePeak":2,"queueBusyMs":25,"sampleMs":1000,"dropped":0,"rtt":20}"#),
             Ok(JsonInput::Feedback(_))

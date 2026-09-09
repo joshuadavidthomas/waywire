@@ -1,7 +1,7 @@
 use crate::{
     cursor::CursorState,
     protocol::{DaemonCommand, DaemonEvent, EventReader},
-    video::{VideoHub, VideoPipeline},
+    video::{VideoHub, VideoPipeline, VideoWorker},
 };
 use anyhow::{Context, Result, anyhow};
 use nix::{
@@ -24,7 +24,7 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     net::UdpSocket,
-    process::{Child, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
     time::{Instant, sleep, timeout},
 };
@@ -196,88 +196,30 @@ impl Daemon {
         let readiness = Readiness::new();
         let active_lease = Arc::new(AtomicU64::new(0));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_COUNT);
-        let (fatal, mut fatal_rx) = mpsc::channel(1);
+        let (fatal, fatal_rx) = mpsc::channel(1);
         let commands = CommandSink {
             tx: command_tx,
             budget: Arc::new(Semaphore::new(COMMAND_BYTES)),
             fatal,
             readiness: readiness.clone(),
         };
-        let (shutdown, mut shutdown_rx) = mpsc::channel(1);
+        let (shutdown, shutdown_rx) = mpsc::channel(1);
         let (pipeline, video_worker) = VideoPipeline::new(hub, commands.clone(), readiness.clone());
-        let port = socket.local_addr()?.port();
-        let mut command = Command::new(&config.path);
-        command
-            .args([
-                "--frame-rate",
-                &config.frame_rate.to_string(),
-                "--bitrate",
-                &config.bitrate.to_string(),
-                "--rtp-port",
-                &port.to_string(),
-                "--xkb-layout",
-                &config.xkb_layout,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("spawn private daemon {}", config.path))?;
-        let pid = child
-            .id()
-            .ok_or_else(|| anyhow!("daemon has no process ID"))? as i32;
-        let stdin = child.stdin.take().context("open daemon stdin")?;
-        let stdout = child.stdout.take().context("open daemon stdout")?;
+        let process = spawn_daemon(&config, socket.local_addr()?.port())?;
         events.reset();
         let state = RuntimeState {
-            readiness: readiness.clone(),
-            active_lease: active_lease.clone(),
-            events: events.clone(),
+            readiness,
+            active_lease,
+            events,
         };
-        let task = tokio::spawn(async move {
-            // This scope owns the pipe futures. Drop them before signalling
-            // the process group so native EOF cleanup can make progress.
-            let result = async {
-                let writer = write_commands(stdin, command_rx, active_lease);
-                let reader = read_events(stdout, events, pipeline.clone());
-                let rtp = pipeline.receive(socket);
-                let video = video_worker.run();
-                let exited = wait_for_leader_exit(pid);
-                let startup = async {
-                    sleep(STARTUP_DEADLINE).await;
-                    if readiness.needs_startup_frame() {
-                        Err(anyhow!(
-                            "daemon did not produce a correlated keyframe before startup deadline"
-                        ))
-                    } else {
-                        std::future::pending::<Result<()>>().await
-                    }
-                };
-                tokio::pin!(writer, reader, rtp, video, exited, startup);
-                tokio::select! {
-                    value = &mut writer => value.context("daemon command writer"),
-                    value = &mut reader => value.context("daemon event reader"),
-                    value = &mut rtp => value.context("RTP receiver"),
-                    value = &mut video => value.context("video pipeline"),
-                    value = &mut exited => {
-                        value?;
-                        Err(anyhow!("daemon exited"))
-                    }
-                    value = &mut startup => value,
-                    message = fatal_rx.recv() => Err(anyhow!(
-                        message.unwrap_or_else(|| "fatal command channel closed".into())
-                    )),
-                    _ = shutdown_rx.recv() => Ok(()),
-                }
-            }
-            .await;
-            readiness.failed();
-            cleanup_group(&mut child, pid).await?;
-            result
-        });
+        let task = tokio::spawn(supervise_daemon(
+            process,
+            socket,
+            pipeline,
+            video_worker,
+            state.clone(),
+            (command_rx, fatal_rx, shutdown_rx),
+        ));
         Ok((
             Self {
                 commands,
@@ -290,6 +232,90 @@ impl Daemon {
     pub async fn shutdown(&self) {
         let _ = self.shutdown.send(()).await;
     }
+}
+
+fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<(Child, i32, ChildStdin, ChildStdout)> {
+    let mut command = Command::new(&config.path);
+    command
+        .args([
+            "--frame-rate",
+            &config.frame_rate.to_string(),
+            "--bitrate",
+            &config.bitrate.to_string(),
+            "--rtp-port",
+            &rtp_port.to_string(),
+            "--xkb-layout",
+            &config.xkb_layout,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    command.as_std_mut().process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn private daemon {}", config.path))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("daemon has no process ID"))? as i32;
+    let stdin = child.stdin.take().context("open daemon stdin")?;
+    let stdout = child.stdout.take().context("open daemon stdout")?;
+    Ok((child, pid, stdin, stdout))
+}
+
+async fn supervise_daemon(
+    process: (Child, i32, ChildStdin, ChildStdout),
+    socket: UdpSocket,
+    pipeline: VideoPipeline,
+    video_worker: VideoWorker,
+    state: RuntimeState,
+    channels: (
+        mpsc::Receiver<Request>,
+        mpsc::Receiver<String>,
+        mpsc::Receiver<()>,
+    ),
+) -> Result<()> {
+    let (mut child, pid, stdin, stdout) = process;
+    let (command_rx, mut fatal_rx, mut shutdown_rx) = channels;
+    // Drop the pipe futures before signalling the process group so native EOF
+    // cleanup can make progress.
+    let result = async {
+        let writer = write_commands(stdin, command_rx, state.active_lease.clone());
+        let reader = read_events(stdout, state.events.clone(), pipeline.clone());
+        let rtp = pipeline.receive(socket);
+        let video = video_worker.run();
+        let exited = wait_for_leader_exit(pid);
+        let startup = async {
+            sleep(STARTUP_DEADLINE).await;
+            if state.readiness.needs_startup_frame() {
+                Err(anyhow!(
+                    "daemon did not produce a correlated keyframe before startup deadline"
+                ))
+            } else {
+                std::future::pending::<Result<()>>().await
+            }
+        };
+        tokio::pin!(writer, reader, rtp, video, exited, startup);
+        tokio::select! {
+            value = &mut writer => value.context("daemon command writer"),
+            value = &mut reader => value.context("daemon event reader"),
+            value = &mut rtp => value.context("RTP receiver"),
+            value = &mut video => value.context("video pipeline"),
+            value = &mut exited => {
+                value?;
+                Err(anyhow!("daemon exited"))
+            }
+            value = &mut startup => value,
+            message = fatal_rx.recv() => Err(anyhow!(
+                message.unwrap_or_else(|| "fatal command channel closed".into())
+            )),
+            _ = shutdown_rx.recv() => Ok(()),
+        }
+    }
+    .await;
+    state.readiness.failed();
+    cleanup_group(&mut child, pid).await?;
+    result
 }
 
 async fn write_commands(
