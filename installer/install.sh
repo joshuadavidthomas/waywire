@@ -95,22 +95,34 @@ done < <(jq -r '.sources[] | select(.name == "mozilla") | .key_fingerprints[]' "
 
 api() { curl --unix-socket "$API_SOCKET" -fsS 'http://sprite/v1/services'; }
 running_artifacts_match() {
-  local pid cgroup executable digest members gateway_found=false streamd_found=false
+  local pid cgroup executable digest members gateway_pid='' streamd_pid=''
   members=$(sudo cat /sys/fs/cgroup/svc.sprite-desktop/cgroup.procs 2>/dev/null) || return 1
   while read -r pid; do
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    if $service_replacement_requested; then
+      case " $previous_service_pids " in *" $pid "*) continue ;; esac
+    fi
     cgroup=$(sudo cat "/proc/$pid/cgroup" 2>/dev/null) || continue
     [ "$cgroup" = '0::/svc.sprite-desktop' ] || continue
-    executable=$(sudo readlink "/proc/$pid/exe" 2>/dev/null) || continue
+    # Sprite permits cmdline inspection but denies /proc/PID/exe, even to root.
+    # The launcher resolves current before exec, so argv names this release.
+    IFS= read -r -d '' executable < <(sudo cat "/proc/$pid/cmdline" 2>/dev/null) || continue
     case "$executable" in
       "$RELEASE_DIR/bin/sprite-desktop-gateway"|"$RELEASE_DIR/bin/sprite-desktop-streamd") ;;
       *) continue ;;
     esac
-    digest=$(sudo sha256sum "/proc/$pid/exe" 2>/dev/null | awk '{print $1}') || continue
-    [ "$digest" != "$expected_gateway_sha" ] || gateway_found=true
-    [ "$digest" != "$expected_streamd_sha" ] || streamd_found=true
+    digest=$(sudo sha256sum "$executable" 2>/dev/null | awk '{print $1}') || continue
+    if [ "$digest" = "$expected_gateway_sha" ]; then
+      [ -z "$gateway_pid" ] || return 1
+      gateway_pid=$pid
+    fi
+    if [ "$digest" = "$expected_streamd_sha" ]; then
+      [ -z "$streamd_pid" ] || return 1
+      streamd_pid=$pid
+    fi
   done <<<"$members"
-  $gateway_found && $streamd_found
+  [ -n "$gateway_pid" ] && [ -n "$streamd_pid" ] || return 1
+  printf '%s:%s\n' "$gateway_pid" "$streamd_pid"
 }
 services_raw=$(api) || fail 'could not list Sprite services'
 live_services=$(jq -ce 'if type != "array" then error("expected service array") else [.[] | {name,cmd,args:(.args // []),http_port:(.http_port // null),needs:(.needs // []),env:(.env // {}),dir:(.dir // null)}] end' <<<"$services_raw") || fail 'Sprite services response is invalid'
@@ -124,8 +136,9 @@ elif sudo test -e "$CURRENT_LINK" || sudo test -L "$CURRENT_LINK"; then
 fi
 target_service=$(jq -c '.services[0]' "$staged/manifest.json")
 current_service=$(jq -c '.[] | select(.name == "sprite-desktop")' <<<"$live_services")
-old_service_pid=$(jq -r '[.[] | select(.name == "sprite-desktop") | .state.pid // 0] | if length == 1 then .[0] else 0 end' <<<"$services_raw")
-[[ "$old_service_pid" =~ ^[0-9]+$ ]] || fail 'Sprite returned an invalid service PID'
+# The API's service PID may not exist in this process namespace after restart.
+# Use actual cgroup members to distinguish replacement processes.
+previous_service_pids=$(sudo cat /sys/fs/cgroup/svc.sprite-desktop/cgroup.procs 2>/dev/null | tr '\n' ' ' || true)
 if [ -n "$current_service" ]; then
   if [ -z "$record" ] || ! jq -e --argjson current "$current_service" '.services == [$current]' <<<"$record" >/dev/null; then
     fail 'service name is foreign: sprite-desktop'
@@ -142,8 +155,7 @@ if [ -n "$listeners" ]; then
   if [ -z "$current_service" ] || [ -z "$record" ] || ! jq -e --argjson current "$current_service" '.services == [$current]' <<<"$record" >/dev/null; then
     fail 'port 8080 is occupied by an unmanaged process'
   fi
-  service_pid=$(jq -r '.[] | select(.name == "sprite-desktop") | .state.pid // 0' <<<"$services_raw")
-  [ "${service_pid:-0}" -gt 0 ] || fail 'port 8080 has no running owner service'
+  jq -e 'any(.[]; .name == "sprite-desktop" and .state.status == "running")' <<<"$services_raw" >/dev/null || fail 'port 8080 has no running owner service'
   awk '{found=0; for (i=1; i<=NF; i++) if ($i == "cgroup:/svc.sprite-desktop") found=1; if (!found) exit 1}' <<<"$listeners" || fail 'port 8080 is occupied by an unmanaged process'
 fi
 recovery=false
@@ -155,7 +167,8 @@ if [ -n "$record" ]; then
   fi
   if [ "$(jq -r .state <<<"$record")" = pending ]; then
     recovery=true
-    jq -e --arg release "$RELEASE" --arg hash "$ARCHIVE_SHA256" '.release == $release and .archive_sha256 == $hash' <<<"$record" >/dev/null || fail 'finish the pending install with its original installer and archive before upgrading'
+    # A corrected release may replace an owned pending install. Ownership and
+    # service definitions were checked above; same-version hashes must match.
   fi
   [ "$installed_release" != "$RELEASE" ] || release_changed=false
 fi
@@ -209,20 +222,15 @@ failpoint after-service-1
 healthy=false
 for _ in $(seq 1 120); do
   candidate_services=$(api 2>/dev/null) || { sleep 1; continue; }
-  candidate_pid=$(jq -er '[.[] | select(.name == "sprite-desktop") | .state.pid] | select(length == 1) | .[0] | select(type == "number" and . > 0)' <<<"$candidate_services" 2>/dev/null) || { sleep 1; continue; }
-  if $service_replacement_requested && [ "$old_service_pid" -gt 0 ] && [ "$candidate_pid" = "$old_service_pid" ]; then
-    sleep 1
-    continue
-  fi
-  [ "$(sudo cat "/proc/$candidate_pid/cgroup" 2>/dev/null || true)" = '0::/svc.sprite-desktop' ] || { sleep 1; continue; }
-  running_artifacts_match || { sleep 1; continue; }
+  jq -e 'any(.[]; .name == "sprite-desktop" and .state.status == "running")' <<<"$candidate_services" >/dev/null || { sleep 1; continue; }
+  candidate_pair=$(running_artifacts_match) || { sleep 1; continue; }
   [ "$(curl -fsS --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)" = ok ] || { sleep 1; continue; }
-  # Keep the new launcher and both native executables stable across a full
-  # observation interval; an old listener can answer while replacement starts.
+  # Keep both replacement executables stable across a full observation
+  # interval; an old listener can answer while replacement starts.
   sleep 1
-  confirmed_pid=$(api 2>/dev/null | jq -er '[.[] | select(.name == "sprite-desktop") | .state.pid] | select(length == 1) | .[0]' 2>/dev/null) || continue
-  [ "$confirmed_pid" = "$candidate_pid" ] || continue
-  running_artifacts_match || continue
+  api 2>/dev/null | jq -e 'any(.[]; .name == "sprite-desktop" and .state.status == "running")' >/dev/null || continue
+  confirmed_pair=$(running_artifacts_match) || continue
+  [ "$confirmed_pair" = "$candidate_pair" ] || continue
   [ "$(curl -fsS --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)" = ok ] || continue
   healthy=true
   break

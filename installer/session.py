@@ -109,7 +109,8 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
-    root = Path("/opt/sprite-desktop/current/bin")
+    # Use the immutable release path in child argv, including across upgrades.
+    root = Path("/opt/sprite-desktop/current/bin").resolve(strict=True)
     with (runtime / "labwc.log").open("w") as log, contextlib.ExitStack() as owned:
         compositor = owned.enter_context(child(
             ["labwc", "-C", str(Path(os.environ["XDG_CONFIG_HOME"]) / "labwc"),

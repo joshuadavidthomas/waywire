@@ -65,7 +65,7 @@ try {
   const code = await command.wait();
   if (code !== 0)
     throw new Error(
-      `Installer exited ${code}; rerun the same release to repair a pending installation`,
+      `Installer exited ${code}; inspect its output before provisioning again`,
     );
 } finally {
   await fs.rm(remote, { recursive: true, force: true });
