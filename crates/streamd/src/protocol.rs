@@ -1,4 +1,7 @@
-use std::io::{self, Read};
+use std::io::Read;
+use std::io::{
+    self,
+};
 
 use thiserror::Error;
 
@@ -127,9 +130,9 @@ impl<R: Read> CommandReader<R> {
         }
         let kind = header[1];
         let state = header[2];
-        let a = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let b = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        let c = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let a = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let b = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let c = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         let invalid = || ProtocolError::InvalidFields(kind);
         let sequence = || if c == 0 { Err(invalid()) } else { Ok(c) };
 
@@ -154,8 +157,7 @@ impl<R: Read> CommandReader<R> {
                 state: match state {
                     0 => KeyState::Released,
                     1 => KeyState::Pressed,
-                    2 => KeyState::Repeated,
-                    _ => unreachable!(),
+                    _ => KeyState::Repeated,
                 },
                 sequence: sequence()?,
             },
@@ -220,7 +222,7 @@ impl<R: Read> CommandReader<R> {
         limit: usize,
         forbid_nul: bool,
     ) -> Result<String, ProtocolError> {
-        let length = usize::try_from(length).map_err(|_| ProtocolError::PayloadTooLarge)?;
+        let length = usize::try_from(length).map_err(|_overflow| ProtocolError::PayloadTooLarge)?;
         if length > limit {
             return Err(ProtocolError::PayloadTooLarge);
         }
@@ -237,7 +239,7 @@ impl<R: Read> CommandReader<R> {
         if forbid_nul && bytes.contains(&0) {
             return Err(ProtocolError::InvalidText);
         }
-        String::from_utf8(bytes).map_err(|_| ProtocolError::InvalidText)
+        String::from_utf8(bytes).map_err(|_invalid| ProtocolError::InvalidText)
     }
 }
 
@@ -273,7 +275,12 @@ impl CommandDecoder {
             }
             let kind = self.bytes[1];
             let payload = if matches!(kind, 7 | 10) {
-                let length = u32::from_le_bytes(self.bytes[4..8].try_into().unwrap()) as usize;
+                let length = u32::from_le_bytes([
+                    self.bytes[4],
+                    self.bytes[5],
+                    self.bytes[6],
+                    self.bytes[7],
+                ]) as usize;
                 let limit = if kind == 7 {
                     MAX_CLIPBOARD_BYTES
                 } else {
@@ -401,7 +408,8 @@ impl Event {
             }
             Self::CursorVisibility(visible) => (5, vec![u8::from(*visible)]),
         };
-        let length = u32::try_from(payload.len()).map_err(|_| ProtocolError::PayloadTooLarge)?;
+        let length =
+            u32::try_from(payload.len()).map_err(|_overflow| ProtocolError::PayloadTooLarge)?;
         let mut bytes = Vec::with_capacity(8 + payload.len());
         bytes.extend_from_slice(&[VERSION, kind, 0, 0]);
         bytes.extend_from_slice(&length.to_le_bytes());
@@ -415,13 +423,14 @@ pub fn cursor_byte_count(width: u32, height: u32) -> Result<usize, ProtocolError
         return Err(ProtocolError::InvalidFields(4));
     }
     usize::try_from(u64::from(width) * u64::from(height) * 4)
-        .map_err(|_| ProtocolError::PayloadTooLarge)
+        .map_err(|_overflow| ProtocolError::PayloadTooLarge)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     fn header(kind: u8, state: u8, a: u32, b: u32, c: u32) -> Vec<u8> {
         let mut bytes = vec![VERSION, kind, state, 0];
@@ -444,14 +453,14 @@ mod tests {
         bytes.extend_from_slice(b"hey");
         let mut reader = CommandReader::new(OneByte(Cursor::new(bytes)));
         assert_eq!(
-            reader.next().unwrap(),
+            reader.next().expect("fragmented text should parse"),
             Some(Command::Text {
                 preedit: true,
                 text: "hey".into(),
                 sequence: 42
             })
         );
-        assert_eq!(reader.next().unwrap(), None);
+        assert_eq!(reader.next().expect("stream should end cleanly"), None);
     }
 
     #[test]
@@ -464,7 +473,9 @@ mod tests {
             CommandReader::new(Cursor::new(header(
                 7,
                 0,
-                MAX_CLIPBOARD_BYTES as u32 + 1,
+                u32::try_from(MAX_CLIPBOARD_BYTES)
+                    .expect("clipboard limit should fit the protocol length field")
+                    + 1,
                 0,
                 0
             )))
@@ -484,7 +495,7 @@ mod tests {
         assert_eq!(
             CommandReader::new(Cursor::new(header(6, 0, 3840, 2160, packed)))
                 .next()
-                .unwrap(),
+                .expect("resize command should parse"),
             Some(Command::Resize {
                 width: 3840,
                 height: 2160,
@@ -495,7 +506,7 @@ mod tests {
         assert_eq!(
             CommandReader::new(Cursor::new(header(11, 1, 9, 0, 0)))
                 .next()
-                .unwrap(),
+                .expect("readiness command should parse"),
             Some(Command::KeyframeReadiness {
                 generation: 9,
                 ready: true
@@ -532,7 +543,7 @@ mod tests {
             input_sequence: 4,
             fps: 60,
         });
-        let bytes = event.encode().unwrap();
+        let bytes = event.encode().expect("frame event should encode");
         assert_eq!(&bytes[..8], &[2, 2, 0, 0, 32, 0, 0, 0]);
         assert_eq!(&bytes[8..12], &1_u32.to_le_bytes());
         assert_eq!(&bytes[12..14], &1280_u16.to_le_bytes());
@@ -545,7 +556,10 @@ mod tests {
 
     #[test]
     fn cursor_payload_is_bounded_and_exact() {
-        assert_eq!(cursor_byte_count(256, 256).unwrap(), 256 * 256 * 4);
+        assert_eq!(
+            cursor_byte_count(256, 256).expect("max cursor should be sized"),
+            256 * 256 * 4
+        );
         assert!(cursor_byte_count(257, 1).is_err());
         let bytes = Event::CursorImage {
             width: 1,
@@ -555,7 +569,7 @@ mod tests {
             bgra: vec![1, 2, 3, 4],
         }
         .encode()
-        .unwrap();
+        .expect("cursor image should encode");
         assert_eq!(&bytes[..8], &[2, 4, 0, 0, 20, 0, 0, 0]);
         assert_eq!(&bytes[16..20], &(-1_i32).to_le_bytes());
     }

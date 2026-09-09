@@ -1,0 +1,43 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+  - repo: https://github.com/joshuadavidthomas/ast-grep-rules
+    rev: v0.5.0
+    hooks:
+      - id: rust
+  - repo: local
+    hooks:
+      - id: typecheck
+        name: typecheck
+        entry: just typecheck
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: just rustfmt-check
+        language: system
+        files: '(^|/)(Cargo\.toml|\.rustfmt\.toml|rust-toolchain\.toml|.*\.rs)$'
+        pass_filenames: false
+      - id: prettier
+        name: prettier
+        entry: just prettier-check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: just clippy-check
+        language: system
+        files: '(^|/)(Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml|.*\.rs)$'
+        pass_filenames: false

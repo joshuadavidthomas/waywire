@@ -1,40 +1,48 @@
-use crate::{
-    daemon::RuntimeState,
-    protocol::{self, JsonInput, TextAction, VideoSample},
-    session::{LeaseState, Sessions},
-    video::VideoHub,
-};
-use axum::{
-    Router,
-    body::Body,
-    extract::{
-        State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
-    },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::get,
-};
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use nix::time::{ClockId, clock_gettime};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::extract::WebSocketUpgrade;
+use axum::extract::ws::Message;
+use axum::extract::ws::WebSocket;
+use axum::http::HeaderMap;
+use axum::http::HeaderValue;
+use axum::http::StatusCode;
+use axum::http::header;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::routing::get;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
+use futures_util::stream::SplitSink;
+use nix::time::ClockId;
+use nix::time::clock_gettime;
 use rust_embed::Embed;
 use serde_json::json;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+
+use crate::daemon::RuntimeState;
+use crate::protocol::JsonInput;
+use crate::protocol::TextAction;
+use crate::protocol::VideoSample;
+use crate::protocol::{
+    self,
 };
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    task::JoinHandle,
-    time::timeout,
-};
-use tokio_util::{
-    sync::CancellationToken,
-    task::{TaskTracker, task_tracker::TaskTrackerToken},
-};
+use crate::session::LeaseState;
+use crate::session::Sessions;
+use crate::video::VideoHub;
 
 const WRITE_LIMIT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_MESSAGE_BYTES: usize = 6 * protocol::MAX_CLIPBOARD_BYTES + 4096;
@@ -66,7 +74,7 @@ impl SocketConnections {
         // Take the tracking token first. Once shutdown closes the semaphore,
         // no untracked upgrader can cross the admission cutoff.
         let task = self.tasks.token();
-        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
         Some(SocketAdmission {
             _task: task,
             _permit: permit,
@@ -179,10 +187,10 @@ async fn stream_socket(mut socket: WebSocket, s: AppState, _admission: SocketAdm
     }
     loop {
         tokio::select! {
-            _ = s.connections.cancellation.cancelled() => break,
+            () = s.connections.cancellation.cancelled() => break,
             incoming = socket.recv() => {
                 match incoming {
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     Some(Ok(_)) => {}
                 }
             }
@@ -196,7 +204,7 @@ async fn stream_socket(mut socket: WebSocket, s: AppState, _admission: SocketAdm
             }
         }
     }
-    s.hub.unsubscribe(id)
+    s.hub.unsubscribe(id);
 }
 async fn control(
     State(s): State<AppState>,
@@ -229,20 +237,18 @@ struct Outbound {
 impl Outbound {
     fn enqueue(&self, message: Message) -> Result<(), ()> {
         let size = message_size(&message);
-        let permits = u32::try_from(size).map_err(|_| ())?;
-        let bytes = self
-            .bytes
-            .clone()
+        let permits = u32::try_from(size).map_err(drop)?;
+        let bytes = Arc::clone(&self.bytes)
             .try_acquire_many_owned(permits)
-            .map_err(|_| ())?;
+            .map_err(drop)?;
         self.tx
             .try_send(OutboundItem {
                 message,
                 _bytes: bytes,
             })
-            .map_err(|_| ())
+            .map_err(drop)
     }
-    fn enqueue_json(&self, value: serde_json::Value) -> Result<(), ()> {
+    fn enqueue_json(&self, value: &serde_json::Value) -> Result<(), ()> {
         self.enqueue(Message::Text(value.to_string().into()))
     }
 }
@@ -268,11 +274,11 @@ async fn control_writer(
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => break,
+            () = cancellation.cancelled() => break,
             item = rx.recv() => {
                 let Some(item) = item else { break };
                 tokio::select! {
-                    _ = cancellation.cancelled() => break,
+                    () = cancellation.cancelled() => break,
                     result = timeout(WRITE_LIMIT, sink.send(item.message)) => {
                         if result.map_or(true, |result| result.is_err()) {
                             break;
@@ -284,6 +290,10 @@ async fn control_writer(
     }
 }
 async fn control_socket(socket: WebSocket, s: AppState, id: u64, _admission: SocketAdmission) {
+    let mut events = s.runtime.events.subscribe();
+    let Ok(initial_events) = s.runtime.events.initial() else {
+        return;
+    };
     let cancellation = s.connections.cancellation.child_token();
     let (sink, mut incoming) = socket.split();
     let (tx, rx) = mpsc::channel(OUTBOUND_MESSAGE_LIMIT);
@@ -292,9 +302,8 @@ async fn control_socket(socket: WebSocket, s: AppState, id: u64, _admission: Soc
         bytes: Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)),
     };
     let mut writer: JoinHandle<()> = tokio::spawn(control_writer(sink, rx, cancellation.clone()));
-    let mut events = s.runtime.events.subscribe();
     let (bitrate, fps, scale) = s.sessions.quality();
-    let initial = s.runtime.events.initial().into_iter().chain([json!({
+    let initial = initial_events.into_iter().chain([json!({
         "type": "quality",
         "bitrate": bitrate,
         "fps": fps,
@@ -305,13 +314,13 @@ async fn control_socket(socket: WebSocket, s: AppState, id: u64, _admission: Soc
         if outbound.enqueue(Message::Text(value.into())).is_err() {
             cancellation.cancel();
             writer.abort();
-            let _ = writer.await;
+            drop(writer.await);
             return;
         }
     }
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => break,
+            () = cancellation.cancelled() => break,
             message = incoming.next() => {
                 let Some(Ok(message)) = message else {
                     break;
@@ -319,11 +328,11 @@ async fn control_socket(socket: WebSocket, s: AppState, id: u64, _admission: Soc
                 let result = match message {
                     Message::Text(text) => handle_text(&outbound, &s, id, text.as_str()).await,
                     Message::Binary(bytes) => match protocol::parse_browser_record(&bytes) {
-                        Ok(command) => s.sessions.input(id, command).await.map_err(|_| ()),
-                        Err(_) => Err(()),
+                        Ok(command) => s.sessions.input(id, command).await.map_err(drop),
+                        Err(_error) => Err(()),
                     },
                     Message::Close(_) => break,
-                    _ => Err(()),
+                    Message::Ping(_) | Message::Pong(_) => Err(()),
                 };
                 if result.is_err() {
                     break;
@@ -344,40 +353,40 @@ async fn control_socket(socket: WebSocket, s: AppState, id: u64, _admission: Soc
         }
     }
     cancellation.cancel();
-    let _ = s.sessions.release(id).await;
+    drop(s.sessions.release(id).await);
     if timeout(WRITE_LIMIT, &mut writer).await.is_err() {
         writer.abort();
-        let _ = writer.await;
+        drop(writer.await);
     }
 }
 async fn handle_text(outbound: &Outbound, s: &AppState, id: u64, text: &str) -> Result<(), ()> {
     match text {
         "acquire" => {
-            let state = match s.sessions.acquire(id).await.map_err(|_| ())? {
+            let state = match s.sessions.acquire(id).await.map_err(drop)? {
                 LeaseState::Active => "active",
                 LeaseState::Busy => "busy",
             };
-            outbound.enqueue_json(json!({"type":"control-state","state":state}))
+            outbound.enqueue_json(&json!({"type":"control-state","state":state}))
         }
         "release" => {
-            s.sessions.release(id).await.map_err(|_| ())?;
-            outbound.enqueue_json(json!({"type":"control-state","state":"ready"}))
+            s.sessions.release(id).await.map_err(drop)?;
+            outbound.enqueue_json(&json!({"type":"control-state","state":"ready"}))
         }
-        _ => match protocol::parse_json(text.as_bytes()).map_err(|_| ())? {
+        _ => match protocol::parse_json(text.as_bytes()).map_err(drop)? {
             JsonInput::Ping { id } => {
-                let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(|_| ())?;
+                let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(drop)?;
                 let nanos = i128::from(time.tv_sec()) * 1_000_000_000 + i128::from(time.tv_nsec());
                 outbound
-                    .enqueue_json(json!({"type":"pong","id":id,"serverNanos":nanos.to_string()}))
+                    .enqueue_json(&json!({"type":"pong","id":id,"serverNanos":nanos.to_string()}))
             }
             JsonInput::Feedback(feedback) => {
                 let Some((bitrate, fps, scale)) =
-                    s.sessions.feedback(id, feedback).await.map_err(|_| ())?
+                    s.sessions.feedback(id, feedback).await.map_err(drop)?
                 else {
                     return Ok(());
                 };
                 outbound.enqueue_json(
-                    json!({"type":"quality","bitrate":bitrate,"fps":fps,"scale":scale}),
+                    &json!({"type":"quality","bitrate":bitrate,"fps":fps,"scale":scale}),
                 )
             }
             JsonInput::Text {
@@ -388,9 +397,9 @@ async fn handle_text(outbound: &Outbound, s: &AppState, id: u64, text: &str) -> 
                 .sessions
                 .text(id, matches!(action, TextAction::Preedit), text, sequence)
                 .await
-                .map_err(|_| ()),
+                .map_err(drop),
             JsonInput::ClipboardWrite { text } => {
-                s.sessions.clipboard(id, text).await.map_err(|_| ())
+                s.sessions.clipboard(id, text).await.map_err(drop)
             }
         },
     }
@@ -411,9 +420,9 @@ async fn send(
     cancellation: &CancellationToken,
 ) -> Result<(), ()> {
     tokio::select! {
-        _ = cancellation.cancelled() => Err(()),
+        () = cancellation.cancelled() => Err(()),
         result = timeout(WRITE_LIMIT, socket.send(message)) => {
-            result.map_err(|_| ())?.map_err(|_| ())
+            result.map_err(drop)?.map_err(drop)
         }
     }
 }
@@ -433,11 +442,12 @@ async fn asset(axum::extract::OriginalUri(uri): axum::extract::OriginalUri) -> R
     let Some(file) = Assets::get(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let mime = if path.ends_with(".html") {
+    let extension = Path::new(path).extension();
+    let mime = if extension.is_some_and(|value| value.eq_ignore_ascii_case("html")) {
         "text/html; charset=utf-8"
-    } else if path.ends_with(".js") {
+    } else if extension.is_some_and(|value| value.eq_ignore_ascii_case("js")) {
         "text/javascript; charset=utf-8"
-    } else if path.ends_with(".css") {
+    } else if extension.is_some_and(|value| value.eq_ignore_ascii_case("css")) {
         "text/css; charset=utf-8"
     } else {
         "application/octet-stream"
@@ -489,7 +499,7 @@ mod tests {
         let bytes = Arc::new(Semaphore::new(4));
         let outbound = Outbound {
             tx,
-            bytes: bytes.clone(),
+            bytes: Arc::clone(&bytes),
         };
         drop(rx);
         assert!(outbound.enqueue(Message::Text("1234".into())).is_err());
@@ -498,11 +508,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let outbound = Outbound {
             tx,
-            bytes: bytes.clone(),
+            bytes: Arc::clone(&bytes),
         };
         assert!(outbound.enqueue(Message::Text("123".into())).is_ok());
         assert_eq!(bytes.available_permits(), 1);
-        drop(rx.recv().await.unwrap());
+        drop(
+            rx.recv()
+                .await
+                .expect("queued test message should remain available"),
+        );
         assert_eq!(bytes.available_permits(), 4);
     }
 

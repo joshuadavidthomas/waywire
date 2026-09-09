@@ -4,62 +4,83 @@ mod cursor;
 pub mod input;
 mod output;
 
-use std::{fs::File, io, io::Read};
+use std::fs::File;
+use std::io;
+use std::io::Read;
 
-use anyhow::{Context, Result, anyhow};
-use calloop::{
-    EventLoop, Interest, Mode, PostAction,
-    channel::{self, Event as ChannelEvent},
-    generic::Generic,
-    signals::{Signal, Signals},
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use calloop::EventLoop;
+use calloop::Interest;
+use calloop::LoopHandle;
+use calloop::Mode;
+use calloop::PostAction;
+use calloop::channel::Event as ChannelEvent;
+use calloop::channel::{
+    self,
 };
+use calloop::generic::Generic;
+use calloop::signals::Signal;
+use calloop::signals::Signals;
 use calloop_wayland_source::WaylandSource;
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use wayland_client::{
-    Connection, Dispatch, QueueHandle, WEnum,
-    backend::WaylandError,
-    delegate_noop, event_created_child,
-    protocol::{wl_buffer, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool},
-};
-use wayland_protocols::ext::{
-    data_control::v1::client::{
-        ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
-        ext_data_control_source_v1,
-    },
-    image_capture_source::v1::client::{
-        ext_image_capture_source_v1, ext_output_image_capture_source_manager_v1,
-    },
-    image_copy_capture::v1::client::{
-        ext_image_copy_capture_cursor_session_v1, ext_image_copy_capture_frame_v1,
-        ext_image_copy_capture_manager_v1, ext_image_copy_capture_session_v1,
-    },
-};
-use wayland_protocols_misc::{
-    zwp_input_method_v2::client::{zwp_input_method_manager_v2, zwp_input_method_v2},
-    zwp_virtual_keyboard_v1::client::{zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1},
-};
-use wayland_protocols_wlr::{
-    output_management::v1::client::{
-        zwlr_output_configuration_head_v1, zwlr_output_configuration_v1, zwlr_output_head_v1,
-        zwlr_output_manager_v1, zwlr_output_mode_v1,
-    },
-    screencopy::v1::client::{zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1},
-    virtual_pointer::v1::client::{zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1},
-};
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
+use wayland_client::Connection;
+use wayland_client::Dispatch;
+use wayland_client::QueueHandle;
+use wayland_client::WEnum;
+use wayland_client::backend::WaylandError;
+use wayland_client::delegate_noop;
+use wayland_client::event_created_child;
+use wayland_client::protocol::wl_buffer;
+use wayland_client::protocol::wl_output;
+use wayland_client::protocol::wl_pointer;
+use wayland_client::protocol::wl_registry;
+use wayland_client::protocol::wl_seat;
+use wayland_client::protocol::wl_shm;
+use wayland_client::protocol::wl_shm_pool;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
+use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1;
+use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_cursor_session_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_frame_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_manager_v2;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_head_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_head_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_mode_v1;
+use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1;
+use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
+use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1;
+use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1;
 
-use self::{
-    capture::Capture,
-    clipboard::Clipboard,
-    cursor::Cursor,
-    input::Input,
-    output::{Head, OutputManager, OutputMode, ResizeRequest},
-};
-use crate::{
-    Options,
-    event_writer::{EventSink, EventWriter},
-    protocol::{Command, CommandDecoder, Event},
-    video::{Notification, VideoEncoder},
-};
+use self::capture::Capture;
+use self::clipboard::Clipboard;
+use self::cursor::Cursor;
+use self::input::Input;
+use self::output::Head;
+use self::output::OutputManager;
+use self::output::OutputMode;
+use self::output::ResizeRequest;
+use crate::Options;
+use crate::event_writer::EventSink;
+use crate::event_writer::EventWriter;
+use crate::protocol::Command;
+use crate::protocol::CommandDecoder;
+use crate::protocol::Event;
+use crate::video::Notification;
+use crate::video::VideoEncoder;
 
 pub(super) enum ControlMessage {
     ClipboardReceived {
@@ -144,13 +165,46 @@ pub fn run(options: Options) -> Result<()> {
     let handle = event_loop.handle();
     WaylandSource::new(connection, event_queue).insert(handle.clone())?;
     handle
-        .insert_source(internal_channel, |event, _, state| {
+        .insert_source(internal_channel, |event, (), state| {
             if let ChannelEvent::Msg(message) = event {
                 state.handle_internal(message);
             }
         })
-        .map_err(|_| anyhow!("register clipboard completion source"))?;
+        .map_err(|_err| anyhow!("register clipboard completion source"))?;
 
+    register_stdin(&handle)?;
+    handle
+        .insert_source(notification_source, |(), (), state| state.drain_video())
+        .map_err(|_err| anyhow!("register encoder notification source"))?;
+    handle.insert_source(signal_source, |event, (), state| {
+        if matches!(event.signal(), Signal::SIGINT | Signal::SIGTERM) {
+            state.stop();
+        }
+    })?;
+
+    state.request_capture()?;
+    while state.running {
+        if let Err(error) = event_loop.dispatch(None, &mut state) {
+            state.fail(error.into());
+        }
+        if let Some(error) = event_writer.failure() {
+            state.fail(error.into());
+        }
+    }
+    drop(state.input.release_all());
+    state.clipboard.cancel_transfers();
+    if let Some(video) = state.video.take() {
+        video.stop();
+    }
+    event_writer.stop();
+    if let Some(error) = state.failure {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn register_stdin(handle: &LoopHandle<'_, State>) -> Result<()> {
     let stdin = File::open("/dev/stdin").context("open daemon command pipe")?;
     let flags = OFlag::from_bits_truncate(fcntl(&stdin, FcntlArg::F_GETFL)?);
     fcntl(&stdin, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
@@ -162,7 +216,7 @@ pub fn run(options: Options) -> Result<()> {
                 state.fail(anyhow!("command pipe reported an error"));
                 return Ok(PostAction::Remove);
             }
-            let mut part = [0_u8; 64 * 1024];
+            let mut part = vec![0_u8; 64 * 1024];
             loop {
                 // SAFETY: reading keeps the registered File in place; it is neither replaced nor dropped.
                 match unsafe { input.get_mut() }.read(&mut part) {
@@ -176,23 +230,29 @@ pub fn run(options: Options) -> Result<()> {
                         }
                         return Ok(PostAction::Remove);
                     }
-                    Ok(count) => match decoder.as_mut().unwrap().push(&part[..count]) {
-                        Ok(commands) => {
-                            for command in commands {
-                                if let Err(error) = state.apply_command(command) {
-                                    state.fail(error);
-                                    return Ok(PostAction::Remove);
-                                }
-                            }
-                            // Yield after one bounded read so a command flood cannot starve
-                            // Wayland dispatch, encoder notifications, or shutdown signals.
-                            break;
-                        }
-                        Err(error) => {
-                            state.fail(error.into());
+                    Ok(count) => {
+                        let Some(decoder) = decoder.as_mut() else {
+                            state.stop();
                             return Ok(PostAction::Remove);
+                        };
+                        match decoder.push(&part[..count]) {
+                            Ok(commands) => {
+                                for command in commands {
+                                    if let Err(error) = state.apply_command(&command) {
+                                        state.fail(error);
+                                        return Ok(PostAction::Remove);
+                                    }
+                                }
+                                // Yield after one bounded read so a command flood cannot starve
+                                // Wayland dispatch, encoder notifications, or shutdown signals.
+                                break;
+                            }
+                            Err(error) => {
+                                state.fail(error.into());
+                                return Ok(PostAction::Remove);
+                            }
                         }
-                    },
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) => {
@@ -204,34 +264,7 @@ pub fn run(options: Options) -> Result<()> {
             Ok(PostAction::Continue)
         },
     )?;
-    handle
-        .insert_source(notification_source, |(), _, state| state.drain_video())
-        .map_err(|_| anyhow!("register encoder notification source"))?;
-    handle.insert_source(signal_source, |event, _, state| match event.signal() {
-        Signal::SIGINT | Signal::SIGTERM => state.stop(),
-        _ => {}
-    })?;
-
-    state.request_capture()?;
-    while state.running {
-        if let Err(error) = event_loop.dispatch(None, &mut state) {
-            state.fail(error.into());
-        }
-        if let Some(error) = event_writer.failure() {
-            state.fail(error.into());
-        }
-    }
-    let _ = state.input.release_all();
-    state.clipboard.cancel_transfers();
-    if let Some(video) = state.video.take() {
-        video.stop();
-    }
-    event_writer.stop();
-    if let Some(error) = state.failure {
-        Err(error)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 impl State {
@@ -253,8 +286,12 @@ impl State {
     }
 
     fn start_cursor(&mut self) -> Result<()> {
-        let output = self.output.clone().unwrap();
-        let seat = self.input.seat.clone().unwrap();
+        let output = self.output.clone().context("compositor has no wl_output")?;
+        let seat = self
+            .input
+            .seat
+            .clone()
+            .context("compositor has no wl_seat")?;
         self.cursor.start(&seat, &output, &self.qh)
     }
 
@@ -290,8 +327,8 @@ impl State {
         self.request_capture()
     }
 
-    fn apply_command(&mut self, command: Command) -> Result<()> {
-        match &command {
+    fn apply_command(&mut self, command: &Command) -> Result<()> {
+        match command {
             Command::Resize {
                 width,
                 height,
@@ -360,7 +397,7 @@ impl State {
                     self.capture.can_wait_for_damage = false;
                     self.request_capture()?;
                 }
-                self.input.apply(&command)?;
+                self.input.apply(command)?;
                 if let Some(sequence) = command.input_sequence() {
                     self.latest_input_sequence = sequence;
                 }
@@ -375,12 +412,12 @@ impl State {
                 if self.clipboard.accepts_transfer(generation) {
                     match result {
                         Ok(text) => {
-                            if let Err(error) = self.event_sink.send(Event::Clipboard(text)) {
+                            if let Err(error) = self.event_sink.send(&Event::Clipboard(text)) {
                                 self.fail(error.into());
                             }
                         }
                         Err(error) => {
-                            eprintln!("sprite-desktop-streamd: clipboard read failed: {error}")
+                            eprintln!("sprite-desktop-streamd: clipboard read failed: {error}");
                         }
                     }
                 }
@@ -398,7 +435,7 @@ impl State {
                     // drained. Its RTP access unit may already be queued at the
                     // gateway; dropping the record lets that old unit consume
                     // metadata from the replacement encoder.
-                    if let Err(error) = self.event_sink.send(Event::Frame(metadata)) {
+                    if let Err(error) = self.event_sink.send(&Event::Frame(metadata)) {
                         self.fail(error.into());
                         return;
                     }
@@ -430,7 +467,7 @@ impl State {
             self.replace_media_generation()?;
         }
         self.capture.can_wait_for_damage = false;
-        self.event_sink.send(Event::ResizeApplied {
+        self.event_sink.send(&Event::ResizeApplied {
             request_id: applied.request_id,
             width: applied.mode.width,
             height: applied.mode.height,
@@ -464,7 +501,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         state: &mut Self,
         registry: &wl_registry::WlRegistry,
         event: wl_registry::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
@@ -522,7 +559,7 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         state: &mut Self,
         _: &wl_output::WlOutput,
         event: wl_output::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -537,7 +574,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         state: &mut Self,
         _: &wl_seat::WlSeat,
         event: wl_seat::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -561,7 +598,7 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
         state: &mut Self,
         proxy: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
         event: zwlr_screencopy_frame_v1::Event,
-        _: &(),
+        (): &(),
         connection: &Connection,
         qh: &QueueHandle<Self>,
     ) {
@@ -621,14 +658,18 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                         state.bitrate_kbps,
                         state.encoded_scale,
                     )?;
-                    state.video.as_ref().unwrap().submit(frame)?;
+                    state
+                        .video
+                        .as_ref()
+                        .context("video encoder missing")?
+                        .submit(frame)?;
                     Ok(())
                 })
             }
             zwlr_screencopy_frame_v1::Event::Failed => Err(anyhow!("Wayland screencopy failed")),
             zwlr_screencopy_frame_v1::Event::Damage { .. }
-            | zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => Ok(()),
-            _ => Ok(()),
+            | zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. }
+            | _ => Ok(()),
         };
         if let Err(error) = result {
             state.fail(error);
@@ -642,11 +683,11 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for State {
         state: &mut Self,
         _: &zwp_input_method_v2::ZwpInputMethodV2,
         event: zwp_input_method_v2::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        state.input.method_event(event);
+        state.input.method_event(&event);
     }
 }
 
@@ -656,7 +697,7 @@ impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for State {
         state: &mut Self,
         _: &zwlr_output_manager_v1::ZwlrOutputManagerV1,
         event: zwlr_output_manager_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -688,7 +729,7 @@ impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for State {
         state: &mut Self,
         proxy: &zwlr_output_head_v1::ZwlrOutputHeadV1,
         event: zwlr_output_head_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -704,7 +745,18 @@ impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for State {
             zwlr_output_head_v1::Event::Name { name } => head.name = Some(name),
             zwlr_output_head_v1::Event::Enabled { enabled } => head.enabled = enabled != 0,
             zwlr_output_head_v1::Event::Finished => head.finished = true,
-            _ => {}
+            zwlr_output_head_v1::Event::Description { .. }
+            | zwlr_output_head_v1::Event::PhysicalSize { .. }
+            | zwlr_output_head_v1::Event::Mode { .. }
+            | zwlr_output_head_v1::Event::CurrentMode { .. }
+            | zwlr_output_head_v1::Event::Position { .. }
+            | zwlr_output_head_v1::Event::Transform { .. }
+            | zwlr_output_head_v1::Event::Scale { .. }
+            | zwlr_output_head_v1::Event::Make { .. }
+            | zwlr_output_head_v1::Event::Model { .. }
+            | zwlr_output_head_v1::Event::SerialNumber { .. }
+            | zwlr_output_head_v1::Event::AdaptiveSync { .. }
+            | _ => {}
         }
     }
     event_created_child!(State, zwlr_output_head_v1::ZwlrOutputHeadV1, [
@@ -717,7 +769,7 @@ impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for S
         state: &mut Self,
         proxy: &zwlr_output_configuration_v1::ZwlrOutputConfigurationV1,
         event: zwlr_output_configuration_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -758,7 +810,7 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for State 
         state: &mut Self,
         _: &ext_data_control_device_v1::ExtDataControlDeviceV1,
         event: ext_data_control_device_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -768,9 +820,8 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for State 
                 Ok(())
             }
             ext_data_control_device_v1::Event::Selection { id } => state.clipboard.select(id),
-            ext_data_control_device_v1::Event::PrimarySelection { .. } => Ok(()),
             ext_data_control_device_v1::Event::Finished => Err(anyhow!("clipboard device stopped")),
-            _ => Ok(()),
+            ext_data_control_device_v1::Event::PrimarySelection { .. } | _ => Ok(()),
         };
         if let Err(error) = result {
             eprintln!("sprite-desktop-streamd: clipboard event failed: {error}");
@@ -786,7 +837,7 @@ impl Dispatch<ext_data_control_offer_v1::ExtDataControlOfferV1, ()> for State {
         state: &mut Self,
         proxy: &ext_data_control_offer_v1::ExtDataControlOfferV1,
         event: ext_data_control_offer_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -801,7 +852,7 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for State 
         state: &mut Self,
         proxy: &ext_data_control_source_v1::ExtDataControlSourceV1,
         event: ext_data_control_source_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -823,7 +874,7 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
         state: &mut Self,
         proxy: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
         event: ext_image_copy_capture_session_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
@@ -840,7 +891,7 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
             ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
                 state.cursor.begin_constraints();
                 if format == WEnum::Value(wl_shm::Format::Argb8888) {
-                    state.cursor.batch_argb = true;
+                    state.cursor.accept_argb();
                 }
                 Ok(())
             }
@@ -871,11 +922,11 @@ impl Dispatch<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCurso
         state: &mut Self,
         proxy: &ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1,
         event: ext_image_copy_capture_cursor_session_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if state.cursor.cursor_session.as_ref() != Some(proxy) {
+        if state.cursor.pointer_session.as_ref() != Some(proxy) {
             return;
         }
         let result = match event {
@@ -887,8 +938,7 @@ impl Dispatch<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCurso
                 state.cursor.hotspot(x, y);
                 Ok(())
             }
-            ext_image_copy_capture_cursor_session_v1::Event::Position { .. } => Ok(()),
-            _ => Ok(()),
+            ext_image_copy_capture_cursor_session_v1::Event::Position { .. } | _ => Ok(()),
         };
         if let Err(error) = result {
             state.fail(error);
@@ -901,7 +951,7 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
         state: &mut Self,
         proxy: &ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
         event: ext_image_copy_capture_frame_v1::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
@@ -924,8 +974,8 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
                 }
             }
             ext_image_copy_capture_frame_v1::Event::Damage { .. }
-            | ext_image_copy_capture_frame_v1::Event::PresentationTime { .. } => Ok(()),
-            _ => Ok(()),
+            | ext_image_copy_capture_frame_v1::Event::PresentationTime { .. }
+            | _ => Ok(()),
         };
         if let Err(error) = result {
             state.fail(error);
@@ -952,7 +1002,10 @@ fn protocol_ready_nanos(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{WaylandError, capture_flush, io, protocol_ready_nanos};
+    use super::WaylandError;
+    use super::capture_flush;
+    use super::io;
+    use super::protocol_ready_nanos;
 
     #[test]
     fn capture_flush_accepts_backpressure_but_rejects_broken_connections() {

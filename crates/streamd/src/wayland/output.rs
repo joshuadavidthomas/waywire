@@ -1,8 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
 use wayland_client::QueueHandle;
-use wayland_protocols_wlr::output_management::v1::client::{
-    zwlr_output_configuration_v1, zwlr_output_head_v1, zwlr_output_manager_v1,
-};
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_head_v1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1;
 
 use super::State;
 
@@ -115,6 +117,15 @@ impl OutputManager {
             bail!("could not select exactly one enabled output head");
         }
 
+        let width =
+            i32::try_from(request.mode.width).context("output width exceeds protocol range")?;
+        let height =
+            i32::try_from(request.mode.height).context("output height exceeds protocol range")?;
+        let refresh = i32::try_from(
+            fps.checked_mul(1_000)
+                .context("output refresh rate overflow")?,
+        )
+        .context("output refresh rate exceeds protocol range")?;
         let configuration = manager.create_configuration(serial, qh, ());
         for head in self.heads.iter().filter(|head| !head.finished) {
             if !head.enabled {
@@ -123,11 +134,7 @@ impl OutputManager {
             }
             let configured = configuration.enable_head(&head.proxy, qh, ());
             if output_name.is_none_or(|name| head.name.as_deref() == Some(name)) {
-                configured.set_custom_mode(
-                    request.mode.width as i32,
-                    request.mode.height as i32,
-                    (fps * 1_000) as i32,
-                );
+                configured.set_custom_mode(width, height, refresh);
                 configured.set_scale(f64::from(request.mode.scale_v120) / 120.0);
             }
         }

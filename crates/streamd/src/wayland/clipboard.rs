@@ -1,28 +1,34 @@
-use std::{
-    fs::File,
-    io::{Read, Write},
-    os::fd::{AsFd, OwnedFd},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    thread,
-    time::{Duration, Instant},
-};
+use std::fs::File;
+use std::io::Read;
+use std::io::Write;
+use std::os::fd::AsFd;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
 use calloop::channel::SyncSender;
-use nix::{
-    fcntl::{FcntlArg, OFlag, fcntl},
-    unistd::pipe,
-};
-use wayland_client::{QueueHandle, protocol::wl_seat};
-use wayland_protocols::ext::data_control::v1::client::{
-    ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
-    ext_data_control_source_v1,
-};
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
+use nix::unistd::pipe;
+use wayland_client::QueueHandle;
+use wayland_client::protocol::wl_seat;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
 
-use super::{ControlMessage, State};
+use super::ControlMessage;
+use super::State;
 use crate::protocol::MAX_CLIPBOARD_BYTES;
 
 const TEXT_MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
@@ -110,12 +116,12 @@ impl Clipboard {
         proxy: &ext_data_control_offer_v1::ExtDataControlOfferV1,
         mime: String,
     ) {
-        if self
+        if let Some(offer) = self
             .selection
-            .as_ref()
-            .is_some_and(|offer| offer.proxy == *proxy)
+            .as_mut()
+            .filter(|offer| offer.proxy == *proxy)
         {
-            self.selection.as_mut().unwrap().mimes.push(mime);
+            offer.mimes.push(mime);
         } else if self.pending_offer.as_ref() == Some(proxy) {
             self.selection = Some(Offer {
                 proxy: proxy.clone(),
@@ -136,7 +142,7 @@ impl Clipboard {
                     generation,
                     result: Ok(String::new()),
                 })
-                .map_err(|_| anyhow::anyhow!("command queue full while clearing clipboard"))?;
+                .map_err(|_error| anyhow::anyhow!("command queue full while clearing clipboard"))?;
             return Ok(());
         };
         if self
@@ -150,7 +156,10 @@ impl Clipboard {
             });
         }
         self.pending_offer = None;
-        let offer = self.selection.as_ref().unwrap();
+        let offer = self
+            .selection
+            .as_ref()
+            .context("selected clipboard offer is unavailable")?;
         let mime = TEXT_MIMES
             .iter()
             .find(|wanted| offer.mimes.iter().any(|offered| offered == **wanted))
@@ -297,7 +306,7 @@ fn spawn_read(
                 match file.read(&mut part) {
                     Ok(0) => {
                         break String::from_utf8(bytes)
-                            .map_err(|_| "clipboard is not UTF-8".to_string());
+                            .map_err(|_error| "clipboard is not UTF-8".to_string());
                     }
                     Ok(count) => {
                         if bytes.len() + count > MAX_CLIPBOARD_BYTES {
@@ -312,7 +321,7 @@ fn spawn_read(
                     Err(error) => break Err(error.to_string()),
                 }
             };
-            let _ = sender.try_send(ControlMessage::ClipboardReceived { generation, result });
+            drop(sender.try_send(ControlMessage::ClipboardReceived { generation, result }));
         })
         .context("start clipboard reader")
 }
@@ -323,10 +332,11 @@ mod tests {
 
     #[test]
     fn source_replacement_does_not_truncate_an_accepted_blocked_transfer() {
-        let (reader, writer) = pipe().unwrap();
-        set_nonblocking(&writer).unwrap();
+        let (reader, writer) = pipe().expect("test pipe should open");
+        set_nonblocking(&writer).expect("test pipe writer should become nonblocking");
         let active = Arc::new(AtomicUsize::new(0));
-        let permit = TransferPermit::reserve(Arc::clone(&active), 1).unwrap();
+        let permit = TransferPermit::reserve(Arc::clone(&active), 1)
+            .expect("first outgoing transfer slot should be available");
         let shutting_down = Arc::new(AtomicBool::new(false));
         let payload_a: Arc<[u8]> = Arc::from(vec![b'a'; MAX_CLIPBOARD_BYTES]);
         let mut selected_payload = Arc::clone(&payload_a);
@@ -336,14 +346,18 @@ mod tests {
             Arc::clone(&shutting_down),
             permit,
         )
-        .unwrap();
+        .expect("clipboard writer thread should start");
 
         // Let the pipe fill before replacing the selected source.
         thread::sleep(Duration::from_millis(25));
         selected_payload = Arc::from(&b"source-b"[..]);
         let mut received = Vec::new();
-        File::from(reader).read_to_end(&mut received).unwrap();
-        handle.join().unwrap();
+        File::from(reader)
+            .read_to_end(&mut received)
+            .expect("clipboard payload should drain from the pipe");
+        handle
+            .join()
+            .expect("clipboard writer thread should finish cleanly");
 
         assert_eq!(received, &*payload_a);
         assert_eq!(&*selected_payload, b"source-b");
@@ -352,10 +366,11 @@ mod tests {
 
     #[test]
     fn shutdown_cancels_a_blocked_write_and_releases_its_thread_slot() {
-        let (_reader, writer) = pipe().unwrap();
-        set_nonblocking(&writer).unwrap();
+        let (_reader, writer) = pipe().expect("test pipe should open");
+        set_nonblocking(&writer).expect("test pipe writer should become nonblocking");
         let active = Arc::new(AtomicUsize::new(0));
-        let permit = TransferPermit::reserve(Arc::clone(&active), 1).unwrap();
+        let permit = TransferPermit::reserve(Arc::clone(&active), 1)
+            .expect("first outgoing transfer slot should be available");
         let shutting_down = Arc::new(AtomicBool::new(false));
         let handle = spawn_write(
             writer,
@@ -363,9 +378,11 @@ mod tests {
             Arc::clone(&shutting_down),
             permit,
         )
-        .unwrap();
+        .expect("clipboard writer thread should start");
         shutting_down.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
+        handle
+            .join()
+            .expect("cancelled clipboard writer should finish cleanly");
 
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert!(TransferPermit::reserve(active, 1).is_some());

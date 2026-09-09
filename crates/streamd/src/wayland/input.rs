@@ -1,25 +1,30 @@
-use std::{ffi::CString, fs::File, io::Write, os::fd::AsFd};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsFd;
 
-use anyhow::{Context, Result, bail};
-use nix::{
-    sys::memfd::{MFdFlags, memfd_create},
-    unistd::ftruncate,
-};
-use wayland_client::{
-    Proxy, QueueHandle,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat},
-};
-use wayland_protocols_misc::{
-    zwp_input_method_v2::client::{zwp_input_method_manager_v2, zwp_input_method_v2},
-    zwp_virtual_keyboard_v1::client::{zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1},
-};
-use wayland_protocols_wlr::virtual_pointer::v1::client::{
-    zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
-};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use nix::sys::memfd::MFdFlags;
+use nix::sys::memfd::memfd_create;
+use nix::unistd::ftruncate;
+use wayland_client::Proxy;
+use wayland_client::QueueHandle;
+use wayland_client::protocol::wl_keyboard;
+use wayland_client::protocol::wl_output;
+use wayland_client::protocol::wl_pointer;
+use wayland_client::protocol::wl_seat;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_manager_v2;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1;
+use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1;
+use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1;
 use xkbcommon::xkb;
 
 use super::State;
-use crate::protocol::{Command, KeyState};
+use crate::protocol::Command;
+use crate::protocol::KeyState;
 
 pub struct Input {
     pub seat: Option<wl_seat::WlSeat>,
@@ -101,8 +106,7 @@ impl Input {
             .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
             .into_bytes();
         text.push(0);
-        let name = CString::new("sprite-desktop-keymap").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC)?;
+        let fd = memfd_create(c"sprite-desktop-keymap", MFdFlags::MFD_CLOEXEC)?;
         ftruncate(&fd, i64::try_from(text.len())?)?;
         let mut file = File::from(fd);
         file.write_all(&text)?;
@@ -155,7 +159,7 @@ impl Input {
             }
             Command::KeyboardKey { key, state, .. } => self.key(time, *key, *state)?,
             Command::ReleaseAll => self.release_all()?,
-            Command::Text { preedit, text, .. } => self.send_text(*preedit, text),
+            Command::Text { preedit, text, .. } => self.send_text(*preedit, text)?,
             Command::Resize { .. }
             | Command::Clipboard(_)
             | Command::Quality { .. }
@@ -257,33 +261,38 @@ impl Input {
             for (key, pressed) in self.pressed_keys.iter_mut().enumerate() {
                 if *pressed {
                     *pressed = false;
-                    keyboard.key(time, key as u32, wl_keyboard::KeyState::Released as u32);
+                    let key = u32::try_from(key).context("pressed key index exceeds u32")?;
+                    keyboard.key(time, key, wl_keyboard::KeyState::Released as u32);
                     if let Some(state) = &mut self.xkb_state {
-                        state.update_key(xkb::Keycode::new(key as u32 + 8), xkb::KeyDirection::Up);
+                        state.update_key(xkb::Keycode::new(key + 8), xkb::KeyDirection::Up);
                     }
                 }
             }
             self.send_modifiers();
         }
-        self.send_text(true, "");
+        self.send_text(true, "")?;
         Ok(())
     }
 
-    fn send_text(&self, preedit: bool, text: &str) {
+    fn send_text(&self, preedit: bool, text: &str) -> Result<()> {
         if !self.method_active {
-            return;
+            return Ok(());
         }
-        let Some(method) = &self.method else { return };
+        let Some(method) = &self.method else {
+            return Ok(());
+        };
         if preedit {
-            method.set_preedit_string(text.to_owned(), text.len() as i32, text.len() as i32);
+            let cursor = i32::try_from(text.len()).context("preedit text exceeds protocol size")?;
+            method.set_preedit_string(text.to_owned(), cursor, cursor);
         } else {
             method.set_preedit_string(String::new(), 0, 0);
             method.commit_string(text.to_owned());
         }
         method.commit(self.method_serial);
+        Ok(())
     }
 
-    pub fn method_event(&mut self, event: zwp_input_method_v2::Event) {
+    pub fn method_event(&mut self, event: &zwp_input_method_v2::Event) {
         match event {
             zwp_input_method_v2::Event::Activate => self.pending_method_active = Some(true),
             zwp_input_method_v2::Event::Deactivate => self.pending_method_active = Some(false),
@@ -301,8 +310,8 @@ impl Input {
             }
             zwp_input_method_v2::Event::SurroundingText { .. }
             | zwp_input_method_v2::Event::TextChangeCause { .. }
-            | zwp_input_method_v2::Event::ContentType { .. } => {}
-            _ => {}
+            | zwp_input_method_v2::Event::ContentType { .. }
+            | _ => {}
         }
     }
 }
@@ -311,7 +320,7 @@ fn monotonic_millis() -> Result<u32> {
     let timestamp = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)?;
     let millis = u64::try_from(timestamp.tv_sec())? * 1_000
         + u64::try_from(timestamp.tv_nsec())? / 1_000_000;
-    Ok(millis as u32)
+    Ok(u32::try_from(millis & u64::from(u32::MAX))?)
 }
 
 fn button_index(button: u32) -> Option<usize> {
@@ -321,7 +330,8 @@ fn button_index(button: u32) -> Option<usize> {
 }
 
 fn button_at(index: usize) -> u32 {
-    0x110 + index as u32
+    const BUTTONS: [u32; 5] = [0x110, 0x111, 0x112, 0x113, 0x114];
+    BUTTONS[index]
 }
 
 pub fn valid_layout(layout: &str) -> bool {

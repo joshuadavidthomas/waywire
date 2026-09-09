@@ -5,24 +5,30 @@ mod protocol;
 mod session;
 mod video;
 
-use crate::{
-    daemon::{AppEvents, Config, Daemon},
-    http::{AppState, SocketConnections},
-    session::Sessions,
-    video::VideoHub,
-};
-use anyhow::{Context, Result, anyhow};
+use std::time::Duration;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use socket2::SockRef;
-use std::time::Duration;
-use tokio::{
-    net::{TcpListener, UdpSocket},
-    sync::watch,
-    task::{JoinError, JoinHandle},
-    time::{Instant, timeout_at},
-};
+use tokio::net::TcpListener;
+use tokio::net::UdpSocket;
+use tokio::sync::watch;
+use tokio::task::JoinError;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
 use url::Url;
+
+use crate::daemon::AppEvents;
+use crate::daemon::Config;
+use crate::daemon::Daemon;
+use crate::http::AppState;
+use crate::http::SocketConnections;
+use crate::session::Sessions;
+use crate::video::VideoHub;
 
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(8);
 
@@ -103,7 +109,7 @@ async fn main() -> Result<()> {
     let hub = VideoHub::new();
     let events = AppEvents::new();
     let (daemon, mut daemon_task) = Daemon::start(
-        Config {
+        &Config {
             path: options.streamd,
             frame_rate: options.frame_rate,
             bitrate: options.bitrate,
@@ -112,8 +118,7 @@ async fn main() -> Result<()> {
         rtp,
         events,
         hub.clone(),
-    )
-    .await?;
+    )?;
     let sessions = Sessions::new(
         daemon.state.clone(),
         daemon.commands.clone(),
@@ -169,11 +174,11 @@ async fn finish_shutdown(
     server: &mut JoinHandle<Result<()>>,
 ) -> Result<()> {
     connections.begin_shutdown();
-    let _ = shutdown_server.send(true);
+    let _shutdown_result = shutdown_server.send(true);
     let deadline = Instant::now() + SHUTDOWN_DEADLINE;
     let sockets_result = timeout_at(deadline, connections.wait())
         .await
-        .map_err(|_| anyhow!("WebSocket shutdown exceeded eight seconds"));
+        .map_err(|_elapsed| anyhow!("WebSocket shutdown exceeded eight seconds"));
     daemon.shutdown().await;
 
     match stop {
@@ -205,7 +210,7 @@ async fn finish_shutdown(
 async fn join_task(deadline: Instant, name: &str, task: &mut JoinHandle<Result<()>>) -> Result<()> {
     timeout_at(deadline, task)
         .await
-        .map_err(|_| anyhow!("{name} did not stop before the shutdown deadline"))?
+        .map_err(|_elapsed| anyhow!("{name} did not stop before the shutdown deadline"))?
         .with_context(|| format!("join {name}"))?
 }
 
@@ -219,8 +224,9 @@ async fn shutdown_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::serve::Listener;
+
+    use super::*;
 
     #[test]
     fn desktop_defaults_use_sixty_fps_and_sixteen_megabit_video() {
@@ -231,7 +237,7 @@ mod tests {
             "--public-url",
             "https://example.test",
         ])
-        .unwrap();
+        .expect("gateway defaults should parse from valid test arguments");
         assert_eq!(options.frame_rate, 60);
         assert_eq!(options.bitrate, 16_000);
     }
@@ -239,7 +245,7 @@ mod tests {
     #[test]
     fn canonical_origin_strips_path_and_rejects_foreign_shapes() {
         assert_eq!(
-            parse_origin("https://example.test/a").unwrap(),
+            parse_origin("https://example.test/a").expect("absolute HTTPS test URL should parse"),
             "https://example.test"
         );
         assert!(parse_origin("example.test").is_err());
@@ -248,11 +254,22 @@ mod tests {
 
     #[tokio::test]
     async fn production_http_listener_sets_nodelay() {
-        let mut listener = http_listener("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let mut listener = http_listener("127.0.0.1:0")
+            .await
+            .expect("test HTTP listener should bind to a loopback port");
+        let address = listener
+            .local_addr()
+            .expect("bound test HTTP listener should have a local address");
         let client = tokio::spawn(tokio::net::TcpStream::connect(address));
         let (accepted, _) = listener.accept().await;
-        client.await.unwrap().unwrap();
-        assert!(accepted.nodelay().unwrap());
+        client
+            .await
+            .expect("test TCP client task should finish")
+            .expect("test TCP client should connect");
+        assert!(
+            accepted
+                .nodelay()
+                .expect("accepted test connection should report TCP_NODELAY")
+        );
     }
 }

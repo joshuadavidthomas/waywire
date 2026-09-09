@@ -1,28 +1,30 @@
-use std::{ffi::CString, fs::File, os::fd::AsFd};
+use std::fs::File;
+use std::os::fd::AsFd;
 
-use anyhow::{Context, Result, bail};
-use memmap2::{MmapMut, MmapOptions};
-use nix::{
-    sys::memfd::{MFdFlags, memfd_create},
-    unistd::ftruncate,
-};
-use wayland_client::{
-    QueueHandle, WEnum,
-    protocol::{wl_buffer, wl_output, wl_seat, wl_shm},
-};
-use wayland_protocols::ext::{
-    image_capture_source::v1::client::ext_output_image_capture_source_manager_v1,
-    image_copy_capture::v1::client::{
-        ext_image_copy_capture_cursor_session_v1, ext_image_copy_capture_frame_v1,
-        ext_image_copy_capture_manager_v1, ext_image_copy_capture_session_v1,
-    },
-};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use memmap2::MmapMut;
+use memmap2::MmapOptions;
+use nix::sys::memfd::MFdFlags;
+use nix::sys::memfd::memfd_create;
+use nix::unistd::ftruncate;
+use wayland_client::QueueHandle;
+use wayland_client::WEnum;
+use wayland_client::protocol::wl_buffer;
+use wayland_client::protocol::wl_output;
+use wayland_client::protocol::wl_seat;
+use wayland_client::protocol::wl_shm;
+use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_cursor_session_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_frame_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
 
 use super::State;
-use crate::{
-    event_writer::EventSink,
-    protocol::{Event, cursor_byte_count},
-};
+use crate::event_writer::EventSink;
+use crate::protocol::Event;
+use crate::protocol::cursor_byte_count;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Hotspot {
@@ -30,11 +32,28 @@ struct Hotspot {
     y: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ConstraintBatch {
+    #[default]
+    Idle,
+    Collecting {
+        argb: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Visibility {
+    #[default]
+    Unknown,
+    Visible,
+    Hidden,
+}
+
 pub struct Cursor {
     pub source_manager:
         Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
     pub capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
-    pub cursor_session:
+    pub pointer_session:
         Option<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1>,
     pub session: Option<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1>,
     pub frame: Option<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1>,
@@ -45,14 +64,13 @@ pub struct Cursor {
     has_pointer: bool,
     pub(super) batch_width: Option<u32>,
     pub(super) batch_height: Option<u32>,
-    pub(super) batch_argb: bool,
-    collecting_constraints: bool,
+    constraint_batch: ConstraintBatch,
     pending_hotspot: Hotspot,
     committed_hotspot: Hotspot,
     transform_normal: bool,
     force_publish: bool,
     published: Option<(u32, u32, Hotspot, Vec<u8>)>,
-    visibility: Option<bool>,
+    visibility: Visibility,
     events: EventSink,
 }
 
@@ -61,7 +79,7 @@ impl Cursor {
         Self {
             source_manager: None,
             capture_manager: None,
-            cursor_session: None,
+            pointer_session: None,
             session: None,
             frame: None,
             buffer: None,
@@ -71,14 +89,13 @@ impl Cursor {
             has_pointer: false,
             batch_width: None,
             batch_height: None,
-            batch_argb: false,
-            collecting_constraints: false,
+            constraint_batch: ConstraintBatch::Idle,
             pending_hotspot: Hotspot::default(),
             committed_hotspot: Hotspot::default(),
             transform_normal: false,
             force_publish: true,
             published: None,
-            visibility: None,
+            visibility: Visibility::Unknown,
             events,
         }
     }
@@ -109,23 +126,27 @@ impl Cursor {
             .context("missing image copy capture manager")?;
         let source = source_manager.create_source(output, qh, ());
         let pointer = seat.get_pointer(qh, ());
-        let cursor_session =
+        let pointer_session =
             capture_manager.create_pointer_cursor_session(&source, &pointer, qh, ());
-        let session = cursor_session.get_capture_session(qh, ());
+        let session = pointer_session.get_capture_session(qh, ());
         source.destroy();
         pointer.release();
-        self.cursor_session = Some(cursor_session);
+        self.pointer_session = Some(pointer_session);
         self.session = Some(session);
         Ok(())
     }
 
     pub fn begin_constraints(&mut self) {
-        if !self.collecting_constraints {
+        if self.constraint_batch == ConstraintBatch::Idle {
             self.batch_width = None;
             self.batch_height = None;
-            self.batch_argb = false;
-            self.collecting_constraints = true;
+            self.constraint_batch = ConstraintBatch::Collecting { argb: false };
         }
+    }
+
+    pub fn accept_argb(&mut self) {
+        self.begin_constraints();
+        self.constraint_batch = ConstraintBatch::Collecting { argb: true };
     }
 
     pub fn finish_constraints(
@@ -133,7 +154,7 @@ impl Cursor {
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
-        self.collecting_constraints = false;
+        let constraint_batch = std::mem::take(&mut self.constraint_batch);
         let width = self
             .batch_width
             .take()
@@ -142,7 +163,7 @@ impl Cursor {
             .batch_height
             .take()
             .context("cursor constraints omitted height")?;
-        if !std::mem::take(&mut self.batch_argb) {
+        if !matches!(constraint_batch, ConstraintBatch::Collecting { argb: true }) {
             bail!("cursor capture does not support ARGB8888 SHM");
         }
         self.destroy_frame();
@@ -165,11 +186,10 @@ impl Cursor {
             buffer.destroy();
         }
         self.mapping = None;
-        let name = CString::new("sprite-desktop-cursor").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC)?;
+        let fd = memfd_create(c"sprite-desktop-cursor", MFdFlags::MFD_CLOEXEC)?;
         ftruncate(&fd, i64::try_from(length)?)?;
         let file = File::from(fd);
-        // The map and Wayland buffer both retain the memfd storage independently.
+        // SAFETY: the map owns a duplicate of the valid memfd and uses its current length.
         let mapping = unsafe { MmapOptions::new().len(length).map_mut(&file)? };
         let pool = shm.create_pool(file.as_fd(), i32::try_from(length)?, qh, ());
         let buffer = pool.create_buffer(
@@ -200,7 +220,12 @@ impl Cursor {
         let buffer = self.buffer.as_ref().context("cursor buffer unavailable")?;
         let frame = session.create_frame(qh, ());
         frame.attach_buffer(buffer);
-        frame.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        frame.damage_buffer(
+            0,
+            0,
+            i32::try_from(self.width).context("cursor width exceeds protocol range")?,
+            i32::try_from(self.height).context("cursor height exceeds protocol range")?,
+        );
         frame.capture();
         self.transform_normal = false;
         self.frame = Some(frame);
@@ -225,7 +250,7 @@ impl Cursor {
                 || published.3 != pixels
         });
         if changed || self.force_publish {
-            self.events.send(Event::CursorImage {
+            self.events.send(&Event::CursorImage {
                 width: self.width,
                 height: self.height,
                 hotspot_x: self.committed_hotspot.x,
@@ -245,7 +270,10 @@ impl Cursor {
         qh: &QueueHandle<State>,
     ) -> Result<()> {
         self.destroy_frame();
-        match failure_recovery(constraints_changed, self.collecting_constraints) {
+        match failure_recovery(
+            constraints_changed,
+            self.constraint_batch != ConstraintBatch::Idle,
+        ) {
             FailureRecovery::WaitForConstraints => Ok(()),
             FailureRecovery::Retry => self.request(qh),
             FailureRecovery::Reallocate => {
@@ -272,14 +300,19 @@ impl Cursor {
     }
 
     pub fn visibility(&mut self, visible: bool) -> Result<()> {
-        if self.visibility == Some(visible) {
+        let visibility = if visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if self.visibility == visibility {
             return Ok(());
         }
         if visible {
             self.force_publish = true;
         }
-        self.events.send(Event::CursorVisibility(visible))?;
-        self.visibility = Some(visible);
+        self.events.send(&Event::CursorVisibility(visible))?;
+        self.visibility = visibility;
         Ok(())
     }
 

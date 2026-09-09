@@ -1,7 +1,10 @@
-use anyhow::{Result, anyhow};
-use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Serialize;
 use std::io::Cursor;
+
+use anyhow::Context;
+use anyhow::Result;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,7 +42,7 @@ impl CursorState {
     ) -> Result<Self> {
         let image = tokio::task::spawn_blocking(move || encode(width, height, &bgra))
             .await
-            .map_err(|_| anyhow!("cursor encoder panicked"))??;
+            .context("cursor encoder task failed")??;
         let mut next = self.clone();
         next.width = width;
         next.height = height;
@@ -85,7 +88,7 @@ mod tests {
         let state = CursorState::default()
             .with_image(1, 1, -2, 3, vec![16, 32, 64, 128])
             .await
-            .unwrap();
+            .expect("test cursor image should encode");
         assert!(state.image.starts_with("data:image/png;base64,"));
         assert_eq!(state.hotspot_x, -2);
     }

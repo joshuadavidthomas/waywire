@@ -1,13 +1,18 @@
-use crate::{
-    daemon::{CommandSink, RuntimeState},
-    protocol::{BrowserCommand, DaemonCommand, Feedback},
-};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
+
 use anyhow::Result;
-use std::{
-    sync::{Arc, Mutex, atomic::Ordering},
-    time::{Duration, Instant},
-};
 use tokio::sync::Mutex as AsyncMutex;
+
+use crate::daemon::CommandSink;
+use crate::daemon::RuntimeState;
+use crate::protocol::BrowserCommand;
+use crate::protocol::DaemonCommand;
+use crate::protocol::Feedback;
 
 #[derive(Clone)]
 pub struct Sessions {
@@ -25,6 +30,14 @@ struct Lease {
     socket: u64,
     epoch: u64,
 }
+
+fn lock_quality(quality: &Mutex<Quality>) -> MutexGuard<'_, Quality> {
+    match quality.lock() {
+        Ok(quality) => quality,
+        Err(error) => panic!("session quality mutex poisoned: {error}"),
+    }
+}
+
 impl Sessions {
     pub fn new(state: RuntimeState, commands: CommandSink, bitrate: u32, fps: u32) -> Self {
         Self {
@@ -115,7 +128,7 @@ impl Sessions {
         Ok(())
     }
     pub fn quality(&self) -> (u32, u32, u32) {
-        self.quality.lock().unwrap().values()
+        lock_quality(&self.quality).values()
     }
     pub async fn feedback(
         &self,
@@ -126,7 +139,7 @@ impl Sessions {
             return Ok(None);
         };
         let command = {
-            let mut quality = self.quality.lock().unwrap();
+            let mut quality = lock_quality(&self.quality);
             quality
                 .update(&feedback, Instant::now())
                 .then(|| DaemonCommand::Quality {
@@ -158,6 +171,7 @@ struct Quality {
 }
 impl Quality {
     fn new(bitrate: u32, fps: u32) -> Self {
+        let now = Instant::now();
         Self {
             bitrate,
             fps,
@@ -166,7 +180,7 @@ impl Quality {
             max_fps: fps,
             bad: 0,
             good: 0,
-            last: Instant::now() - Duration::from_secs(6),
+            last: now.checked_sub(Duration::from_secs(6)).unwrap_or(now),
         }
     }
     fn values(&self) -> (u32, u32, u32) {
@@ -255,7 +269,9 @@ mod tests {
         assert!(!quality.update(&feedback(50, 50, 5, 200.0, 0, 20.0), now));
         assert!(quality.update(&feedback(50, 50, 5, 200.0, 0, 20.0), now));
         assert_eq!(quality.values(), (6400, 60, 100));
-        quality.last = now - Duration::from_secs(6);
+        quality.last = now
+            .checked_sub(Duration::from_secs(6))
+            .expect("test instant should be at least six seconds after its minimum");
         for _ in 0..7 {
             assert!(!quality.update(&feedback(50, 45, 0, 0.0, 0, 20.0), now));
         }

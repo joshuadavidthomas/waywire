@@ -1,33 +1,44 @@
-use crate::{
-    cursor::CursorState,
-    protocol::{DaemonCommand, DaemonEvent, EventReader},
-    video::{VideoHub, VideoPipeline, VideoWorker},
-};
-use anyhow::{Context, Result, anyhow};
-use nix::{
-    sys::{
-        signal::{Signal, kill},
-        wait::{Id, WaitPidFlag, WaitStatus, waitid},
-    },
-    unistd::Pid,
-};
+use std::os::unix::process::CommandExt;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use nix::sys::signal::Signal;
+use nix::sys::signal::kill;
+use nix::sys::wait::Id;
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
+use nix::sys::wait::waitid;
+use nix::unistd::Pid;
 use serde_json::json;
-use std::{
-    os::unix::process::CommandExt,
-    process::Stdio,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
-use tokio::{
-    io::AsyncWriteExt,
-    net::UdpSocket,
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
-    time::{Instant, sleep, timeout},
-};
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
+use tokio::process::Child;
+use tokio::process::ChildStdin;
+use tokio::process::ChildStdout;
+use tokio::process::Command;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
+
+use crate::cursor::CursorState;
+use crate::protocol::DaemonCommand;
+use crate::protocol::DaemonEvent;
+use crate::protocol::EventReader;
+use crate::video::VideoHub;
+use crate::video::VideoPipeline;
+use crate::video::VideoWorker;
 
 const COMMAND_COUNT: usize = 128;
 const COMMAND_BYTES: usize = 2 * 1024 * 1024;
@@ -58,6 +69,14 @@ enum ReadinessState {
     WaitingForKeyframe,
     Failed,
 }
+
+fn lock_readiness(state: &Mutex<ReadinessState>) -> MutexGuard<'_, ReadinessState> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(error) => panic!("daemon readiness mutex poisoned: {error}"),
+    }
+}
+
 impl Readiness {
     fn new() -> Self {
         Self {
@@ -65,25 +84,25 @@ impl Readiness {
         }
     }
     pub(crate) fn mark_video_ready(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_readiness(&self.state);
         if *state != ReadinessState::Failed {
             *state = ReadinessState::Ready;
         }
     }
     pub(crate) fn await_keyframe(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_readiness(&self.state);
         if *state == ReadinessState::Ready {
             *state = ReadinessState::WaitingForKeyframe;
         }
     }
     pub(crate) fn failed(&self) {
-        *self.state.lock().unwrap() = ReadinessState::Failed;
+        *lock_readiness(&self.state) = ReadinessState::Failed;
     }
     pub(crate) fn is_ready(&self) -> bool {
-        *self.state.lock().unwrap() == ReadinessState::Ready
+        *lock_readiness(&self.state) == ReadinessState::Ready
     }
     pub(crate) fn needs_startup_frame(&self) -> bool {
-        *self.state.lock().unwrap() == ReadinessState::WaitingForFirstFrame
+        *lock_readiness(&self.state) == ReadinessState::WaitingForFirstFrame
     }
 }
 #[derive(Clone)]
@@ -92,6 +111,21 @@ pub struct AppEvents {
     latest_clipboard: Arc<Mutex<Option<String>>>,
     latest_cursor: Arc<Mutex<CursorState>>,
 }
+
+fn lock_clipboard(state: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(error) => panic!("daemon clipboard state mutex poisoned: {error}"),
+    }
+}
+
+fn lock_cursor(state: &Mutex<CursorState>) -> MutexGuard<'_, CursorState> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(error) => panic!("daemon cursor state mutex poisoned: {error}"),
+    }
+}
+
 impl AppEvents {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(64);
@@ -104,19 +138,21 @@ impl AppEvents {
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
     }
-    pub fn initial(&self) -> Vec<String> {
-        let mut values = vec![serde_json::to_string(&*self.latest_cursor.lock().unwrap()).unwrap()];
-        if let Some(value) = self.latest_clipboard.lock().unwrap().clone() {
+    pub fn initial(&self) -> Result<Vec<String>> {
+        let cursor = lock_cursor(&self.latest_cursor);
+        let mut values = vec![serde_json::to_string(&*cursor)?];
+        drop(cursor);
+        if let Some(value) = lock_clipboard(&self.latest_clipboard).clone() {
             values.push(value);
         }
-        values
+        Ok(values)
     }
     fn publish(&self, value: String) {
-        let _ = self.tx.send(value);
+        drop(self.tx.send(value));
     }
     fn reset(&self) {
-        *self.latest_clipboard.lock().unwrap() = None;
-        *self.latest_cursor.lock().unwrap() = CursorState::default();
+        *lock_clipboard(&self.latest_clipboard) = None;
+        *lock_cursor(&self.latest_cursor) = CursorState::default();
     }
 }
 enum Authority {
@@ -137,12 +173,14 @@ pub struct CommandSink {
 }
 impl CommandSink {
     async fn send(&self, authority: Authority, command: DaemonCommand) -> Result<()> {
-        let count =
-            u32::try_from(command.encoded_len()).map_err(|_| anyhow!("command length overflow"))?;
-        let permit = timeout(PIPE_DEADLINE, self.budget.clone().acquire_many_owned(count))
-            .await
-            .map_err(|_| anyhow!("daemon command byte budget stalled"))?
-            .map_err(|_| anyhow!("daemon command budget closed"))?;
+        let count = u32::try_from(command.encoded_len()).context("command length overflow")?;
+        let permit = timeout(
+            PIPE_DEADLINE,
+            Arc::clone(&self.budget).acquire_many_owned(count),
+        )
+        .await
+        .context("daemon command byte budget stalled")?
+        .context("daemon command budget closed")?;
         let request = Request {
             authority,
             command,
@@ -158,7 +196,7 @@ impl CommandSink {
         self.readiness.failed();
         // The first fatal error shuts down the session. Later failures need
         // neither additional queue space nor a second shutdown transition.
-        let _ = self.fatal.try_send(message.to_owned());
+        drop(self.fatal.try_send(message.to_owned()));
         Err(anyhow!(message.to_owned()))
     }
     pub async fn system(&self, command: DaemonCommand) -> Result<()> {
@@ -187,8 +225,8 @@ pub struct Config {
     pub xkb_layout: String,
 }
 impl Daemon {
-    pub async fn start(
-        config: Config,
+    pub fn start(
+        config: &Config,
         socket: UdpSocket,
         events: AppEvents,
         hub: VideoHub,
@@ -205,7 +243,7 @@ impl Daemon {
         };
         let (shutdown, shutdown_rx) = mpsc::channel(1);
         let (pipeline, video_worker) = VideoPipeline::new(hub, commands.clone(), readiness.clone());
-        let process = spawn_daemon(&config, socket.local_addr()?.port())?;
+        let process = spawn_daemon(config, socket.local_addr()?.port())?;
         events.reset();
         let state = RuntimeState {
             readiness,
@@ -230,7 +268,7 @@ impl Daemon {
         ))
     }
     pub async fn shutdown(&self) {
-        let _ = self.shutdown.send(()).await;
+        let _send_result = self.shutdown.send(()).await;
     }
 }
 
@@ -255,9 +293,12 @@ fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<(Child, i32, ChildStdi
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn private daemon {}", config.path))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow!("daemon has no process ID"))? as i32;
+    let pid = i32::try_from(
+        child
+            .id()
+            .ok_or_else(|| anyhow!("daemon has no process ID"))?,
+    )
+    .context("daemon process ID exceeds i32")?;
     let stdin = child.stdin.take().context("open daemon stdin")?;
     let stdout = child.stdout.take().context("open daemon stdout")?;
     Ok((child, pid, stdin, stdout))
@@ -280,7 +321,7 @@ async fn supervise_daemon(
     // Drop the pipe futures before signalling the process group so native EOF
     // cleanup can make progress.
     let result = async {
-        let writer = write_commands(stdin, command_rx, state.active_lease.clone());
+        let writer = write_commands(stdin, command_rx, Arc::clone(&state.active_lease));
         let reader = read_events(stdout, state.events.clone(), pipeline.clone());
         let rtp = pipeline.receive(socket);
         let video = video_worker.run();
@@ -329,10 +370,10 @@ async fn write_commands(
         {
             continue;
         }
-        let bytes = request.command.encode();
+        let bytes = request.command.encode()?;
         timeout(PIPE_DEADLINE, output.write_all(&bytes))
             .await
-            .map_err(|_| anyhow!("daemon stdin stalled"))??;
+            .context("daemon stdin stalled")??;
     }
     Err(anyhow!("command queue closed"))
 }
@@ -347,7 +388,7 @@ async fn read_events(
             DaemonEvent::Frame(metadata) => pipeline.metadata(metadata).await?,
             DaemonEvent::Clipboard(text) => {
                 let value = json!({"type":"clipboard","text":text}).to_string();
-                *events.latest_clipboard.lock().unwrap() = Some(value.clone());
+                *lock_clipboard(&events.latest_clipboard) = Some(value.clone());
                 events.publish(value);
             }
             DaemonEvent::ResizeApplied {
@@ -361,12 +402,8 @@ async fn read_events(
                     .to_string(),
             ),
             DaemonEvent::CursorVisibility(visible) => {
-                let next = events
-                    .latest_cursor
-                    .lock()
-                    .unwrap()
-                    .with_visibility(visible);
-                *events.latest_cursor.lock().unwrap() = next.clone();
+                let next = lock_cursor(&events.latest_cursor).with_visibility(visible);
+                *lock_cursor(&events.latest_cursor) = next.clone();
                 events.publish(serde_json::to_string(&next)?);
             }
             DaemonEvent::CursorImage {
@@ -376,11 +413,11 @@ async fn read_events(
                 hotspot_y,
                 bgra,
             } => {
-                let current = events.latest_cursor.lock().unwrap().clone();
+                let current = lock_cursor(&events.latest_cursor).clone();
                 let next = current
                     .with_image(width, height, hotspot_x, hotspot_y, bgra)
                     .await?;
-                *events.latest_cursor.lock().unwrap() = next.clone();
+                *lock_cursor(&events.latest_cursor) = next.clone();
                 events.publish(serde_json::to_string(&next)?);
             }
         }
@@ -395,27 +432,32 @@ async fn wait_for_leader_exit(pid: i32) -> Result<()> {
             WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
         )? {
             WaitStatus::StillAlive => sleep(Duration::from_millis(25)).await,
-            _ => return Ok(()),
+            WaitStatus::Exited(..)
+            | WaitStatus::Signaled(..)
+            | WaitStatus::Stopped(..)
+            | WaitStatus::PtraceEvent(..)
+            | WaitStatus::PtraceSyscall(_)
+            | WaitStatus::Continued(_) => return Ok(()),
         }
     }
 }
 async fn cleanup_group(child: &mut Child, pid: i32) -> Result<()> {
     let group = Pid::from_raw(-pid);
-    let _ = kill(group, Signal::SIGTERM);
+    let _term_result = kill(group, Signal::SIGTERM);
     let deadline = Instant::now() + GROUP_EXIT_DEADLINE;
     loop {
         if kill(group, None).is_err() {
             break;
         }
         if Instant::now() >= deadline {
-            let _ = kill(group, Signal::SIGKILL);
+            let _kill_result = kill(group, Signal::SIGKILL);
             break;
         }
         sleep(Duration::from_millis(25)).await;
     }
-    let _ = timeout(GROUP_EXIT_DEADLINE, child.wait())
+    timeout(GROUP_EXIT_DEADLINE, child.wait())
         .await
-        .map_err(|_| anyhow!("daemon leader could not be reaped"))??;
+        .context("daemon leader could not be reaped")??;
     Ok(())
 }
 

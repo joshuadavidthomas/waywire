@@ -8,6 +8,32 @@ rust-version = "1.97.0"
 version = "0.1.0-dev"
 publish = false
 
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# pedantic
+missing_errors_doc = "allow"
+
+# restriction
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+expect_used = "warn"
+get_unwrap = "warn"
+let_underscore_must_use = "warn"
+map_err_ignore = "warn"
+mem_forget = "warn"
+mod_module_files = "warn"
+multiple_unsafe_ops_per_block = "warn"
+panic_in_result_fn = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unused_result_ok = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+wildcard_enum_match_arm = "warn"
+
 [workspace.dependencies]
 anyhow = "1.0.100"
 axum = { version = "0.8.9", features = ["ws"] }

@@ -1,22 +1,40 @@
-use std::{
-    io::{self, Write},
-    os::{fd::AsFd, unix::process::CommandExt},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::{Arc, Condvar, Mutex, mpsc},
-    thread,
-    time::{Duration, Instant},
+use std::io::Write;
+use std::io::{
+    self,
 };
+use std::ops::ControlFlow;
+use std::os::fd::AsFd;
+use std::os::unix::process::CommandExt;
+use std::process::Child;
+use std::process::ChildStdin;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
-use calloop::ping::{Ping, PingSource, make_ping};
-use nix::{
-    errno::Errno,
-    fcntl::{FcntlArg, OFlag, fcntl},
-    poll::{PollFd, PollFlags, poll},
-    sys::signal::{SigSet, SigmaskHow, pthread_sigmask},
-};
+use calloop::ping::Ping;
+use calloop::ping::PingSource;
+use calloop::ping::make_ping;
+use nix::errno::Errno;
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
+use nix::poll::PollFd;
+use nix::poll::PollFlags;
+use nix::poll::poll;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::SigmaskHow;
+use nix::sys::signal::pthread_sigmask;
 use thiserror::Error;
 
-use crate::protocol::{FrameMetadata, MAX_RAW_PIXELS};
+use crate::protocol::FrameMetadata;
+use crate::protocol::MAX_RAW_PIXELS;
 
 const SLOT_COUNT: usize = 3;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
@@ -54,7 +72,7 @@ impl EncoderConfig {
             return Err(VideoError::InvalidFrame);
         }
         usize::try_from(pixels.checked_mul(4).ok_or(VideoError::InvalidFrame)?)
-            .map_err(|_| VideoError::InvalidFrame)
+            .map_err(|_overflow| VideoError::InvalidFrame)
     }
 }
 
@@ -162,6 +180,33 @@ struct Shared {
     work: Condvar,
 }
 
+fn lock_pool(shared: &Shared) -> MutexGuard<'_, Pool> {
+    match shared.pool.lock() {
+        Ok(pool) => pool,
+        Err(error) => panic!("video frame pool mutex poisoned: {error}"),
+    }
+}
+
+fn wait_for_pool<'a>(work: &Condvar, pool: MutexGuard<'a, Pool>) -> MutexGuard<'a, Pool> {
+    match work.wait(pool) {
+        Ok(pool) => pool,
+        Err(error) => panic!("video frame pool mutex poisoned while waiting for work: {error}"),
+    }
+}
+
+fn wait_for_pool_timeout<'a>(
+    work: &Condvar,
+    pool: MutexGuard<'a, Pool>,
+    timeout: Duration,
+) -> MutexGuard<'a, Pool> {
+    match work.wait_timeout(pool, timeout) {
+        Ok((pool, _timeout)) => pool,
+        Err(error) => {
+            panic!("video frame pool mutex poisoned while waiting for timed work: {error}")
+        }
+    }
+}
+
 pub struct VideoEncoder {
     shared: Arc<Shared>,
     notifications: mpsc::Receiver<Notification>,
@@ -209,18 +254,20 @@ impl VideoEncoder {
         let worker = thread::Builder::new()
             .name("streamd-ffmpeg".into())
             .spawn(move || {
-                worker_main(
-                    worker_shared,
-                    notifications_tx,
-                    notification_wake,
-                    ffmpeg,
+                Worker {
+                    shared: &worker_shared,
+                    notifications: &notifications_tx,
+                    notification_wake: &notification_wake,
+                    ffmpeg: &ffmpeg,
                     rtp_port,
-                    RestartBackoff {
+                    process: None,
+                    restart: RestartState::new(RestartBackoff {
                         min: restart_delay_min,
                         max: restart_delay_max,
-                    },
-                    spawn,
-                )
+                    }),
+                    consecutive_spawn_failures: 0,
+                }
+                .run(spawn);
             })?;
         Ok(Self {
             shared,
@@ -232,17 +279,16 @@ impl VideoEncoder {
 
     pub(crate) fn submit(&self, frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
         frame.validate()?;
-        let mut pool = self.shared.pool.lock().unwrap();
+        let mut pool = lock_pool(&self.shared);
         if pool.stopping {
             return Err(VideoError::Stopped);
         }
         if frame.metadata.generation != pool.generation {
             return Err(VideoError::InvalidFrame);
         }
-        let result = if let Some(slot) = pool.pending {
-            let FrameSlot::Pending(pending) = &mut pool.slots[slot] else {
-                unreachable!("pending slot state disagrees with pool index");
-            };
+        let result = if let Some(slot) = pool.pending
+            && let FrameSlot::Pending(pending) = &mut pool.slots[slot]
+        {
             pending.replace_from(frame);
             SubmitResult::ReplacedPending
         } else {
@@ -251,10 +297,11 @@ impl VideoEncoder {
                 .find(|index| matches!(pool.slots[*index], FrameSlot::Free(_)))
                 .ok_or(VideoError::PoolExhausted)?;
             pool.next_free = (slot + 1) % SLOT_COUNT;
-            let FrameSlot::Free(storage) =
-                std::mem::replace(&mut pool.slots[slot], FrameSlot::Free(Vec::new()))
-            else {
-                unreachable!("selected frame slot is not free");
+            let storage = match &mut pool.slots[slot] {
+                FrameSlot::Free(storage) => std::mem::take(storage),
+                FrameSlot::Pending(_) | FrameSlot::Encoding => {
+                    return Err(VideoError::PoolExhausted);
+                }
             };
             pool.slots[slot] = FrameSlot::Pending(RawFrame::copy_from(storage, frame));
             pool.pending = Some(slot);
@@ -265,7 +312,7 @@ impl VideoEncoder {
     }
 
     pub fn set_generation(&self, generation: u32) -> Result<(), VideoError> {
-        let mut pool = self.shared.pool.lock().unwrap();
+        let mut pool = lock_pool(&self.shared);
         if pool.stopping {
             return Err(VideoError::Stopped);
         }
@@ -279,12 +326,13 @@ impl VideoEncoder {
                 FrameSlot::Pending(frame) if frame.metadata.generation != generation
             );
             if discard {
-                let FrameSlot::Pending(frame) =
-                    std::mem::replace(&mut pool.slots[slot], FrameSlot::Free(Vec::new()))
-                else {
-                    unreachable!("pending slot state disagrees with pool index");
-                };
-                pool.slots[slot] = FrameSlot::Free(frame.pixels);
+                let salvaged =
+                    match std::mem::replace(&mut pool.slots[slot], FrameSlot::Free(Vec::new())) {
+                        FrameSlot::Pending(frame) => frame.pixels,
+                        FrameSlot::Free(pixels) => pixels,
+                        FrameSlot::Encoding => Vec::new(),
+                    };
+                pool.slots[slot] = FrameSlot::Free(salvaged);
                 pool.pending = None;
             }
         }
@@ -299,14 +347,12 @@ impl VideoEncoder {
     pub fn try_notification(&self) -> Option<Notification> {
         match self.notifications.try_recv() {
             Ok(notification) => Some(notification),
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => self
-                .shared
-                .pool
-                .lock()
-                .unwrap()
-                .notification_failure
-                .take()
-                .map(Notification::Fatal),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                lock_pool(&self.shared)
+                    .notification_failure
+                    .take()
+                    .map(Notification::Fatal)
+            }
         }
     }
 
@@ -316,18 +362,18 @@ impl VideoEncoder {
 
     fn stop_inner(&mut self) {
         {
-            let mut pool = self.shared.pool.lock().unwrap();
+            let mut pool = lock_pool(&self.shared);
             pool.stopping = true;
             self.shared.work.notify_all();
         }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            drop(worker.join());
         }
     }
 
     #[cfg(test)]
     fn child_pid(&self) -> Option<u32> {
-        self.shared.pool.lock().unwrap().child_pid
+        lock_pool(&self.shared).child_pid
     }
 }
 
@@ -357,6 +403,12 @@ enum EncoderTransition {
     RequestNewGeneration,
 }
 
+enum TransitionOutcome {
+    Proceed(usize, RawFrame),
+    Retry,
+    Stop,
+}
+
 fn encoder_transition(
     active_config: EncoderConfig,
     active_generation: u32,
@@ -380,202 +432,283 @@ impl EncoderProcess {
 }
 
 fn reap_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) | Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        drop(child.kill());
+        drop(child.wait());
     }
 }
 
-fn worker_main<F>(
-    shared: Arc<Shared>,
-    notifications: mpsc::SyncSender<Notification>,
-    notification_wake: Ping,
-    ffmpeg: String,
+struct RestartState {
+    retry_at: Option<Instant>,
+    delay: Duration,
+    backoff: RestartBackoff,
+}
+
+impl RestartState {
+    fn new(backoff: RestartBackoff) -> Self {
+        Self {
+            retry_at: None,
+            delay: backoff.min,
+            backoff,
+        }
+    }
+
+    fn schedule(&mut self) {
+        self.retry_at = Some(Instant::now() + self.delay);
+        self.delay = (self.delay * 2).min(self.backoff.max);
+    }
+
+    fn reset(&mut self) {
+        self.delay = self.backoff.min;
+    }
+}
+
+fn child_has_exited(active: &mut EncoderProcess) -> bool {
+    active.child.try_wait().ok().flatten().is_some()
+}
+
+struct Worker<'a> {
+    shared: &'a Shared,
+    notifications: &'a mpsc::SyncSender<Notification>,
+    notification_wake: &'a Ping,
+    ffmpeg: &'a str,
     rtp_port: u16,
-    restart_backoff: RestartBackoff,
-    mut spawn: F,
-) where
-    F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess>,
-{
-    let mut process: Option<EncoderProcess> = None;
-    let mut restart_delay = restart_backoff.min;
-    let mut retry_at: Option<Instant> = None;
-    let mut consecutive_spawn_failures = 0_u8;
+    process: Option<EncoderProcess>,
+    restart: RestartState,
+    consecutive_spawn_failures: u8,
+}
 
-    loop {
-        if is_stopping(&shared) {
-            stop_process(&shared, process.take());
-            return;
-        }
-
-        if process
-            .as_mut()
-            .is_some_and(|active| active.child.try_wait().ok().flatten().is_some())
-        {
-            let exited = process.take().unwrap();
-            let generation = exited.generation;
-            stop_process(&shared, Some(exited));
-            if current_generation(&shared) == generation {
-                if !request_new_generation(&shared, &notifications, &notification_wake, generation)
-                {
-                    return;
-                }
-                retry_at = Some(Instant::now() + restart_delay);
-                restart_delay = (restart_delay * 2).min(restart_backoff.max);
+impl Worker<'_> {
+    fn on_process_exit(&mut self, exited: EncoderProcess) -> ControlFlow<()> {
+        let generation = exited.generation;
+        stop_process(self.shared, Some(exited));
+        if current_generation(self.shared) == generation {
+            if !request_new_generation(
+                self.shared,
+                self.notifications,
+                self.notification_wake,
+                generation,
+            ) {
+                return ControlFlow::Break(());
             }
-            continue;
+            self.restart.schedule();
         }
+        ControlFlow::Continue(())
+    }
 
-        if let Some(wait_until) = retry_at.take()
-            && !wait_until_or_stop(&shared, wait_until)
-        {
-            stop_process(&shared, process.take());
-            return;
+    fn handle_spawn_failure(
+        &mut self,
+        slot: usize,
+        frame: RawFrame,
+        error: &io::Error,
+    ) -> ControlFlow<()> {
+        eprintln!("sprite-desktop-streamd: could not start ffmpeg: {error}");
+        self.consecutive_spawn_failures = self.consecutive_spawn_failures.saturating_add(1);
+        if self.consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
+            release_slot(self.shared, slot, frame);
+            let attempts = self.consecutive_spawn_failures;
+            let _ = send_notification(
+                self.shared,
+                self.notifications,
+                self.notification_wake,
+                Notification::Fatal(format!(
+                    "video encoder could not start after {attempts} attempts: {error}"
+                )),
+            );
+            return ControlFlow::Break(());
         }
+        self.restart.schedule();
+        requeue_after_spawn_failure(self.shared, slot, frame);
+        ControlFlow::Continue(())
+    }
 
-        let Some((slot, frame)) = take_pending_frame(&shared) else {
-            continue;
-        };
-
-        if frame.metadata.generation != current_generation(&shared) {
-            release_slot(&shared, slot, frame);
-            continue;
-        }
-
-        let child_exited = process
-            .as_mut()
-            .is_some_and(|active| active.child.try_wait().ok().flatten().is_some());
-        if child_exited {
-            let exited = process.take().unwrap();
-            let generation = exited.generation;
-            stop_process(&shared, Some(exited));
-            release_slot(&shared, slot, frame);
-            if current_generation(&shared) == generation {
-                if !request_new_generation(&shared, &notifications, &notification_wake, generation)
-                {
-                    return;
-                }
-                retry_at = Some(Instant::now() + restart_delay);
-                restart_delay = (restart_delay * 2).min(restart_backoff.max);
-            }
-            continue;
-        }
-
-        let transition = process.as_ref().map_or(EncoderTransition::Reuse, |active| {
-            encoder_transition(
-                active.config,
-                active.generation,
-                frame.config,
-                frame.metadata.generation,
-            )
-        });
+    fn apply_transition(&mut self, slot: usize, frame: RawFrame) -> TransitionOutcome {
+        let transition = self
+            .process
+            .as_ref()
+            .map_or(EncoderTransition::Reuse, |active| {
+                encoder_transition(
+                    active.config,
+                    active.generation,
+                    frame.config,
+                    frame.metadata.generation,
+                )
+            });
         match transition {
-            EncoderTransition::Reuse => {}
+            EncoderTransition::Reuse => TransitionOutcome::Proceed(slot, frame),
             EncoderTransition::ReplaceForGeneration => {
-                stop_process(&shared, process.take());
+                stop_process(self.shared, self.process.take());
+                TransitionOutcome::Proceed(slot, frame)
             }
             EncoderTransition::RequestNewGeneration => {
                 let generation = frame.metadata.generation;
-                stop_process(&shared, process.take());
-                release_slot(&shared, slot, frame);
-                if current_generation(&shared) == generation
+                stop_process(self.shared, self.process.take());
+                release_slot(self.shared, slot, frame);
+                if current_generation(self.shared) == generation
                     && !request_new_generation(
-                        &shared,
-                        &notifications,
-                        &notification_wake,
+                        self.shared,
+                        self.notifications,
+                        self.notification_wake,
                         generation,
                     )
                 {
+                    return TransitionOutcome::Stop;
+                }
+                TransitionOutcome::Retry
+            }
+        }
+    }
+
+    fn handle_write_failure(
+        &mut self,
+        generation: u32,
+        frame_generation: u32,
+        slot: usize,
+        frame: RawFrame,
+        error: &io::Error,
+    ) -> ControlFlow<()> {
+        eprintln!("sprite-desktop-streamd: ffmpeg frame write failed: {error}");
+        stop_process(self.shared, self.process.take());
+        release_slot(self.shared, slot, frame);
+        if is_stopping(self.shared) {
+            return ControlFlow::Break(());
+        }
+        if current_generation(self.shared) != frame_generation {
+            return ControlFlow::Continue(());
+        }
+        if !request_new_generation(
+            self.shared,
+            self.notifications,
+            self.notification_wake,
+            generation,
+        ) {
+            return ControlFlow::Break(());
+        }
+        self.restart.schedule();
+        ControlFlow::Continue(())
+    }
+
+    fn run<F>(mut self, mut spawn: F)
+    where
+        F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess>,
+    {
+        loop {
+            if is_stopping(self.shared) {
+                stop_process(self.shared, self.process.take());
+                return;
+            }
+
+            if self.process.as_mut().is_some_and(child_has_exited) {
+                let Some(exited) = self.process.take() else {
+                    continue;
+                };
+                if self.on_process_exit(exited).is_break() {
                     return;
                 }
                 continue;
             }
-        }
 
-        if process.is_none() {
-            match spawn(&ffmpeg, rtp_port, frame.config, frame.metadata.generation) {
-                Ok(started) => {
-                    shared.pool.lock().unwrap().child_pid = Some(started.child.id());
-                    process = Some(started);
-                    consecutive_spawn_failures = 0;
-                }
-                Err(error) => {
-                    eprintln!("sprite-desktop-streamd: could not start ffmpeg: {error}");
-                    consecutive_spawn_failures = consecutive_spawn_failures.saturating_add(1);
-                    if consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
-                        release_slot(&shared, slot, frame);
-                        let _ = send_notification(
-                            &shared,
-                            &notifications,
-                            &notification_wake,
-                            Notification::Fatal(format!(
-                                "video encoder could not start after {consecutive_spawn_failures} attempts: {error}"
-                            )),
-                        );
-                        return;
-                    }
-                    retry_at = Some(Instant::now() + restart_delay);
-                    restart_delay = (restart_delay * 2).min(restart_backoff.max);
-                    requeue_after_spawn_failure(&shared, slot, frame);
-                    continue;
-                }
-            }
-        }
-
-        let active = process.as_mut().unwrap();
-        let frame_generation = frame.metadata.generation;
-        if let Err(error) = write_frame(&shared, &mut active.input, &frame.pixels, frame_generation)
-        {
-            let generation = active.generation;
-            eprintln!("sprite-desktop-streamd: ffmpeg frame write failed: {error}");
-            stop_process(&shared, process.take());
-            release_slot(&shared, slot, frame);
-            if is_stopping(&shared) {
+            if let Some(wait_until) = self.restart.retry_at.take()
+                && !wait_until_or_stop(self.shared, wait_until)
+            {
+                stop_process(self.shared, self.process.take());
                 return;
             }
-            if current_generation(&shared) != frame_generation {
+
+            let Some((slot, frame)) = take_pending_frame(self.shared) else {
+                continue;
+            };
+
+            if frame.metadata.generation != current_generation(self.shared) {
+                release_slot(self.shared, slot, frame);
                 continue;
             }
-            if !request_new_generation(&shared, &notifications, &notification_wake, generation) {
+
+            if self.process.as_mut().is_some_and(child_has_exited) {
+                let Some(exited) = self.process.take() else {
+                    release_slot(self.shared, slot, frame);
+                    continue;
+                };
+                release_slot(self.shared, slot, frame);
+                if self.on_process_exit(exited).is_break() {
+                    return;
+                }
+                continue;
+            }
+
+            let (slot, frame) = match self.apply_transition(slot, frame) {
+                TransitionOutcome::Proceed(slot, frame) => (slot, frame),
+                TransitionOutcome::Retry => continue,
+                TransitionOutcome::Stop => return,
+            };
+
+            if self.process.is_none() {
+                match spawn(
+                    self.ffmpeg,
+                    self.rtp_port,
+                    frame.config,
+                    frame.metadata.generation,
+                ) {
+                    Ok(started) => {
+                        lock_pool(self.shared).child_pid = Some(started.child.id());
+                        self.process = Some(started);
+                        self.consecutive_spawn_failures = 0;
+                    }
+                    Err(error) => match self.handle_spawn_failure(slot, frame, &error) {
+                        ControlFlow::Break(()) => return,
+                        ControlFlow::Continue(()) => continue,
+                    },
+                }
+            }
+
+            let Some(active) = self.process.as_mut() else {
+                release_slot(self.shared, slot, frame);
+                continue;
+            };
+            let frame_generation = frame.metadata.generation;
+            let write_result = write_frame(
+                self.shared,
+                &mut active.input,
+                &frame.pixels,
+                frame_generation,
+            );
+            if let Err(error) = write_result {
+                let generation = active.generation;
+                match self.handle_write_failure(generation, frame_generation, slot, frame, &error) {
+                    ControlFlow::Break(()) => return,
+                    ControlFlow::Continue(()) => continue,
+                }
+            }
+
+            // Correlation metadata follows only a complete raw-frame pipe write.
+            if !send_notification(
+                self.shared,
+                self.notifications,
+                self.notification_wake,
+                Notification::Submitted(frame.metadata.clone()),
+            ) {
+                stop_process(self.shared, self.process.take());
+                release_slot(self.shared, slot, frame);
                 return;
             }
-            retry_at = Some(Instant::now() + restart_delay);
-            restart_delay = (restart_delay * 2).min(restart_backoff.max);
-            continue;
+            self.restart.reset();
+            release_slot(self.shared, slot, frame);
         }
-
-        // Correlation metadata follows only a complete raw-frame pipe write.
-        if !send_notification(
-            &shared,
-            &notifications,
-            &notification_wake,
-            Notification::Submitted(frame.metadata.clone()),
-        ) {
-            stop_process(&shared, process.take());
-            release_slot(&shared, slot, frame);
-            return;
-        }
-        restart_delay = restart_backoff.min;
-        release_slot(&shared, slot, frame);
     }
 }
 
 fn take_pending_frame(shared: &Shared) -> Option<(usize, RawFrame)> {
-    let mut pool = shared.pool.lock().unwrap();
+    let mut pool = lock_pool(shared);
     if pool.pending.is_none() && !pool.stopping {
-        let (next, _) = shared.work.wait_timeout(pool, CHILD_POLL_INTERVAL).unwrap();
-        pool = next;
+        pool = wait_for_pool_timeout(&shared.work, pool, CHILD_POLL_INTERVAL);
     }
-    if pool.stopping || pool.pending.is_none() {
+    if pool.stopping {
         return None;
     }
-    let slot = pool.pending.take().unwrap();
+    let slot = pool.pending.take()?;
     let FrameSlot::Pending(frame) = std::mem::replace(&mut pool.slots[slot], FrameSlot::Encoding)
     else {
-        unreachable!("pending slot state disagrees with pool index");
+        return None;
     };
     pool.encoding = Some(slot);
     Some((slot, frame))
@@ -595,9 +728,9 @@ fn request_new_generation(
     ) {
         return false;
     }
-    let mut pool = shared.pool.lock().unwrap();
+    let mut pool = lock_pool(shared);
     while pool.generation == generation && !pool.stopping {
-        pool = shared.work.wait(pool).unwrap();
+        pool = wait_for_pool(&shared.work, pool);
     }
     !pool.stopping
 }
@@ -637,7 +770,7 @@ fn send_notification_until(
                 // event loop drained an earlier, coalesced ping.
                 notification_wake.ping();
                 notification = returned;
-                let mut pool = shared.pool.lock().unwrap();
+                let mut pool = lock_pool(shared);
                 if pool.stopping {
                     return false;
                 }
@@ -659,15 +792,13 @@ fn send_notification_until(
 
 fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> bool {
     while Instant::now() < deadline {
-        let pool = shared.pool.lock().unwrap();
+        let pool = lock_pool(shared);
         if pool.stopping {
             return false;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let (pool, _) = shared
-            .work
-            .wait_timeout(pool, remaining.min(Duration::from_millis(20)))
-            .unwrap();
+        let pool =
+            wait_for_pool_timeout(&shared.work, pool, remaining.min(Duration::from_millis(20)));
         if pool.stopping {
             return false;
         }
@@ -676,15 +807,15 @@ fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> bool {
 }
 
 fn is_stopping(shared: &Shared) -> bool {
-    shared.pool.lock().unwrap().stopping
+    lock_pool(shared).stopping
 }
 
 fn current_generation(shared: &Shared) -> u32 {
-    shared.pool.lock().unwrap().generation
+    lock_pool(shared).generation
 }
 
 fn release_slot(shared: &Shared, slot: usize, frame: RawFrame) {
-    let mut pool = shared.pool.lock().unwrap();
+    let mut pool = lock_pool(shared);
     assert_eq!(pool.encoding, Some(slot));
     assert!(matches!(pool.slots[slot], FrameSlot::Encoding));
     pool.encoding = None;
@@ -693,7 +824,7 @@ fn release_slot(shared: &Shared, slot: usize, frame: RawFrame) {
 }
 
 fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
-    let mut pool = shared.pool.lock().unwrap();
+    let mut pool = lock_pool(shared);
     assert_eq!(pool.encoding, Some(slot));
     assert!(matches!(pool.slots[slot], FrameSlot::Encoding));
     pool.encoding = None;
@@ -710,7 +841,7 @@ fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
 }
 
 fn stop_process(shared: &Shared, process: Option<EncoderProcess>) {
-    shared.pool.lock().unwrap().child_pid = None;
+    lock_pool(shared).child_pid = None;
     if let Some(process) = process {
         process.stop();
     }
@@ -733,12 +864,9 @@ fn spawn_ffmpeg(
         .stderr(Stdio::inherit());
     reset_signal_mask_before_exec(&mut command);
     let mut child = command.spawn()?;
-    let input = match child.stdin.take() {
-        Some(input) => input,
-        None => {
-            reap_child(&mut child);
-            return Err(io::Error::other("ffmpeg stdin unavailable"));
-        }
+    let Some(input) = child.stdin.take() else {
+        reap_child(&mut child);
+        return Err(io::Error::other("ffmpeg stdin unavailable"));
     };
     if let Err(error) = fcntl(&input, FcntlArg::F_SETPIPE_SZ(1024 * 1024)) {
         drop(input);
@@ -865,7 +993,7 @@ fn write_frame(
     let started = Instant::now();
     let mut written = 0;
     while written < bytes.len() {
-        let pool = shared.pool.lock().unwrap();
+        let pool = lock_pool(shared);
         if pool.stopping {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -917,11 +1045,21 @@ pub fn encoded_dimensions(
     const MAX_MACROBLOCKS_PER_SECOND: u32 = 2_073_600;
     let maximum = MAX_FRAME_MACROBLOCKS.min(MAX_MACROBLOCKS_PER_SECOND / fps);
     for scale in (1..=requested_scale).rev() {
-        let width = (raw_width * scale / 100).max(2) & !1;
-        let height = (raw_height * scale / 100).max(2) & !1;
-        let macroblocks = width.div_ceil(16) * height.div_ceil(16);
-        if macroblocks <= maximum {
-            return (width as u16, height as u16);
+        let Some(scaled_width) = raw_width.checked_mul(scale) else {
+            continue;
+        };
+        let Some(scaled_height) = raw_height.checked_mul(scale) else {
+            continue;
+        };
+        let width = (scaled_width / 100).max(2) & !1;
+        let height = (scaled_height / 100).max(2) & !1;
+        let Some(macroblocks) = width.div_ceil(16).checked_mul(height.div_ceil(16)) else {
+            continue;
+        };
+        if macroblocks <= maximum
+            && let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height))
+        {
+            return (width, height);
         }
     }
     (2, 2)

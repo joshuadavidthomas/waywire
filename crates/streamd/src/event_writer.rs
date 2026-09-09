@@ -1,12 +1,19 @@
-use std::{
-    collections::VecDeque,
-    io::{self, Write},
-    sync::{Arc, Condvar, Mutex},
-    thread,
-    time::{Duration, Instant},
+use std::collections::VecDeque;
+use std::io::Write;
+use std::io::{
+    self,
 };
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
 use thiserror::Error;
 
 use crate::protocol::Event;
@@ -39,6 +46,20 @@ struct Shared {
     ready: Condvar,
 }
 
+fn lock_queue(queue: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
+    match queue.lock() {
+        Ok(queue) => queue,
+        Err(error) => panic!("event writer queue mutex poisoned: {error}"),
+    }
+}
+
+fn wait_for_queue<'a>(ready: &Condvar, queue: MutexGuard<'a, Queue>) -> MutexGuard<'a, Queue> {
+    match ready.wait(queue) {
+        Ok(queue) => queue,
+        Err(error) => panic!("event writer queue mutex poisoned while waiting: {error}"),
+    }
+}
+
 #[derive(Clone)]
 pub struct EventSink {
     shared: Arc<Shared>,
@@ -63,7 +84,7 @@ impl EventWriter {
         let thread_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("streamd-events".into())
-            .spawn(move || writer_main(thread_shared))?;
+            .spawn(move || writer_main(&thread_shared))?;
         Ok((
             Self {
                 shared: Arc::clone(&shared),
@@ -74,10 +95,7 @@ impl EventWriter {
     }
 
     pub fn failure(&self) -> Option<EventWriterError> {
-        self.shared
-            .queue
-            .lock()
-            .unwrap()
+        lock_queue(&self.shared.queue)
             .failure
             .clone()
             .map(EventWriterError::Write)
@@ -89,12 +107,12 @@ impl EventWriter {
 
     fn stop_inner(&mut self) {
         {
-            let mut queue = self.shared.queue.lock().unwrap();
+            let mut queue = lock_queue(&self.shared.queue);
             queue.stopping = true;
             self.shared.ready.notify_one();
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            drop(thread.join());
         }
     }
 }
@@ -106,10 +124,10 @@ impl Drop for EventWriter {
 }
 
 impl EventSink {
-    pub fn send(&self, event: Event) -> Result<(), EventWriterError> {
+    pub fn send(&self, event: &Event) -> Result<(), EventWriterError> {
         let bytes = event.encode()?;
         let replaceable_kind = matches!(bytes.get(1), Some(4 | 5)).then(|| bytes[1]);
-        let mut queue = self.shared.queue.lock().unwrap();
+        let mut queue = lock_queue(&self.shared.queue);
         if let Some(failure) = &queue.failure {
             return Err(EventWriterError::Write(failure.clone()));
         }
@@ -145,34 +163,35 @@ impl EventSink {
     }
 }
 
-fn writer_main(shared: Arc<Shared>) {
+fn writer_main(shared: &Shared) {
     let stdout = io::stdout();
     if let Ok(raw_flags) = fcntl(&stdout, FcntlArg::F_GETFL) {
         let flags = OFlag::from_bits_truncate(raw_flags);
         if let Err(error) = fcntl(&stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-            shared.queue.lock().unwrap().failure = Some(error.to_string());
+            lock_queue(&shared.queue).failure = Some(error.to_string());
             return;
         }
     } else {
-        shared.queue.lock().unwrap().failure = Some("could not read stdout flags".into());
+        lock_queue(&shared.queue).failure = Some("could not read stdout flags".into());
         return;
     }
     let mut output = stdout.lock();
     loop {
         let record = {
-            let mut queue = shared.queue.lock().unwrap();
+            let mut queue = lock_queue(&shared.queue);
             while queue.records.is_empty() && !queue.stopping {
-                queue = shared.ready.wait(queue).unwrap();
+                queue = wait_for_queue(&shared.ready, queue);
             }
-            if queue.records.is_empty() && queue.stopping {
-                return;
+            match queue.records.pop_front() {
+                Some(record) => {
+                    queue.bytes -= record.len();
+                    record
+                }
+                None => return,
             }
-            let record = queue.records.pop_front().unwrap();
-            queue.bytes -= record.len();
-            record
         };
         if let Err(error) = write_with_deadline(&mut output, &record) {
-            let mut queue = shared.queue.lock().unwrap();
+            let mut queue = lock_queue(&shared.queue);
             queue.failure = Some(error.to_string());
             queue.records.clear();
             queue.bytes = 0;
@@ -224,7 +243,7 @@ mod tests {
     fn replaceable_cursor_does_not_discard_required_metadata() {
         let sink = sink_with_queue(VecDeque::new(), 0);
         let shared = Arc::clone(&sink.shared);
-        sink.send(Event::Frame(FrameMetadata {
+        sink.send(&Event::Frame(FrameMetadata {
             generation: 1,
             width: 2,
             height: 2,
@@ -233,10 +252,15 @@ mod tests {
             input_sequence: 0,
             fps: 60,
         }))
-        .unwrap();
-        sink.send(Event::CursorVisibility(false)).unwrap();
-        sink.send(Event::CursorVisibility(true)).unwrap();
-        let queue = shared.queue.lock().unwrap();
+        .expect("frame metadata should queue");
+        sink.send(&Event::CursorVisibility(false))
+            .expect("cursor hide should queue");
+        sink.send(&Event::CursorVisibility(true))
+            .expect("cursor show should queue");
+        let queue = shared
+            .queue
+            .lock()
+            .expect("queue lock should not be poisoned");
         assert_eq!(queue.records.len(), 2);
         assert_eq!(queue.records[0][1], 2);
         assert_eq!(queue.records[1], vec![2, 5, 0, 0, 1, 0, 0, 0, 1]);
@@ -252,12 +276,12 @@ mod tests {
             bgra: vec![0; 4],
         }
         .encode()
-        .unwrap();
+        .expect("cursor image should encode");
         let filler_len = MAX_QUEUED_BYTES - old.len();
         let records = VecDeque::from([vec![0; filler_len], old.clone()]);
         let sink = sink_with_queue(records, MAX_QUEUED_BYTES);
 
-        let result = sink.send(Event::CursorImage {
+        let result = sink.send(&Event::CursorImage {
             width: 2,
             height: 2,
             hotspot_x: 0,
@@ -266,7 +290,11 @@ mod tests {
         });
 
         assert!(matches!(result, Err(EventWriterError::QueueFull)));
-        let queue = sink.shared.queue.lock().unwrap();
+        let queue = sink
+            .shared
+            .queue
+            .lock()
+            .expect("queue lock should not be poisoned");
         assert_eq!(queue.bytes, MAX_QUEUED_BYTES);
         assert_eq!(queue.records.back(), Some(&old));
     }

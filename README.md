@@ -6,7 +6,8 @@ Sprite Desktop runs a private, single-user LXQt desktop on a Fly Sprite. A Rust 
 
 - Node.js 24 or newer
 - pnpm 11.9.0, as declared in `package.json`
-- the Rust toolchain in `rust-toolchain.toml`
+- the Rust toolchains declared in `rust-toolchain.toml` and `tools/rustfmt/rust-toolchain.toml`
+- [just](https://just.systems/) and [uv](https://docs.astral.sh/uv/)
 - a Fly Sprite with URL authentication set to `sprite` and private access set to `admins`
 - `SPRITES_TOKEN` in the operator's environment
 
@@ -16,13 +17,13 @@ Install dependencies and build a release archive:
 
 ```sh
 pnpm install
-pnpm release --version v1.0.0 --source REVISION
+just release v1.0.0 REVISION
 ```
 
 Provision an existing Sprite:
 
 ```sh
-pnpm provision --sprite SPRITE_NAME --release v1.0.0
+just provision SPRITE_NAME v1.0.0
 ```
 
 Open the Sprite's private URL after provisioning. The gateway needs no public relay, Cloudflare Worker, browser-held Sprite token, or shared application secret.
@@ -30,11 +31,11 @@ Open the Sprite's private URL after provisioning. The gateway needs no public re
 ## Local Checks
 
 ```sh
-pnpm check
-pnpm test
-pnpm build
-pnpm format:check
-cargo test -p sprite-desktop-streamd -- --ignored
+just lint
+just test
+just build
+just fmt-check
+just test-streamd
 ```
 
 The ignored stream daemon tests require ffmpeg with libx264.

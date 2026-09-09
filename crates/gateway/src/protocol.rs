@@ -2,10 +2,10 @@ use std::io;
 
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    time::{Duration, timeout},
-};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::time::Duration;
+use tokio::time::timeout;
 
 const PARTIAL_EVENT_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -87,20 +87,23 @@ impl<R: AsyncRead + Unpin> EventReader<R> {
             self.input.read_exact(&mut header[1..]),
         )
         .await
-        .map_err(|_| ProtocolError::Truncated)?
+        .map_err(|_elapsed| ProtocolError::Truncated)?
         .map_err(map_eof)?;
         if header[0] != VERSION || header[2] != 0 || header[3] != 0 {
             return Err(ProtocolError::InvalidHeader);
         }
         let kind = header[1];
-        let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let len = usize::try_from(u32::from_le_bytes([
+            header[4], header[5], header[6], header[7],
+        ]))
+        .map_err(|_overflow| ProtocolError::TooLarge)?;
         if len > MAX_EVENT_BYTES {
             return Err(ProtocolError::TooLarge);
         }
         let mut payload = vec![0; len];
         timeout(PARTIAL_EVENT_DEADLINE, self.input.read_exact(&mut payload))
             .await
-            .map_err(|_| ProtocolError::Truncated)?
+            .map_err(|_elapsed| ProtocolError::Truncated)?
             .map_err(map_eof)?;
         decode_event(kind, payload).map(Some)
     }
@@ -118,7 +121,7 @@ fn decode_event(kind: u8, payload: Vec<u8>) -> Result<DaemonEvent, ProtocolError
     let invalid = || ProtocolError::InvalidEvent(kind);
     match kind {
         1 => Ok(DaemonEvent::Clipboard(
-            String::from_utf8(payload).map_err(|_| ProtocolError::Utf8)?,
+            String::from_utf8(payload).map_err(|_error| ProtocolError::Utf8)?,
         )),
         2 if payload.len() == 32 => {
             let frame = FrameMetadata {
@@ -170,8 +173,8 @@ fn decode_event(kind: u8, payload: Vec<u8>) -> Result<DaemonEvent, ProtocolError
             Ok(DaemonEvent::CursorImage {
                 width,
                 height,
-                hotspot_x: le32(&payload[8..12]) as i32,
-                hotspot_y: le32(&payload[12..16]) as i32,
+                hotspot_x: le32(&payload[8..12]).cast_signed(),
+                hotspot_y: le32(&payload[12..16]).cast_signed(),
                 bgra: payload[16..].to_vec(),
             })
         }
@@ -188,14 +191,16 @@ fn cursor_bytes(width: u32, height: u32) -> Option<usize> {
     }
     usize::try_from(u64::from(width) * u64::from(height) * 4).ok()
 }
-fn le16(b: &[u8]) -> u16 {
-    u16::from_le_bytes(b.try_into().unwrap())
+fn le16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
 }
-fn le32(b: &[u8]) -> u32 {
-    u32::from_le_bytes(b.try_into().unwrap())
+fn le32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
-fn le64(b: &[u8]) -> u64 {
-    u64::from_le_bytes(b.try_into().unwrap())
+fn le64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -227,9 +232,10 @@ pub fn parse_browser_record(bytes: &[u8]) -> Result<BrowserCommand, &'static str
         4 => value.state <= 2 && (1..256).contains(&value.a) && value.b == 0 && value.c != 0,
         5 => value.state == 0 && value.a == 0 && value.b == 0 && value.c == 0,
         6 => {
+            let scale = value.c & u32::from(u16::MAX);
             value.state == 0
                 && valid_size(value.a, value.b)
-                && (120..=480).contains(&(value.c as u16))
+                && (120..=480).contains(&scale)
                 && value.c >> 16 != 0
         }
         _ => false,
@@ -249,6 +255,10 @@ fn valid_size(width: u32, height: u32) -> bool {
         && height.is_multiple_of(2)
         && u64::from(width) * u64::from(height) <= 3840 * 2160
 }
+
+#[derive(Debug, Error)]
+#[error("command text exceeds the protocol length limit")]
+pub struct CommandEncodeError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DaemonCommand {
@@ -275,34 +285,39 @@ impl DaemonCommand {
         CONTROL_BYTES
             + match self {
                 Self::Clipboard(text) | Self::Text { text, .. } => text.len(),
-                _ => 0,
+                Self::Browser(_)
+                | Self::ReleaseAll
+                | Self::KeyframeReadiness { .. }
+                | Self::Quality { .. } => 0,
             }
     }
-    pub fn encode(self) -> Vec<u8> {
+    pub fn encode(self) -> Result<Vec<u8>, CommandEncodeError> {
         match self {
-            Self::Browser(v) => command(v.kind, v.state, v.a, v.b, v.c),
-            Self::ReleaseAll => command(5, 0, 0, 0, 0),
+            Self::Browser(v) => Ok(command(v.kind, v.state, v.a, v.b, v.c)),
+            Self::ReleaseAll => Ok(command(5, 0, 0, 0, 0)),
             Self::KeyframeReadiness { generation, ready } => {
-                command(11, u8::from(ready), generation, 0, 0)
+                Ok(command(11, u8::from(ready), generation, 0, 0))
             }
             Self::Quality {
                 bitrate,
                 fps,
                 scale,
-            } => command(9, 0, bitrate, fps, scale),
+            } => Ok(command(9, 0, bitrate, fps, scale)),
             Self::Clipboard(text) => {
-                let mut out = command(7, 0, text.len() as u32, 0, 0);
+                let length = u32::try_from(text.len()).map_err(|_overflow| CommandEncodeError)?;
+                let mut out = command(7, 0, length, 0, 0);
                 out.extend_from_slice(text.as_bytes());
-                out
+                Ok(out)
             }
             Self::Text {
                 preedit,
                 text,
                 sequence,
             } => {
-                let mut out = command(10, u8::from(preedit), text.len() as u32, sequence, 0);
+                let length = u32::try_from(text.len()).map_err(|_overflow| CommandEncodeError)?;
+                let mut out = command(10, u8::from(preedit), length, sequence, 0);
                 out.extend_from_slice(text.as_bytes());
-                out
+                Ok(out)
             }
         }
     }
@@ -354,8 +369,9 @@ pub enum TextAction {
 }
 
 pub fn parse_json(bytes: &[u8]) -> Result<JsonInput, &'static str> {
-    let value: JsonInput = serde_json::from_slice(bytes).map_err(|_| "invalid JSON control")?;
-    match &value {
+    let value: JsonInput =
+        serde_json::from_slice(bytes).map_err(|_error| "invalid JSON control")?;
+    let error = match &value {
         JsonInput::Feedback(feedback)
             if feedback.received > 10_000
                 || feedback.presented > 10_000
@@ -370,18 +386,22 @@ pub fn parse_json(bytes: &[u8]) -> Result<JsonInput, &'static str> {
                 || !feedback.rtt.is_finite()
                 || !(0.0..=60_000.0).contains(&feedback.rtt) =>
         {
-            Err("invalid feedback")
+            Some("invalid feedback")
         }
         JsonInput::Text { text, sequence, .. }
             if text.len() > MAX_TEXT_BYTES || text.contains('\0') || *sequence == 0 =>
         {
-            Err("invalid text")
+            Some("invalid text")
         }
         JsonInput::ClipboardWrite { text } if text.len() > MAX_CLIPBOARD_BYTES => {
-            Err("invalid clipboard")
+            Some("invalid clipboard")
         }
-        _ => Ok(value),
-    }
+        JsonInput::Ping { .. }
+        | JsonInput::Feedback(_)
+        | JsonInput::Text { .. }
+        | JsonInput::ClipboardWrite { .. } => None,
+    };
+    error.map_or(Ok(value), Err)
 }
 
 #[derive(Clone, Debug)]
@@ -410,8 +430,9 @@ pub fn encode_video(sample: &VideoSample) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::AsyncWriteExt;
+
+    use super::*;
     fn record(kind: u8, state: u8, a: u32, b: u32, c: u32) -> Vec<u8> {
         command(kind, state, a, b, c)
     }
@@ -424,6 +445,7 @@ mod tests {
                     ready: true
                 }
                 .encode()
+                .expect("test daemon command should encode")
             )
             .is_err()
         );
@@ -477,16 +499,23 @@ mod tests {
         let (mut tx, rx) = tokio::io::duplex(64);
         tokio::spawn(async move {
             for byte in [2, 5, 0, 0, 1, 0, 0, 0, 1] {
-                tx.write_all(&[byte]).await.unwrap();
+                tx.write_all(&[byte])
+                    .await
+                    .expect("test duplex writer should accept an event byte");
             }
         });
         let mut reader = EventReader::new(rx);
         assert_eq!(
-            reader.next().await.unwrap(),
+            reader
+                .next()
+                .await
+                .expect("complete test event should decode"),
             Some(DaemonEvent::CursorVisibility(true))
         );
         let (mut tx, rx) = tokio::io::duplex(64);
-        tx.write_all(&[2, 4]).await.unwrap();
+        tx.write_all(&[2, 4])
+            .await
+            .expect("test duplex writer should accept a partial event");
         drop(tx);
         assert!(matches!(
             EventReader::new(rx).next().await,

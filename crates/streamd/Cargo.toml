@@ -20,3 +20,6 @@ wayland-protocols.workspace = true
 wayland-protocols-misc.workspace = true
 wayland-protocols-wlr.workspace = true
 xkbcommon.workspace = true
+
+[lints]
+workspace = true

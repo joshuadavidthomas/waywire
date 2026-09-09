@@ -1,17 +1,26 @@
-use crate::{
-    daemon::{CommandSink, Readiness},
-    protocol::{DaemonCommand, FrameMetadata, VideoSample},
-};
-use anyhow::{Result, anyhow};
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
-};
-use tokio::{
-    net::UdpSocket,
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
-    time::{Duration, Instant, sleep_until},
-};
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use tokio::net::UdpSocket;
+use tokio::sync::Notify;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
+use tokio::time::Duration;
+use tokio::time::Instant;
+use tokio::time::sleep_until;
+
+use crate::daemon::CommandSink;
+use crate::daemon::Readiness;
+use crate::protocol::DaemonCommand;
+use crate::protocol::FrameMetadata;
+use crate::protocol::VideoSample;
 
 const MAX_ACCESS_UNIT: usize = 16 << 20;
 const MAX_PENDING_RECORDS: usize = 120;
@@ -46,14 +55,22 @@ pub struct VideoSubscription {
     queue: Arc<Mutex<ViewerQueue>>,
     notify: Arc<Notify>,
 }
+
+fn lock_video_state<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(error) => panic!("video state mutex poisoned: {error}"),
+    }
+}
+
 impl VideoSubscription {
     pub async fn next(&self) -> VideoSample {
         loop {
             if let Some(frame) = {
-                let mut queue = self.queue.lock().unwrap();
+                let mut queue = lock_video_state(&self.queue);
                 let frame = queue.frames.pop_front();
                 if let Some(value) = &frame {
-                    queue.bytes -= value.data.len()
+                    queue.bytes -= value.data.len();
                 }
                 frame
             } {
@@ -77,25 +94,25 @@ impl VideoHub {
     pub fn subscribe(&self) -> (u64, Vec<VideoSample>, VideoSubscription) {
         let queue = Arc::new(Mutex::new(ViewerQueue::default()));
         let notify = Arc::new(Notify::new());
-        let mut hub = self.inner.lock().unwrap();
+        let mut hub = lock_video_state(&self.inner);
         let id = hub.next;
         hub.next += 1;
         let bootstrap = hub.gop.clone();
         hub.subscribers.insert(
             id,
             Subscriber {
-                queue: queue.clone(),
-                notify: notify.clone(),
+                queue: Arc::clone(&queue),
+                notify: Arc::clone(&notify),
                 waiting_for_keyframe: bootstrap.is_empty(),
             },
         );
         (id, bootstrap, VideoSubscription { queue, notify })
     }
     pub fn unsubscribe(&self, id: u64) {
-        self.inner.lock().unwrap().subscribers.remove(&id);
+        lock_video_state(&self.inner).subscribers.remove(&id);
     }
     fn broadcast(&self, sample: VideoSample) -> bool {
-        let mut hub = self.inner.lock().unwrap();
+        let mut hub = lock_video_state(&self.inner);
         let stream_reset = sample.discontinuity
             || hub.gop.first().is_some_and(|first_cached| {
                 first_cached.metadata.generation != sample.metadata.generation
@@ -119,7 +136,7 @@ impl VideoHub {
             }
         }
         for subscriber in hub.subscribers.values_mut() {
-            let mut queue = subscriber.queue.lock().unwrap();
+            let mut queue = lock_video_state(&subscriber.queue);
             if stream_reset {
                 queue.frames.clear();
                 queue.bytes = 0;
@@ -156,6 +173,7 @@ impl VideoHub {
             frame.key && frame.metadata.generation == sample.metadata.generation
         });
         drop(hub);
+        drop(sample);
         ready
     }
 }
@@ -180,9 +198,7 @@ fn decode_packet(data: &[u8]) -> Result<Packet> {
         if start + 4 > data.len() {
             return Err(anyhow!("truncated RTP extension"));
         }
-        let words = usize::from(u16::from_be_bytes(
-            data[start + 2..start + 4].try_into().unwrap(),
-        ));
+        let words = usize::from(u16::from_be_bytes([data[start + 2], data[start + 3]]));
         start = start
             .checked_add(4 + words * 4)
             .ok_or_else(|| anyhow!("RTP extension overflow"))?;
@@ -192,7 +208,7 @@ fn decode_packet(data: &[u8]) -> Result<Packet> {
     }
     let mut end = data.len();
     if data[0] & 0x20 != 0 {
-        let padding = usize::from(*data.last().unwrap());
+        let padding = usize::from(data[data.len() - 1]);
         if padding == 0 || padding > end - start {
             return Err(anyhow!("invalid RTP padding"));
         }
@@ -203,9 +219,9 @@ fn decode_packet(data: &[u8]) -> Result<Packet> {
     }
     Ok(Packet {
         marker: data[1] & 0x80 != 0,
-        sequence: u16::from_be_bytes(data[2..4].try_into().unwrap()),
-        timestamp: u32::from_be_bytes(data[4..8].try_into().unwrap()),
-        ssrc: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+        sequence: u16::from_be_bytes([data[2], data[3]]),
+        timestamp: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+        ssrc: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
         payload: data[start..end].to_vec(),
     })
 }
@@ -264,7 +280,8 @@ impl Assembler {
             }
         }
         self.timestamp = Some(packet.timestamp);
-        if let Err(error) = self.append_payload(&packet.payload) {
+        let payload = packet.payload;
+        if let Err(error) = self.append_payload(&payload) {
             self.clear_access_unit();
             self.recovering = true;
             return Err(error);
@@ -308,7 +325,7 @@ impl Assembler {
                     if rest.len() < 2 {
                         return Err(anyhow!("truncated STAP-A length"));
                     }
-                    let len = usize::from(u16::from_be_bytes(rest[..2].try_into().unwrap()));
+                    let len = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
                     rest = &rest[2..];
                     if len == 0 || len > rest.len() {
                         return Err(anyhow!("invalid STAP-A NAL length"));
@@ -445,10 +462,10 @@ impl Correlator {
             }
 
             let metadata_count = if unit.ssrc == self.last_generation {
-                metadata_gap(
-                    unit.timestamp.wrapping_sub(self.last_timestamp.unwrap()),
-                    self.last_fps,
-                )?
+                let last_timestamp = self
+                    .last_timestamp
+                    .ok_or_else(|| anyhow!("current generation has no prior RTP timestamp"))?;
+                metadata_gap(unit.timestamp.wrapping_sub(last_timestamp), self.last_fps)?
             } else {
                 1
             };
@@ -464,9 +481,12 @@ impl Correlator {
                 break;
             };
 
-            let pending = self.units.pop_front().unwrap();
+            let pending = self
+                .units
+                .pop_front()
+                .ok_or_else(|| anyhow!("front RTP unit disappeared during correlation"))?;
             let unit = pending.value.unit;
-            let metadata = self.take_metadata_through(index);
+            let metadata = self.take_metadata_through(index)?;
             debug_assert_eq!(metadata.generation, unit.ssrc);
             let generation_changed = metadata.generation != self.last_generation;
             let discontinuity = unit.discontinuity || index > 0 || generation_changed;
@@ -507,12 +527,12 @@ impl Correlator {
         }
         (None, false)
     }
-    fn take_metadata_through(&mut self, index: usize) -> FrameMetadata {
+    fn take_metadata_through(&mut self, index: usize) -> Result<FrameMetadata> {
         let mut metadata = None;
         for _ in 0..=index {
             metadata = self.metadata.pop_front().map(|item| item.value);
         }
-        metadata.unwrap()
+        metadata.ok_or_else(|| anyhow!("matched frame metadata disappeared during correlation"))
     }
     fn deadline(&self) -> Option<Instant> {
         self.metadata
@@ -532,10 +552,12 @@ fn metadata_gap(delta: u32, fps: u32) -> Result<usize> {
     if count == 0 {
         return Ok(1);
     }
-    if count > MAX_PENDING_RECORDS as u64 {
+    let maximum =
+        u64::try_from(MAX_PENDING_RECORDS).context("metadata record limit does not fit in u64")?;
+    if count > maximum {
         return Err(anyhow!("RTP timestamp gap exceeds correlation window"));
     }
-    Ok(count as usize)
+    usize::try_from(count).context("RTP timestamp gap does not fit in usize")
 }
 
 enum PipelineMessage {
@@ -571,24 +593,21 @@ impl VideoPipeline {
         self.tx
             .send(PipelineMessage::Metadata(value))
             .await
-            .map_err(|_| anyhow!("video pipeline stopped"))
+            .context("video pipeline stopped")
     }
     async fn unit(&self, value: Unit) -> Result<()> {
-        let bytes =
-            u32::try_from(value.data.len()).map_err(|_| anyhow!("access unit size overflow"))?;
-        let permit = self
-            .unit_budget
-            .clone()
+        let bytes = u32::try_from(value.data.len()).context("access unit size overflow")?;
+        let permit = Arc::clone(&self.unit_budget)
             .acquire_many_owned(bytes)
             .await
-            .map_err(|_| anyhow!("video byte budget closed"))?;
+            .context("video byte budget closed")?;
         self.tx
             .send(PipelineMessage::Unit(PendingUnit {
                 unit: value,
                 _bytes: permit,
             }))
             .await
-            .map_err(|_| anyhow!("video pipeline stopped"))
+            .context("video pipeline stopped")
     }
     pub async fn receive(self, socket: UdpSocket) -> Result<()> {
         let mut assembler = Assembler::default();
@@ -598,9 +617,8 @@ impl VideoPipeline {
             if !source.ip().is_loopback() {
                 continue;
             }
-            let packet = match decode_packet(&buffer[..length]) {
-                Ok(value) => value,
-                Err(_) => continue,
+            let Ok(packet) = decode_packet(&buffer[..length]) else {
+                continue;
             };
             if let Ok(Some(unit)) = assembler.consume(packet) {
                 self.unit(unit).await?;
@@ -615,7 +633,7 @@ impl VideoWorker {
             let message = if let Some(deadline) = state.deadline() {
                 tokio::select! {
                     value = self.rx.recv() => value,
-                    _ = sleep_until(deadline) => {
+                    () = sleep_until(deadline) => {
                         return Err(anyhow!("video metadata/RTP correlation stalled"));
                     }
                 }

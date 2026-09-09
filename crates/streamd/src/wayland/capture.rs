@@ -1,22 +1,28 @@
-use std::{ffi::CString, fs::File, os::fd::AsFd};
+use std::fs::File;
+use std::os::fd::AsFd;
 
-use anyhow::{Context, Result, bail};
-use memmap2::{MmapMut, MmapOptions};
-use nix::sys::memfd::{MFdFlags, memfd_create};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use memmap2::MmapMut;
+use memmap2::MmapOptions;
+use nix::sys::memfd::MFdFlags;
+use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
-use wayland_client::{
-    Proxy, QueueHandle,
-    protocol::{wl_buffer, wl_output, wl_shm},
-};
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
-};
+use wayland_client::Proxy;
+use wayland_client::QueueHandle;
+use wayland_client::protocol::wl_buffer;
+use wayland_client::protocol::wl_output;
+use wayland_client::protocol::wl_shm;
+use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1;
+use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
 
 use super::State;
-use crate::{
-    protocol::{FrameMetadata, MAX_RAW_PIXELS},
-    video::{CapturedFrame, EncoderConfig, encoded_dimensions},
-};
+use crate::protocol::FrameMetadata;
+use crate::protocol::MAX_RAW_PIXELS;
+use crate::video::CapturedFrame;
+use crate::video::EncoderConfig;
+use crate::video::encoded_dimensions;
 
 pub struct Capture {
     pub manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
@@ -106,11 +112,10 @@ impl Capture {
         self.mapping = None;
         let length = usize::try_from(u64::from(stride) * u64::from(height))
             .context("capture allocation exceeds address space")?;
-        let name = CString::new("sprite-desktop-capture").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC)?;
+        let fd = memfd_create(c"sprite-desktop-capture", MFdFlags::MFD_CLOEXEC)?;
         ftruncate(&fd, i64::try_from(length)?)?;
         let file = File::from(fd);
-        // The memfd remains valid for the map's lifetime. Wayland receives its own fd copy.
+        // SAFETY: the map owns a duplicate of the valid memfd and uses its current length.
         let mapping = unsafe { MmapOptions::new().len(length).map_mut(&file)? };
         let pool = shm.create_pool(file.as_fd(), i32::try_from(length)?, qh, ());
         let buffer = pool.create_buffer(

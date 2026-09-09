@@ -1,0 +1,67 @@
+set dotenv-load
+set unstable
+
+# List all available commands
+[private]
+default:
+    @just --list
+
+build:
+    pnpm --filter @sprite-desktop/web build
+    cargo build --locked --release --workspace
+
+check:
+    @just typecheck
+    cargo check --locked --workspace --all-targets --all-features
+
+clean:
+    cargo clean
+
+clippy *ARGS:
+    cargo clippy --locked --workspace --all-targets --all-features --fix --allow-dirty {{ ARGS }} -- -D warnings
+
+clippy-check:
+    cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+dev-web:
+    pnpm --filter @sprite-desktop/web dev
+
+fmt:
+    @just --fmt
+    cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all
+    pnpm exec prettier --write .
+
+fmt-check:
+    @just --fmt --check
+    @just rustfmt-check
+    @just prettier-check
+
+lint *ARGS:
+    @just --fmt --check
+    uvx prek==0.5.2 run --all-files --show-diff-on-failure --color always {{ ARGS }}
+
+prettier-check:
+    pnpm exec prettier --check .
+
+provision SPRITE RELEASE:
+    pnpm --filter @sprite-desktop/provision provision --sprite "{{ SPRITE }}" --release "{{ RELEASE }}"
+
+release VERSION SOURCE:
+    pnpm exec tsx scripts/build-release.ts --version "{{ VERSION }}" --source "{{ SOURCE }}"
+
+rustfmt-check:
+    cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all -- --check
+
+test:
+    pnpm --filter @sprite-desktop/web test
+    cargo test --locked --workspace
+    python3 -m unittest discover -s installer -p 'test_*.py'
+    shellcheck installer/desktop.sh installer/install.sh
+    pnpm exec tsx --test scripts/build-release.test.ts
+
+test-streamd *ARGS:
+    cargo test --locked -p sprite-desktop-streamd -- --ignored {{ ARGS }}
+
+typecheck:
+    pnpm --filter @sprite-desktop/web check
+    pnpm --filter @sprite-desktop/provision check

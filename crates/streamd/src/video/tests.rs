@@ -1,23 +1,24 @@
-use std::{
-    fs::File,
-    io::Read,
-    net::UdpSocket,
-    os::unix::process::ExitStatusExt,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::fs::File;
+use std::io::Read;
+use std::net::UdpSocket;
+use std::os::unix::process::ExitStatusExt;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use calloop::EventLoop;
-use nix::{
-    fcntl::{FcntlArg, OFlag, fcntl},
-    sys::signal::{Signal, kill},
-    unistd::{Pid, pipe},
-};
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
+use nix::sys::signal::Signal;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+use nix::unistd::pipe;
 
 use super::*;
 
 fn frame(sequence: u64, generation: u32) -> RawFrame {
     RawFrame {
-        pixels: vec![sequence as u8; 16],
+        pixels: vec![sequence.to_le_bytes()[0]; 16],
         metadata: FrameMetadata {
             generation,
             width: 2,
@@ -50,20 +51,26 @@ fn sized_frame(sequence: u64, generation: u32, width: u32, height: u32) -> RawFr
     let config = EncoderConfig {
         raw_width: width,
         raw_height: height,
-        encoded_width: u16::try_from(width).unwrap(),
-        encoded_height: u16::try_from(height).unwrap(),
+        encoded_width: u16::try_from(width).expect("test frame width should fit u16"),
+        encoded_height: u16::try_from(height).expect("test frame height should fit u16"),
         fps: 60,
         bitrate_kbps: 8_000,
     };
     RawFrame {
-        pixels: vec![sequence as u8; config.validate().unwrap()],
+        pixels: vec![
+            sequence.to_le_bytes()[0];
+            config
+                .validate()
+                .expect("sized test frame should have a valid encoder config")
+        ],
         metadata: FrameMetadata {
             generation,
             width: config.encoded_width,
             height: config.encoded_height,
             capture_nanos: sequence,
             sequence,
-            input_sequence: u32::try_from(sequence).unwrap(),
+            input_sequence: u32::try_from(sequence)
+                .expect("test frame sequence should fit the input sequence field"),
             fps: config.fps,
         },
         config,
@@ -84,7 +91,12 @@ fn real_frame_at_fps(sequence: u64, generation: u32, fps: u32) -> RawFrame {
         bitrate_kbps: 8_000,
     };
     RawFrame {
-        pixels: vec![sequence as u8; config.validate().unwrap()],
+        pixels: vec![
+            sequence.to_le_bytes()[0];
+            config
+                .validate()
+                .expect("real-sized test frame should have a valid encoder config")
+        ],
         metadata: FrameMetadata {
             generation,
             width: config.encoded_width,
@@ -115,12 +127,18 @@ fn shared() -> Arc<Shared> {
 }
 
 fn nonblocking_pipe() -> (File, File, usize) {
-    let (reader, writer) = pipe().unwrap();
+    let (reader, writer) = pipe().expect("test pipe should open");
     let requested_capacity = 64 * 1024;
-    let _ = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(requested_capacity));
-    let capacity = usize::try_from(fcntl(&writer, FcntlArg::F_GETPIPE_SZ).unwrap()).unwrap();
-    let flags = OFlag::from_bits_truncate(fcntl(&writer, FcntlArg::F_GETFL).unwrap());
-    fcntl(&writer, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+    let _pipe_resize_succeeded = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(requested_capacity)).is_ok();
+    let capacity = usize::try_from(
+        fcntl(&writer, FcntlArg::F_GETPIPE_SZ).expect("test pipe capacity should be readable"),
+    )
+    .expect("test pipe capacity should fit usize");
+    let flags = OFlag::from_bits_truncate(
+        fcntl(&writer, FcntlArg::F_GETFL).expect("test pipe flags should be readable"),
+    );
+    fcntl(&writer, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        .expect("test pipe should become nonblocking");
     (File::from(reader), File::from(writer), capacity)
 }
 
@@ -169,16 +187,21 @@ where
         restart_delay,
         spawn,
     )
-    .unwrap()
+    .expect("test video encoder worker should start")
 }
 
 fn shared_pending_sequence(shared: &Shared) -> Option<u64> {
-    let pool = shared.pool.lock().unwrap();
+    let pool = shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned");
     let slot = pool.pending?;
-    let FrameSlot::Pending(frame) = &pool.slots[slot] else {
-        panic!("pending slot state disagrees with pool index");
-    };
-    Some(frame.metadata.sequence)
+    match &pool.slots[slot] {
+        FrameSlot::Pending(frame) => Some(frame.metadata.sequence),
+        FrameSlot::Free(_) | FrameSlot::Encoding => {
+            panic!("pending slot state disagrees with pool index")
+        }
+    }
 }
 
 #[derive(Default)]
@@ -206,8 +229,11 @@ impl H264AccessUnit {
                 let mut remaining = &payload[1..];
                 while !remaining.is_empty() {
                     assert!(remaining.len() >= 2, "truncated STAP-A NAL length");
-                    let length =
-                        usize::from(u16::from_be_bytes(remaining[..2].try_into().unwrap()));
+                    let length = usize::from(u16::from_be_bytes(
+                        remaining[..2]
+                            .try_into()
+                            .expect("checked STAP-A length should contain two bytes"),
+                    ));
                     remaining = &remaining[2..];
                     assert!(length > 0, "empty STAP-A NAL");
                     assert!(remaining.len() >= length, "truncated STAP-A NAL");
@@ -271,12 +297,20 @@ fn receive_frame(socket: &UdpSocket, mut access_unit: Option<&mut H264AccessUnit
     let mut ssrc = None;
     let mut timestamp = None;
     while Instant::now() < deadline {
-        let mut packet = [0_u8; 65_535];
+        let mut packet = vec![0_u8; 65_535].into_boxed_slice();
         match socket.recv(&mut packet) {
             Ok(length) if length >= 12 => {
                 let packet = &packet[..length];
-                let packet_ssrc = u32::from_be_bytes(packet[8..12].try_into().unwrap());
-                let packet_timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+                let packet_ssrc = u32::from_be_bytes(
+                    packet[8..12]
+                        .try_into()
+                        .expect("checked RTP packet should contain an SSRC"),
+                );
+                let packet_timestamp = u32::from_be_bytes(
+                    packet[4..8]
+                        .try_into()
+                        .expect("checked RTP packet should contain a timestamp"),
+                );
                 if let Some(previous) = ssrc {
                     assert_eq!(packet_ssrc, previous);
                 }
@@ -378,9 +412,9 @@ struct SpsColorContract {
 // the SPS produced by this fixed FFmpeg/libx264 configuration.
 fn parse_test_sps(nal: &[u8]) -> SpsColorContract {
     let mut bits = BitReader::for_sps(nal);
-    let profile = bits.bits(8) as u8;
-    let constraints = bits.bits(8) as u8;
-    let level = bits.bits(8) as u8;
+    let profile = u8::try_from(bits.bits(8)).expect("8-bit SPS profile should fit u8");
+    let constraints = u8::try_from(bits.bits(8)).expect("8-bit SPS constraints should fit u8");
+    let level = u8::try_from(bits.bits(8)).expect("8-bit SPS level should fit u8");
     bits.unsigned_exp_golomb();
 
     assert_eq!(profile, 244, "test parser only accepts High 4:4:4 SPS");
@@ -429,9 +463,12 @@ fn parse_test_sps(nal: &[u8]) -> SpsColorContract {
     bits.bits(3);
     let full_range = bits.bit();
     assert!(bits.bit(), "SPS VUI has no color description");
-    let color_primaries = bits.bits(8) as u8;
-    let transfer_characteristics = bits.bits(8) as u8;
-    let matrix_coefficients = bits.bits(8) as u8;
+    let color_primaries =
+        u8::try_from(bits.bits(8)).expect("8-bit SPS color primaries should fit u8");
+    let transfer_characteristics =
+        u8::try_from(bits.bits(8)).expect("8-bit SPS transfer characteristics should fit u8");
+    let matrix_coefficients =
+        u8::try_from(bits.bits(8)).expect("8-bit SPS matrix coefficients should fit u8");
 
     SpsColorContract {
         profile,
@@ -460,7 +497,7 @@ fn spawn_failure_retries_queued_frame_without_another_submit() {
         },
     );
 
-    submit_frame(&encoder, &frame(1, 1)).unwrap();
+    submit_frame(&encoder, &frame(1, 1)).expect("test frame should be accepted by the encoder");
 
     assert!(matches!(
         wait_for_notification(&encoder),
@@ -484,7 +521,7 @@ fn newer_pending_frame_replaces_queued_spawn_retry() {
             }
         },
     );
-    submit_frame(&encoder, &frame(1, 1)).unwrap();
+    submit_frame(&encoder, &frame(1, 1)).expect("test frame should be accepted by the encoder");
     let deadline = Instant::now() + Duration::from_secs(1);
     while attempts.load(Ordering::SeqCst) == 0
         || shared_pending_sequence(&encoder.shared) != Some(1)
@@ -494,7 +531,7 @@ fn newer_pending_frame_replaces_queued_spawn_retry() {
     }
 
     assert_eq!(
-        submit_frame(&encoder, &frame(2, 1)).unwrap(),
+        submit_frame(&encoder, &frame(2, 1)).expect("test frame should be accepted by the encoder"),
         SubmitResult::ReplacedPending
     );
     assert!(matches!(
@@ -513,10 +550,13 @@ fn repeated_spawn_failures_publish_fatal_at_the_attempt_bound() {
         spawn_attempts.fetch_add(1, Ordering::SeqCst);
         Err(io::Error::other("injected persistent spawn failure"))
     });
-    submit_frame(&encoder, &frame(1, 1)).unwrap();
+    submit_frame(&encoder, &frame(1, 1)).expect("test frame should be accepted by the encoder");
 
-    let Notification::Fatal(error) = wait_for_notification(&encoder) else {
-        panic!("spawn exhaustion emitted frame metadata");
+    let error = match wait_for_notification(&encoder) {
+        Notification::Fatal(error) => error,
+        Notification::Submitted(_) | Notification::RestartRequired { .. } => {
+            panic!("spawn exhaustion emitted frame metadata")
+        }
     };
     assert!(error.contains("after 6 attempts"));
     assert_eq!(
@@ -536,17 +576,29 @@ fn generation_change_and_stop_discard_spawn_retry_frame() {
             notification_source: None,
             worker: None,
         };
-        submit_frame(&encoder, &frame(1, 1)).unwrap();
-        let (slot, encoding) = take_pending_frame(&shared).unwrap();
+        submit_frame(&encoder, &frame(1, 1)).expect("test frame should be accepted by the encoder");
+        let (slot, encoding) =
+            take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
         if stop {
-            shared.pool.lock().unwrap().stopping = true;
+            shared
+                .pool
+                .lock()
+                .expect("frame pool mutex should not be poisoned")
+                .stopping = true;
         } else {
-            shared.pool.lock().unwrap().generation = 2;
+            shared
+                .pool
+                .lock()
+                .expect("frame pool mutex should not be poisoned")
+                .generation = 2;
         }
 
         requeue_after_spawn_failure(&shared, slot, encoding);
 
-        let pool = shared.pool.lock().unwrap();
+        let pool = shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned");
         assert!(pool.pending.is_none());
         assert!(pool.encoding.is_none());
         assert!(matches!(pool.slots[slot], FrameSlot::Free(_)));
@@ -566,47 +618,72 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
 
     let first = frame(1, 1);
     assert_eq!(
-        encoder.submit(captured(&first)).unwrap(),
+        encoder
+            .submit(captured(&first))
+            .expect("test frame should be accepted by the encoder"),
         SubmitResult::Queued
     );
-    let (first_slot, first_encoding) = take_pending_frame(&shared).unwrap();
+    let (first_slot, first_encoding) =
+        take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
 
     let second = frame(2, 1);
     assert_eq!(
-        encoder.submit(captured(&second)).unwrap(),
+        encoder
+            .submit(captured(&second))
+            .expect("test frame should be accepted by the encoder"),
         SubmitResult::Queued
     );
-    let pending_slot = shared.pool.lock().unwrap().pending.unwrap();
+    let pending_slot = shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .pending
+        .expect("submitted test frame should have a pending slot index");
     let (pending_pointer, pending_capacity) = {
-        let pool = shared.pool.lock().unwrap();
-        let FrameSlot::Pending(pending) = &pool.slots[pending_slot] else {
-            panic!("latest frame was not pending");
-        };
-        (pending.pixels.as_ptr(), pending.pixels.capacity())
+        let pool = shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned");
+        match &pool.slots[pending_slot] {
+            FrameSlot::Pending(pending) => (pending.pixels.as_ptr(), pending.pixels.capacity()),
+            FrameSlot::Free(_) | FrameSlot::Encoding => panic!("latest frame was not pending"),
+        }
     };
 
     for sequence in 4..=103 {
         let replacement = frame(sequence, 1);
         assert_eq!(
-            encoder.submit(captured(&replacement)).unwrap(),
+            encoder
+                .submit(captured(&replacement))
+                .expect("test frame should be accepted by the encoder"),
             SubmitResult::ReplacedPending
         );
-        let pool = shared.pool.lock().unwrap();
-        let FrameSlot::Pending(pending) = &pool.slots[pending_slot] else {
-            panic!("replacement frame was not pending");
-        };
-        assert_eq!(pending.pixels.as_ptr(), pending_pointer);
-        assert_eq!(pending.pixels.capacity(), pending_capacity);
-        assert_eq!(pending.metadata, replacement.metadata);
-        assert_eq!(pending.config, replacement.config);
-        assert_eq!(pending.pixels, replacement.pixels);
+        let pool = shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned");
+        match &pool.slots[pending_slot] {
+            FrameSlot::Pending(pending) => {
+                assert_eq!(pending.pixels.as_ptr(), pending_pointer);
+                assert_eq!(pending.pixels.capacity(), pending_capacity);
+                assert_eq!(pending.metadata, replacement.metadata);
+                assert_eq!(pending.config, replacement.config);
+                assert_eq!(pending.pixels, replacement.pixels);
+            }
+            FrameSlot::Free(_) | FrameSlot::Encoding => {
+                panic!("replacement frame was not pending")
+            }
+        }
     }
 
     assert_eq!(first_encoding.metadata.sequence, 1);
     assert!(first_encoding.pixels.iter().all(|pixel| *pixel == 1));
     assert_ne!(first_encoding.pixels.as_ptr(), pending_pointer);
     {
-        let pool = shared.pool.lock().unwrap();
+        let pool = shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned");
         assert!(matches!(pool.slots[first_slot], FrameSlot::Encoding));
         assert!(matches!(pool.slots[pending_slot], FrameSlot::Pending(_)));
         assert_eq!(
@@ -619,7 +696,8 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
     }
 
     release_slot(&shared, first_slot, first_encoding);
-    let (latest_slot, latest) = take_pending_frame(&shared).unwrap();
+    let (latest_slot, latest) =
+        take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
     assert_eq!(latest_slot, pending_slot);
     assert_eq!(latest.metadata.sequence, 103);
     assert!(latest.pixels.iter().all(|pixel| *pixel == 103));
@@ -637,14 +715,24 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
     };
 
     let current = frame(1, 1);
-    encoder.submit(captured(&current)).unwrap();
-    let pending_slot = shared.pool.lock().unwrap().pending.unwrap();
+    encoder
+        .submit(captured(&current))
+        .expect("test frame should be accepted by the encoder");
+    let pending_slot = shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .pending
+        .expect("submitted test frame should have a pending slot index");
     let pending_pointer = {
-        let pool = shared.pool.lock().unwrap();
-        let FrameSlot::Pending(pending) = &pool.slots[pending_slot] else {
-            panic!("current frame was not pending");
-        };
-        pending.pixels.as_ptr()
+        let pool = shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned");
+        match &pool.slots[pending_slot] {
+            FrameSlot::Pending(pending) => pending.pixels.as_ptr(),
+            FrameSlot::Free(_) | FrameSlot::Encoding => panic!("current frame was not pending"),
+        }
     };
 
     let future = frame(2, 2);
@@ -653,21 +741,35 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
         Err(VideoError::InvalidFrame)
     ));
     {
-        let pool = shared.pool.lock().unwrap();
-        let FrameSlot::Pending(pending) = &pool.slots[pending_slot] else {
-            panic!("rejected input changed the pending slot");
-        };
-        assert_eq!(pending.metadata.sequence, 1);
-        assert_eq!(pending.pixels.as_ptr(), pending_pointer);
+        let pool = shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned");
+        match &pool.slots[pending_slot] {
+            FrameSlot::Pending(pending) => {
+                assert_eq!(pending.metadata.sequence, 1);
+                assert_eq!(pending.pixels.as_ptr(), pending_pointer);
+            }
+            FrameSlot::Free(_) | FrameSlot::Encoding => {
+                panic!("rejected input changed the pending slot")
+            }
+        }
     }
 
-    encoder.set_generation(2).unwrap();
-    let pool = shared.pool.lock().unwrap();
+    encoder
+        .set_generation(2)
+        .expect("valid next media generation should be accepted");
+    let pool = shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned");
     assert!(pool.pending.is_none());
-    let FrameSlot::Free(storage) = &pool.slots[pending_slot] else {
-        panic!("old-generation pending storage was not released");
-    };
-    assert_eq!(storage.as_ptr(), pending_pointer);
+    match &pool.slots[pending_slot] {
+        FrameSlot::Free(storage) => assert_eq!(storage.as_ptr(), pending_pointer),
+        FrameSlot::Pending(_) | FrameSlot::Encoding => {
+            panic!("old-generation pending storage was not released")
+        }
+    }
 }
 
 #[test]
@@ -692,18 +794,35 @@ fn generation_changes_are_positive_checked_increments() {
         encoder.set_generation(3),
         Err(VideoError::InvalidFrame)
     ));
-    encoder.set_generation(2).unwrap();
+    encoder
+        .set_generation(2)
+        .expect("valid next media generation should be accepted");
     assert!(matches!(
         encoder.set_generation(2),
         Err(VideoError::InvalidFrame)
     ));
-    shared.pool.lock().unwrap().generation = MAX_MEDIA_GENERATION;
+    shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .generation = MAX_MEDIA_GENERATION;
     assert!(matches!(
         encoder.set_generation(MAX_MEDIA_GENERATION + 1),
         Err(VideoError::InvalidFrame)
     ));
-    assert_eq!(shared.pool.lock().unwrap().generation, MAX_MEDIA_GENERATION);
-    shared.pool.lock().unwrap().generation = u32::MAX;
+    assert_eq!(
+        shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned")
+            .generation,
+        MAX_MEDIA_GENERATION
+    );
+    shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .generation = u32::MAX;
     assert!(matches!(
         encoder.set_generation(1),
         Err(VideoError::InvalidFrame)
@@ -722,9 +841,15 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
 
     for sequence in 1..=SLOT_COUNT as u64 {
         let small = sized_frame(sequence, 1, 2, 2);
-        encoder.submit(captured(&small)).unwrap();
-        let (slot, stored) = take_pending_frame(&shared).unwrap();
-        assert_eq!(slot, sequence as usize - 1);
+        encoder
+            .submit(captured(&small))
+            .expect("test frame should be accepted by the encoder");
+        let (slot, stored) =
+            take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
+        assert_eq!(
+            slot,
+            usize::try_from(sequence).expect("slot test sequence should fit usize") - 1
+        );
         release_slot(&shared, slot, stored);
     }
 
@@ -732,8 +857,11 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
     let mut capacities = [0; SLOT_COUNT];
     for sequence in 4..=6 {
         let large = sized_frame(sequence, 1, 64, 64);
-        encoder.submit(captured(&large)).unwrap();
-        let (slot, stored) = take_pending_frame(&shared).unwrap();
+        encoder
+            .submit(captured(&large))
+            .expect("test frame should be accepted by the encoder");
+        let (slot, stored) =
+            take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
         pointers[slot] = stored.pixels.as_ptr();
         capacities[slot] = stored.pixels.capacity();
         assert!(capacities[slot] >= large.pixels.len());
@@ -749,8 +877,11 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
         } else {
             sized_frame(sequence, 1, 2, 2)
         };
-        encoder.submit(captured(&source)).unwrap();
-        let (slot, reused) = take_pending_frame(&shared).unwrap();
+        encoder
+            .submit(captured(&source))
+            .expect("test frame should be accepted by the encoder");
+        let (slot, reused) =
+            take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
         assert_eq!(reused.pixels.as_ptr(), pointers[slot]);
         assert_eq!(reused.pixels.capacity(), capacities[slot]);
         assert_eq!(reused.pixels, source.pixels);
@@ -761,43 +892,65 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
 #[test]
 fn partial_pipe_writes_finish_the_same_frame() {
     let (mut reader, mut writer, capacity) = nonblocking_pipe();
-    let bytes: Vec<_> = (0..capacity * 3 + 17).map(|index| index as u8).collect();
+    let bytes: Vec<_> = (0..capacity * 3 + 17)
+        .map(|index| index.to_le_bytes()[0])
+        .collect();
     let drain = thread::spawn(move || {
         thread::sleep(Duration::from_millis(10));
         let mut received = Vec::new();
-        reader.read_to_end(&mut received).unwrap();
+        reader
+            .read_to_end(&mut received)
+            .expect("test pipe should drain to EOF");
         received
     });
 
-    write_frame(&shared(), &mut writer, &bytes, 1).unwrap();
+    write_frame(&shared(), &mut writer, &bytes, 1).expect("test frame write should complete");
     drop(writer);
 
-    assert_eq!(drain.join().unwrap(), bytes);
+    assert_eq!(
+        drain
+            .join()
+            .expect("pipe drain thread should finish cleanly"),
+        bytes
+    );
 }
 
 #[test]
 fn generation_change_abandons_a_partially_written_pipe_frame() {
     let (mut reader, mut writer, capacity) = nonblocking_pipe();
-    writer.write_all(&vec![0xa5; capacity]).unwrap();
+    writer
+        .write_all(&vec![0xa5; capacity])
+        .expect("test pipe should accept its filler bytes");
     let shared = shared();
     let controller_shared = Arc::clone(&shared);
     let controller = thread::spawn(move || {
         let mut filler = vec![0; capacity];
-        reader.read_exact(&mut filler).unwrap();
+        reader
+            .read_exact(&mut filler)
+            .expect("test pipe filler should drain completely");
         assert!(filler.iter().all(|byte| *byte == 0xa5));
         thread::sleep(Duration::from_millis(10));
         let changed_at = Instant::now();
-        controller_shared.pool.lock().unwrap().generation = 2;
+        controller_shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned")
+            .generation = 2;
         (reader, changed_at)
     });
     let bytes = vec![0x5a; capacity * 2];
 
-    let error = write_frame(&shared, &mut writer, &bytes, 1).unwrap_err();
+    let error = write_frame(&shared, &mut writer, &bytes, 1)
+        .expect_err("generation change should interrupt the frame write");
     let returned_at = Instant::now();
-    let (mut reader, changed_at) = controller.join().unwrap();
+    let (mut reader, changed_at) = controller
+        .join()
+        .expect("pipe controller thread should finish cleanly");
     drop(writer);
     let mut received = Vec::new();
-    reader.read_to_end(&mut received).unwrap();
+    reader
+        .read_to_end(&mut received)
+        .expect("test pipe should drain to EOF");
 
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert!(!received.is_empty());
@@ -809,20 +962,33 @@ fn generation_change_abandons_a_partially_written_pipe_frame() {
 #[test]
 fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
     let (_reader, mut writer, capacity) = nonblocking_pipe();
-    writer.write_all(&vec![0xa5; capacity]).unwrap();
+    writer
+        .write_all(&vec![0xa5; capacity])
+        .expect("test pipe should accept its filler bytes");
     let shared = shared();
     let writer_shared = Arc::clone(&shared);
     let (started_tx, started_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        started_tx.send(()).unwrap();
+        started_tx
+            .send(())
+            .expect("worker should report that its write started");
         write_frame(&writer_shared, &mut writer, &[0x5a], 1)
     });
-    started_rx.recv().unwrap();
+    started_rx
+        .recv()
+        .expect("test should observe the worker starting");
     thread::sleep(Duration::from_millis(10));
 
     let stopped_at = Instant::now();
-    shared.pool.lock().unwrap().stopping = true;
-    let error = worker.join().unwrap().unwrap_err();
+    shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .stopping = true;
+    let error = worker
+        .join()
+        .expect("blocked pipe writer thread should finish cleanly")
+        .expect_err("stopping should interrupt the blocked frame write");
 
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert!(stopped_at.elapsed() < Duration::from_millis(100));
@@ -832,19 +998,22 @@ fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
 fn notification_wakeup_drains_a_burst_and_rearms_without_loss() {
     let shared = shared();
     let (sender, receiver) = mpsc::sync_channel(64);
-    let (notification_wake, notification_source) = make_ping().unwrap();
-    let mut event_loop = EventLoop::<Vec<u64>>::try_new().unwrap();
+    let (notification_wake, notification_source) =
+        make_ping().expect("test notification ping should open");
+    let mut event_loop = EventLoop::<Vec<u64>>::try_new().expect("test event loop should open");
     event_loop
         .handle()
-        .insert_source(notification_source, move |(), _, sequences| {
+        .insert_source(notification_source, move |(), (), sequences| {
             while let Ok(notification) = receiver.try_recv() {
-                let Notification::Submitted(metadata) = notification else {
-                    panic!("unexpected notification");
-                };
-                sequences.push(metadata.sequence);
+                match notification {
+                    Notification::Submitted(metadata) => sequences.push(metadata.sequence),
+                    Notification::RestartRequired { .. } | Notification::Fatal(_) => {
+                        panic!("unexpected notification")
+                    }
+                }
             }
         })
-        .unwrap();
+        .expect("notification source should register with the test event loop");
 
     for sequence in 0..64 {
         assert!(send_notification(
@@ -857,7 +1026,7 @@ fn notification_wakeup_drains_a_burst_and_rearms_without_loss() {
     let mut sequences = Vec::new();
     event_loop
         .dispatch(Duration::from_millis(100), &mut sequences)
-        .unwrap();
+        .expect("test event loop should dispatch the notification");
     assert_eq!(sequences, (0..64).collect::<Vec<_>>());
 
     assert!(send_notification(
@@ -868,7 +1037,7 @@ fn notification_wakeup_drains_a_burst_and_rearms_without_loss() {
     ));
     event_loop
         .dispatch(Duration::from_millis(100), &mut sequences)
-        .unwrap();
+        .expect("test event loop should dispatch the notification");
     assert_eq!(sequences.last(), Some(&64));
 }
 
@@ -878,17 +1047,18 @@ fn full_notification_queue_wakes_for_fatal_side_channel() {
     let (sender, receiver) = mpsc::sync_channel(1);
     sender
         .send(Notification::Submitted(frame(1, 1).metadata))
-        .unwrap();
-    let (notification_wake, notification_source) = make_ping().unwrap();
-    let mut event_loop = EventLoop::<usize>::try_new().unwrap();
+        .expect("test notification should enter the queue");
+    let (notification_wake, notification_source) =
+        make_ping().expect("test notification ping should open");
+    let mut event_loop = EventLoop::<usize>::try_new().expect("test event loop should open");
     event_loop
         .handle()
-        .insert_source(notification_source, move |(), _, drained| {
+        .insert_source(notification_source, move |(), (), drained| {
             while receiver.try_recv().is_ok() {
                 *drained += 1;
             }
         })
-        .unwrap();
+        .expect("notification source should register with the test event loop");
 
     assert!(!send_notification_until(
         &shared,
@@ -900,11 +1070,16 @@ fn full_notification_queue_wakes_for_fatal_side_channel() {
     let mut drained = 0;
     event_loop
         .dispatch(Duration::from_millis(100), &mut drained)
-        .unwrap();
+        .expect("test event loop should dispatch the notification");
 
     assert_eq!(drained, 1);
     assert_eq!(
-        shared.pool.lock().unwrap().notification_failure.as_deref(),
+        shared
+            .pool
+            .lock()
+            .expect("frame pool mutex should not be poisoned")
+            .notification_failure
+            .as_deref(),
         Some("video notification queue remained full")
     );
 }
@@ -913,11 +1088,15 @@ fn full_notification_queue_wakes_for_fatal_side_channel() {
 fn a_full_notification_queue_cannot_block_shutdown() {
     let shared = shared();
     let (sender, receiver) = mpsc::sync_channel(1);
-    let (notification_wake, _) = make_ping().unwrap();
+    let (notification_wake, _) = make_ping().expect("test notification ping should open");
     sender
         .send(Notification::Fatal("occupy queue".into()))
-        .unwrap();
-    shared.pool.lock().unwrap().stopping = true;
+        .expect("test notification should enter the queue");
+    shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .stopping = true;
     let started = Instant::now();
 
     assert!(!send_notification(
@@ -935,37 +1114,58 @@ fn worker_inherits_blocked_signal_and_child_resets_mask_before_exec() {
     struct MaskGuard(SigSet);
     impl Drop for MaskGuard {
         fn drop(&mut self) {
-            self.0.thread_set_mask().unwrap();
+            self.0
+                .thread_set_mask()
+                .expect("original signal mask should be restored");
         }
     }
 
     let mut blocked = SigSet::empty();
     blocked.add(Signal::SIGTERM);
-    let _mask_guard = MaskGuard(blocked.thread_swap_mask(SigmaskHow::SIG_BLOCK).unwrap());
+    let _mask_guard = MaskGuard(
+        blocked
+            .thread_swap_mask(SigmaskHow::SIG_BLOCK)
+            .expect("SIGTERM should be blocked for the test worker"),
+    );
     let (pid_tx, pid_rx) = mpsc::channel();
     let (status_tx, status_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        assert!(SigSet::thread_get_mask().unwrap().contains(Signal::SIGTERM));
+        assert!(
+            SigSet::thread_get_mask()
+                .expect("worker signal mask should be readable")
+                .contains(Signal::SIGTERM)
+        );
         let mut command = Command::new("sleep");
         command.arg("30");
         reset_signal_mask_before_exec(&mut command);
-        let mut child = command.spawn().unwrap();
-        pid_tx.send(child.id()).unwrap();
-        status_tx.send(child.wait().unwrap()).unwrap();
+        let mut child = command.spawn().expect("test child process should start");
+        pid_tx
+            .send(child.id())
+            .expect("worker should publish the child PID");
+        status_tx
+            .send(child.wait().expect("test child process should be waitable"))
+            .expect("worker should publish the child exit status");
     });
 
-    let child_pid = pid_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    let child_pid = Pid::from_raw(i32::try_from(child_pid).unwrap());
-    kill(child_pid, Signal::SIGTERM).unwrap();
+    let child_pid = pid_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("test child should publish its PID before the deadline");
+    let child_pid =
+        Pid::from_raw(i32::try_from(child_pid).expect("test child PID should fit pid_t"));
+    kill(child_pid, Signal::SIGTERM).expect("SIGTERM should reach the test child");
     let status = match status_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(status) => status,
         Err(error) => {
-            let _ = kill(child_pid, Signal::SIGKILL);
-            worker.join().unwrap();
+            let _kill_succeeded = kill(child_pid, Signal::SIGKILL).is_ok();
+            worker
+                .join()
+                .expect("test worker thread should finish cleanly");
             panic!("SIGTERM did not stop child with reset mask: {error}");
         }
     };
-    worker.join().unwrap();
+    worker
+        .join()
+        .expect("test worker thread should finish cleanly");
     assert_eq!(status.signal(), Some(Signal::SIGTERM as i32));
 }
 
@@ -981,7 +1181,11 @@ fn ffmpeg_flags_match_the_rtp_contract() {
                 "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on",
             ]
     }));
-    assert_eq!(args.last().unwrap(), "rtp://127.0.0.1:5000?pkt_size=60000");
+    assert_eq!(
+        args.last()
+            .expect("FFmpeg argument list should include an output URL"),
+        "rtp://127.0.0.1:5000?pkt_size=60000"
+    );
 }
 
 #[test]
@@ -1022,7 +1226,13 @@ fn ffmpeg_converts_and_tags_desktop_srgb_consistently() {
 #[test]
 fn dimensions_enforce_level_and_four_k_budget() {
     assert_eq!(encoded_dimensions(3840, 2160, 100, 60), (3840, 2160));
-    assert_eq!(frame(1, 1).config.validate().unwrap(), 16);
+    assert_eq!(
+        frame(1, 1)
+            .config
+            .validate()
+            .expect("fixed test frame should have a valid encoder config"),
+        16
+    );
     let mut oversized = frame(1, 1).config;
     oversized.raw_width = 3842;
     oversized.raw_height = 2160;
@@ -1078,13 +1288,19 @@ fn every_same_generation_config_change_requests_a_new_generation() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_actual_sps_matches_gateway_avc1_f40034() {
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let socket =
+        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    let port = socket.local_addr().unwrap().port();
-    let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
-    submit_frame(&encoder, &real_frame(1, 1)).unwrap();
+        .expect("test RTP socket timeout should be configured");
+    let port = socket
+        .local_addr()
+        .expect("bound test RTP socket should have a local address")
+        .port();
+    let encoder = VideoEncoder::start("ffmpeg".into(), port)
+        .expect("FFmpeg-backed test encoder should start");
+    submit_frame(&encoder, &real_frame(1, 1))
+        .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
@@ -1124,16 +1340,31 @@ fn ffmpeg_actual_sps_matches_gateway_avc1_f40034() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_preserves_largest_supported_generation_in_ssrc() {
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let socket =
+        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    let encoder =
-        VideoEncoder::start("ffmpeg".into(), socket.local_addr().unwrap().port()).unwrap();
+        .expect("test RTP socket timeout should be configured");
+    let encoder = VideoEncoder::start(
+        "ffmpeg".into(),
+        socket
+            .local_addr()
+            .expect("bound test RTP socket should have a local address")
+            .port(),
+    )
+    .expect("FFmpeg-backed test encoder should start");
     let generation = MAX_MEDIA_GENERATION;
-    encoder.shared.pool.lock().unwrap().generation = generation - 1;
-    encoder.set_generation(generation).unwrap();
-    submit_frame(&encoder, &real_frame(1, generation)).unwrap();
+    encoder
+        .shared
+        .pool
+        .lock()
+        .expect("frame pool mutex should not be poisoned")
+        .generation = generation - 1;
+    encoder
+        .set_generation(generation)
+        .expect("valid next media generation should be accepted");
+    submit_frame(&encoder, &real_frame(1, generation))
+        .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(_)
@@ -1145,15 +1376,20 @@ fn ffmpeg_preserves_largest_supported_generation_in_ssrc() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_stdin_has_one_mib_capacity() {
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let socket =
+        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     let process = spawn_ffmpeg(
         "ffmpeg",
-        socket.local_addr().unwrap().port(),
+        socket
+            .local_addr()
+            .expect("bound test RTP socket should have a local address")
+            .port(),
         real_frame(1, 1).config,
         1,
     )
-    .unwrap();
-    let capacity = fcntl(&process.input, FcntlArg::F_GETPIPE_SZ).unwrap();
+    .expect("FFmpeg test process should start");
+    let capacity = fcntl(&process.input, FcntlArg::F_GETPIPE_SZ)
+        .expect("FFmpeg stdin pipe capacity should be readable");
     process.stop();
     assert_eq!(capacity, 1024 * 1024);
 }
@@ -1161,13 +1397,19 @@ fn ffmpeg_stdin_has_one_mib_capacity() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_emits_a_complete_rtp_frame_without_stdin_eof() {
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let socket =
+        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    let port = socket.local_addr().unwrap().port();
-    let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
-    submit_frame(&encoder, &real_frame(1, 1)).unwrap();
+        .expect("test RTP socket timeout should be configured");
+    let port = socket
+        .local_addr()
+        .expect("bound test RTP socket should have a local address")
+        .port();
+    let encoder = VideoEncoder::start("ffmpeg".into(), port)
+        .expect("FFmpeg-backed test encoder should start");
+    submit_frame(&encoder, &real_frame(1, 1))
+        .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
@@ -1186,12 +1428,17 @@ fn ffmpeg_emits_a_complete_rtp_frame_without_stdin_eof() {
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_sparse_frames_resume_after_idle_at_thirty_and_sixty_fps() {
     for fps in [30, 60] {
-        let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let socket =
+            UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let port = socket.local_addr().unwrap().port();
-        let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
+            .expect("test RTP socket timeout should be configured");
+        let port = socket
+            .local_addr()
+            .expect("bound test RTP socket should have a local address")
+            .port();
+        let encoder = VideoEncoder::start("ffmpeg".into(), port)
+            .expect("FFmpeg-backed test encoder should start");
 
         for (sequence, idle) in [
             (1, Duration::ZERO),
@@ -1200,7 +1447,7 @@ fn ffmpeg_sparse_frames_resume_after_idle_at_thirty_and_sixty_fps() {
         ] {
             thread::sleep(idle);
             let frame = real_frame_at_fps(sequence, 1, fps);
-            submit_frame(&encoder, &frame).unwrap();
+            submit_frame(&encoder, &frame).expect("test frame should be accepted by the encoder");
             assert!(matches!(
                 wait_for_notification(&encoder),
                 Notification::Submitted(FrameMetadata {
@@ -1221,13 +1468,19 @@ fn ffmpeg_sparse_frames_resume_after_idle_at_thirty_and_sixty_fps() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let socket =
+        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    let port = socket.local_addr().unwrap().port();
-    let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
-    submit_frame(&encoder, &real_frame(1, 1)).unwrap();
+        .expect("test RTP socket timeout should be configured");
+    let port = socket
+        .local_addr()
+        .expect("bound test RTP socket should have a local address")
+        .port();
+    let encoder = VideoEncoder::start("ffmpeg".into(), port)
+        .expect("FFmpeg-backed test encoder should start");
+    submit_frame(&encoder, &real_frame(1, 1))
+        .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
@@ -1239,7 +1492,8 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
     let old_ssrc = receive_frame_ssrc(&socket);
     let pid = encoder.child_pid().expect("ffmpeg child was not recorded");
 
-    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).unwrap();
+    let pid = i32::try_from(pid).expect("FFmpeg child PID should fit pid_t");
+    kill(Pid::from_raw(pid), Signal::SIGKILL).expect("SIGKILL should reach the FFmpeg child");
     assert_eq!(
         wait_for_notification(&encoder),
         Notification::RestartRequired { generation: 1 }
@@ -1247,8 +1501,11 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
     thread::sleep(Duration::from_millis(100));
     assert!(encoder.child_pid().is_none());
 
-    encoder.set_generation(2).unwrap();
-    submit_frame(&encoder, &real_frame(2, 2)).unwrap();
+    encoder
+        .set_generation(2)
+        .expect("valid next media generation should be accepted");
+    submit_frame(&encoder, &real_frame(2, 2))
+        .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
@@ -1266,13 +1523,19 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let socket =
+        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    let port = socket.local_addr().unwrap().port();
-    let encoder = VideoEncoder::start("ffmpeg".into(), port).unwrap();
-    submit_frame(&encoder, &real_frame(1, 1)).unwrap();
+        .expect("test RTP socket timeout should be configured");
+    let port = socket
+        .local_addr()
+        .expect("bound test RTP socket should have a local address")
+        .port();
+    let encoder = VideoEncoder::start("ffmpeg".into(), port)
+        .expect("FFmpeg-backed test encoder should start");
+    submit_frame(&encoder, &real_frame(1, 1))
+        .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
@@ -1285,7 +1548,7 @@ fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
 
     let mut changed = real_frame(2, 1);
     changed.config.bitrate_kbps = 4_000;
-    submit_frame(&encoder, &changed).unwrap();
+    submit_frame(&encoder, &changed).expect("test frame should be accepted by the encoder");
     assert_eq!(
         wait_for_notification(&encoder),
         Notification::RestartRequired { generation: 1 }
@@ -1294,8 +1557,10 @@ fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
 
     let mut replacement = real_frame(3, 2);
     replacement.config.bitrate_kbps = 4_000;
-    encoder.set_generation(2).unwrap();
-    submit_frame(&encoder, &replacement).unwrap();
+    encoder
+        .set_generation(2)
+        .expect("valid next media generation should be accepted");
+    submit_frame(&encoder, &replacement).expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
