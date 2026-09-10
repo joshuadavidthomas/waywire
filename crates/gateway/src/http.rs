@@ -1,9 +1,11 @@
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
@@ -24,7 +26,6 @@ use futures_util::stream::SplitSink;
 use nix::time::ClockId;
 use nix::time::clock_gettime;
 use rust_embed::Embed;
-use sprite_desktop_protocol::browser::BrowserError;
 use sprite_desktop_protocol::browser::ClientEvent;
 use sprite_desktop_protocol::browser::ClientMessage;
 use sprite_desktop_protocol::browser::ControlState;
@@ -62,92 +63,34 @@ const OUTBOUND_MESSAGE_LIMIT: usize = 32;
 const OUTBOUND_BYTE_LIMIT: usize = 2 * MAX_CONTROL_MESSAGE_BYTES;
 const MAX_UPGRADED_CONNECTIONS: usize = 32;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 enum SocketEnd {
-    #[error("gateway shutdown")]
-    GatewayShutdown,
-    #[error("client sent a WebSocket close frame without a status")]
-    ClientCloseWithoutStatus,
-    #[error("client sent WebSocket close frame {code}: {reason}")]
-    ClientClose { code: u16, reason: String },
-    #[error("client disconnected without a close frame")]
-    ClientDisconnected,
-    #[error("WebSocket read failed: {0}")]
-    Read(#[source] axum::Error),
-    #[error("WebSocket write timed out after five seconds")]
-    WriteTimeout,
-    #[error("WebSocket write failed: {0}")]
-    Write(#[source] axum::Error),
-    #[error(transparent)]
-    Outbound(#[from] OutboundError),
-    #[error("browser control parse failed: {0}")]
-    Browser(#[source] BrowserError),
-    #[error("{operation} failed: {source:#}")]
-    Session {
-        operation: &'static str,
-        #[source]
-        source: anyhow::Error,
-    },
-    #[error("read monotonic clock: {0}")]
-    Clock(#[source] nix::errno::Errno),
-    #[error("control event subscription lagged by {0} events")]
-    EventLagged(u64),
-    #[error("control event broadcaster closed")]
-    EventBroadcastClosed,
-    #[error("control writer stopped without a socket termination")]
-    WriterStopped,
-    #[error("control writer task failed: {0}")]
-    WriterTask(#[source] tokio::task::JoinError),
-    #[error("control writer did not stop within five seconds")]
-    WriterShutdownTimeout,
-    #[error("{primary}; socket cleanup also failed: {cleanup}")]
-    Cleanup {
-        primary: Box<Self>,
-        cleanup: Box<Self>,
-    },
+    Shutdown,
+    ClientClosed(Option<CloseFrame>),
+    Disconnected,
+    Failed(anyhow::Error),
 }
 
 impl SocketEnd {
     fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+impl fmt::Display for SocketEnd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::GatewayShutdown
-            | Self::ClientCloseWithoutStatus
-            | Self::ClientClose { .. }
-            | Self::ClientDisconnected => false,
-            Self::Read(_)
-            | Self::WriteTimeout
-            | Self::Write(_)
-            | Self::Outbound(_)
-            | Self::Browser(_)
-            | Self::Session { .. }
-            | Self::Clock(_)
-            | Self::EventLagged(_)
-            | Self::EventBroadcastClosed
-            | Self::WriterStopped
-            | Self::WriterTask(_)
-            | Self::WriterShutdownTimeout => true,
-            Self::Cleanup { primary, cleanup } => primary.is_failure() || cleanup.is_failure(),
-        }
-    }
-
-    fn client_close(frame: Option<CloseFrame>) -> Self {
-        match frame {
-            Some(frame) => Self::ClientClose {
-                code: frame.code,
-                reason: frame.reason.to_string(),
-            },
-            None => Self::ClientCloseWithoutStatus,
-        }
-    }
-
-    fn session(operation: &'static str, source: anyhow::Error) -> Self {
-        Self::Session { operation, source }
-    }
-
-    fn with_cleanup(self, cleanup: Self) -> Self {
-        Self::Cleanup {
-            primary: Box::new(self),
-            cleanup: Box::new(cleanup),
+            Self::Shutdown => formatter.write_str("gateway shutdown"),
+            Self::ClientClosed(Some(frame)) => write!(
+                formatter,
+                "client sent WebSocket close frame {}: {}",
+                frame.code, frame.reason
+            ),
+            Self::ClientClosed(None) => {
+                formatter.write_str("client sent a WebSocket close frame without a status")
+            }
+            Self::Disconnected => formatter.write_str("client disconnected without a close frame"),
+            Self::Failed(error) => write!(formatter, "{error:#}"),
         }
     }
 }
@@ -164,16 +107,8 @@ pub(crate) struct SocketConnections {
 }
 
 struct SocketAdmission {
-    task: TaskTrackerToken,
-    permit: OwnedSemaphorePermit,
-}
-
-impl SocketAdmission {
-    fn release(self) {
-        let Self { task, permit } = self;
-        drop(task);
-        drop(permit);
-    }
+    _task: TaskTrackerToken,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl SocketConnections {
@@ -190,7 +125,10 @@ impl SocketConnections {
         // no untracked upgrader can cross the admission cutoff.
         let task = self.tasks.token();
         let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
-        Some(SocketAdmission { task, permit })
+        Some(SocketAdmission {
+            _task: task,
+            _permit: permit,
+        })
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -206,38 +144,17 @@ impl SocketConnections {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    readiness: Readiness,
-    events: AppEvents,
-    sessions: Sessions,
-    hub: VideoHub,
-    origin: Arc<str>,
-    frame_rate: Fps,
-    connections: SocketConnections,
-    next_socket_id: Arc<AtomicU64>,
+    pub(crate) readiness: Readiness,
+    pub(crate) events: AppEvents,
+    pub(crate) sessions: Sessions,
+    pub(crate) hub: VideoHub,
+    pub(crate) origin: Arc<str>,
+    pub(crate) frame_rate: Fps,
+    pub(crate) connections: SocketConnections,
+    pub(crate) next_socket_id: Arc<AtomicU64>,
 }
 
 impl AppState {
-    pub(crate) fn new(
-        readiness: Readiness,
-        events: AppEvents,
-        sessions: Sessions,
-        hub: VideoHub,
-        origin: String,
-        frame_rate: Fps,
-        connections: SocketConnections,
-    ) -> Self {
-        Self {
-            readiness,
-            events,
-            sessions,
-            hub,
-            origin: origin.into(),
-            frame_rate,
-            connections,
-            next_socket_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
     fn allocate_socket_id(&self) -> SocketId {
         SocketId::new(self.next_socket_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -291,12 +208,11 @@ async fn stream_socket(
     mut socket: WebSocket,
     state: AppState,
     socket_id: SocketId,
-    admission: SocketAdmission,
+    _admission: SocketAdmission,
 ) {
     info!(socket_id = socket_id.get(), "stream socket opened");
     let reason = run_stream_socket(&mut socket, &state).await;
     log_socket_close("stream", socket_id, &reason);
-    admission.release();
 }
 
 async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEnd {
@@ -318,16 +234,20 @@ async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEn
         loop {
             tokio::select! {
                 () = state.connections.cancellation.cancelled() => {
-                    return Ok(SocketEnd::GatewayShutdown);
+                    return Ok(SocketEnd::Shutdown);
                 }
                 incoming = socket.recv() => {
                     match incoming {
                         Some(Ok(Message::Close(frame))) => {
-                            return Ok(SocketEnd::client_close(frame));
+                            return Ok(SocketEnd::ClientClosed(frame));
                         }
                         Some(Ok(_)) => {}
-                        Some(Err(error)) => return Ok(SocketEnd::Read(error)),
-                        None => return Ok(SocketEnd::ClientDisconnected),
+                        Some(Err(error)) => {
+                            return Ok(SocketEnd::Failed(
+                                anyhow::Error::new(error).context("WebSocket read failed"),
+                            ));
+                        }
+                        None => return Ok(SocketEnd::Disconnected),
                     }
                 }
                 frame = subscription.next() => {
@@ -369,8 +289,6 @@ struct OutboundItem {
 
 #[derive(Debug, Error)]
 enum OutboundError {
-    #[error("outbound message has {size} bytes, which exceeds the queue's integer limit")]
-    MessageTooLarge { size: usize },
     #[error("outbound byte budget is exhausted")]
     ByteBudgetExhausted,
     #[error("outbound byte budget is closed")]
@@ -383,6 +301,12 @@ enum OutboundError {
     Serialization(#[source] serde_json::Error),
 }
 
+impl From<OutboundError> for SocketEnd {
+    fn from(error: OutboundError) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
 #[derive(Clone)]
 struct Outbound {
     tx: mpsc::Sender<OutboundItem>,
@@ -392,8 +316,7 @@ struct Outbound {
 impl Outbound {
     fn enqueue(&self, message: Message) -> Result<(), OutboundError> {
         let size = message_size(&message);
-        let permits =
-            u32::try_from(size).map_err(|_overflow| OutboundError::MessageTooLarge { size })?;
+        let permits = u32::try_from(size).unwrap_or(u32::MAX);
         let bytes = Arc::clone(&self.bytes)
             .try_acquire_many_owned(permits)
             .map_err(|error| match error {
@@ -446,7 +369,9 @@ async fn control_writer(
             () = cancellation.cancelled() => break 'writer Ok(()),
             item = receiver.recv() => {
                 let Some(OutboundItem { message, bytes }) = item else {
-                    break 'writer Err(SocketEnd::WriterStopped);
+                    break 'writer Err(SocketEnd::Failed(anyhow!(
+                        "control writer stopped without a socket termination"
+                    )));
                 };
                 tokio::select! {
                     biased;
@@ -458,8 +383,12 @@ async fn control_writer(
                         drop(bytes);
                         match write_result {
                             Ok(Ok(())) => {}
-                            Ok(Err(error)) => break 'writer Err(SocketEnd::Write(error)),
-                            Err(_elapsed) => break 'writer Err(SocketEnd::WriteTimeout),
+                            Ok(Err(error)) => break 'writer Err(SocketEnd::Failed(
+                                anyhow::Error::new(error).context("WebSocket write failed"),
+                            )),
+                            Err(_elapsed) => break 'writer Err(SocketEnd::Failed(anyhow!(
+                                "WebSocket write timed out after five seconds"
+                            ))),
                         }
                     }
                 }
@@ -474,12 +403,11 @@ async fn control_socket(
     socket: WebSocket,
     state: AppState,
     socket_id: SocketId,
-    admission: SocketAdmission,
+    _admission: SocketAdmission,
 ) {
     info!(socket_id = socket_id.get(), "control socket opened");
     let reason = run_control_socket(socket, &state, socket_id).await;
     log_socket_close("control", socket_id, &reason);
-    admission.release();
 }
 
 fn log_socket_close(kind: &'static str, socket_id: SocketId, reason: &SocketEnd) {
@@ -493,7 +421,6 @@ fn log_socket_close(kind: &'static str, socket_id: SocketId, reason: &SocketEnd)
 async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: SocketId) -> SocketEnd {
     // Subscribe before reading the snapshot so an update cannot fall between them.
     let mut events = state.events.subscribe();
-    let initial_events = state.events.initial();
     let cancellation = state.connections.cancellation.child_token();
     let (sink, mut incoming) = socket.split();
     let (sender, receiver) = mpsc::channel(OUTBOUND_MESSAGE_LIMIT);
@@ -501,13 +428,12 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
         tx: sender,
         bytes: Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)),
     };
-    let mut writer: JoinHandle<Result<(), SocketEnd>> =
-        tokio::spawn(control_writer(sink, receiver, cancellation.clone()));
+    let mut writer = tokio::spawn(control_writer(sink, receiver, cancellation.clone()));
     let mut writer_finished = false;
 
     let reason = 'connected: {
         if let Err(error) =
-            enqueue_initial_events(&outbound, initial_events, state.sessions.quality())
+            enqueue_initial_events(&outbound, state.events.initial(), state.sessions.quality())
         {
             break 'connected error.into();
         }
@@ -515,42 +441,47 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
         loop {
             tokio::select! {
                 biased;
-                () = state.connections.cancellation.cancelled() => {
-                    break 'connected SocketEnd::GatewayShutdown;
-                }
+                () = state.connections.cancellation.cancelled() => break 'connected SocketEnd::Shutdown,
                 writer_result = &mut writer => {
                     writer_finished = true;
                     break 'connected match writer_result {
-                        Ok(Ok(())) => SocketEnd::WriterStopped,
+                        Ok(Ok(())) => SocketEnd::Failed(anyhow!(
+                            "control writer stopped without a socket termination"
+                        )),
                         Ok(Err(error)) => error,
-                        Err(error) => SocketEnd::WriterTask(error),
+                        Err(error) => SocketEnd::Failed(anyhow!(
+                            "control writer task failed: {error}"
+                        )),
                     };
                 }
                 incoming_result = incoming.next() => {
                     let message = match incoming_result {
                         Some(Ok(message)) => message,
-                        Some(Err(error)) => break 'connected SocketEnd::Read(error),
-                        None => break 'connected SocketEnd::ClientDisconnected,
+                        Some(Err(error)) => break 'connected SocketEnd::Failed(anyhow!(
+                            "WebSocket read failed: {error}"
+                        )),
+                        None => break 'connected SocketEnd::Disconnected,
                     };
                     let result = match message {
                         Message::Text(text) => {
                             handle_text(&outbound, state, socket_id, text.as_str()).await
                         }
                         Message::Binary(bytes) => {
-                            let command = parse_browser_record(&bytes)
-                                .map_err(SocketEnd::Browser);
+                            let command = parse_browser_record(&bytes).map_err(|error| {
+                                SocketEnd::Failed(anyhow!("browser control parse failed: {error}"))
+                            });
                             match command {
                                 Ok(command) => state
                                     .sessions
                                     .input(socket_id, command)
                                     .await
-                                    .map_err(|error| SocketEnd::session("send binary input", error)),
+                                    .map_err(|error| {
+                                        SocketEnd::Failed(error.context("send binary input"))
+                                    }),
                                 Err(error) => Err(error),
                             }
                         }
-                        Message::Close(frame) => {
-                            break 'connected SocketEnd::client_close(frame);
-                        }
+                        Message::Close(frame) => break 'connected SocketEnd::ClientClosed(frame),
                         Message::Ping(_) | Message::Pong(_) => Ok(()),
                     };
                     if let Err(error) = result {
@@ -566,12 +497,12 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                                 break 'connected error.into();
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(count)) => {
-                            break 'connected SocketEnd::EventLagged(count);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            break 'connected SocketEnd::EventBroadcastClosed;
-                        }
+                        Err(broadcast::error::RecvError::Lagged(count)) => break 'connected
+                            SocketEnd::Failed(anyhow!(
+                                "control event subscription lagged by {count} events"
+                            )),
+                        Err(broadcast::error::RecvError::Closed) => break 'connected
+                            SocketEnd::Failed(anyhow!("control event broadcaster closed")),
                     }
                 }
             }
@@ -604,7 +535,7 @@ fn enqueue_initial_events(
 }
 
 async fn finish_control_socket(
-    mut reason: SocketEnd,
+    reason: SocketEnd,
     state: &AppState,
     socket_id: SocketId,
     cancellation: CancellationToken,
@@ -612,22 +543,44 @@ async fn finish_control_socket(
     writer: &mut JoinHandle<Result<(), SocketEnd>>,
 ) -> SocketEnd {
     cancellation.cancel();
-    if let Err(error) = state.sessions.release(socket_id).await {
-        reason = reason.with_cleanup(SocketEnd::session("release input lease", error));
-    }
+    let mut cleanup_error = state
+        .sessions
+        .release(socket_id)
+        .await
+        .err()
+        .map(|error| error.context("release input lease"));
 
     if !writer_finished {
-        match timeout(WRITE_LIMIT, &mut *writer).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => reason = reason.with_cleanup(error),
-            Ok(Err(error)) => reason = reason.with_cleanup(SocketEnd::WriterTask(error)),
+        let writer_error = match timeout(WRITE_LIMIT, &mut *writer).await {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(SocketEnd::Failed(error)))) => Some(error),
+            Ok(Ok(Err(clean_end))) => Some(anyhow!(clean_end.to_string())),
+            Ok(Err(error)) => Some(anyhow::Error::new(error).context("control writer task failed")),
             Err(_elapsed) => {
                 writer.abort();
                 let _ = writer.await;
-                reason = reason.with_cleanup(SocketEnd::WriterShutdownTimeout);
+                Some(anyhow!("control writer did not stop within five seconds"))
             }
+        };
+        if let Some(writer_error) = writer_error {
+            cleanup_error = Some(match cleanup_error {
+                Some(error) => error.context(format!("cleanup also failed: {writer_error:#}")),
+                None => writer_error,
+            });
         }
     }
+
+    let Some(cleanup_error) = cleanup_error else {
+        return reason;
+    };
+    if let SocketEnd::Failed(error) = reason {
+        return SocketEnd::Failed(error.context(format!("cleanup also failed: {cleanup_error:#}")));
+    }
+    warn!(
+        socket_id = socket_id.get(),
+        reason = %format_args!("{cleanup_error:#}"),
+        "socket cleanup failed"
+    );
     reason
 }
 
@@ -643,7 +596,7 @@ async fn handle_text(
                 .sessions
                 .acquire(socket_id)
                 .await
-                .map_err(|error| SocketEnd::session("acquire input lease", error))?
+                .map_err(|error| SocketEnd::Failed(error.context("acquire input lease")))?
             {
                 LeaseState::Active => ControlState::Active,
                 LeaseState::Busy => ControlState::Busy,
@@ -659,16 +612,20 @@ async fn handle_text(
                 .sessions
                 .release(socket_id)
                 .await
-                .map_err(|error| SocketEnd::session("release input lease", error))?;
+                .map_err(|error| SocketEnd::Failed(error.context("release input lease")))?;
             outbound
                 .enqueue_event(&ClientEvent::ControlState {
                     state: ControlState::Ready,
                 })
                 .map_err(SocketEnd::from)
         }
-        _ => match ClientMessage::parse_json(text.as_bytes()).map_err(SocketEnd::Browser)? {
+        _ => match ClientMessage::parse_json(text.as_bytes()).map_err(|error| {
+            SocketEnd::Failed(anyhow::Error::new(error).context("browser control parse failed"))
+        })? {
             ClientMessage::Ping { id: request_id } => {
-                let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(SocketEnd::Clock)?;
+                let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(|error| {
+                    SocketEnd::Failed(anyhow::Error::new(error).context("read monotonic clock"))
+                })?;
                 let nanos = i128::from(time.tv_sec()) * 1_000_000_000 + i128::from(time.tv_nsec());
                 outbound
                     .enqueue_event(&ClientEvent::Pong {
@@ -682,7 +639,7 @@ async fn handle_text(
                     .sessions
                     .feedback(socket_id, feedback)
                     .await
-                    .map_err(|error| SocketEnd::session("apply quality feedback", error))?;
+                    .map_err(|error| SocketEnd::Failed(error.context("apply quality feedback")))?;
                 if let Some(levels) = levels {
                     outbound
                         .enqueue_event(&ClientEvent::Quality(levels))
@@ -705,12 +662,12 @@ async fn handle_text(
                     },
                 )
                 .await
-                .map_err(|error| SocketEnd::session("send text input", error)),
+                .map_err(|error| SocketEnd::Failed(error.context("send text input"))),
             ClientMessage::ClipboardWrite { text } => state
                 .sessions
                 .input(socket_id, Command::Clipboard(text))
                 .await
-                .map_err(|error| SocketEnd::session("send clipboard input", error)),
+                .map_err(|error| SocketEnd::Failed(error.context("send clipboard input"))),
         },
     }
 }
@@ -730,12 +687,16 @@ async fn send(
     cancellation: &CancellationToken,
 ) -> Result<(), SocketEnd> {
     tokio::select! {
-        () = cancellation.cancelled() => Err(SocketEnd::GatewayShutdown),
+        () = cancellation.cancelled() => Err(SocketEnd::Shutdown),
         result = timeout(WRITE_LIMIT, socket.send(message)) => {
             match result {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(SocketEnd::Write(error)),
-                Err(_elapsed) => Err(SocketEnd::WriteTimeout),
+                Ok(Err(error)) => Err(SocketEnd::Failed(
+                    anyhow::Error::new(error).context("WebSocket write failed"),
+                )),
+                Err(_elapsed) => Err(SocketEnd::Failed(anyhow!(
+                    "WebSocket write timed out after five seconds"
+                ))),
             }
         }
     }
@@ -883,8 +844,8 @@ mod tests {
     }
 
     #[test]
-    fn socket_close_reasons_keep_peer_and_cleanup_details() {
-        let peer_close = SocketEnd::client_close(Some(CloseFrame {
+    fn socket_close_reasons_keep_peer_details() {
+        let peer_close = SocketEnd::ClientClosed(Some(CloseFrame {
             code: 1008,
             reason: "policy".into(),
         }));
@@ -893,16 +854,8 @@ mod tests {
             "client sent WebSocket close frame 1008: policy"
         );
         assert!(!peer_close.is_failure());
-
-        let reason = peer_close.with_cleanup(SocketEnd::WriterShutdownTimeout);
-        assert_eq!(
-            reason.to_string(),
-            "client sent WebSocket close frame 1008: policy; socket cleanup also failed: \
-             control writer did not stop within five seconds"
-        );
-        assert!(reason.is_failure());
-        assert!(SocketEnd::WriteTimeout.is_failure());
-        assert!(!SocketEnd::GatewayShutdown.is_failure());
+        assert!(SocketEnd::Failed(anyhow!("write timeout")).is_failure());
+        assert!(!SocketEnd::Shutdown.is_failure());
     }
 
     #[test]

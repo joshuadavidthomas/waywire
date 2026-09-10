@@ -336,14 +336,15 @@ impl Daemon {
             fatal: fatal_rx,
             shutdown: shutdown_rx,
         };
-        let runtime = DaemonRuntime {
+        let supervisor = tokio::spawn(supervise_daemon(
+            process,
             socket,
             pipeline,
             video_worker,
-            readiness: readiness.clone(),
-            events: events.clone(),
-        };
-        let supervisor = tokio::spawn(supervise_daemon(process, runtime, receivers));
+            readiness.clone(),
+            events.clone(),
+            receivers,
+        ));
         Ok(StartedDaemon {
             daemon: Self {
                 commands,
@@ -371,14 +372,6 @@ struct DaemonReceivers {
     commands: CommandReader,
     fatal: mpsc::Receiver<CommandSinkError>,
     shutdown: mpsc::Receiver<()>,
-}
-
-struct DaemonRuntime {
-    socket: UdpSocket,
-    pipeline: VideoPipeline,
-    video_worker: VideoWorker,
-    readiness: Readiness,
-    events: AppEvents,
 }
 
 fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
@@ -420,16 +413,13 @@ fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
     })
 }
 
-#[derive(Debug, Error)]
-#[error("{terminal:#}; daemon process group cleanup also failed: {cleanup:#}")]
-struct DaemonCleanupError {
-    terminal: anyhow::Error,
-    cleanup: anyhow::Error,
-}
-
 async fn supervise_daemon(
     process: SpawnedDaemon,
-    runtime: DaemonRuntime,
+    socket: UdpSocket,
+    pipeline: VideoPipeline,
+    video_worker: VideoWorker,
+    readiness: Readiness,
+    events: AppEvents,
     receivers: DaemonReceivers,
 ) -> Result<()> {
     let SpawnedDaemon {
@@ -438,13 +428,6 @@ async fn supervise_daemon(
         stdin,
         stdout,
     } = process;
-    let DaemonRuntime {
-        socket,
-        pipeline,
-        video_worker,
-        readiness,
-        events,
-    } = runtime;
     let DaemonReceivers {
         commands: command_reader,
         fatal: mut fatal_rx,
@@ -492,11 +475,9 @@ async fn supervise_daemon(
         Ok(()) => result,
         Err(cleanup_error) => match result {
             Ok(()) => Err(cleanup_error.context("clean up daemon process group")),
-            Err(terminal) => Err(DaemonCleanupError {
-                terminal,
-                cleanup: cleanup_error,
-            }
-            .into()),
+            Err(terminal) => Err(terminal.context(format!(
+                "daemon process group cleanup also failed: {cleanup_error:#}"
+            ))),
         },
     };
     match &result {

@@ -5,7 +5,8 @@ mod protocol;
 mod session;
 mod video;
 
-use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -160,15 +161,16 @@ async fn main() -> Result<()> {
     let mut daemon_task = started.supervisor;
     let sessions = Sessions::new(daemon.commands.clone(), options.bitrate, options.frame_rate);
     let connections = SocketConnections::new();
-    let app = http::router(AppState::new(
-        daemon.readiness.clone(),
-        daemon.events.clone(),
+    let app = http::router(AppState {
+        readiness: daemon.readiness.clone(),
+        events: daemon.events.clone(),
         sessions,
         hub,
-        options.origin,
-        options.frame_rate,
-        connections.clone(),
-    ));
+        origin: options.origin.into(),
+        frame_rate: options.frame_rate,
+        connections: connections.clone(),
+        next_socket_id: Arc::new(AtomicU64::new(1)),
+    });
     let (tx, rx) = watch::channel(false);
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -244,52 +246,27 @@ async fn finish_shutdown(
         }
     };
 
-    combine_shutdown_results([
+    let results = [
         ("WebSocket connections", sockets_result),
         ("daemon supervisor", daemon_result),
         ("HTTP server", server_result),
         ("shutdown trigger", trigger_result),
-    ])
-}
-
-#[derive(Debug)]
-struct ShutdownFailure {
-    component: &'static str,
-    error: anyhow::Error,
-}
-
-#[derive(Debug)]
-struct ShutdownFailures(Vec<ShutdownFailure>);
-
-impl fmt::Display for ShutdownFailures {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, failure) in self.0.iter().enumerate() {
-            if index > 0 {
-                formatter.write_str("; ")?;
-            }
-            write!(formatter, "{}: {:#}", failure.component, failure.error)?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for ShutdownFailures {}
-
-fn combine_shutdown_results<const N: usize>(
-    results: [(&'static str, Result<()>); N],
-) -> Result<()> {
-    let mut failures = Vec::new();
+    ];
+    let mut first_failure = None;
     for (component, result) in results {
         if let Err(error) = result {
             warn!(component, reason = %format_args!("{error:#}"), "shutdown component failed");
-            failures.push(ShutdownFailure { component, error });
+            if first_failure.is_none() {
+                first_failure = Some((component, error));
+            }
         }
     }
 
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ShutdownFailures(failures).into())
+    match first_failure {
+        Some((component, error)) => {
+            Err(error.context(format!("{component} did not shut down cleanly")))
+        }
+        None => Ok(()),
     }
 }
 
@@ -326,23 +303,6 @@ mod tests {
         );
         assert!(parse_origin("example.test").is_err());
         assert!(parse_origin("https://u@example.test").is_err());
-    }
-
-    #[test]
-    fn shutdown_result_keeps_every_component_failure() {
-        let result = combine_shutdown_results([
-            ("sockets", Err(anyhow!("socket timeout"))),
-            ("daemon", Err(anyhow!("SIGKILL failed"))),
-            ("server", Ok(())),
-            ("trigger", Err(anyhow!("signal task failed"))),
-        ])
-        .expect_err("component failures should fail shutdown");
-        let message = format!("{result:#}");
-
-        assert!(message.contains("sockets: socket timeout"));
-        assert!(message.contains("daemon: SIGKILL failed"));
-        assert!(message.contains("trigger: signal task failed"));
-        assert!(!message.contains("server:"));
     }
 
     #[tokio::test]
