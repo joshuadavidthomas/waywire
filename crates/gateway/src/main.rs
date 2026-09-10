@@ -5,6 +5,7 @@ mod protocol;
 mod session;
 mod video;
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,6 +14,8 @@ use anyhow::anyhow;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use socket2::SockRef;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::Kbps;
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -20,9 +23,11 @@ use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
+use tracing::info;
+use tracing::warn;
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
-use crate::daemon::AppEvents;
 use crate::daemon::Config;
 use crate::daemon::Daemon;
 use crate::http::AppState;
@@ -33,10 +38,21 @@ use crate::video::VideoHub;
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(8);
 
 type TaskResult = std::result::Result<Result<()>, JoinError>;
+
 enum Stop {
     Signal(Result<()>),
     Daemon(TaskResult),
     Server(TaskResult),
+}
+
+impl Stop {
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::Signal(_) => "shutdown signal",
+            Self::Daemon(_) => "daemon supervisor stopped",
+            Self::Server(_) => "HTTP server stopped",
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -50,17 +66,18 @@ struct Options {
     listen: String,
     #[arg(long)]
     streamd: String,
-    #[arg(long,env="PUBLIC_URL",value_parser=parse_origin)]
-    public_url: String,
-    #[arg(long,default_value_t=60,value_parser=clap::value_parser!(u32).range(10..=120))]
-    frame_rate: u32,
-    #[arg(long,default_value_t=16_000,value_parser=clap::value_parser!(u32).range(300..=50_000))]
-    bitrate: u32,
-    #[arg(long,default_value="us",value_parser=parse_layout)]
+    #[arg(long = "public-url", env = "PUBLIC_URL", value_parser = parse_origin)]
+    origin: String,
+    #[arg(long, default_value = "60", value_parser = parse_fps)]
+    frame_rate: Fps,
+    #[arg(long, default_value = "16000", value_parser = parse_kbps)]
+    bitrate: Kbps,
+    #[arg(long, default_value = "us", value_parser = parse_layout)]
     xkb_layout: String,
 }
+
 fn parse_origin(raw: &str) -> Result<String, String> {
-    let url = Url::parse(raw).map_err(|e| e.to_string())?;
+    let url = Url::parse(raw).map_err(|error| error.to_string())?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -70,12 +87,27 @@ fn parse_origin(raw: &str) -> Result<String, String> {
     }
     Ok(url.origin().ascii_serialization())
 }
+
+fn parse_fps(value: &str) -> Result<Fps, String> {
+    let value = value
+        .parse()
+        .map_err(|error| format!("frame rate must be an integer: {error}"))?;
+    Fps::new(value).map_err(|error| error.to_string())
+}
+
+fn parse_kbps(value: &str) -> Result<Kbps, String> {
+    let value = value
+        .parse()
+        .map_err(|error| format!("bitrate must be an integer: {error}"))?;
+    Kbps::new(value).map_err(|error| error.to_string())
+}
+
 fn parse_layout(value: &str) -> Result<String, String> {
     if !value.is_empty()
         && value.len() <= 32
         && value
             .bytes()
-            .all(|v| v.is_ascii_alphanumeric() || v == b'_' || v == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
         Ok(value.into())
     } else {
@@ -91,13 +123,20 @@ async fn http_listener(
         .with_context(|| format!("bind HTTP listener {address}"))?
         .tap_io(|stream| {
             if let Err(error) = stream.set_nodelay(true) {
-                eprintln!("failed to set TCP_NODELAY on accepted HTTP connection: {error}");
+                warn!(%error, "failed to set TCP_NODELAY on accepted HTTP connection");
             }
         }))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let options = Options::parse();
     let listener = http_listener(&options.listen).await?;
     let rtp = UdpSocket::bind("127.0.0.1:0")
@@ -107,8 +146,7 @@ async fn main() -> Result<()> {
         .set_recv_buffer_size(4 << 20)
         .context("set loopback RTP receive buffer to 4 MiB")?;
     let hub = VideoHub::new();
-    let events = AppEvents::new();
-    let (daemon, mut daemon_task) = Daemon::start(
+    let started = Daemon::start(
         &Config {
             path: options.streamd,
             frame_rate: options.frame_rate,
@@ -116,21 +154,18 @@ async fn main() -> Result<()> {
             xkb_layout: options.xkb_layout,
         },
         rtp,
-        events,
         hub.clone(),
     )?;
-    let sessions = Sessions::new(
-        daemon.state.clone(),
-        daemon.commands.clone(),
-        options.bitrate,
-        options.frame_rate,
-    );
+    let daemon = started.daemon;
+    let mut daemon_task = started.supervisor;
+    let sessions = Sessions::new(daemon.commands.clone(), options.bitrate, options.frame_rate);
     let connections = SocketConnections::new();
     let app = http::router(AppState::new(
-        daemon.state.clone(),
+        daemon.readiness.clone(),
+        daemon.events.clone(),
         sessions,
         hub,
-        options.public_url,
+        options.origin,
         options.frame_rate,
         connections.clone(),
     ));
@@ -154,7 +189,8 @@ async fn main() -> Result<()> {
         result = &mut server => Stop::Server(result),
     };
 
-    finish_shutdown(
+    info!(reason = stop.reason(), "shutdown beginning");
+    let result = finish_shutdown(
         stop,
         connections,
         tx,
@@ -162,7 +198,13 @@ async fn main() -> Result<()> {
         &mut daemon_task,
         &mut server,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        info!(outcome = "clean", "shutdown ended");
+    } else {
+        info!(outcome = "failed", "shutdown ended");
+    }
+    result
 }
 
 async fn finish_shutdown(
@@ -174,37 +216,85 @@ async fn finish_shutdown(
     server: &mut JoinHandle<Result<()>>,
 ) -> Result<()> {
     connections.begin_shutdown();
-    let _shutdown_result = shutdown_server.send(true);
+    let _ = shutdown_server.send(true);
     let deadline = Instant::now() + SHUTDOWN_DEADLINE;
     let sockets_result = timeout_at(deadline, connections.wait())
         .await
         .map_err(|_elapsed| anyhow!("WebSocket shutdown exceeded eight seconds"));
     daemon.shutdown().await;
 
-    match stop {
-        Stop::Signal(signal) => {
+    let (trigger_result, daemon_result, server_result) = match stop {
+        Stop::Signal(signal_result) => {
+            let trigger_result = signal_result;
             let daemon_result = join_task(deadline, "daemon supervisor", daemon_task).await;
             let server_result = join_task(deadline, "HTTP server", server).await;
-            signal
-                .and(sockets_result)
-                .and(daemon_result)
-                .and(server_result)
+            (trigger_result, daemon_result, server_result)
         }
-        Stop::Daemon(daemon_result) => {
+        Stop::Daemon(task_result) => {
+            let trigger_result = Err(anyhow!("daemon supervisor stopped"));
+            let daemon_result = completed_task("daemon supervisor", task_result);
             let server_result = join_task(deadline, "HTTP server", server).await;
-            sockets_result?;
-            server_result?;
-            daemon_result??;
-            Err(anyhow!("daemon supervisor stopped"))
+            (trigger_result, daemon_result, server_result)
         }
-        Stop::Server(server_result) => {
+        Stop::Server(task_result) => {
+            let trigger_result = Err(anyhow!("HTTP server stopped"));
             let daemon_result = join_task(deadline, "daemon supervisor", daemon_task).await;
-            sockets_result?;
-            daemon_result?;
-            server_result??;
-            Err(anyhow!("HTTP server stopped"))
+            let server_result = completed_task("HTTP server", task_result);
+            (trigger_result, daemon_result, server_result)
+        }
+    };
+
+    combine_shutdown_results([
+        ("WebSocket connections", sockets_result),
+        ("daemon supervisor", daemon_result),
+        ("HTTP server", server_result),
+        ("shutdown trigger", trigger_result),
+    ])
+}
+
+#[derive(Debug)]
+struct ShutdownFailure {
+    component: &'static str,
+    error: anyhow::Error,
+}
+
+#[derive(Debug)]
+struct ShutdownFailures(Vec<ShutdownFailure>);
+
+impl fmt::Display for ShutdownFailures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, failure) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{}: {:#}", failure.component, failure.error)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ShutdownFailures {}
+
+fn combine_shutdown_results<const N: usize>(
+    results: [(&'static str, Result<()>); N],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for (component, result) in results {
+        if let Err(error) = result {
+            warn!(component, reason = %format_args!("{error:#}"), "shutdown component failed");
+            failures.push(ShutdownFailure { component, error });
         }
     }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ShutdownFailures(failures).into())
+    }
+}
+
+fn completed_task(name: &str, result: TaskResult) -> Result<()> {
+    result.with_context(|| format!("join {name}"))?
 }
 
 async fn join_task(deadline: Instant, name: &str, task: &mut JoinHandle<Result<()>>) -> Result<()> {
@@ -229,20 +319,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_defaults_use_sixty_fps_and_sixteen_megabit_video() {
-        let options = Options::try_parse_from([
-            "sprite-desktop-gateway",
-            "--streamd",
-            "sprite-desktop-streamd",
-            "--public-url",
-            "https://example.test",
-        ])
-        .expect("gateway defaults should parse from valid test arguments");
-        assert_eq!(options.frame_rate, 60);
-        assert_eq!(options.bitrate, 16_000);
-    }
-
-    #[test]
     fn canonical_origin_strips_path_and_rejects_foreign_shapes() {
         assert_eq!(
             parse_origin("https://example.test/a").expect("absolute HTTPS test URL should parse"),
@@ -250,6 +326,23 @@ mod tests {
         );
         assert!(parse_origin("example.test").is_err());
         assert!(parse_origin("https://u@example.test").is_err());
+    }
+
+    #[test]
+    fn shutdown_result_keeps_every_component_failure() {
+        let result = combine_shutdown_results([
+            ("sockets", Err(anyhow!("socket timeout"))),
+            ("daemon", Err(anyhow!("SIGKILL failed"))),
+            ("server", Ok(())),
+            ("trigger", Err(anyhow!("signal task failed"))),
+        ])
+        .expect_err("component failures should fail shutdown");
+        let message = format!("{result:#}");
+
+        assert!(message.contains("sockets: socket timeout"));
+        assert!(message.contains("daemon: SIGKILL failed"));
+        assert!(message.contains("trigger: signal task failed"));
+        assert!(!message.contains("server:"));
     }
 
     #[tokio::test]

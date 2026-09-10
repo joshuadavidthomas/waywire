@@ -14,12 +14,13 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::bail;
 use calloop::channel::SyncSender;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use nix::unistd::pipe;
+use sprite_desktop_protocol::pipe::ClipboardText;
+use sprite_desktop_protocol::pipe::MAX_CLIPBOARD_BYTES;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_seat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
@@ -29,7 +30,6 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1
 
 use super::ControlMessage;
 use super::State;
-use crate::protocol::MAX_CLIPBOARD_BYTES;
 
 const TEXT_MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 const MAX_INCOMING_TRANSFERS: usize = 4;
@@ -46,10 +46,10 @@ struct Source {
     payload: Arc<[u8]>,
 }
 
-pub struct Clipboard {
-    pub manager: Option<ext_data_control_manager_v1::ExtDataControlManagerV1>,
-    pub device: Option<ext_data_control_device_v1::ExtDataControlDeviceV1>,
-    pub pending_offer: Option<ext_data_control_offer_v1::ExtDataControlOfferV1>,
+pub(crate) struct Clipboard {
+    pub(crate) manager: Option<ext_data_control_manager_v1::ExtDataControlManagerV1>,
+    pub(crate) device: Option<ext_data_control_device_v1::ExtDataControlDeviceV1>,
+    pub(crate) pending_offer: Option<ext_data_control_offer_v1::ExtDataControlOfferV1>,
     selection: Option<Offer>,
     source: Option<Source>,
     incoming_generation: Arc<AtomicU64>,
@@ -60,7 +60,7 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub fn new(command_sender: SyncSender<ControlMessage>) -> Self {
+    pub(crate) fn new(command_sender: SyncSender<ControlMessage>) -> Self {
         Self {
             manager: None,
             device: None,
@@ -75,7 +75,7 @@ impl Clipboard {
         }
     }
 
-    pub fn start(&mut self, seat: &wl_seat::WlSeat, qh: &QueueHandle<State>) -> Result<()> {
+    pub(crate) fn start(&mut self, seat: &wl_seat::WlSeat, qh: &QueueHandle<State>) -> Result<()> {
         let manager = self
             .manager
             .as_ref()
@@ -84,10 +84,7 @@ impl Clipboard {
         Ok(())
     }
 
-    pub fn set_text(&mut self, text: String, qh: &QueueHandle<State>) -> Result<()> {
-        if text.len() > MAX_CLIPBOARD_BYTES {
-            bail!("clipboard exceeds one MiB");
-        }
+    pub(crate) fn set_text(&mut self, text: &ClipboardText, qh: &QueueHandle<State>) -> Result<()> {
         let manager = self
             .manager
             .as_ref()
@@ -103,7 +100,7 @@ impl Clipboard {
         device.set_selection(Some(&proxy));
         let source = Source {
             proxy,
-            payload: Arc::from(text.into_bytes()),
+            payload: Arc::from(text.get().as_bytes()),
         };
         if let Some(old) = self.source.replace(source) {
             old.proxy.destroy();
@@ -111,7 +108,7 @@ impl Clipboard {
         Ok(())
     }
 
-    pub fn offer_mime(
+    pub(crate) fn offer_mime(
         &mut self,
         proxy: &ext_data_control_offer_v1::ExtDataControlOfferV1,
         mime: String,
@@ -130,7 +127,7 @@ impl Clipboard {
         }
     }
 
-    pub fn select(
+    pub(crate) fn select(
         &mut self,
         selected: Option<ext_data_control_offer_v1::ExtDataControlOfferV1>,
     ) -> Result<()> {
@@ -140,7 +137,7 @@ impl Clipboard {
             self.command_sender
                 .try_send(ControlMessage::ClipboardReceived {
                     generation,
-                    result: Ok(String::new()),
+                    result: ClipboardText::new(String::new()).map_err(|error| error.to_string()),
                 })
                 .map_err(|_error| anyhow::anyhow!("command queue full while clearing clipboard"))?;
             return Ok(());
@@ -181,7 +178,7 @@ impl Clipboard {
         Ok(())
     }
 
-    pub fn send_requested(
+    pub(crate) fn send_requested(
         &self,
         requested_source: &ext_data_control_source_v1::ExtDataControlSourceV1,
         fd: OwnedFd,
@@ -206,7 +203,10 @@ impl Clipboard {
         Ok(())
     }
 
-    pub fn cancel_source(&mut self, source: &ext_data_control_source_v1::ExtDataControlSourceV1) {
+    pub(crate) fn cancel_source(
+        &mut self,
+        source: &ext_data_control_source_v1::ExtDataControlSourceV1,
+    ) {
         if self
             .source
             .as_ref()
@@ -217,12 +217,12 @@ impl Clipboard {
         source.destroy();
     }
 
-    pub fn accepts_transfer(&self, generation: u64) -> bool {
+    pub(crate) fn accepts_transfer(&self, generation: u64) -> bool {
         self.incoming_generation.load(Ordering::SeqCst) == generation
     }
 
-    pub fn cancel_transfers(&self) {
-        self.incoming_generation.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn cancel_transfers(&self) {
+        let _ = self.incoming_generation.fetch_add(1, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
     }
 }
@@ -244,7 +244,7 @@ impl TransferPermit {
 
 impl Drop for TransferPermit {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -263,7 +263,7 @@ fn spawn_write(
     thread::Builder::new()
         .name("streamd-clipboard-write".into())
         .spawn(move || {
-            let _permit = permit;
+            let permit_guard = permit;
             let mut file = File::from(fd);
             let started = Instant::now();
             let mut offset = 0;
@@ -281,6 +281,7 @@ fn spawn_write(
                     Err(_) => break,
                 }
             }
+            drop(permit_guard);
         })
         .context("start clipboard writer")
 }
@@ -295,22 +296,27 @@ fn spawn_read(
     thread::Builder::new()
         .name("streamd-clipboard-read".into())
         .spawn(move || {
-            let _permit = permit;
+            let permit_guard = permit;
             let mut file = File::from(fd);
             let mut bytes = Vec::new();
             let result = loop {
                 if current_generation.load(Ordering::SeqCst) != generation {
-                    return;
+                    break None;
                 }
                 let mut part = [0_u8; 4096];
                 match file.read(&mut part) {
                     Ok(0) => {
-                        break String::from_utf8(bytes)
-                            .map_err(|_error| "clipboard is not UTF-8".to_string());
+                        break Some(
+                            String::from_utf8(bytes)
+                                .map_err(|_error| "clipboard is not UTF-8".to_string())
+                                .and_then(|text| {
+                                    ClipboardText::new(text).map_err(|error| error.to_string())
+                                }),
+                        );
                     }
                     Ok(count) => {
                         if bytes.len() + count > MAX_CLIPBOARD_BYTES {
-                            break Err("clipboard exceeds one MiB".to_string());
+                            break Some(Err("clipboard exceeds one MiB".to_string()));
                         }
                         bytes.extend_from_slice(&part[..count]);
                     }
@@ -318,10 +324,13 @@ fn spawn_read(
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
-                    Err(error) => break Err(error.to_string()),
+                    Err(error) => break Some(Err(error.to_string())),
                 }
             };
-            drop(sender.try_send(ControlMessage::ClipboardReceived { generation, result }));
+            if let Some(result) = result {
+                let _ = sender.try_send(ControlMessage::ClipboardReceived { generation, result });
+            }
+            drop(permit_guard);
         })
         .context("start clipboard reader")
 }
@@ -366,7 +375,7 @@ mod tests {
 
     #[test]
     fn shutdown_cancels_a_blocked_write_and_releases_its_thread_slot() {
-        let (_reader, writer) = pipe().expect("test pipe should open");
+        let (reader_guard, writer) = pipe().expect("test pipe should open");
         set_nonblocking(&writer).expect("test pipe writer should become nonblocking");
         let active = Arc::new(AtomicUsize::new(0));
         let permit = TransferPermit::reserve(Arc::clone(&active), 1)
@@ -386,5 +395,6 @@ mod tests {
 
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert!(TransferPermit::reserve(active, 1).is_some());
+        drop(reader_guard);
     }
 }

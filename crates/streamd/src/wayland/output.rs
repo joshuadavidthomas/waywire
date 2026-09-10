@@ -1,6 +1,10 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::FrameSize;
+use sprite_desktop_protocol::pipe::RequestId;
+use sprite_desktop_protocol::pipe::ScaleV120;
 use wayland_client::QueueHandle;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_head_v1;
@@ -9,27 +13,26 @@ use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1
 use super::State;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutputMode {
-    pub width: u32,
-    pub height: u32,
-    pub scale_v120: u16,
+pub(crate) struct OutputMode {
+    pub(crate) size: FrameSize,
+    pub(crate) scale_v120: ScaleV120,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResizeRequest {
-    pub mode: OutputMode,
-    pub request_id: u16,
+pub(crate) struct ResizeRequest {
+    pub(crate) mode: OutputMode,
+    pub(crate) request_id: RequestId,
 }
 
-pub struct Head {
-    pub proxy: zwlr_output_head_v1::ZwlrOutputHeadV1,
-    pub name: Option<String>,
-    pub enabled: bool,
-    pub finished: bool,
+pub(crate) struct Head {
+    pub(crate) proxy: zwlr_output_head_v1::ZwlrOutputHeadV1,
+    pub(crate) name: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) finished: bool,
 }
 
-pub struct PendingResize {
-    pub configuration: zwlr_output_configuration_v1::ZwlrOutputConfigurationV1,
+pub(crate) struct PendingResize {
+    pub(crate) configuration: zwlr_output_configuration_v1::ZwlrOutputConfigurationV1,
     request: ResizeRequest,
     serial: u32,
 }
@@ -41,28 +44,28 @@ struct QueuedResize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppliedResize {
-    pub mode: OutputMode,
-    pub request_id: u16,
-    pub dimensions_changed: bool,
+pub(crate) struct AppliedResize {
+    pub(crate) mode: OutputMode,
+    pub(crate) request_id: RequestId,
+    pub(crate) dimensions_changed: bool,
 }
 
 fn output_dimensions_changed(current: Option<OutputMode>, next: OutputMode) -> bool {
-    current.is_none_or(|current| current.width != next.width || current.height != next.height)
+    current.is_none_or(|current| current.size != next.size)
 }
 
-pub struct OutputManager {
-    pub manager: Option<zwlr_output_manager_v1::ZwlrOutputManagerV1>,
-    pub heads: Vec<Head>,
-    pub serial: Option<u32>,
-    pub finished: bool,
-    pub pending: Option<PendingResize>,
+pub(crate) struct OutputManager {
+    pub(crate) manager: Option<zwlr_output_manager_v1::ZwlrOutputManagerV1>,
+    pub(crate) heads: Vec<Head>,
+    pub(crate) serial: Option<u32>,
+    pub(crate) finished: bool,
+    pub(crate) pending: Option<PendingResize>,
     queued: Option<QueuedResize>,
-    pub current: Option<OutputMode>,
+    pub(crate) current: Option<OutputMode>,
 }
 
 impl OutputManager {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             manager: None,
             heads: Vec::new(),
@@ -74,12 +77,12 @@ impl OutputManager {
         }
     }
 
-    pub fn configure(
+    pub(crate) fn configure(
         &mut self,
         output_name: Option<&str>,
         mode: OutputMode,
-        request_id: u16,
-        fps: u32,
+        request_id: RequestId,
+        fps: Fps,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
         let request = ResizeRequest { mode, request_id };
@@ -94,7 +97,7 @@ impl OutputManager {
         &mut self,
         output_name: Option<&str>,
         request: ResizeRequest,
-        fps: u32,
+        fps: Fps,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
         let manager = self
@@ -117,12 +120,13 @@ impl OutputManager {
             bail!("could not select exactly one enabled output head");
         }
 
-        let width =
-            i32::try_from(request.mode.width).context("output width exceeds protocol range")?;
-        let height =
-            i32::try_from(request.mode.height).context("output height exceeds protocol range")?;
+        let width = i32::try_from(request.mode.size.width())
+            .context("output width exceeds protocol range")?;
+        let height = i32::try_from(request.mode.size.height())
+            .context("output height exceeds protocol range")?;
         let refresh = i32::try_from(
-            fps.checked_mul(1_000)
+            fps.get()
+                .checked_mul(1_000)
                 .context("output refresh rate overflow")?,
         )
         .context("output refresh rate exceeds protocol range")?;
@@ -135,7 +139,7 @@ impl OutputManager {
             let configured = configuration.enable_head(&head.proxy, qh, ());
             if output_name.is_none_or(|name| head.name.as_deref() == Some(name)) {
                 configured.set_custom_mode(width, height, refresh);
-                configured.set_scale(f64::from(request.mode.scale_v120) / 120.0);
+                configured.set_scale(f64::from(request.mode.scale_v120.get()) / 120.0);
             }
         }
         configuration.apply();
@@ -155,7 +159,7 @@ impl OutputManager {
         });
     }
 
-    pub fn take_succeeded(&mut self) -> Option<AppliedResize> {
+    pub(crate) fn take_succeeded(&mut self) -> Option<AppliedResize> {
         let pending = self.pending.take()?;
         pending.configuration.destroy();
         let dimensions_changed = output_dimensions_changed(self.current, pending.request.mode);
@@ -167,13 +171,13 @@ impl OutputManager {
         })
     }
 
-    pub fn reject_pending(&mut self) {
+    pub(crate) fn reject_pending(&mut self) {
         if let Some(pending) = self.pending.take() {
             pending.configuration.destroy();
         }
     }
 
-    pub fn retry_cancelled(&mut self) {
+    pub(crate) fn retry_cancelled(&mut self) {
         let Some(pending) = self.pending.take() else {
             return;
         };
@@ -189,7 +193,7 @@ impl OutputManager {
         });
     }
 
-    pub fn publish_serial(&mut self, serial: u32) -> bool {
+    pub(crate) fn publish_serial(&mut self, serial: u32) -> bool {
         self.serial = Some(serial);
         self.pending.is_none()
             && self
@@ -197,7 +201,7 @@ impl OutputManager {
                 .is_some_and(|queued| queued.retry_after.is_some_and(|stale| stale != serial))
     }
 
-    pub fn take_ready_queued(&mut self) -> Option<ResizeRequest> {
+    pub(crate) fn take_ready_queued(&mut self) -> Option<ResizeRequest> {
         let queued = self.queued?;
         if queued
             .retry_after
@@ -208,7 +212,7 @@ impl OutputManager {
         self.queued.take().map(|queued| queued.request)
     }
 
-    pub fn has_queued(&self) -> bool {
+    pub(crate) fn has_queued(&self) -> bool {
         self.queued.is_some()
     }
 }
@@ -220,11 +224,10 @@ mod tests {
     fn request(request_id: u16, width: u32, height: u32) -> ResizeRequest {
         ResizeRequest {
             mode: OutputMode {
-                width,
-                height,
-                scale_v120: 120,
+                size: FrameSize::new(width, height).expect("valid test frame size"),
+                scale_v120: ScaleV120::new(120).expect("valid test output scale"),
             },
-            request_id,
+            request_id: RequestId::new(request_id).expect("valid test request ID"),
         }
     }
 

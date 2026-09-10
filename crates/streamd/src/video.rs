@@ -1,7 +1,5 @@
+use std::io;
 use std::io::Write;
-use std::io::{
-    self,
-};
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
@@ -31,10 +29,14 @@ use nix::poll::poll;
 use nix::sys::signal::SigSet;
 use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::FrameDimension;
+use sprite_desktop_protocol::pipe::FrameMetadata;
+use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::Kbps;
+use sprite_desktop_protocol::pipe::MAX_RAW_PIXELS;
+use sprite_desktop_protocol::pipe::ScalePercent;
 use thiserror::Error;
-
-use crate::protocol::FrameMetadata;
-use crate::protocol::MAX_RAW_PIXELS;
 
 const SLOT_COUNT: usize = 3;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
@@ -49,26 +51,19 @@ const RESTART_DELAY_MAX: Duration = Duration::from_secs(30);
 const MAX_CONSECUTIVE_SPAWN_FAILURES: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncoderConfig {
-    pub raw_width: u32,
-    pub raw_height: u32,
-    pub encoded_width: u16,
-    pub encoded_height: u16,
-    pub fps: u32,
-    pub bitrate_kbps: u32,
+pub(crate) struct EncoderConfig {
+    pub(crate) raw_width: FrameDimension,
+    pub(crate) raw_height: FrameDimension,
+    pub(crate) encoded_width: FrameDimension,
+    pub(crate) encoded_height: FrameDimension,
+    pub(crate) fps: Fps,
+    pub(crate) bitrate_kbps: Kbps,
 }
 
 impl EncoderConfig {
-    pub fn validate(self) -> Result<usize, VideoError> {
-        let pixels = u64::from(self.raw_width) * u64::from(self.raw_height);
-        if self.raw_width == 0
-            || self.raw_height == 0
-            || pixels > MAX_RAW_PIXELS
-            || self.encoded_width == 0
-            || self.encoded_height == 0
-            || !(10..=120).contains(&self.fps)
-            || !(300..=50_000).contains(&self.bitrate_kbps)
-        {
+    pub(crate) fn validate(self) -> Result<usize, VideoError> {
+        let pixels = u64::from(self.raw_width.get()) * u64::from(self.raw_height.get());
+        if pixels > MAX_RAW_PIXELS {
             return Err(VideoError::InvalidFrame);
         }
         usize::try_from(pixels.checked_mul(4).ok_or(VideoError::InvalidFrame)?)
@@ -94,8 +89,7 @@ impl<'a> CapturedFrame<'a> {
 
     fn validate(&self) -> Result<(), VideoError> {
         if self.pixels.len() != self.config.validate()?
-            || self.metadata.generation == 0
-            || self.metadata.generation > MAX_MEDIA_GENERATION
+            || self.metadata.generation.get() > MAX_MEDIA_GENERATION
             || self.metadata.width != self.config.encoded_width
             || self.metadata.height != self.config.encoded_height
             || self.metadata.fps != self.config.fps
@@ -134,20 +128,20 @@ impl RawFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notification {
+pub(crate) enum Notification {
     Submitted(FrameMetadata),
-    RestartRequired { generation: u32 },
+    RestartRequired { generation: Generation },
     Fatal(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmitResult {
+pub(crate) enum SubmitResult {
     Queued,
     ReplacedPending,
 }
 
 #[derive(Debug, Error)]
-pub enum VideoError {
+pub(crate) enum VideoError {
     #[error("raw frame or encoder configuration is invalid")]
     InvalidFrame,
     #[error("video encoder stopped")]
@@ -169,7 +163,7 @@ struct Pool {
     pending: Option<usize>,
     encoding: Option<usize>,
     next_free: usize,
-    generation: u32,
+    generation: Generation,
     stopping: bool,
     notification_failure: Option<String>,
     child_pid: Option<u32>,
@@ -207,7 +201,7 @@ fn wait_for_pool_timeout<'a>(
     }
 }
 
-pub struct VideoEncoder {
+pub(crate) struct VideoEncoder {
     shared: Arc<Shared>,
     notifications: mpsc::Receiver<Notification>,
     notification_source: Option<PingSource>,
@@ -215,7 +209,7 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    pub fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
+    pub(crate) fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
         Self::start_with_spawner(
             ffmpeg,
             rtp_port,
@@ -233,15 +227,19 @@ impl VideoEncoder {
         spawn: F,
     ) -> Result<Self, VideoError>
     where
-        F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess> + Send + 'static,
+        F: FnMut(&str, u16, EncoderConfig, Generation) -> io::Result<EncoderProcess>
+            + Send
+            + 'static,
     {
+        let initial_generation =
+            Generation::new(1).map_err(|_invalid_generation| VideoError::InvalidFrame)?;
         let shared = Arc::new(Shared {
             pool: Mutex::new(Pool {
                 slots: std::array::from_fn(|_| FrameSlot::Free(Vec::new())),
                 pending: None,
                 encoding: None,
                 next_free: 0,
-                generation: 1,
+                generation: initial_generation,
                 stopping: false,
                 notification_failure: None,
                 child_pid: None,
@@ -311,12 +309,14 @@ impl VideoEncoder {
         Ok(result)
     }
 
-    pub fn set_generation(&self, generation: u32) -> Result<(), VideoError> {
+    pub(crate) fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
         let mut pool = lock_pool(&self.shared);
         if pool.stopping {
             return Err(VideoError::Stopped);
         }
-        if generation > MAX_MEDIA_GENERATION || pool.generation.checked_add(1) != Some(generation) {
+        if generation.get() > MAX_MEDIA_GENERATION
+            || pool.generation.get().checked_add(1) != Some(generation.get())
+        {
             return Err(VideoError::InvalidFrame);
         }
         pool.generation = generation;
@@ -344,7 +344,7 @@ impl VideoEncoder {
         self.notification_source.take()
     }
 
-    pub fn try_notification(&self) -> Option<Notification> {
+    pub(crate) fn try_notification(&self) -> Option<Notification> {
         match self.notifications.try_recv() {
             Ok(notification) => Some(notification),
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
@@ -356,7 +356,7 @@ impl VideoEncoder {
         }
     }
 
-    pub fn stop(mut self) {
+    pub(crate) fn stop(mut self) {
         self.stop_inner();
     }
 
@@ -367,7 +367,7 @@ impl VideoEncoder {
             self.shared.work.notify_all();
         }
         if let Some(worker) = self.worker.take() {
-            drop(worker.join());
+            let _ = worker.join();
         }
     }
 
@@ -387,7 +387,7 @@ struct EncoderProcess {
     child: Child,
     input: ChildStdin,
     config: EncoderConfig,
-    generation: u32,
+    generation: Generation,
 }
 
 #[derive(Clone, Copy)]
@@ -411,9 +411,9 @@ enum TransitionOutcome {
 
 fn encoder_transition(
     active_config: EncoderConfig,
-    active_generation: u32,
+    active_generation: Generation,
     frame_config: EncoderConfig,
-    frame_generation: u32,
+    frame_generation: Generation,
 ) -> EncoderTransition {
     if active_generation != frame_generation {
         EncoderTransition::ReplaceForGeneration
@@ -433,8 +433,8 @@ impl EncoderProcess {
 
 fn reap_child(child: &mut Child) {
     if !matches!(child.try_wait(), Ok(Some(_))) {
-        drop(child.kill());
-        drop(child.wait());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -561,8 +561,8 @@ impl Worker<'_> {
 
     fn handle_write_failure(
         &mut self,
-        generation: u32,
-        frame_generation: u32,
+        generation: Generation,
+        frame_generation: Generation,
         slot: usize,
         frame: RawFrame,
         error: &io::Error,
@@ -590,7 +590,7 @@ impl Worker<'_> {
 
     fn run<F>(mut self, mut spawn: F)
     where
-        F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess>,
+        F: FnMut(&str, u16, EncoderConfig, Generation) -> io::Result<EncoderProcess>,
     {
         loop {
             if is_stopping(self.shared) {
@@ -718,7 +718,7 @@ fn request_new_generation(
     shared: &Shared,
     notifications: &mpsc::SyncSender<Notification>,
     notification_wake: &Ping,
-    generation: u32,
+    generation: Generation,
 ) -> bool {
     if !send_notification(
         shared,
@@ -810,7 +810,7 @@ fn is_stopping(shared: &Shared) -> bool {
     lock_pool(shared).stopping
 }
 
-fn current_generation(shared: &Shared) -> u32 {
+fn current_generation(shared: &Shared) -> Generation {
     lock_pool(shared).generation
 }
 
@@ -851,7 +851,7 @@ fn spawn_ffmpeg(
     ffmpeg: &str,
     rtp_port: u16,
     config: EncoderConfig,
-    generation: u32,
+    generation: Generation,
 ) -> io::Result<EncoderProcess> {
     // The local RTP contract uses SSRC as the frame generation. The gateway
     // can correlate reordered replacement traffic by identity.
@@ -905,11 +905,11 @@ fn reset_signal_mask_before_exec(command: &mut Command) {
     }
 }
 
-fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: u32) -> Vec<String> {
-    let rate = config.fps.to_string();
-    let keyframe_interval = config.fps.div_ceil(4).to_string();
-    let bitrate = format!("{}k", config.bitrate_kbps);
-    let peak = format!("{}k", config.bitrate_kbps * 2);
+fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> Vec<String> {
+    let rate = config.fps.get().to_string();
+    let keyframe_interval = config.fps.get().div_ceil(4).to_string();
+    let bitrate = format!("{}k", config.bitrate_kbps.get());
+    let peak = format!("{}k", config.bitrate_kbps.get() * 2);
     vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -920,7 +920,7 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: u32) -> Vec<Str
         "-pixel_format".into(),
         "bgra".into(),
         "-video_size".into(),
-        format!("{}x{}", config.raw_width, config.raw_height),
+        format!("{}x{}", config.raw_width.get(), config.raw_height.get()),
         "-framerate".into(),
         rate.clone(),
         "-re".into(),
@@ -962,7 +962,7 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: u32) -> Vec<Str
         // through Chromium's WebCodecs-to-canvas path.
         format!(
             "scale={}:{}:out_color_matrix=bt709:out_range=pc",
-            config.encoded_width, config.encoded_height
+            config.encoded_width.get(), config.encoded_height.get()
         ),
         "-colorspace".into(),
         "bt709".into(),
@@ -975,7 +975,7 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: u32) -> Vec<Str
         "-payload_type".into(),
         "96".into(),
         "-ssrc".into(),
-        generation.to_string(),
+        generation.get().to_string(),
         "-rtpflags".into(),
         "skip_rtcp".into(),
         "-f".into(),
@@ -988,7 +988,7 @@ fn write_frame(
     shared: &Shared,
     output: &mut (impl Write + AsFd),
     bytes: &[u8],
-    generation: u32,
+    generation: Generation,
 ) -> io::Result<()> {
     let started = Instant::now();
     let mut written = 0;
@@ -1035,16 +1035,16 @@ fn write_frame(
     Ok(())
 }
 
-pub fn encoded_dimensions(
+pub(crate) fn encoded_dimensions(
     raw_width: u32,
     raw_height: u32,
-    requested_scale: u32,
-    fps: u32,
+    requested_scale: ScalePercent,
+    fps: Fps,
 ) -> (u16, u16) {
     const MAX_FRAME_MACROBLOCKS: u32 = 36_864;
     const MAX_MACROBLOCKS_PER_SECOND: u32 = 2_073_600;
-    let maximum = MAX_FRAME_MACROBLOCKS.min(MAX_MACROBLOCKS_PER_SECOND / fps);
-    for scale in (1..=requested_scale).rev() {
+    let maximum = MAX_FRAME_MACROBLOCKS.min(MAX_MACROBLOCKS_PER_SECOND / fps.get());
+    for scale in (1..=requested_scale.get()).rev() {
         let Some(scaled_width) = raw_width.checked_mul(scale) else {
             continue;
         };

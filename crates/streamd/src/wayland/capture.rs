@@ -9,6 +9,14 @@ use memmap2::MmapOptions;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::FrameDimension;
+use sprite_desktop_protocol::pipe::FrameMetadata;
+use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::InputSequence;
+use sprite_desktop_protocol::pipe::Kbps;
+use sprite_desktop_protocol::pipe::MAX_RAW_PIXELS;
+use sprite_desktop_protocol::pipe::ScalePercent;
 use wayland_client::Proxy;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_buffer;
@@ -18,29 +26,27 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
 
 use super::State;
-use crate::protocol::FrameMetadata;
-use crate::protocol::MAX_RAW_PIXELS;
 use crate::video::CapturedFrame;
 use crate::video::EncoderConfig;
 use crate::video::encoded_dimensions;
 
-pub struct Capture {
-    pub manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
-    pub frame: Option<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1>,
-    pub buffer: Option<wl_buffer::WlBuffer>,
+pub(crate) struct Capture {
+    pub(crate) manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
+    pub(crate) frame: Option<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1>,
+    pub(crate) buffer: Option<wl_buffer::WlBuffer>,
     mapping: Option<MmapMut>,
-    pub width: u32,
-    pub height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     stride: u32,
     format: Option<wl_shm::Format>,
     constraints: bool,
-    pub can_wait_for_damage: bool,
-    pub cursor_overlay: bool,
-    pub sequence: u64,
+    pub(crate) can_wait_for_damage: bool,
+    pub(crate) cursor_overlay: bool,
+    pub(crate) sequence: u64,
 }
 
 impl Capture {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             manager: None,
             frame: None,
@@ -57,7 +63,11 @@ impl Capture {
         }
     }
 
-    pub fn request(&mut self, output: &wl_output::WlOutput, qh: &QueueHandle<State>) -> Result<()> {
+    pub(crate) fn request(
+        &mut self,
+        output: &wl_output::WlOutput,
+        qh: &QueueHandle<State>,
+    ) -> Result<()> {
         if self.frame.is_some() {
             bail!("capture frame is already pending");
         }
@@ -70,14 +80,14 @@ impl Capture {
         Ok(())
     }
 
-    pub fn cancel(&mut self) {
+    pub(crate) fn cancel(&mut self) {
         if let Some(frame) = self.frame.take() {
             frame.destroy();
         }
         self.constraints = false;
     }
 
-    pub fn set_constraints(
+    pub(crate) fn set_constraints(
         &mut self,
         shm: &wl_shm::WlShm,
         width: u32,
@@ -138,7 +148,7 @@ impl Capture {
         Ok(())
     }
 
-    pub fn begin_copy(&self, wait_for_damage: bool) -> Result<()> {
+    pub(crate) fn begin_copy(&self, wait_for_damage: bool) -> Result<()> {
         if !self.constraints {
             bail!("screencopy frame omitted SHM constraints");
         }
@@ -152,14 +162,14 @@ impl Capture {
         Ok(())
     }
 
-    pub fn completed_frame(
+    pub(crate) fn completed_frame(
         &mut self,
         capture_nanos: u64,
-        generation: u32,
-        input_sequence: u32,
-        fps: u32,
-        bitrate_kbps: u32,
-        scale_percent: u32,
+        generation: Generation,
+        input_sequence: Option<InputSequence>,
+        fps: Fps,
+        bitrate_kbps: Kbps,
+        scale_percent: ScalePercent,
     ) -> Result<CapturedFrame<'_>> {
         let mapping = self.mapping.as_ref().context("missing capture mapping")?;
         let expected = usize::try_from(u64::from(self.width) * u64::from(self.height) * 4)?;
@@ -170,8 +180,8 @@ impl Capture {
             encoded_dimensions(self.width, self.height, scale_percent, fps);
         let metadata = FrameMetadata {
             generation,
-            width: encoded_width,
-            height: encoded_height,
+            width: FrameDimension::new(encoded_width)?,
+            height: FrameDimension::new(encoded_height)?,
             capture_nanos,
             sequence: self.sequence,
             input_sequence,
@@ -186,10 +196,10 @@ impl Capture {
             mapping,
             metadata,
             EncoderConfig {
-                raw_width: self.width,
-                raw_height: self.height,
-                encoded_width,
-                encoded_height,
+                raw_width: FrameDimension::new(u16::try_from(self.width)?)?,
+                raw_height: FrameDimension::new(u16::try_from(self.height)?)?,
+                encoded_width: FrameDimension::new(encoded_width)?,
+                encoded_height: FrameDimension::new(encoded_height)?,
                 fps,
                 bitrate_kbps,
             },

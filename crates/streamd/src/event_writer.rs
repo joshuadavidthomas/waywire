@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
+use std::io;
 use std::io::Write;
-use std::io::{
-    self,
-};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -14,28 +12,48 @@ use std::time::Instant;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
+use sprite_desktop_protocol::pipe::Event;
 use thiserror::Error;
-
-use crate::protocol::Event;
 
 const MAX_QUEUED_EVENTS: usize = 256;
 const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
-pub enum EventWriterError {
+pub(crate) enum EventWriterError {
     #[error("stdout event queue is full")]
     QueueFull,
     #[error("stdout event encoding failed")]
-    Encode(#[from] crate::protocol::ProtocolError),
+    Encode(#[from] sprite_desktop_protocol::pipe::ProtocolError),
     #[error("stdout event writer failed: {0}")]
     Write(String),
     #[error("stdout event writer stopped")]
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replacement {
+    CursorImage,
+    CursorVisibility,
+}
+
+impl Replacement {
+    fn for_event(event: &Event) -> Option<Self> {
+        match event {
+            Event::CursorImage { .. } => Some(Self::CursorImage),
+            Event::CursorVisibility(_) => Some(Self::CursorVisibility),
+            Event::Clipboard(_) | Event::Frame(_) | Event::ResizeApplied { .. } => None,
+        }
+    }
+}
+
+struct QueuedEvent {
+    bytes: Vec<u8>,
+    replacement: Option<Replacement>,
+}
+
 struct Queue {
-    records: VecDeque<Vec<u8>>,
+    records: VecDeque<QueuedEvent>,
     bytes: usize,
     stopping: bool,
     failure: Option<String>,
@@ -61,17 +79,17 @@ fn wait_for_queue<'a>(ready: &Condvar, queue: MutexGuard<'a, Queue>) -> MutexGua
 }
 
 #[derive(Clone)]
-pub struct EventSink {
+pub(crate) struct EventSink {
     shared: Arc<Shared>,
 }
 
-pub struct EventWriter {
+pub(crate) struct EventWriter {
     shared: Arc<Shared>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl EventWriter {
-    pub fn start() -> io::Result<(Self, EventSink)> {
+    pub(crate) fn start() -> io::Result<(Self, EventSink)> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 records: VecDeque::new(),
@@ -94,14 +112,14 @@ impl EventWriter {
         ))
     }
 
-    pub fn failure(&self) -> Option<EventWriterError> {
+    pub(crate) fn failure(&self) -> Option<EventWriterError> {
         lock_queue(&self.shared.queue)
             .failure
             .clone()
             .map(EventWriterError::Write)
     }
 
-    pub fn stop(mut self) {
+    pub(crate) fn stop(mut self) {
         self.stop_inner();
     }
 
@@ -112,7 +130,7 @@ impl EventWriter {
             self.shared.ready.notify_one();
         }
         if let Some(thread) = self.thread.take() {
-            drop(thread.join());
+            let _ = thread.join();
         }
     }
 }
@@ -124,9 +142,9 @@ impl Drop for EventWriter {
 }
 
 impl EventSink {
-    pub fn send(&self, event: &Event) -> Result<(), EventWriterError> {
+    pub(crate) fn send(&self, event: &Event) -> Result<(), EventWriterError> {
+        let replacement = Replacement::for_event(event);
         let bytes = event.encode()?;
-        let replaceable_kind = matches!(bytes.get(1), Some(4 | 5)).then(|| bytes[1]);
         let mut queue = lock_queue(&self.shared.queue);
         if let Some(failure) = &queue.failure {
             return Err(EventWriterError::Write(failure.clone()));
@@ -135,10 +153,13 @@ impl EventSink {
             return Err(EventWriterError::Stopped);
         }
 
-        if let Some(kind) = replaceable_kind
-            && let Some(index) = queue.records.iter().rposition(|record| record[1] == kind)
+        if let Some(replacement) = replacement
+            && let Some(index) = queue
+                .records
+                .iter()
+                .rposition(|record| record.replacement == Some(replacement))
         {
-            let replaced_len = queue.records[index].len();
+            let replaced_len = queue.records[index].bytes.len();
             let proposed_bytes = queue
                 .bytes
                 .saturating_sub(replaced_len)
@@ -146,7 +167,10 @@ impl EventSink {
             if proposed_bytes > MAX_QUEUED_BYTES {
                 return Err(EventWriterError::QueueFull);
             }
-            queue.records[index] = bytes;
+            queue.records[index] = QueuedEvent {
+                bytes,
+                replacement: Some(replacement),
+            };
             queue.bytes = proposed_bytes;
             return Ok(());
         }
@@ -157,7 +181,7 @@ impl EventSink {
             return Err(EventWriterError::QueueFull);
         }
         queue.bytes += bytes.len();
-        queue.records.push_back(bytes);
+        queue.records.push_back(QueuedEvent { bytes, replacement });
         self.shared.ready.notify_one();
         Ok(())
     }
@@ -184,8 +208,8 @@ fn writer_main(shared: &Shared) {
             }
             match queue.records.pop_front() {
                 Some(record) => {
-                    queue.bytes -= record.len();
-                    record
+                    queue.bytes -= record.bytes.len();
+                    record.bytes
                 }
                 None => return,
             }
@@ -222,10 +246,15 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::protocol::FrameMetadata;
+    use sprite_desktop_protocol::pipe::CursorSize;
+    use sprite_desktop_protocol::pipe::Fps;
+    use sprite_desktop_protocol::pipe::FrameDimension;
+    use sprite_desktop_protocol::pipe::FrameMetadata;
+    use sprite_desktop_protocol::pipe::Generation;
 
-    fn sink_with_queue(records: VecDeque<Vec<u8>>, bytes: usize) -> EventSink {
+    use super::*;
+
+    fn sink_with_queue(records: VecDeque<QueuedEvent>, bytes: usize) -> EventSink {
         EventSink {
             shared: Arc::new(Shared {
                 queue: Mutex::new(Queue {
@@ -244,33 +273,33 @@ mod tests {
         let sink = sink_with_queue(VecDeque::new(), 0);
         let shared = Arc::clone(&sink.shared);
         sink.send(&Event::Frame(FrameMetadata {
-            generation: 1,
-            width: 2,
-            height: 2,
+            generation: Generation::new(1).expect("test generation should be valid"),
+            width: FrameDimension::new(2).expect("test frame width should be valid"),
+            height: FrameDimension::new(2).expect("test frame height should be valid"),
             capture_nanos: 1,
             sequence: 1,
-            input_sequence: 0,
-            fps: 60,
+            input_sequence: None,
+            fps: Fps::new(60).expect("test frame rate should be valid"),
         }))
         .expect("frame metadata should queue");
         sink.send(&Event::CursorVisibility(false))
             .expect("cursor hide should queue");
-        sink.send(&Event::CursorVisibility(true))
-            .expect("cursor show should queue");
+        let visible = Event::CursorVisibility(true);
+        sink.send(&visible).expect("cursor show should queue");
+        let expected = visible.encode().expect("cursor show should encode");
         let queue = shared
             .queue
             .lock()
             .expect("queue lock should not be poisoned");
         assert_eq!(queue.records.len(), 2);
-        assert_eq!(queue.records[0][1], 2);
-        assert_eq!(queue.records[1], vec![2, 5, 0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(queue.records[0].replacement, None);
+        assert_eq!(queue.records[1].bytes, expected);
     }
 
     #[test]
     fn replaceable_cursor_cannot_break_the_byte_budget() {
         let old = Event::CursorImage {
-            width: 1,
-            height: 1,
+            size: CursorSize::new(1, 1).expect("test cursor size should be valid"),
             hotspot_x: 0,
             hotspot_y: 0,
             bgra: vec![0; 4],
@@ -278,12 +307,20 @@ mod tests {
         .encode()
         .expect("cursor image should encode");
         let filler_len = MAX_QUEUED_BYTES - old.len();
-        let records = VecDeque::from([vec![0; filler_len], old.clone()]);
+        let records = VecDeque::from([
+            QueuedEvent {
+                bytes: vec![0; filler_len],
+                replacement: None,
+            },
+            QueuedEvent {
+                bytes: old.clone(),
+                replacement: Some(Replacement::CursorImage),
+            },
+        ]);
         let sink = sink_with_queue(records, MAX_QUEUED_BYTES);
 
         let result = sink.send(&Event::CursorImage {
-            width: 2,
-            height: 2,
+            size: CursorSize::new(2, 2).expect("test cursor size should be valid"),
             hotspot_x: 0,
             hotspot_y: 0,
             bgra: vec![0; 16],
@@ -296,6 +333,6 @@ mod tests {
             .lock()
             .expect("queue lock should not be poisoned");
         assert_eq!(queue.bytes, MAX_QUEUED_BYTES);
-        assert_eq!(queue.records.back(), Some(&old));
+        assert_eq!(queue.records.back().map(|record| &record.bytes), Some(&old));
     }
 }

@@ -1,7 +1,7 @@
 mod capture;
 mod clipboard;
 mod cursor;
-pub mod input;
+pub(crate) mod input;
 mod output;
 
 use std::fs::File;
@@ -16,10 +16,8 @@ use calloop::Interest;
 use calloop::LoopHandle;
 use calloop::Mode;
 use calloop::PostAction;
+use calloop::channel;
 use calloop::channel::Event as ChannelEvent;
-use calloop::channel::{
-    self,
-};
 use calloop::generic::Generic;
 use calloop::signals::Signal;
 use calloop::signals::Signals;
@@ -27,6 +25,14 @@ use calloop_wayland_source::WaylandSource;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
+use sprite_desktop_protocol::pipe::ClipboardText;
+use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::Event;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::InputSequence;
+use sprite_desktop_protocol::pipe::Kbps;
+use sprite_desktop_protocol::pipe::ScalePercent;
 use wayland_client::Connection;
 use wayland_client::Dispatch;
 use wayland_client::QueueHandle;
@@ -74,22 +80,20 @@ use self::output::OutputManager;
 use self::output::OutputMode;
 use self::output::ResizeRequest;
 use crate::Options;
+use crate::command_reader::CommandReader;
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
-use crate::protocol::Command;
-use crate::protocol::CommandDecoder;
-use crate::protocol::Event;
 use crate::video::Notification;
 use crate::video::VideoEncoder;
 
-pub(super) enum ControlMessage {
+pub(crate) enum ControlMessage {
     ClipboardReceived {
         generation: u64,
-        result: std::result::Result<String, String>,
+        result: std::result::Result<ClipboardText, String>,
     },
 }
 
-pub struct State {
+pub(crate) struct State {
     qh: QueueHandle<Self>,
     running: bool,
     failure: Option<anyhow::Error>,
@@ -103,15 +107,15 @@ pub struct State {
     cursor: Cursor,
     video: Option<VideoEncoder>,
     event_sink: EventSink,
-    generation: u32,
-    acknowledged_generation: u32,
-    latest_input_sequence: u32,
-    fps: u32,
-    bitrate_kbps: u32,
-    encoded_scale: u32,
+    generation: Generation,
+    acknowledged_generation: Option<Generation>,
+    latest_input_sequence: Option<InputSequence>,
+    fps: Fps,
+    bitrate_kbps: Kbps,
+    encoded_scale: ScalePercent,
 }
 
-pub fn run(options: Options) -> Result<()> {
+pub(crate) fn run(options: Options) -> Result<()> {
     // Signals::new blocks these signals in this thread. Do this before any
     // native worker starts so every worker inherits the blocked mask.
     let signal_source =
@@ -139,12 +143,12 @@ pub fn run(options: Options) -> Result<()> {
         cursor: Cursor::new(event_sink.clone()),
         video: Some(video),
         event_sink,
-        generation: 1,
-        acknowledged_generation: 0,
-        latest_input_sequence: 0,
+        generation: Generation::new(1)?,
+        acknowledged_generation: None,
+        latest_input_sequence: None,
         fps: options.frame_rate,
         bitrate_kbps: options.bitrate,
-        encoded_scale: 100,
+        encoded_scale: ScalePercent::new(100)?,
     };
 
     connection.display().get_registry(&qh, ());
@@ -191,7 +195,7 @@ pub fn run(options: Options) -> Result<()> {
             state.fail(error.into());
         }
     }
-    drop(state.input.release_all());
+    let _ = state.input.release_all();
     state.clipboard.cancel_transfers();
     if let Some(video) = state.video.take() {
         video.stop();
@@ -208,7 +212,7 @@ fn register_stdin(handle: &LoopHandle<'_, State>) -> Result<()> {
     let stdin = File::open("/dev/stdin").context("open daemon command pipe")?;
     let flags = OFlag::from_bits_truncate(fcntl(&stdin, FcntlArg::F_GETFL)?);
     fcntl(&stdin, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-    let mut decoder = Some(CommandDecoder::new());
+    let mut reader = Some(CommandReader::new());
     handle.insert_source(
         Generic::new(stdin, Interest::READ, Mode::Level),
         move |readiness, input, state| {
@@ -221,8 +225,8 @@ fn register_stdin(handle: &LoopHandle<'_, State>) -> Result<()> {
                 // SAFETY: reading keeps the registered File in place; it is neither replaced nor dropped.
                 match unsafe { input.get_mut() }.read(&mut part) {
                     Ok(0) => {
-                        if let Some(decoder) = decoder.take()
-                            && let Err(error) = decoder.finish()
+                        if let Some(reader) = reader.take()
+                            && let Err(error) = reader.finish()
                         {
                             state.fail(error.into());
                         } else {
@@ -231,11 +235,11 @@ fn register_stdin(handle: &LoopHandle<'_, State>) -> Result<()> {
                         return Ok(PostAction::Remove);
                     }
                     Ok(count) => {
-                        let Some(decoder) = decoder.as_mut() else {
+                        let Some(reader) = reader.as_mut() else {
                             state.stop();
                             return Ok(PostAction::Remove);
                         };
-                        match decoder.push(&part[..count]) {
+                        match reader.push(&part[..count]) {
                             Ok(commands) => {
                                 for command in commands {
                                     if let Err(error) = state.apply_command(&command) {
@@ -313,8 +317,8 @@ impl State {
     }
 
     fn replace_media_generation(&mut self) -> Result<()> {
-        self.generation = self.generation.wrapping_add(1).max(1);
-        self.acknowledged_generation = 0;
+        self.generation = Generation::new(self.generation.get().wrapping_add(1).max(1))?;
+        self.acknowledged_generation = None;
         if let Some(video) = &self.video {
             video.set_generation(self.generation)?;
         }
@@ -330,8 +334,7 @@ impl State {
     fn apply_command(&mut self, command: &Command) -> Result<()> {
         match command {
             Command::Resize {
-                width,
-                height,
+                size,
                 scale_v120,
                 request_id,
             } => {
@@ -339,8 +342,7 @@ impl State {
                 if let Err(error) = self.outputs.configure(
                     self.output_name.as_deref(),
                     OutputMode {
-                        width: *width,
-                        height: *height,
+                        size: *size,
                         scale_v120: *scale_v120,
                     },
                     *request_id,
@@ -351,7 +353,9 @@ impl State {
                     return Err(error);
                 }
             }
-            Command::Clipboard(text) => self.clipboard.set_text(text.clone(), &self.qh)?,
+            Command::Clipboard(text) => {
+                self.clipboard.set_text(text, &self.qh)?;
+            }
             Command::Quality {
                 bitrate_kbps,
                 fps,
@@ -369,9 +373,9 @@ impl State {
             Command::KeyframeReadiness { generation, ready } => {
                 if *generation == self.generation {
                     if *ready {
-                        self.acknowledged_generation = *generation;
-                    } else if self.acknowledged_generation == *generation {
-                        self.acknowledged_generation = 0;
+                        self.acknowledged_generation = Some(*generation);
+                    } else if self.acknowledged_generation == Some(*generation) {
+                        self.acknowledged_generation = None;
                         self.capture.cancel();
                         self.request_capture()?;
                     }
@@ -399,7 +403,7 @@ impl State {
                 }
                 self.input.apply(command)?;
                 if let Some(sequence) = command.input_sequence() {
-                    self.latest_input_sequence = sequence;
+                    self.latest_input_sequence = Some(sequence);
                 }
             }
         }
@@ -469,8 +473,7 @@ impl State {
         self.capture.can_wait_for_damage = false;
         self.event_sink.send(&Event::ResizeApplied {
             request_id: applied.request_id,
-            width: applied.mode.width,
-            height: applied.mode.height,
+            size: applied.mode.size,
             scale_v120: applied.mode.scale_v120,
             generation: self.generation,
         })?;
@@ -619,7 +622,7 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
             },
             zwlr_screencopy_frame_v1::Event::BufferDone => (|| -> Result<()> {
                 let wait = state.capture.can_wait_for_damage
-                    && state.acknowledged_generation == state.generation;
+                    && state.acknowledged_generation == Some(state.generation);
                 state.capture.begin_copy(wait)?;
                 capture_flush(connection.flush())
             })(),
@@ -934,8 +937,11 @@ impl Dispatch<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCurso
             ext_image_copy_capture_cursor_session_v1::Event::Leave => {
                 state.cursor.visibility(false)
             }
-            ext_image_copy_capture_cursor_session_v1::Event::Hotspot { x, y } => {
-                state.cursor.hotspot(x, y);
+            ext_image_copy_capture_cursor_session_v1::Event::Hotspot {
+                x: hotspot_x,
+                y: hotspot_y,
+            } => {
+                state.cursor.hotspot(hotspot_x, hotspot_y);
                 Ok(())
             }
             ext_image_copy_capture_cursor_session_v1::Event::Position { .. } | _ => Ok(()),

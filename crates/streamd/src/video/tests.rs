@@ -16,25 +16,63 @@ use nix::unistd::pipe;
 
 use super::*;
 
+fn generation(value: u32) -> Generation {
+    Generation::new(value).expect("valid test generation")
+}
+
+fn dimension(value: u16) -> FrameDimension {
+    FrameDimension::new(value).expect("valid test frame dimension")
+}
+
+fn fps(value: u32) -> Fps {
+    Fps::new(value).expect("valid test frame rate")
+}
+
+fn kbps(value: u32) -> Kbps {
+    Kbps::new(value).expect("valid test bitrate")
+}
+
+fn wire_metadata(
+    sequence: u64,
+    generation: u32,
+    width: FrameDimension,
+    height: FrameDimension,
+    input_sequence: Option<u32>,
+    fps: Fps,
+) -> FrameMetadata {
+    FrameMetadata {
+        generation: sprite_desktop_protocol::pipe::Generation::new(generation)
+            .expect("test generation should be valid"),
+        width,
+        height,
+        capture_nanos: sequence,
+        sequence,
+        input_sequence: input_sequence.map(|value| {
+            sprite_desktop_protocol::pipe::InputSequence::new(value)
+                .expect("test input sequence should be valid")
+        }),
+        fps,
+    }
+}
+
 fn frame(sequence: u64, generation: u32) -> RawFrame {
     RawFrame {
         pixels: vec![sequence.to_le_bytes()[0]; 16],
-        metadata: FrameMetadata {
-            generation,
-            width: 2,
-            height: 2,
-            capture_nanos: sequence,
+        metadata: wire_metadata(
             sequence,
-            input_sequence: 0,
-            fps: 60,
-        },
+            generation,
+            dimension(2),
+            dimension(2),
+            None,
+            fps(60),
+        ),
         config: EncoderConfig {
-            raw_width: 2,
-            raw_height: 2,
-            encoded_width: 2,
-            encoded_height: 2,
-            fps: 60,
-            bitrate_kbps: 8_000,
+            raw_width: dimension(2),
+            raw_height: dimension(2),
+            encoded_width: dimension(2),
+            encoded_height: dimension(2),
+            fps: fps(60),
+            bitrate_kbps: kbps(8_000),
         },
     }
 }
@@ -49,12 +87,12 @@ fn submit_frame(encoder: &VideoEncoder, frame: &RawFrame) -> Result<SubmitResult
 
 fn sized_frame(sequence: u64, generation: u32, width: u32, height: u32) -> RawFrame {
     let config = EncoderConfig {
-        raw_width: width,
-        raw_height: height,
-        encoded_width: u16::try_from(width).expect("test frame width should fit u16"),
-        encoded_height: u16::try_from(height).expect("test frame height should fit u16"),
-        fps: 60,
-        bitrate_kbps: 8_000,
+        raw_width: dimension(u16::try_from(width).expect("test frame width should fit u16")),
+        raw_height: dimension(u16::try_from(height).expect("test frame height should fit u16")),
+        encoded_width: dimension(u16::try_from(width).expect("test frame width should fit u16")),
+        encoded_height: dimension(u16::try_from(height).expect("test frame height should fit u16")),
+        fps: fps(60),
+        bitrate_kbps: kbps(8_000),
     };
     RawFrame {
         pixels: vec![
@@ -63,16 +101,17 @@ fn sized_frame(sequence: u64, generation: u32, width: u32, height: u32) -> RawFr
                 .validate()
                 .expect("sized test frame should have a valid encoder config")
         ],
-        metadata: FrameMetadata {
-            generation,
-            width: config.encoded_width,
-            height: config.encoded_height,
-            capture_nanos: sequence,
+        metadata: wire_metadata(
             sequence,
-            input_sequence: u32::try_from(sequence)
-                .expect("test frame sequence should fit the input sequence field"),
-            fps: config.fps,
-        },
+            generation,
+            config.encoded_width,
+            config.encoded_height,
+            Some(
+                u32::try_from(sequence)
+                    .expect("test frame sequence should fit the input sequence field"),
+            ),
+            config.fps,
+        ),
         config,
     }
 }
@@ -81,14 +120,14 @@ fn real_frame(sequence: u64, generation: u32) -> RawFrame {
     real_frame_at_fps(sequence, generation, 60)
 }
 
-fn real_frame_at_fps(sequence: u64, generation: u32, fps: u32) -> RawFrame {
+fn real_frame_at_fps(sequence: u64, generation: u32, frame_rate: u32) -> RawFrame {
     let config = EncoderConfig {
-        raw_width: 320,
-        raw_height: 180,
-        encoded_width: 320,
-        encoded_height: 180,
-        fps,
-        bitrate_kbps: 8_000,
+        raw_width: dimension(320),
+        raw_height: dimension(180),
+        encoded_width: dimension(320),
+        encoded_height: dimension(180),
+        fps: fps(frame_rate),
+        bitrate_kbps: kbps(8_000),
     };
     RawFrame {
         pixels: vec![
@@ -97,15 +136,14 @@ fn real_frame_at_fps(sequence: u64, generation: u32, fps: u32) -> RawFrame {
                 .validate()
                 .expect("real-sized test frame should have a valid encoder config")
         ],
-        metadata: FrameMetadata {
-            generation,
-            width: config.encoded_width,
-            height: config.encoded_height,
-            capture_nanos: sequence,
+        metadata: wire_metadata(
             sequence,
-            input_sequence: 0,
-            fps: config.fps,
-        },
+            generation,
+            config.encoded_width,
+            config.encoded_height,
+            None,
+            config.fps,
+        ),
         config,
     }
 }
@@ -117,7 +155,7 @@ fn shared() -> Arc<Shared> {
             pending: None,
             encoding: None,
             next_free: 0,
-            generation: 1,
+            generation: generation(1),
             stopping: false,
             notification_failure: None,
             child_pid: None,
@@ -129,7 +167,7 @@ fn shared() -> Arc<Shared> {
 fn nonblocking_pipe() -> (File, File, usize) {
     let (reader, writer) = pipe().expect("test pipe should open");
     let requested_capacity = 64 * 1024;
-    let _pipe_resize_succeeded = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(requested_capacity)).is_ok();
+    let _ = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(requested_capacity));
     let capacity = usize::try_from(
         fcntl(&writer, FcntlArg::F_GETPIPE_SZ).expect("test pipe capacity should be readable"),
     )
@@ -153,7 +191,7 @@ fn wait_for_notification(encoder: &VideoEncoder) -> Notification {
     }
 }
 
-fn spawn_test_sink(config: EncoderConfig, generation: u32) -> io::Result<EncoderProcess> {
+fn spawn_test_sink(config: EncoderConfig, generation: Generation) -> io::Result<EncoderProcess> {
     let mut command = Command::new("cat");
     command
         .stdin(Stdio::piped())
@@ -178,7 +216,7 @@ fn spawn_test_sink(config: EncoderConfig, generation: u32) -> io::Result<Encoder
 
 fn encoder_with_spawner<F>(restart_delay: Duration, spawn: F) -> VideoEncoder
 where
-    F: FnMut(&str, u16, EncoderConfig, u32) -> io::Result<EncoderProcess> + Send + 'static,
+    F: FnMut(&str, u16, EncoderConfig, Generation) -> io::Result<EncoderProcess> + Send + 'static,
 {
     VideoEncoder::start_with_spawner(
         "test-encoder".into(),
@@ -590,7 +628,7 @@ fn generation_change_and_stop_discard_spawn_retry_frame() {
                 .pool
                 .lock()
                 .expect("frame pool mutex should not be poisoned")
-                .generation = 2;
+                .generation = generation(2);
         }
 
         requeue_after_spawn_failure(&shared, slot, encoding);
@@ -757,7 +795,7 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
     }
 
     encoder
-        .set_generation(2)
+        .set_generation(generation(2))
         .expect("valid next media generation should be accepted");
     let pool = shared
         .pool
@@ -783,31 +821,27 @@ fn generation_changes_are_positive_checked_increments() {
     };
 
     assert!(matches!(
-        encoder.set_generation(0),
+        encoder.set_generation(generation(1)),
         Err(VideoError::InvalidFrame)
     ));
     assert!(matches!(
-        encoder.set_generation(1),
-        Err(VideoError::InvalidFrame)
-    ));
-    assert!(matches!(
-        encoder.set_generation(3),
+        encoder.set_generation(generation(3)),
         Err(VideoError::InvalidFrame)
     ));
     encoder
-        .set_generation(2)
+        .set_generation(generation(2))
         .expect("valid next media generation should be accepted");
     assert!(matches!(
-        encoder.set_generation(2),
+        encoder.set_generation(generation(2)),
         Err(VideoError::InvalidFrame)
     ));
     shared
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .generation = MAX_MEDIA_GENERATION;
+        .generation = generation(MAX_MEDIA_GENERATION);
     assert!(matches!(
-        encoder.set_generation(MAX_MEDIA_GENERATION + 1),
+        encoder.set_generation(generation(MAX_MEDIA_GENERATION + 1)),
         Err(VideoError::InvalidFrame)
     ));
     assert_eq!(
@@ -816,15 +850,15 @@ fn generation_changes_are_positive_checked_increments() {
             .lock()
             .expect("frame pool mutex should not be poisoned")
             .generation,
-        MAX_MEDIA_GENERATION
+        generation(MAX_MEDIA_GENERATION)
     );
     shared
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .generation = u32::MAX;
+        .generation = generation(u32::MAX);
     assert!(matches!(
-        encoder.set_generation(1),
+        encoder.set_generation(generation(1)),
         Err(VideoError::InvalidFrame)
     ));
 }
@@ -904,7 +938,8 @@ fn partial_pipe_writes_finish_the_same_frame() {
         received
     });
 
-    write_frame(&shared(), &mut writer, &bytes, 1).expect("test frame write should complete");
+    write_frame(&shared(), &mut writer, &bytes, generation(1))
+        .expect("test frame write should complete");
     drop(writer);
 
     assert_eq!(
@@ -935,12 +970,12 @@ fn generation_change_abandons_a_partially_written_pipe_frame() {
             .pool
             .lock()
             .expect("frame pool mutex should not be poisoned")
-            .generation = 2;
+            .generation = generation(2);
         (reader, changed_at)
     });
     let bytes = vec![0x5a; capacity * 2];
 
-    let error = write_frame(&shared, &mut writer, &bytes, 1)
+    let error = write_frame(&shared, &mut writer, &bytes, generation(1))
         .expect_err("generation change should interrupt the frame write");
     let returned_at = Instant::now();
     let (mut reader, changed_at) = controller
@@ -961,7 +996,7 @@ fn generation_change_abandons_a_partially_written_pipe_frame() {
 
 #[test]
 fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
-    let (_reader, mut writer, capacity) = nonblocking_pipe();
+    let (reader_guard, mut writer, capacity) = nonblocking_pipe();
     writer
         .write_all(&vec![0xa5; capacity])
         .expect("test pipe should accept its filler bytes");
@@ -972,7 +1007,7 @@ fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
         started_tx
             .send(())
             .expect("worker should report that its write started");
-        write_frame(&writer_shared, &mut writer, &[0x5a], 1)
+        write_frame(&writer_shared, &mut writer, &[0x5a], generation(1))
     });
     started_rx
         .recv()
@@ -992,6 +1027,7 @@ fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
 
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert!(stopped_at.elapsed() < Duration::from_millis(100));
+    drop(reader_guard);
 }
 
 #[test]
@@ -1122,7 +1158,7 @@ fn worker_inherits_blocked_signal_and_child_resets_mask_before_exec() {
 
     let mut blocked = SigSet::empty();
     blocked.add(Signal::SIGTERM);
-    let _mask_guard = MaskGuard(
+    let mask_guard = MaskGuard(
         blocked
             .thread_swap_mask(SigmaskHow::SIG_BLOCK)
             .expect("SIGTERM should be blocked for the test worker"),
@@ -1156,7 +1192,7 @@ fn worker_inherits_blocked_signal_and_child_resets_mask_before_exec() {
     let status = match status_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(status) => status,
         Err(error) => {
-            let _kill_succeeded = kill(child_pid, Signal::SIGKILL).is_ok();
+            let _ = kill(child_pid, Signal::SIGKILL);
             worker
                 .join()
                 .expect("test worker thread should finish cleanly");
@@ -1167,11 +1203,12 @@ fn worker_inherits_blocked_signal_and_child_resets_mask_before_exec() {
         .join()
         .expect("test worker thread should finish cleanly");
     assert_eq!(status.signal(), Some(Signal::SIGTERM as i32));
+    drop(mask_guard);
 }
 
 #[test]
 fn ffmpeg_flags_match_the_rtp_contract() {
-    let args = ffmpeg_args(5000, frame(1, 1).config, 17);
+    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
     assert!(args.windows(2).any(|pair| pair == ["-payload_type", "96"]));
     assert!(args.windows(2).any(|pair| pair == ["-ssrc", "17"]));
     assert!(args.windows(2).any(|pair| {
@@ -1190,12 +1227,12 @@ fn ffmpeg_flags_match_the_rtp_contract() {
 
 #[test]
 fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
-    for (fps, interval) in [(60, 15), (30, 8), (1, 1)] {
+    for (rate, interval) in [(60, 15), (30, 8), (10, 3)] {
         let mut config = frame(1, 1).config;
-        config.fps = fps;
-        let args = ffmpeg_args(5000, config, 17);
+        config.fps = fps(rate);
+        let args = ffmpeg_args(5000, config, generation(17));
         for (flag, value) in [
-            ("-framerate", fps),
+            ("-framerate", rate),
             ("-g", interval),
             ("-keyint_min", interval),
         ] {
@@ -1209,7 +1246,7 @@ fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
 
 #[test]
 fn ffmpeg_converts_and_tags_desktop_srgb_consistently() {
-    let args = ffmpeg_args(5000, frame(1, 1).config, 17);
+    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
     for pair in [
         ["-profile:v", "high444"],
         ["-pix_fmt", "yuv444p"],
@@ -1225,7 +1262,16 @@ fn ffmpeg_converts_and_tags_desktop_srgb_consistently() {
 
 #[test]
 fn dimensions_enforce_level_and_four_k_budget() {
-    assert_eq!(encoded_dimensions(3840, 2160, 100, 60), (3840, 2160));
+    assert_eq!(
+        encoded_dimensions(
+            3840,
+            2160,
+            sprite_desktop_protocol::pipe::ScalePercent::new(100)
+                .expect("full test scale should be valid"),
+            fps(60),
+        ),
+        (3840, 2160)
+    );
     assert_eq!(
         frame(1, 1)
             .config
@@ -1234,8 +1280,8 @@ fn dimensions_enforce_level_and_four_k_budget() {
         16
     );
     let mut oversized = frame(1, 1).config;
-    oversized.raw_width = 3842;
-    oversized.raw_height = 2160;
+    oversized.raw_width = dimension(3842);
+    oversized.raw_height = dimension(2160);
     assert!(matches!(
         oversized.validate(),
         Err(VideoError::InvalidFrame)
@@ -1247,40 +1293,43 @@ fn every_same_generation_config_change_requests_a_new_generation() {
     let active = frame(1, 1).config;
     let changed_configs = [
         EncoderConfig {
-            raw_width: 4,
+            raw_width: dimension(4),
             ..active
         },
         EncoderConfig {
-            raw_height: 4,
+            raw_height: dimension(4),
             ..active
         },
         EncoderConfig {
-            encoded_width: 4,
+            encoded_width: dimension(4),
             ..active
         },
         EncoderConfig {
-            encoded_height: 4,
+            encoded_height: dimension(4),
             ..active
         },
-        EncoderConfig { fps: 30, ..active },
         EncoderConfig {
-            bitrate_kbps: 4_000,
+            fps: fps(30),
+            ..active
+        },
+        EncoderConfig {
+            bitrate_kbps: kbps(4_000),
             ..active
         },
     ];
 
     for changed in changed_configs {
         assert_eq!(
-            encoder_transition(active, 1, changed, 1),
+            encoder_transition(active, generation(1), changed, generation(1)),
             EncoderTransition::RequestNewGeneration
         );
     }
     assert_eq!(
-        encoder_transition(active, 1, changed_configs[0], 2),
+        encoder_transition(active, generation(1), changed_configs[0], generation(2)),
         EncoderTransition::ReplaceForGeneration
     );
     assert_eq!(
-        encoder_transition(active, 1, active, 1),
+        encoder_transition(active, generation(1), active, generation(1)),
         EncoderTransition::Reuse
     );
 }
@@ -1304,10 +1353,10 @@ fn ffmpeg_actual_sps_matches_gateway_avc1_f40034() {
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
-            generation: 1,
+            generation,
             sequence: 1,
             ..
-        })
+        }) if generation.get() == 1
     ));
 
     let access_unit = receive_first_rtp_access_unit(&socket);
@@ -1359,9 +1408,9 @@ fn ffmpeg_preserves_largest_supported_generation_in_ssrc() {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .generation = generation - 1;
+        .generation = Generation::new(generation - 1).expect("valid prior generation");
     encoder
-        .set_generation(generation)
+        .set_generation(Generation::new(generation).expect("valid maximum generation"))
         .expect("valid next media generation should be accepted");
     submit_frame(&encoder, &real_frame(1, generation))
         .expect("test frame should be accepted by the encoder");
@@ -1385,7 +1434,7 @@ fn ffmpeg_stdin_has_one_mib_capacity() {
             .expect("bound test RTP socket should have a local address")
             .port(),
         real_frame(1, 1).config,
-        1,
+        generation(1),
     )
     .expect("FFmpeg test process should start");
     let capacity = fcntl(&process.input, FcntlArg::F_GETPIPE_SZ)
@@ -1413,10 +1462,10 @@ fn ffmpeg_emits_a_complete_rtp_frame_without_stdin_eof() {
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
-            generation: 1,
+            generation,
             sequence: 1,
             ..
-        })
+        }) if generation.get() == 1
     ));
 
     assert_eq!(receive_frame_ssrc(&socket), 1);
@@ -1451,11 +1500,13 @@ fn ffmpeg_sparse_frames_resume_after_idle_at_thirty_and_sixty_fps() {
             assert!(matches!(
                 wait_for_notification(&encoder),
                 Notification::Submitted(FrameMetadata {
-                    generation: 1,
+                    generation,
                     sequence: submitted,
                     fps: submitted_fps,
                     ..
-                }) if submitted == sequence && submitted_fps == fps
+                }) if generation.get() == 1
+                    && submitted == sequence
+                    && submitted_fps.get() == fps
             ));
             assert_eq!(receive_frame_ssrc(&socket), 1);
             assert!(encoder.child_pid().is_some());
@@ -1484,10 +1535,10 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
-            generation: 1,
+            generation,
             sequence: 1,
             ..
-        })
+        }) if generation.get() == 1
     ));
     let old_ssrc = receive_frame_ssrc(&socket);
     let pid = encoder.child_pid().expect("ffmpeg child was not recorded");
@@ -1496,23 +1547,25 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
     kill(Pid::from_raw(pid), Signal::SIGKILL).expect("SIGKILL should reach the FFmpeg child");
     assert_eq!(
         wait_for_notification(&encoder),
-        Notification::RestartRequired { generation: 1 }
+        Notification::RestartRequired {
+            generation: generation(1)
+        }
     );
     thread::sleep(Duration::from_millis(100));
     assert!(encoder.child_pid().is_none());
 
     encoder
-        .set_generation(2)
+        .set_generation(generation(2))
         .expect("valid next media generation should be accepted");
     submit_frame(&encoder, &real_frame(2, 2))
         .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
-            generation: 2,
+            generation,
             sequence: 2,
             ..
-        })
+        }) if generation.get() == 2
     ));
     let new_ssrc = receive_frame_ssrc(&socket);
     assert_eq!(old_ssrc, 1);
@@ -1539,35 +1592,37 @@ fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
-            generation: 1,
+            generation,
             sequence: 1,
             ..
-        })
+        }) if generation.get() == 1
     ));
     let old_ssrc = receive_frame_ssrc(&socket);
 
     let mut changed = real_frame(2, 1);
-    changed.config.bitrate_kbps = 4_000;
+    changed.config.bitrate_kbps = kbps(4_000);
     submit_frame(&encoder, &changed).expect("test frame should be accepted by the encoder");
     assert_eq!(
         wait_for_notification(&encoder),
-        Notification::RestartRequired { generation: 1 }
+        Notification::RestartRequired {
+            generation: generation(1)
+        }
     );
     assert!(encoder.child_pid().is_none());
 
     let mut replacement = real_frame(3, 2);
-    replacement.config.bitrate_kbps = 4_000;
+    replacement.config.bitrate_kbps = kbps(4_000);
     encoder
-        .set_generation(2)
+        .set_generation(generation(2))
         .expect("valid next media generation should be accepted");
     submit_frame(&encoder, &replacement).expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
         Notification::Submitted(FrameMetadata {
-            generation: 2,
+            generation,
             sequence: 3,
             ..
-        })
+        }) if generation.get() == 2
     ));
     let new_ssrc = receive_frame_ssrc(&socket);
     assert_eq!(old_ssrc, 1);

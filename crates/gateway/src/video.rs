@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use sprite_desktop_protocol::browser::VideoSample;
+use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::FrameMetadata;
+use sprite_desktop_protocol::pipe::Generation;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -15,59 +20,64 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
+use tracing::debug;
+use tracing::warn;
 
 use crate::daemon::CommandSink;
 use crate::daemon::Readiness;
-use crate::protocol::DaemonCommand;
-use crate::protocol::FrameMetadata;
-use crate::protocol::VideoSample;
+use crate::daemon::lock;
 
 const MAX_ACCESS_UNIT: usize = 16 << 20;
-const MAX_PENDING_RECORDS: usize = 120;
+const MAX_PENDING_RECORDS: u64 = 120;
+const PENDING_RECORD_CAPACITY: usize = 120;
 const MAX_PENDING_UNIT_BYTES: usize = 32 << 20;
 const MAX_GOP_FRAMES: usize = 241;
 const MAX_GOP_BYTES: usize = 32 << 20;
 const MAX_VIEWER_FRAMES: usize = 8;
 const MAX_VIEWER_BYTES: usize = 32 << 20;
 const UNMATCHED_DEADLINE: Duration = Duration::from_secs(2);
+const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
-pub struct VideoHub {
+pub(crate) struct VideoHub {
     inner: Arc<Mutex<Hub>>,
 }
+
 struct Hub {
     subscribers: HashMap<u64, Subscriber>,
     next: u64,
     gop: Vec<VideoSample>,
     gop_bytes: usize,
 }
+
 struct Subscriber {
     queue: Arc<Mutex<ViewerQueue>>,
     notify: Arc<Notify>,
     waiting_for_keyframe: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GopState {
+    KeyframeCached,
+    Recovering,
+}
+
 #[derive(Default)]
 struct ViewerQueue {
     frames: VecDeque<VideoSample>,
     bytes: usize,
 }
-pub struct VideoSubscription {
+
+pub(crate) struct VideoSubscription {
     queue: Arc<Mutex<ViewerQueue>>,
     notify: Arc<Notify>,
 }
 
-fn lock_video_state<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
-    match state.lock() {
-        Ok(state) => state,
-        Err(error) => panic!("video state mutex poisoned: {error}"),
-    }
-}
-
 impl VideoSubscription {
-    pub async fn next(&self) -> VideoSample {
+    pub(crate) async fn next(&self) -> VideoSample {
         loop {
             if let Some(frame) = {
-                let mut queue = lock_video_state(&self.queue);
+                let mut queue = lock(&self.queue, "video viewer queue");
                 let frame = queue.frames.pop_front();
                 if let Some(value) = &frame {
                     queue.bytes -= value.data.len();
@@ -80,8 +90,9 @@ impl VideoSubscription {
         }
     }
 }
+
 impl VideoHub {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Hub {
                 subscribers: HashMap::new(),
@@ -91,10 +102,11 @@ impl VideoHub {
             })),
         }
     }
-    pub fn subscribe(&self) -> (u64, Vec<VideoSample>, VideoSubscription) {
+
+    pub(crate) fn subscribe(&self) -> (u64, Vec<VideoSample>, VideoSubscription) {
         let queue = Arc::new(Mutex::new(ViewerQueue::default()));
         let notify = Arc::new(Notify::new());
-        let mut hub = lock_video_state(&self.inner);
+        let mut hub = lock(&self.inner, "video hub");
         let id = hub.next;
         hub.next += 1;
         let bootstrap = hub.gop.clone();
@@ -108,11 +120,14 @@ impl VideoHub {
         );
         (id, bootstrap, VideoSubscription { queue, notify })
     }
-    pub fn unsubscribe(&self, id: u64) {
-        lock_video_state(&self.inner).subscribers.remove(&id);
+
+    pub(crate) fn unsubscribe(&self, id: u64) {
+        let _ = lock(&self.inner, "video hub").subscribers.remove(&id);
     }
-    fn broadcast(&self, sample: VideoSample) -> bool {
-        let mut hub = lock_video_state(&self.inner);
+
+    fn broadcast(&self, sample: VideoSample) -> GopState {
+        let generation = sample.metadata.generation;
+        let mut hub = lock(&self.inner, "video hub");
         let stream_reset = sample.discontinuity
             || hub.gop.first().is_some_and(|first_cached| {
                 first_cached.metadata.generation != sample.metadata.generation
@@ -121,60 +136,64 @@ impl VideoHub {
             hub.gop.clear();
             hub.gop_bytes = 0;
         }
+        for subscriber in hub.subscribers.values_mut() {
+            {
+                let mut queue = lock(&subscriber.queue, "video viewer queue");
+                if stream_reset {
+                    queue.frames.clear();
+                    queue.bytes = 0;
+                    subscriber.waiting_for_keyframe = true;
+                }
+                let recovering = subscriber.waiting_for_keyframe;
+                if recovering {
+                    if !sample.key {
+                        continue;
+                    }
+                    subscriber.waiting_for_keyframe = false;
+                }
+                let overflow = queue.frames.len() == MAX_VIEWER_FRAMES
+                    || queue.bytes + sample.data.len() > MAX_VIEWER_BYTES;
+                if overflow {
+                    queue.frames.clear();
+                    queue.bytes = 0;
+                    if !sample.key {
+                        subscriber.waiting_for_keyframe = true;
+                        continue;
+                    }
+                    subscriber.waiting_for_keyframe = false;
+                }
+                let mut outgoing = sample.clone();
+                if stream_reset || recovering || overflow {
+                    outgoing.discontinuity = true;
+                }
+                queue.bytes += outgoing.data.len();
+                queue.frames.push_back(outgoing);
+            }
+            subscriber.notify.notify_one();
+        }
         if sample.key {
             hub.gop.clear();
             hub.gop_bytes = sample.data.len();
-            hub.gop.push(sample.clone());
+            hub.gop.push(sample);
         } else if !hub.gop.is_empty() {
             if hub.gop.len() < MAX_GOP_FRAMES && hub.gop_bytes + sample.data.len() <= MAX_GOP_BYTES
             {
                 hub.gop_bytes += sample.data.len();
-                hub.gop.push(sample.clone());
+                hub.gop.push(sample);
             } else {
                 hub.gop.clear();
                 hub.gop_bytes = 0;
             }
         }
-        for subscriber in hub.subscribers.values_mut() {
-            let mut queue = lock_video_state(&subscriber.queue);
-            if stream_reset {
-                queue.frames.clear();
-                queue.bytes = 0;
-                subscriber.waiting_for_keyframe = true;
-            }
-            let recovering = subscriber.waiting_for_keyframe;
-            if recovering {
-                if !sample.key {
-                    continue;
-                }
-                subscriber.waiting_for_keyframe = false;
-            }
-            let overflow = queue.frames.len() == MAX_VIEWER_FRAMES
-                || queue.bytes + sample.data.len() > MAX_VIEWER_BYTES;
-            if overflow {
-                queue.frames.clear();
-                queue.bytes = 0;
-                if !sample.key {
-                    subscriber.waiting_for_keyframe = true;
-                    continue;
-                }
-                subscriber.waiting_for_keyframe = false;
-            }
-            let mut outgoing = sample.clone();
-            if stream_reset || recovering || overflow {
-                outgoing.discontinuity = true;
-            }
-            queue.bytes += outgoing.data.len();
-            queue.frames.push_back(outgoing);
-            drop(queue);
-            subscriber.notify.notify_one();
+        if hub
+            .gop
+            .first()
+            .is_some_and(|frame| frame.key && frame.metadata.generation == generation)
+        {
+            GopState::KeyframeCached
+        } else {
+            GopState::Recovering
         }
-        let ready = hub.gop.first().is_some_and(|frame| {
-            frame.key && frame.metadata.generation == sample.metadata.generation
-        });
-        drop(hub);
-        drop(sample);
-        ready
     }
 }
 
@@ -183,9 +202,10 @@ struct Packet {
     marker: bool,
     sequence: u16,
     timestamp: u32,
-    ssrc: u32,
+    generation: Generation,
     payload: Vec<u8>,
 }
+
 fn decode_packet(data: &[u8]) -> Result<Packet> {
     if data.len() < 12 || data[0] >> 6 != 2 {
         return Err(anyhow!("invalid RTP header"));
@@ -217,11 +237,13 @@ fn decode_packet(data: &[u8]) -> Result<Packet> {
     if start == end || data[1] & 0x7f != 96 {
         return Err(anyhow!("wrong RTP payload type or empty payload"));
     }
+    let generation = Generation::new(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
+        .map_err(|_invalid_generation| anyhow!("RTP SSRC generation must be positive"))?;
     Ok(Packet {
         marker: data[1] & 0x80 != 0,
         sequence: u16::from_be_bytes([data[2], data[3]]),
         timestamp: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
-        ssrc: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
+        generation,
         payload: data[start..end].to_vec(),
     })
 }
@@ -233,38 +255,128 @@ struct Assembler {
     fu_kind: Option<u8>,
     timestamp: Option<u32>,
     next_sequence: Option<u16>,
-    ssrc: Option<u32>,
+    generation: Option<Generation>,
+    buffered_packets: u64,
     recovering: bool,
 }
+
 #[derive(Debug)]
 struct Unit {
     data: Arc<[u8]>,
     key: bool,
     discontinuity: bool,
     timestamp: u32,
-    ssrc: u32,
+    generation: Generation,
 }
-impl Assembler {
-    fn consume(&mut self, packet: Packet) -> Result<Option<Unit>> {
-        if packet.ssrc == 0 {
-            return Err(anyhow!("RTP SSRC generation must be positive"));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssemblyDrop {
+    EmptyAccessUnit,
+    GenerationDiscontinuity,
+    PacketRejection,
+    RecoveringWithoutKeyframe,
+    SequenceDiscontinuity,
+    StaleGeneration,
+    TimestampDiscontinuity,
+}
+
+impl fmt::Display for AssemblyDrop {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyAccessUnit => formatter.write_str("empty RTP access unit"),
+            Self::GenerationDiscontinuity => {
+                formatter.write_str("RTP generation changed during a buffered access unit")
+            }
+            Self::PacketRejection => {
+                formatter.write_str("buffered RTP access unit discarded after packet rejection")
+            }
+            Self::RecoveringWithoutKeyframe => {
+                formatter.write_str("RTP access unit dropped while awaiting a keyframe")
+            }
+            Self::SequenceDiscontinuity => {
+                formatter.write_str("RTP sequence changed during a buffered access unit")
+            }
+            Self::StaleGeneration => formatter.write_str("stale RTP generation"),
+            Self::TimestampDiscontinuity => {
+                formatter.write_str("RTP timestamp changed during a buffered access unit")
+            }
         }
-        if self.ssrc.is_some_and(|ssrc| packet.ssrc < ssrc) {
+    }
+}
+
+#[derive(Debug)]
+enum AssemblyOutcome {
+    Incomplete,
+    Complete(Unit),
+    Dropped,
+}
+
+#[derive(Debug, Default)]
+struct AssemblyDrops {
+    packets: u64,
+    last_reason: Option<AssemblyDrop>,
+}
+
+impl AssemblyDrops {
+    fn record(&mut self, packets: u64, reason: AssemblyDrop) {
+        if packets == 0 {
+            return;
+        }
+        self.packets = self.packets.saturating_add(packets);
+        self.last_reason = Some(reason);
+    }
+}
+
+#[derive(Debug)]
+struct AssemblyResult {
+    outcome: Result<AssemblyOutcome>,
+    drops: AssemblyDrops,
+}
+
+impl AssemblyResult {
+    fn accepted(outcome: AssemblyOutcome, drops: AssemblyDrops) -> Self {
+        Self {
+            outcome: Ok(outcome),
+            drops,
+        }
+    }
+
+    fn rejected(error: anyhow::Error, drops: AssemblyDrops) -> Self {
+        Self {
+            outcome: Err(error),
+            drops,
+        }
+    }
+}
+
+impl Assembler {
+    fn consume(&mut self, packet: Packet) -> AssemblyResult {
+        let mut drops = AssemblyDrops::default();
+        if self
+            .generation
+            .is_some_and(|generation| packet.generation.get() < generation.get())
+        {
             // SSRC is the monotonic frame generation. A packet from an older
             // encoder must not alter access-unit or restart state.
-            return Ok(None);
+            drops.record(1, AssemblyDrop::StaleGeneration);
+            return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
-        if self.ssrc.is_some_and(|ssrc| packet.ssrc > ssrc) {
-            self.clear_access_unit();
+        if self
+            .generation
+            .is_some_and(|generation| packet.generation.get() > generation.get())
+        {
+            let discarded = self.clear_access_unit();
+            drops.record(discarded, AssemblyDrop::GenerationDiscontinuity);
             self.next_sequence = None;
             self.recovering = true;
         }
-        self.ssrc = Some(packet.ssrc);
+        self.generation = Some(packet.generation);
         if self
             .next_sequence
             .is_some_and(|next| next != packet.sequence)
         {
-            self.clear_access_unit();
+            let discarded = self.clear_access_unit();
+            drops.record(discarded, AssemblyDrop::SequenceDiscontinuity);
             self.recovering = true;
         }
         self.next_sequence = Some(packet.sequence.wrapping_add(1));
@@ -273,42 +385,59 @@ impl Assembler {
             .is_some_and(|timestamp| timestamp != packet.timestamp)
         {
             let incomplete = self.fu_kind.is_some();
-            self.clear_access_unit();
+            let discarded = self.clear_access_unit();
+            drops.record(discarded, AssemblyDrop::TimestampDiscontinuity);
             self.recovering = true;
             if incomplete {
-                return Err(anyhow!("RTP timestamp changed during FU-A"));
+                return AssemblyResult::rejected(
+                    anyhow!("RTP timestamp changed during FU-A"),
+                    drops,
+                );
             }
         }
         self.timestamp = Some(packet.timestamp);
         let payload = packet.payload;
         if let Err(error) = self.append_payload(&payload) {
-            self.clear_access_unit();
+            let discarded = self.clear_access_unit();
+            drops.record(discarded, AssemblyDrop::PacketRejection);
             self.recovering = true;
-            return Err(error);
+            return AssemblyResult::rejected(error, drops);
         }
+        self.buffered_packets = self.buffered_packets.saturating_add(1);
         if !packet.marker {
-            return Ok(None);
+            return AssemblyResult::accepted(AssemblyOutcome::Incomplete, drops);
         }
         if self.fu_kind.is_some() {
-            self.clear_access_unit();
+            let buffered = self.clear_access_unit();
+            drops.record(buffered.saturating_sub(1), AssemblyDrop::PacketRejection);
             self.recovering = true;
-            return Err(anyhow!("RTP marker ended an incomplete FU-A"));
+            return AssemblyResult::rejected(anyhow!("RTP marker ended an incomplete FU-A"), drops);
         }
         let data = std::mem::take(&mut self.data);
         let key = std::mem::take(&mut self.key);
+        let access_unit_packets = std::mem::take(&mut self.buffered_packets);
         self.timestamp = None;
-        if data.is_empty() || self.recovering && !key {
-            return Ok(None);
+        if data.is_empty() {
+            drops.record(access_unit_packets, AssemblyDrop::EmptyAccessUnit);
+            return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
+        }
+        if self.recovering && !key {
+            drops.record(access_unit_packets, AssemblyDrop::RecoveringWithoutKeyframe);
+            return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
         let discontinuity = std::mem::take(&mut self.recovering);
-        Ok(Some(Unit {
-            data: data.into(),
-            key,
-            discontinuity,
-            timestamp: packet.timestamp,
-            ssrc: packet.ssrc,
-        }))
+        AssemblyResult::accepted(
+            AssemblyOutcome::Complete(Unit {
+                data: data.into(),
+                key,
+                discontinuity,
+                timestamp: packet.timestamp,
+                generation: packet.generation,
+            }),
+            drops,
+        )
     }
+
     fn append_payload(&mut self, payload: &[u8]) -> Result<()> {
         if payload.is_empty() {
             return Err(anyhow!("empty H.264 RTP payload"));
@@ -339,6 +468,7 @@ impl Assembler {
             kind => Err(anyhow!("unsupported H.264 packetization type {kind}")),
         }
     }
+
     fn append_fu(&mut self, payload: &[u8]) -> Result<()> {
         if payload.len() < 3 {
             return Err(anyhow!("truncated FU-A payload"));
@@ -367,6 +497,7 @@ impl Assembler {
         }
         Ok(())
     }
+
     fn append_nal(&mut self, nal: &[u8]) -> Result<()> {
         if nal[0] & 31 == 5 {
             self.key = true;
@@ -374,6 +505,7 @@ impl Assembler {
         self.push(&[0, 0, 0, 1])?;
         self.push(nal)
     }
+
     fn push(&mut self, value: &[u8]) -> Result<()> {
         if self.data.len().saturating_add(value.len()) > MAX_ACCESS_UNIT {
             return Err(anyhow!("H.264 access unit exceeds byte limit"));
@@ -381,11 +513,13 @@ impl Assembler {
         self.data.extend_from_slice(value);
         Ok(())
     }
-    fn clear_access_unit(&mut self) {
+
+    fn clear_access_unit(&mut self) -> u64 {
         self.data.clear();
         self.key = false;
         self.fu_kind = None;
         self.timestamp = None;
+        std::mem::take(&mut self.buffered_packets)
     }
 }
 
@@ -393,37 +527,39 @@ struct Pending<T> {
     value: T,
     queued_at: Instant,
 }
+
 struct PendingUnit {
     unit: Unit,
-    _bytes: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
 }
+
 struct Correlator {
     metadata: VecDeque<Pending<FrameMetadata>>,
     units: VecDeque<Pending<PendingUnit>>,
     last_timestamp: Option<u32>,
-    last_generation: u32,
-    last_fps: u32,
-    ready_generation: u32,
+    last_generation: Option<Generation>,
+    last_fps: Option<Fps>,
 }
+
 impl Correlator {
     fn new() -> Self {
         Self {
             metadata: VecDeque::new(),
             units: VecDeque::new(),
             last_timestamp: None,
-            last_generation: 0,
-            last_fps: 60,
-            ready_generation: 0,
+            last_generation: None,
+            last_fps: None,
         }
     }
+
     fn push_metadata(&mut self, value: FrameMetadata) -> Result<Vec<VideoSample>> {
-        if value.generation == 0 {
-            return Err(anyhow!("frame generation must be positive"));
-        }
-        if value.generation < self.last_generation {
+        if self
+            .last_generation
+            .is_some_and(|generation| value.generation.get() < generation.get())
+        {
             return self.drain();
         }
-        if self.metadata.len() == MAX_PENDING_RECORDS {
+        if self.metadata.len() == PENDING_RECORD_CAPACITY {
             return Err(anyhow!("metadata count limit exceeded"));
         }
         self.metadata.push_back(Pending {
@@ -432,14 +568,15 @@ impl Correlator {
         });
         self.drain()
     }
+
     fn push_unit(&mut self, value: PendingUnit) -> Result<Vec<VideoSample>> {
-        if value.unit.ssrc == 0 {
-            return Err(anyhow!("RTP SSRC generation must be positive"));
-        }
-        if value.unit.ssrc < self.last_generation {
+        if self
+            .last_generation
+            .is_some_and(|generation| value.unit.generation.get() < generation.get())
+        {
             return self.drain();
         }
-        if self.units.len() == MAX_PENDING_RECORDS {
+        if self.units.len() == PENDING_RECORD_CAPACITY {
             return Err(anyhow!("RTP unit count limit exceeded"));
         }
         self.units.push_back(Pending {
@@ -448,6 +585,7 @@ impl Correlator {
         });
         self.drain()
     }
+
     fn drain(&mut self) -> Result<Vec<VideoSample>> {
         let mut samples = Vec::new();
         loop {
@@ -456,26 +594,32 @@ impl Correlator {
                 break;
             };
             let unit = &pending.value.unit;
-            if unit.ssrc < self.last_generation {
-                self.units.pop_front();
+            if self
+                .last_generation
+                .is_some_and(|generation| unit.generation.get() < generation.get())
+            {
+                let _ = self.units.pop_front();
                 continue;
             }
 
-            let metadata_count = if unit.ssrc == self.last_generation {
+            let metadata_count = if self.last_generation == Some(unit.generation) {
                 let last_timestamp = self
                     .last_timestamp
                     .ok_or_else(|| anyhow!("current generation has no prior RTP timestamp"))?;
-                metadata_gap(unit.timestamp.wrapping_sub(last_timestamp), self.last_fps)?
+                let last_fps = self
+                    .last_fps
+                    .ok_or_else(|| anyhow!("current generation has no prior frame rate"))?;
+                metadata_gap(unit.timestamp.wrapping_sub(last_timestamp), last_fps)?
             } else {
                 1
             };
             let (metadata_index, passed_generation) =
-                self.find_nth_generation_metadata(unit.ssrc, metadata_count);
+                self.find_nth_generation_metadata(unit.generation, metadata_count);
             let Some(index) = metadata_index else {
                 if passed_generation {
                     // Metadata is ordered by generation. This unit's record can
                     // no longer arrive, so it cannot be correlated safely.
-                    self.units.pop_front();
+                    let _ = self.units.pop_front();
                     continue;
                 }
                 break;
@@ -485,14 +629,18 @@ impl Correlator {
                 .units
                 .pop_front()
                 .ok_or_else(|| anyhow!("front RTP unit disappeared during correlation"))?;
-            let unit = pending.value.unit;
+            let PendingUnit {
+                unit,
+                bytes: byte_permit,
+            } = pending.value;
+            drop(byte_permit);
             let metadata = self.take_metadata_through(index)?;
-            debug_assert_eq!(metadata.generation, unit.ssrc);
-            let generation_changed = metadata.generation != self.last_generation;
+            debug_assert_eq!(metadata.generation, unit.generation);
+            let generation_changed = self.last_generation != Some(metadata.generation);
             let discontinuity = unit.discontinuity || index > 0 || generation_changed;
             self.last_timestamp = Some(unit.timestamp);
-            self.last_generation = metadata.generation;
-            self.last_fps = metadata.fps;
+            self.last_generation = Some(metadata.generation);
+            self.last_fps = Some(metadata.fps);
             samples.push(VideoSample {
                 data: unit.data,
                 key: unit.key,
@@ -502,19 +650,24 @@ impl Correlator {
         }
         Ok(samples)
     }
+
     fn discard_stale_metadata(&mut self) {
-        while self
-            .metadata
-            .front()
-            .is_some_and(|item| item.value.generation < self.last_generation)
-        {
-            self.metadata.pop_front();
+        while self.metadata.front().is_some_and(|item| {
+            self.last_generation
+                .is_some_and(|generation| item.value.generation.get() < generation.get())
+        }) {
+            let _ = self.metadata.pop_front();
         }
     }
-    fn find_nth_generation_metadata(&self, generation: u32, count: usize) -> (Option<usize>, bool) {
+
+    fn find_nth_generation_metadata(
+        &self,
+        generation: Generation,
+        count: usize,
+    ) -> (Option<usize>, bool) {
         let mut matches = 0;
         for (index, item) in self.metadata.iter().enumerate() {
-            match item.value.generation.cmp(&generation) {
+            match item.value.generation.get().cmp(&generation.get()) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => {
                     matches += 1;
@@ -527,6 +680,7 @@ impl Correlator {
         }
         (None, false)
     }
+
     fn take_metadata_through(&mut self, index: usize) -> Result<FrameMetadata> {
         let mut metadata = None;
         for _ in 0..=index {
@@ -534,50 +688,117 @@ impl Correlator {
         }
         metadata.ok_or_else(|| anyhow!("matched frame metadata disappeared during correlation"))
     }
+
     fn deadline(&self) -> Option<Instant> {
         self.metadata
             .front()
-            .map(|v| v.queued_at)
+            .map(|pending| pending.queued_at)
             .into_iter()
-            .chain(self.units.front().map(|v| v.queued_at))
+            .chain(self.units.front().map(|pending| pending.queued_at))
             .min()
             .map(|at| at + UNMATCHED_DEADLINE)
     }
 }
-fn metadata_gap(delta: u32, fps: u32) -> Result<usize> {
+
+#[allow(clippy::cast_possible_truncation)] // `count` is bounded to 120 before the cast.
+fn metadata_gap(delta: u32, fps: Fps) -> Result<usize> {
     if delta == 0 {
         return Ok(1);
     }
-    let count = (u64::from(delta) * u64::from(fps) + 45_000) / 90_000;
+    let count = (u64::from(delta) * u64::from(fps.get()) + 45_000) / 90_000;
     if count == 0 {
         return Ok(1);
     }
-    let maximum =
-        u64::try_from(MAX_PENDING_RECORDS).context("metadata record limit does not fit in u64")?;
-    if count > maximum {
+    if count > MAX_PENDING_RECORDS {
         return Err(anyhow!("RTP timestamp gap exceeds correlation window"));
     }
-    usize::try_from(count).context("RTP timestamp gap does not fit in usize")
+    Ok(count as usize)
 }
 
 enum PipelineMessage {
     Metadata(FrameMetadata),
     Unit(PendingUnit),
 }
+
+#[derive(Default)]
+struct PacketDropSummary {
+    dropped_packets: u64,
+    rejected_packets: u64,
+    last_reason: Option<String>,
+    last_report: Option<Instant>,
+}
+
+impl PacketDropSummary {
+    fn record_drops(&mut self, packets: u64, reason: impl fmt::Display) {
+        debug!(dropped_packets = packets, reason = %reason, "RTP packets dropped");
+        self.dropped_packets = self.dropped_packets.saturating_add(packets);
+        self.last_reason = Some(reason.to_string());
+    }
+
+    fn record_rejection(&mut self, reason: impl fmt::Display) {
+        debug!(reason = %reason, "RTP packet rejected");
+        self.rejected_packets = self.rejected_packets.saturating_add(1);
+        self.last_reason = Some(reason.to_string());
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        if self.dropped_packets == 0 && self.rejected_packets == 0 {
+            None
+        } else {
+            Some(
+                self.last_report
+                    .map_or_else(Instant::now, |at| at + DROP_REPORT_INTERVAL),
+            )
+        }
+    }
+
+    fn report_if_due(&mut self) {
+        let Some(deadline) = self.deadline() else {
+            return;
+        };
+        if deadline > Instant::now() {
+            return;
+        }
+        self.report();
+    }
+
+    fn report(&mut self) {
+        let last_reason = self
+            .last_reason
+            .take()
+            .unwrap_or_else(|| "unknown RTP packet failure".to_owned());
+        warn!(
+            dropped_packets = self.dropped_packets,
+            rejected_packets = self.rejected_packets,
+            %last_reason,
+            "RTP packets dropped or rejected"
+        );
+        self.dropped_packets = 0;
+        self.rejected_packets = 0;
+        self.last_report = Some(Instant::now());
+    }
+}
+
 #[derive(Clone)]
-pub struct VideoPipeline {
+pub(crate) struct VideoPipeline {
     tx: mpsc::Sender<PipelineMessage>,
     unit_budget: Arc<Semaphore>,
 }
-pub struct VideoWorker {
+
+pub(crate) struct VideoWorker {
     rx: mpsc::Receiver<PipelineMessage>,
     hub: VideoHub,
     commands: CommandSink,
     readiness: Readiness,
 }
+
 impl VideoPipeline {
-    pub fn new(hub: VideoHub, commands: CommandSink, readiness: Readiness) -> (Self, VideoWorker) {
-        let (tx, rx) = mpsc::channel(MAX_PENDING_RECORDS);
+    pub(crate) fn new(
+        hub: VideoHub,
+        commands: CommandSink,
+        readiness: Readiness,
+    ) -> (Self, VideoWorker) {
+        let (tx, rx) = mpsc::channel(PENDING_RECORD_CAPACITY);
         let unit_budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
         (
             Self { tx, unit_budget },
@@ -589,12 +810,14 @@ impl VideoPipeline {
             },
         )
     }
-    pub async fn metadata(&self, value: FrameMetadata) -> Result<()> {
+
+    pub(crate) async fn metadata(&self, value: FrameMetadata) -> Result<()> {
         self.tx
             .send(PipelineMessage::Metadata(value))
             .await
             .context("video pipeline stopped")
     }
+
     async fn unit(&self, value: Unit) -> Result<()> {
         let bytes = u32::try_from(value.data.len()).context("access unit size overflow")?;
         let permit = Arc::clone(&self.unit_budget)
@@ -604,31 +827,59 @@ impl VideoPipeline {
         self.tx
             .send(PipelineMessage::Unit(PendingUnit {
                 unit: value,
-                _bytes: permit,
+                bytes: permit,
             }))
             .await
             .context("video pipeline stopped")
     }
-    pub async fn receive(self, socket: UdpSocket) -> Result<()> {
+
+    pub(crate) async fn receive(self, socket: UdpSocket) -> Result<()> {
         let mut assembler = Assembler::default();
+        let mut summary = PacketDropSummary::default();
         let mut buffer = vec![0; 65_536];
         loop {
-            let (length, source) = socket.recv_from(&mut buffer).await?;
-            if !source.ip().is_loopback() {
-                continue;
-            }
-            let Ok(packet) = decode_packet(&buffer[..length]) else {
+            summary.report_if_due();
+            let received = if let Some(deadline) = summary.deadline() {
+                tokio::select! {
+                    value = socket.recv_from(&mut buffer) => Some(value),
+                    () = sleep_until(deadline) => None,
+                }
+            } else {
+                Some(socket.recv_from(&mut buffer).await)
+            };
+            let Some(received) = received else {
+                summary.report();
                 continue;
             };
-            if let Ok(Some(unit)) = assembler.consume(packet) {
-                self.unit(unit).await?;
+            let (length, source) = received?;
+            if !source.ip().is_loopback() {
+                summary.record_rejection(format_args!("non-loopback RTP source {source}"));
+                continue;
+            }
+            let packet = match decode_packet(&buffer[..length]) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    summary.record_rejection(error);
+                    continue;
+                }
+            };
+            let result = assembler.consume(packet);
+            if let Some(reason) = result.drops.last_reason {
+                summary.record_drops(result.drops.packets, reason);
+            }
+            match result.outcome {
+                Ok(AssemblyOutcome::Complete(unit)) => self.unit(unit).await?,
+                Ok(AssemblyOutcome::Dropped | AssemblyOutcome::Incomplete) => {}
+                Err(error) => summary.record_rejection(error),
             }
         }
     }
 }
+
 impl VideoWorker {
-    pub async fn run(mut self) -> Result<()> {
+    pub(crate) async fn run(mut self) -> Result<()> {
         let mut state = Correlator::new();
+        let mut ready_generation = None;
         loop {
             let message = if let Some(deadline) = state.deadline() {
                 tokio::select! {
@@ -649,23 +900,26 @@ impl VideoWorker {
             };
             for frame in frames {
                 let generation = frame.metadata.generation;
-                let ready = self.hub.broadcast(frame);
-                if ready {
-                    self.readiness.mark_video_ready();
-                } else {
-                    self.readiness.await_keyframe();
-                }
-                let transition = if ready && state.ready_generation != generation {
-                    state.ready_generation = generation;
-                    Some((generation, true))
-                } else if !ready && state.ready_generation != 0 {
-                    Some((std::mem::take(&mut state.ready_generation), false))
-                } else {
-                    None
+                let transition = match self.hub.broadcast(frame) {
+                    GopState::KeyframeCached => {
+                        self.readiness.mark_video_ready();
+                        if ready_generation == Some(generation) {
+                            None
+                        } else {
+                            ready_generation = Some(generation);
+                            Some((generation, true))
+                        }
+                    }
+                    GopState::Recovering => {
+                        self.readiness.await_keyframe();
+                        ready_generation
+                            .take()
+                            .map(|generation| (generation, false))
+                    }
                 };
                 if let Some((generation, ready)) = transition {
                     self.commands
-                        .system(DaemonCommand::KeyframeReadiness { generation, ready })
+                        .system(Command::KeyframeReadiness { generation, ready })
                         .await?;
                 }
             }

@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::sys::signal::kill;
 use nix::sys::wait::Id;
@@ -17,13 +18,21 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitid;
 use nix::unistd::Pid;
-use serde_json::json;
+use sprite_desktop_protocol::browser::ClientEvent;
+use sprite_desktop_protocol::browser::CursorState;
+use sprite_desktop_protocol::pipe::ClipboardText;
+use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::Event;
+use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::Kbps;
+use thiserror::Error;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
-use tokio::process::Command;
+use tokio::process::Command as ProcessCommand;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
@@ -31,11 +40,12 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tracing::info;
+use tracing::warn;
 
-use crate::cursor::CursorState;
-use crate::protocol::DaemonCommand;
-use crate::protocol::DaemonEvent;
+use crate::cursor::CursorUpdate;
 use crate::protocol::EventReader;
+use crate::session::LeaseEpoch;
 use crate::video::VideoHub;
 use crate::video::VideoPipeline;
 use crate::video::VideoWorker;
@@ -47,21 +57,10 @@ const STARTUP_DEADLINE: Duration = Duration::from_secs(15);
 const GROUP_EXIT_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
-pub struct RuntimeState {
-    readiness: Readiness,
-    pub active_lease: Arc<AtomicU64>,
-    pub events: AppEvents,
-}
-impl RuntimeState {
-    pub fn is_ready(&self) -> bool {
-        self.readiness.is_ready()
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct Readiness {
     state: Arc<Mutex<ReadinessState>>,
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadinessState {
     WaitingForFirstFrame,
@@ -70,64 +69,56 @@ enum ReadinessState {
     Failed,
 }
 
-fn lock_readiness(state: &Mutex<ReadinessState>) -> MutexGuard<'_, ReadinessState> {
-    match state.lock() {
-        Ok(state) => state,
-        Err(error) => panic!("daemon readiness mutex poisoned: {error}"),
+pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>, purpose: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(value) => value,
+        Err(error) => panic!("{purpose} mutex poisoned: {error}"),
     }
 }
 
 impl Readiness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(ReadinessState::WaitingForFirstFrame)),
         }
     }
+
     pub(crate) fn mark_video_ready(&self) {
-        let mut state = lock_readiness(&self.state);
+        let mut state = lock(&self.state, "daemon readiness");
         if *state != ReadinessState::Failed {
             *state = ReadinessState::Ready;
         }
     }
+
     pub(crate) fn await_keyframe(&self) {
-        let mut state = lock_readiness(&self.state);
+        let mut state = lock(&self.state, "daemon readiness");
         if *state == ReadinessState::Ready {
             *state = ReadinessState::WaitingForKeyframe;
         }
     }
+
     pub(crate) fn failed(&self) {
-        *lock_readiness(&self.state) = ReadinessState::Failed;
+        *lock(&self.state, "daemon readiness") = ReadinessState::Failed;
     }
+
     pub(crate) fn is_ready(&self) -> bool {
-        *lock_readiness(&self.state) == ReadinessState::Ready
+        *lock(&self.state, "daemon readiness") == ReadinessState::Ready
     }
+
     pub(crate) fn needs_startup_frame(&self) -> bool {
-        *lock_readiness(&self.state) == ReadinessState::WaitingForFirstFrame
+        *lock(&self.state, "daemon readiness") == ReadinessState::WaitingForFirstFrame
     }
 }
+
 #[derive(Clone)]
-pub struct AppEvents {
-    tx: broadcast::Sender<String>,
-    latest_clipboard: Arc<Mutex<Option<String>>>,
+pub(crate) struct AppEvents {
+    tx: broadcast::Sender<ClientEvent>,
+    latest_clipboard: Arc<Mutex<Option<ClipboardText>>>,
     latest_cursor: Arc<Mutex<CursorState>>,
 }
 
-fn lock_clipboard(state: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
-    match state.lock() {
-        Ok(state) => state,
-        Err(error) => panic!("daemon clipboard state mutex poisoned: {error}"),
-    }
-}
-
-fn lock_cursor(state: &Mutex<CursorState>) -> MutexGuard<'_, CursorState> {
-    match state.lock() {
-        Ok(state) => state,
-        Err(error) => panic!("daemon cursor state mutex poisoned: {error}"),
-    }
-}
-
 impl AppEvents {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (tx, _) = broadcast::channel(64);
         Self {
             tx,
@@ -135,151 +126,269 @@ impl AppEvents {
             latest_cursor: Arc::new(Mutex::new(CursorState::default())),
         }
     }
-    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ClientEvent> {
         self.tx.subscribe()
     }
-    pub fn initial(&self) -> Result<Vec<String>> {
-        let cursor = lock_cursor(&self.latest_cursor);
-        let mut values = vec![serde_json::to_string(&*cursor)?];
-        drop(cursor);
-        if let Some(value) = lock_clipboard(&self.latest_clipboard).clone() {
-            values.push(value);
+
+    pub(crate) fn initial(&self) -> Vec<ClientEvent> {
+        let cursor = lock(&self.latest_cursor, "daemon cursor state").clone();
+        let mut values = vec![ClientEvent::Cursor(cursor)];
+        if let Some(text) = lock(&self.latest_clipboard, "daemon clipboard state").clone() {
+            values.push(ClientEvent::Clipboard { text });
         }
-        Ok(values)
+        values
     }
-    fn publish(&self, value: String) {
-        drop(self.tx.send(value));
-    }
-    fn reset(&self) {
-        *lock_clipboard(&self.latest_clipboard) = None;
-        *lock_cursor(&self.latest_cursor) = CursorState::default();
+
+    fn publish(&self, value: ClientEvent) {
+        let _ = self.tx.send(value);
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authority {
     System,
-    Lease(u64),
+    Lease(LeaseEpoch),
 }
+
 struct Request {
     authority: Authority,
-    command: DaemonCommand,
-    _bytes: OwnedSemaphorePermit,
+    command: Command,
+    bytes: OwnedSemaphorePermit,
 }
+
+struct AuthorizedCommand {
+    command: Command,
+    bytes: OwnedSemaphorePermit,
+}
+
+struct CommandReader {
+    requests: mpsc::Receiver<Request>,
+    active_lease: Arc<AtomicU64>,
+}
+
+impl CommandReader {
+    async fn recv(&mut self) -> Option<AuthorizedCommand> {
+        while let Some(request) = self.requests.recv().await {
+            let authorized = match request.authority {
+                Authority::System => true,
+                Authority::Lease(lease) => self.active_lease.load(Ordering::Acquire) == lease.get(),
+            };
+            if authorized {
+                return Some(AuthorizedCommand {
+                    command: request.command,
+                    bytes: request.bytes,
+                });
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(crate) enum CommandSinkError {
+    #[error("daemon command length {length} exceeds the pipe budget's integer limit")]
+    LengthOverflow { length: usize },
+    #[error("daemon command byte budget closed")]
+    ByteBudgetClosed,
+    #[error("daemon command byte budget stalled for two seconds")]
+    ByteBudgetStalled,
+    #[error("daemon command writer stopped")]
+    WriterStopped,
+    #[error("daemon command count budget stalled for two seconds")]
+    CountBudgetStalled,
+}
+
 #[derive(Clone)]
-pub struct CommandSink {
+pub(crate) struct CommandSink {
     tx: mpsc::Sender<Request>,
     budget: Arc<Semaphore>,
-    fatal: mpsc::Sender<String>,
+    fatal: mpsc::Sender<CommandSinkError>,
     readiness: Readiness,
+    active_lease: Arc<AtomicU64>,
 }
+
 impl CommandSink {
-    async fn send(&self, authority: Authority, command: DaemonCommand) -> Result<()> {
-        let count = u32::try_from(command.encoded_len()).context("command length overflow")?;
-        let permit = timeout(
+    fn new(
+        capacity: usize,
+        budget_bytes: usize,
+        fatal: mpsc::Sender<CommandSinkError>,
+        readiness: Readiness,
+    ) -> (Self, CommandReader) {
+        let (tx, requests) = mpsc::channel(capacity);
+        let active_lease = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                tx,
+                budget: Arc::new(Semaphore::new(budget_bytes)),
+                fatal,
+                readiness,
+                active_lease: Arc::clone(&active_lease),
+            },
+            CommandReader {
+                requests,
+                active_lease,
+            },
+        )
+    }
+
+    async fn send(&self, authority: Authority, command: Command) -> Result<(), CommandSinkError> {
+        let length = command.encoded_len();
+        let count = u32::try_from(length)
+            .map_err(|_overflow| CommandSinkError::LengthOverflow { length })?;
+        let permit = match timeout(
             PIPE_DEADLINE,
             Arc::clone(&self.budget).acquire_many_owned(count),
         )
         .await
-        .context("daemon command byte budget stalled")?
-        .context("daemon command budget closed")?;
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => return Err(CommandSinkError::ByteBudgetClosed),
+            Err(_elapsed) => return Err(CommandSinkError::ByteBudgetStalled),
+        };
         let request = Request {
             authority,
             command,
-            _bytes: permit,
+            bytes: permit,
         };
         match timeout(PIPE_DEADLINE, self.tx.send(request)).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(anyhow!("daemon command writer stopped")),
-            Err(_) => Err(anyhow!("daemon command count budget stalled")),
+            Ok(Err(_closed)) => Err(CommandSinkError::WriterStopped),
+            Err(_elapsed) => Err(CommandSinkError::CountBudgetStalled),
         }
     }
-    fn fail<T>(&self, message: &str) -> Result<T> {
+
+    fn fail<T>(&self, error: CommandSinkError) -> Result<T, CommandSinkError> {
         self.readiness.failed();
         // The first fatal error shuts down the session. Later failures need
         // neither additional queue space nor a second shutdown transition.
-        drop(self.fatal.try_send(message.to_owned()));
-        Err(anyhow!(message.to_owned()))
+        let _ = self.fatal.try_send(error.clone());
+        Err(error)
     }
-    pub async fn system(&self, command: DaemonCommand) -> Result<()> {
+
+    pub(crate) async fn system(&self, command: Command) -> Result<(), CommandSinkError> {
         match self.send(Authority::System, command).await {
             Ok(()) => Ok(()),
-            Err(error) => self.fail(&error.to_string()),
+            Err(error) => self.fail(error),
         }
     }
-    pub async fn input(&self, lease: u64, command: DaemonCommand) -> Result<()> {
+
+    pub(crate) async fn input(
+        &self,
+        lease: LeaseEpoch,
+        command: Command,
+    ) -> Result<(), CommandSinkError> {
         match self.send(Authority::Lease(lease), command).await {
             Ok(()) => Ok(()),
-            Err(error) => self.fail(&error.to_string()),
+            Err(error) => self.fail(error),
         }
+    }
+
+    pub(crate) fn set_active_lease(&self, lease: LeaseEpoch) {
+        // Release publishes the epoch before its commands enter the FIFO. The
+        // reader's Acquire either sees this epoch or rejects the command.
+        self.active_lease.store(lease.get(), Ordering::Release);
+    }
+
+    pub(crate) fn clear_active_lease(&self) {
+        // Release invalidates the epoch after ReleaseAll enters the FIFO. A
+        // reader that observes the clear can only drop late leased commands;
+        // system commands remain ordered by the channel.
+        self.active_lease.store(0, Ordering::Release);
     }
 }
 
-pub struct Daemon {
-    pub commands: CommandSink,
-    pub state: RuntimeState,
+pub(crate) struct Daemon {
+    pub(crate) commands: CommandSink,
+    pub(crate) readiness: Readiness,
+    pub(crate) events: AppEvents,
     shutdown: mpsc::Sender<()>,
 }
-pub struct Config {
-    pub path: String,
-    pub frame_rate: u32,
-    pub bitrate: u32,
-    pub xkb_layout: String,
+
+pub(crate) struct StartedDaemon {
+    pub(crate) daemon: Daemon,
+    pub(crate) supervisor: tokio::task::JoinHandle<Result<()>>,
 }
+
+pub(crate) struct Config {
+    pub(crate) path: String,
+    pub(crate) frame_rate: Fps,
+    pub(crate) bitrate: Kbps,
+    pub(crate) xkb_layout: String,
+}
+
 impl Daemon {
-    pub fn start(
+    pub(crate) fn start(
         config: &Config,
         socket: UdpSocket,
-        events: AppEvents,
         hub: VideoHub,
-    ) -> Result<(Self, tokio::task::JoinHandle<Result<()>>)> {
+    ) -> Result<StartedDaemon> {
         let readiness = Readiness::new();
-        let active_lease = Arc::new(AtomicU64::new(0));
-        let (command_tx, command_rx) = mpsc::channel(COMMAND_COUNT);
+        let events = AppEvents::new();
         let (fatal, fatal_rx) = mpsc::channel(1);
-        let commands = CommandSink {
-            tx: command_tx,
-            budget: Arc::new(Semaphore::new(COMMAND_BYTES)),
-            fatal,
-            readiness: readiness.clone(),
-        };
+        let (commands, command_reader) =
+            CommandSink::new(COMMAND_COUNT, COMMAND_BYTES, fatal, readiness.clone());
         let (shutdown, shutdown_rx) = mpsc::channel(1);
         let (pipeline, video_worker) = VideoPipeline::new(hub, commands.clone(), readiness.clone());
         let process = spawn_daemon(config, socket.local_addr()?.port())?;
-        events.reset();
-        let state = RuntimeState {
-            readiness,
-            active_lease,
-            events,
+        let receivers = DaemonReceivers {
+            commands: command_reader,
+            fatal: fatal_rx,
+            shutdown: shutdown_rx,
         };
-        let task = tokio::spawn(supervise_daemon(
-            process,
+        let runtime = DaemonRuntime {
             socket,
             pipeline,
             video_worker,
-            state.clone(),
-            (command_rx, fatal_rx, shutdown_rx),
-        ));
-        Ok((
-            Self {
+            readiness: readiness.clone(),
+            events: events.clone(),
+        };
+        let supervisor = tokio::spawn(supervise_daemon(process, runtime, receivers));
+        Ok(StartedDaemon {
+            daemon: Self {
                 commands,
-                state,
+                readiness,
+                events,
                 shutdown,
             },
-            task,
-        ))
+            supervisor,
+        })
     }
-    pub async fn shutdown(&self) {
-        let _send_result = self.shutdown.send(()).await;
+
+    pub(crate) async fn shutdown(&self) {
+        let _ = self.shutdown.send(()).await;
     }
 }
 
-fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<(Child, i32, ChildStdin, ChildStdout)> {
-    let mut command = Command::new(&config.path);
+struct SpawnedDaemon {
+    child: Child,
+    pid: Pid,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
+
+struct DaemonReceivers {
+    commands: CommandReader,
+    fatal: mpsc::Receiver<CommandSinkError>,
+    shutdown: mpsc::Receiver<()>,
+}
+
+struct DaemonRuntime {
+    socket: UdpSocket,
+    pipeline: VideoPipeline,
+    video_worker: VideoWorker,
+    readiness: Readiness,
+    events: AppEvents,
+}
+
+fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
+    let mut command = ProcessCommand::new(&config.path);
     command
         .args([
             "--frame-rate",
-            &config.frame_rate.to_string(),
+            &config.frame_rate.get().to_string(),
             "--bitrate",
-            &config.bitrate.to_string(),
+            &config.bitrate.get().to_string(),
             "--rtp-port",
             &rtp_port.to_string(),
             "--xkb-layout",
@@ -293,42 +402,65 @@ fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<(Child, i32, ChildStdi
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn private daemon {}", config.path))?;
-    let pid = i32::try_from(
+    let raw_pid = i32::try_from(
         child
             .id()
             .ok_or_else(|| anyhow!("daemon has no process ID"))?,
     )
     .context("daemon process ID exceeds i32")?;
+    let pid = Pid::from_raw(raw_pid);
     let stdin = child.stdin.take().context("open daemon stdin")?;
     let stdout = child.stdout.take().context("open daemon stdout")?;
-    Ok((child, pid, stdin, stdout))
+    info!(%pid, path = %config.path, "daemon spawned");
+    Ok(SpawnedDaemon {
+        child,
+        pid,
+        stdin,
+        stdout,
+    })
+}
+
+#[derive(Debug, Error)]
+#[error("{terminal:#}; daemon process group cleanup also failed: {cleanup:#}")]
+struct DaemonCleanupError {
+    terminal: anyhow::Error,
+    cleanup: anyhow::Error,
 }
 
 async fn supervise_daemon(
-    process: (Child, i32, ChildStdin, ChildStdout),
-    socket: UdpSocket,
-    pipeline: VideoPipeline,
-    video_worker: VideoWorker,
-    state: RuntimeState,
-    channels: (
-        mpsc::Receiver<Request>,
-        mpsc::Receiver<String>,
-        mpsc::Receiver<()>,
-    ),
+    process: SpawnedDaemon,
+    runtime: DaemonRuntime,
+    receivers: DaemonReceivers,
 ) -> Result<()> {
-    let (mut child, pid, stdin, stdout) = process;
-    let (command_rx, mut fatal_rx, mut shutdown_rx) = channels;
+    let SpawnedDaemon {
+        mut child,
+        pid,
+        stdin,
+        stdout,
+    } = process;
+    let DaemonRuntime {
+        socket,
+        pipeline,
+        video_worker,
+        readiness,
+        events,
+    } = runtime;
+    let DaemonReceivers {
+        commands: command_reader,
+        fatal: mut fatal_rx,
+        shutdown: mut shutdown_rx,
+    } = receivers;
     // Drop the pipe futures before signalling the process group so native EOF
     // cleanup can make progress.
     let result = async {
-        let writer = write_commands(stdin, command_rx, Arc::clone(&state.active_lease));
-        let reader = read_events(stdout, state.events.clone(), pipeline.clone());
+        let writer = write_commands(stdin, command_reader);
+        let reader = read_events(stdout, events, pipeline.clone());
         let rtp = pipeline.receive(socket);
         let video = video_worker.run();
         let exited = wait_for_leader_exit(pid);
         let startup = async {
             sleep(STARTUP_DEADLINE).await;
-            if state.readiness.needs_startup_frame() {
+            if readiness.needs_startup_frame() {
                 Err(anyhow!(
                     "daemon did not produce a correlated keyframe before startup deadline"
                 ))
@@ -343,40 +475,73 @@ async fn supervise_daemon(
             value = &mut rtp => value.context("RTP receiver"),
             value = &mut video => value.context("video pipeline"),
             value = &mut exited => {
-                value?;
-                Err(anyhow!("daemon exited"))
+                let status = value?;
+                Err(anyhow!("daemon exited with status {status:?}"))
             }
             value = &mut startup => value,
-            message = fatal_rx.recv() => Err(anyhow!(
-                message.unwrap_or_else(|| "fatal command channel closed".into())
-            )),
+            error = fatal_rx.recv() => match error {
+                Some(error) => Err(error.into()),
+                None => Err(anyhow!("fatal command channel closed")),
+            },
             _ = shutdown_rx.recv() => Ok(()),
         }
     }
     .await;
-    state.readiness.failed();
-    cleanup_group(&mut child, pid).await?;
+    readiness.failed();
+    let result = match cleanup_group(&mut child, pid).await {
+        Ok(()) => result,
+        Err(cleanup_error) => match result {
+            Ok(()) => Err(cleanup_error.context("clean up daemon process group")),
+            Err(terminal) => Err(DaemonCleanupError {
+                terminal,
+                cleanup: cleanup_error,
+            }
+            .into()),
+        },
+    };
+    match &result {
+        Ok(()) => info!(%pid, reason = "shutdown requested", "daemon supervisor stopped"),
+        Err(error) => {
+            warn!(%pid, reason = %format_args!("{error:#}"), "daemon supervisor stopped");
+        }
+    }
     result
 }
 
-async fn write_commands(
-    mut output: tokio::process::ChildStdin,
-    mut requests: mpsc::Receiver<Request>,
-    active_lease: Arc<AtomicU64>,
-) -> Result<()> {
-    while let Some(request) = requests.recv().await {
-        if let Authority::Lease(expected) = request.authority
-            && active_lease.load(Ordering::Acquire) != expected
-        {
-            continue;
-        }
-        let bytes = request.command.encode()?;
-        timeout(PIPE_DEADLINE, output.write_all(&bytes))
-            .await
-            .context("daemon stdin stalled")??;
-    }
-    Err(anyhow!("command queue closed"))
+#[derive(Debug, Error)]
+enum CommandWriterError {
+    #[error("command queue closed")]
+    QueueClosed,
+    #[error("write daemon command: {0}")]
+    Write(#[source] std::io::Error),
+    #[error("daemon command write timed out after two seconds")]
+    WriteTimeout,
 }
+
+async fn write_commands<W>(
+    mut output: W,
+    mut commands: CommandReader,
+) -> Result<(), CommandWriterError>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(command) = commands.recv().await {
+        let AuthorizedCommand {
+            command,
+            bytes: byte_permit,
+        } = command;
+        let encoded = command.encode();
+        let write_result = timeout(PIPE_DEADLINE, output.write_all(&encoded)).await;
+        drop(byte_permit);
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(CommandWriterError::Write(error)),
+            Err(_elapsed) => return Err(CommandWriterError::WriteTimeout),
+        }
+    }
+    Err(CommandWriterError::QueueClosed)
+}
+
 async fn read_events(
     stdout: tokio::process::ChildStdout,
     events: AppEvents,
@@ -385,75 +550,101 @@ async fn read_events(
     let mut reader = EventReader::new(stdout);
     while let Some(event) = reader.next().await? {
         match event {
-            DaemonEvent::Frame(metadata) => pipeline.metadata(metadata).await?,
-            DaemonEvent::Clipboard(text) => {
-                let value = json!({"type":"clipboard","text":text}).to_string();
-                *lock_clipboard(&events.latest_clipboard) = Some(value.clone());
-                events.publish(value);
+            Event::Frame(metadata) => pipeline.metadata(metadata).await?,
+            Event::Clipboard(text) => {
+                *lock(&events.latest_clipboard, "daemon clipboard state") = Some(text.clone());
+                events.publish(ClientEvent::Clipboard { text });
             }
-            DaemonEvent::ResizeApplied {
-                request,
-                width,
-                height,
-                scale,
+            Event::ResizeApplied {
+                request_id,
+                size,
+                scale_v120,
                 generation,
-            } => events.publish(
-                json!({"type":"resize-applied","request":request,"width":width,"height":height,"scale":scale,"generation":generation})
-                    .to_string(),
-            ),
-            DaemonEvent::CursorVisibility(visible) => {
-                let next = lock_cursor(&events.latest_cursor).with_visibility(visible);
-                *lock_cursor(&events.latest_cursor) = next.clone();
-                events.publish(serde_json::to_string(&next)?);
+            } => events.publish(ClientEvent::ResizeApplied {
+                request: request_id,
+                width: size.width(),
+                height: size.height(),
+                scale: scale_v120,
+                generation,
+            }),
+            Event::CursorVisibility(visible) => {
+                publish_cursor_update(&events, CursorUpdate::visibility(visible));
             }
-            DaemonEvent::CursorImage {
-                width,
-                height,
+            Event::CursorImage {
+                size,
                 hotspot_x,
                 hotspot_y,
                 bgra,
             } => {
-                let current = lock_cursor(&events.latest_cursor).clone();
-                let next = current
-                    .with_image(width, height, hotspot_x, hotspot_y, bgra)
-                    .await?;
-                *lock_cursor(&events.latest_cursor) = next.clone();
-                events.publish(serde_json::to_string(&next)?);
+                let update = CursorUpdate::image(size, hotspot_x, hotspot_y, bgra).await?;
+                publish_cursor_update(&events, update);
             }
         }
     }
     Err(anyhow!("daemon event pipe closed"))
 }
-async fn wait_for_leader_exit(pid: i32) -> Result<()> {
-    let pid = Pid::from_raw(pid);
+
+fn publish_cursor_update(events: &AppEvents, update: CursorUpdate) {
+    let event = {
+        let mut cursor = lock(&events.latest_cursor, "daemon cursor state");
+        update.apply(&mut cursor);
+        ClientEvent::Cursor(cursor.clone())
+    };
+    events.publish(event);
+}
+
+async fn wait_for_leader_exit(pid: Pid) -> Result<WaitStatus> {
     loop {
         match waitid(
             Id::Pid(pid),
             WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
         )? {
             WaitStatus::StillAlive => sleep(Duration::from_millis(25)).await,
-            WaitStatus::Exited(..)
+            status @ (WaitStatus::Exited(..)
             | WaitStatus::Signaled(..)
             | WaitStatus::Stopped(..)
             | WaitStatus::PtraceEvent(..)
             | WaitStatus::PtraceSyscall(_)
-            | WaitStatus::Continued(_) => return Ok(()),
+            | WaitStatus::Continued(_)) => return Ok(status),
         }
     }
 }
-async fn cleanup_group(child: &mut Child, pid: i32) -> Result<()> {
-    let group = Pid::from_raw(-pid);
-    let _term_result = kill(group, Signal::SIGTERM);
-    let deadline = Instant::now() + GROUP_EXIT_DEADLINE;
-    loop {
-        if kill(group, None).is_err() {
-            break;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessGroupState {
+    Alive,
+    Gone,
+}
+
+fn process_group_state(result: std::result::Result<(), Errno>) -> Result<ProcessGroupState> {
+    match result {
+        Ok(()) => Ok(ProcessGroupState::Alive),
+        Err(Errno::ESRCH) => Ok(ProcessGroupState::Gone),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn cleanup_group(child: &mut Child, pid: Pid) -> Result<()> {
+    let group = Pid::from_raw(-pid.as_raw());
+    let state = process_group_state(kill(group, Signal::SIGTERM))
+        .context("send SIGTERM to daemon process group")?;
+    if state == ProcessGroupState::Alive {
+        let deadline = Instant::now() + GROUP_EXIT_DEADLINE;
+        loop {
+            match process_group_state(kill(group, None))
+                .context("probe daemon process group after SIGTERM")?
+            {
+                ProcessGroupState::Gone => break,
+                ProcessGroupState::Alive if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                ProcessGroupState::Alive => {
+                    let _ = process_group_state(kill(group, Signal::SIGKILL))
+                        .context("send SIGKILL to daemon process group")?;
+                    break;
+                }
+            }
         }
-        if Instant::now() >= deadline {
-            let _kill_result = kill(group, Signal::SIGKILL);
-            break;
-        }
-        sleep(Duration::from_millis(25)).await;
     }
     timeout(GROUP_EXIT_DEADLINE, child.wait())
         .await
@@ -463,7 +654,210 @@ async fn cleanup_group(child: &mut Child, pid: i32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use sprite_desktop_protocol::browser::Feedback;
+    use sprite_desktop_protocol::browser::FeedbackValues;
+    use sprite_desktop_protocol::pipe::Generation;
+    use sprite_desktop_protocol::pipe::ScalePercent;
+    use tokio::io::AsyncReadExt;
+
     use super::*;
+    use crate::session::LeaseState;
+    use crate::session::Sessions;
+    use crate::session::SocketId;
+
+    fn command_sink(capacity: usize) -> (CommandSink, CommandReader) {
+        let (fatal, _) = mpsc::channel(1);
+        CommandSink::new(capacity, COMMAND_BYTES, fatal, Readiness::new())
+    }
+
+    #[tokio::test]
+    async fn lease_transitions_keep_fifo_order_and_reject_stale_input() {
+        let (commands, command_reader) = command_sink(8);
+        let (mut output, daemon_input) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(write_commands(daemon_input, command_reader));
+        let first = LeaseEpoch::FIRST;
+        let second = first.next();
+
+        commands.set_active_lease(first);
+        let first_input = Command::KeyframeReadiness {
+            generation: Generation::new(1).expect("test generation should be valid"),
+            ready: true,
+        };
+        let first_bytes = first_input.encode();
+        commands
+            .input(first, first_input)
+            .await
+            .expect("first lease input should queue");
+        let mut written = vec![0; first_bytes.len()];
+        output
+            .read_exact(&mut written)
+            .await
+            .expect("active lease input should be written");
+        assert_eq!(written, first_bytes);
+
+        commands.set_active_lease(second);
+        commands
+            .system(Command::ReleaseAll)
+            .await
+            .expect("lease transition reset should queue");
+        commands
+            .input(
+                first,
+                Command::KeyframeReadiness {
+                    generation: Generation::new(2).expect("test generation should be valid"),
+                    ready: false,
+                },
+            )
+            .await
+            .expect("stale lease input should enter the queue before filtering");
+        let second_input = Command::Quality {
+            bitrate_kbps: Kbps::new(8_000).expect("test bitrate should be valid"),
+            fps: Fps::new(60).expect("test frame rate should be valid"),
+            scale_percent: ScalePercent::new(100).expect("test scale should be valid"),
+        };
+        let mut expected = Command::ReleaseAll.encode();
+        expected.extend_from_slice(&second_input.encode());
+        commands
+            .input(second, second_input)
+            .await
+            .expect("second lease input should queue");
+        drop(commands);
+
+        written.clear();
+        output
+            .read_to_end(&mut written)
+            .await
+            .expect("command writer output should close");
+        assert_eq!(written, expected);
+        assert!(matches!(
+            writer.await.expect("command writer task should run"),
+            Err(CommandWriterError::QueueClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn quality_change_is_queued_as_system_work_before_lease_release() {
+        let (commands, mut command_reader) = command_sink(1);
+        let sessions = Sessions::new(
+            commands.clone(),
+            Kbps::new(8_000).expect("test bitrate should be valid"),
+            Fps::new(60).expect("test frame rate should be valid"),
+        );
+        let socket = SocketId::new(1);
+        let feedback = Feedback::new(FeedbackValues {
+            received: 50,
+            presented: 50,
+            queue_peak: 5,
+            queue_busy_ms: 200.0,
+            sample_ms: 1_000.0,
+            dropped: 0,
+            rtt: 20.0,
+        })
+        .expect("test feedback should be valid");
+
+        assert!(matches!(
+            sessions.acquire(socket).await.expect("acquire lease"),
+            LeaseState::Active
+        ));
+        let initial_release = command_reader
+            .recv()
+            .await
+            .expect("initial release should queue");
+        assert!(matches!(initial_release.command, Command::ReleaseAll));
+
+        sessions
+            .feedback(socket, feedback)
+            .await
+            .expect("first feedback should be accepted");
+        commands
+            .system(Command::ReleaseAll)
+            .await
+            .expect("fill command queue");
+
+        let feedback_sessions = sessions.clone();
+        let feedback_task =
+            tokio::spawn(async move { feedback_sessions.feedback(socket, feedback).await });
+        timeout(Duration::from_secs(1), async {
+            while sessions.quality().bitrate.get() == 8_000 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quality update should reach the blocked command send");
+
+        let release_sessions = sessions.clone();
+        let release_task = tokio::spawn(async move { release_sessions.release(socket).await });
+        tokio::task::yield_now().await;
+
+        let filler = command_reader
+            .recv()
+            .await
+            .expect("queue filler should remain first");
+        assert!(matches!(filler.command, Command::ReleaseAll));
+        feedback_task
+            .await
+            .expect("feedback task should run")
+            .expect("quality command should queue");
+        let quality = command_reader
+            .recv()
+            .await
+            .expect("quality command should queue");
+        assert!(matches!(&quality.command, Command::Quality { .. }));
+        let Command::Quality {
+            bitrate_kbps,
+            fps,
+            scale_percent,
+        } = quality.command
+        else {
+            return;
+        };
+        assert_eq!(bitrate_kbps.get(), 6_400);
+        assert_eq!(fps.get(), 60);
+        assert_eq!(scale_percent.get(), 100);
+
+        release_task
+            .await
+            .expect("release task should run")
+            .expect("release command should queue");
+        let final_release = command_reader
+            .recv()
+            .await
+            .expect("final release should queue");
+        assert!(matches!(final_release.command, Command::ReleaseAll));
+        assert!(!sessions.owns(socket).await);
+    }
+
+    #[tokio::test]
+    async fn closed_command_budget_keeps_its_typed_terminal_reason() {
+        let (commands, request_guard) = command_sink(1);
+        commands.budget.close();
+
+        let error = commands
+            .system(Command::ReleaseAll)
+            .await
+            .expect_err("closed byte budget should reject a command");
+
+        assert_eq!(error, CommandSinkError::ByteBudgetClosed);
+        assert!(!commands.readiness.is_ready());
+        assert!(!commands.readiness.needs_startup_frame());
+        drop(request_guard);
+    }
+
+    #[test]
+    fn only_esrch_means_a_process_group_is_gone() {
+        assert_eq!(
+            process_group_state(Err(Errno::ESRCH)).expect("ESRCH should mean the group is gone"),
+            ProcessGroupState::Gone
+        );
+        assert_eq!(
+            process_group_state(Ok(())).expect("a successful probe should mean the group is alive"),
+            ProcessGroupState::Alive
+        );
+
+        let error = process_group_state(Err(Errno::EPERM))
+            .expect_err("EPERM must remain a process-group cleanup error");
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+    }
 
     #[test]
     fn video_ready_cannot_revive_a_failed_runtime() {

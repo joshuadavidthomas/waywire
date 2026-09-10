@@ -8,6 +8,11 @@ use anyhow::bail;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
+use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::KeyCode;
+use sprite_desktop_protocol::pipe::KeyState;
+use sprite_desktop_protocol::pipe::PointerButton;
+use sprite_desktop_protocol::pipe::TextAction;
 use wayland_client::Proxy;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_keyboard;
@@ -23,17 +28,17 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1;
 use xkbcommon::xkb;
 
 use super::State;
-use crate::protocol::Command;
-use crate::protocol::KeyState;
 
-pub struct Input {
-    pub seat: Option<wl_seat::WlSeat>,
-    pub pointer_manager: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
-    pub keyboard_manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
-    pub method_manager: Option<zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
+pub(crate) struct Input {
+    pub(crate) seat: Option<wl_seat::WlSeat>,
+    pub(crate) pointer_manager:
+        Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
+    pub(crate) keyboard_manager:
+        Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    pub(crate) method_manager: Option<zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
     pointer: Option<zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
     keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
-    pub method: Option<zwp_input_method_v2::ZwpInputMethodV2>,
+    pub(crate) method: Option<zwp_input_method_v2::ZwpInputMethodV2>,
     method_active: bool,
     pending_method_active: Option<bool>,
     method_serial: u32,
@@ -44,7 +49,7 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn new(layout: String) -> Self {
+    pub(crate) fn new(layout: String) -> Self {
         Self {
             seat: None,
             pointer_manager: None,
@@ -63,7 +68,11 @@ impl Input {
         }
     }
 
-    pub fn start(&mut self, output: &wl_output::WlOutput, qh: &QueueHandle<State>) -> Result<()> {
+    pub(crate) fn start(
+        &mut self,
+        output: &wl_output::WlOutput,
+        qh: &QueueHandle<State>,
+    ) -> Result<()> {
         let seat = self.seat.clone().context("missing wl_seat")?;
         let pointer_manager = self
             .pointer_manager
@@ -119,15 +128,19 @@ impl Input {
         Ok(())
     }
 
-    pub fn apply(&mut self, command: &Command) -> Result<()> {
+    pub(crate) fn apply(&mut self, command: &Command) -> Result<()> {
         let time = monotonic_millis()?;
         match command {
-            Command::PointerAbsolute { x, y, .. } => {
+            Command::PointerAbsolute {
+                x: horizontal,
+                y: vertical,
+                ..
+            } => {
                 let pointer = self
                     .pointer
                     .as_ref()
                     .context("virtual pointer unavailable")?;
-                pointer.motion_absolute(time, *x, *y, 65_535, 65_535);
+                pointer.motion_absolute(time, horizontal.get(), vertical.get(), 65_535, 65_535);
                 pointer.frame();
             }
             Command::PointerRelative { dx, dy, .. } => {
@@ -135,7 +148,7 @@ impl Input {
                     .pointer
                     .as_ref()
                     .context("virtual pointer unavailable")?;
-                pointer.motion(time, f64::from(*dx), f64::from(*dy));
+                pointer.motion(time, f64::from(dx.get()), f64::from(dy.get()));
                 pointer.frame();
             }
             Command::PointerButton {
@@ -149,17 +162,23 @@ impl Input {
                     .as_ref()
                     .context("virtual pointer unavailable")?;
                 pointer.axis_source(wl_pointer::AxisSource::Continuous);
-                if *dx != 0.0 {
-                    pointer.axis(time, wl_pointer::Axis::HorizontalScroll, f64::from(*dx));
+                if dx.get() != 0.0 {
+                    pointer.axis(
+                        time,
+                        wl_pointer::Axis::HorizontalScroll,
+                        f64::from(dx.get()),
+                    );
                 }
-                if *dy != 0.0 {
-                    pointer.axis(time, wl_pointer::Axis::VerticalScroll, f64::from(*dy));
+                if dy.get() != 0.0 {
+                    pointer.axis(time, wl_pointer::Axis::VerticalScroll, f64::from(dy.get()));
                 }
                 pointer.frame();
             }
             Command::KeyboardKey { key, state, .. } => self.key(time, *key, *state)?,
             Command::ReleaseAll => self.release_all()?,
-            Command::Text { preedit, text, .. } => self.send_text(*preedit, text)?,
+            Command::Text { action, text, .. } => {
+                self.send_text(*action, text.get())?;
+            }
             Command::Resize { .. }
             | Command::Clipboard(_)
             | Command::Quality { .. }
@@ -170,8 +189,8 @@ impl Input {
         Ok(())
     }
 
-    fn button(&mut self, time: u32, button: u32, pressed: bool) -> Result<()> {
-        let index = button_index(button).context("unknown pointer button")?;
+    fn button(&mut self, time: u32, button: PointerButton, pressed: bool) -> Result<()> {
+        let index = button_index(button);
         if self.pressed_buttons[index] == pressed {
             return Ok(());
         }
@@ -182,7 +201,7 @@ impl Input {
             .context("virtual pointer unavailable")?;
         pointer.button(
             time,
-            button,
+            button.get(),
             if pressed {
                 wl_pointer::ButtonState::Pressed
             } else {
@@ -193,16 +212,16 @@ impl Input {
         Ok(())
     }
 
-    fn key(&mut self, time: u32, key: u32, state: KeyState) -> Result<()> {
-        let index = usize::try_from(key)?;
+    fn key(&mut self, time: u32, key: KeyCode, state: KeyState) -> Result<()> {
+        let index = usize::try_from(key.get())?;
         let keyboard = self
             .keyboard
             .as_ref()
             .context("virtual keyboard unavailable")?;
         if state == KeyState::Repeated {
             if self.pressed_keys[index] {
-                keyboard.key(time, key, wl_keyboard::KeyState::Released as u32);
-                keyboard.key(time, key, wl_keyboard::KeyState::Pressed as u32);
+                keyboard.key(time, key.get(), wl_keyboard::KeyState::Released as u32);
+                keyboard.key(time, key.get(), wl_keyboard::KeyState::Pressed as u32);
             }
             return Ok(());
         }
@@ -213,7 +232,7 @@ impl Input {
         self.pressed_keys[index] = pressed;
         keyboard.key(
             time,
-            key,
+            key.get(),
             if pressed {
                 wl_keyboard::KeyState::Pressed
             } else {
@@ -222,7 +241,7 @@ impl Input {
         );
         if let Some(xkb_state) = &mut self.xkb_state {
             xkb_state.update_key(
-                xkb::Keycode::new(key + 8),
+                xkb::Keycode::new(key.get() + 8),
                 if pressed {
                     xkb::KeyDirection::Down
                 } else {
@@ -246,7 +265,7 @@ impl Input {
         );
     }
 
-    pub fn release_all(&mut self) -> Result<()> {
+    pub(crate) fn release_all(&mut self) -> Result<()> {
         let time = monotonic_millis()?;
         if let Some(pointer) = &self.pointer {
             for (index, pressed) in self.pressed_buttons.iter_mut().enumerate() {
@@ -270,18 +289,18 @@ impl Input {
             }
             self.send_modifiers();
         }
-        self.send_text(true, "")?;
+        self.send_text(TextAction::Preedit, "")?;
         Ok(())
     }
 
-    fn send_text(&self, preedit: bool, text: &str) -> Result<()> {
+    fn send_text(&self, action: TextAction, text: &str) -> Result<()> {
         if !self.method_active {
             return Ok(());
         }
         let Some(method) = &self.method else {
             return Ok(());
         };
-        if preedit {
+        if action == TextAction::Preedit {
             let cursor = i32::try_from(text.len()).context("preedit text exceeds protocol size")?;
             method.set_preedit_string(text.to_owned(), cursor, cursor);
         } else {
@@ -292,7 +311,7 @@ impl Input {
         Ok(())
     }
 
-    pub fn method_event(&mut self, event: &zwp_input_method_v2::Event) {
+    pub(crate) fn method_event(&mut self, event: &zwp_input_method_v2::Event) {
         match event {
             zwp_input_method_v2::Event::Activate => self.pending_method_active = Some(true),
             zwp_input_method_v2::Event::Deactivate => self.pending_method_active = Some(false),
@@ -323,10 +342,8 @@ fn monotonic_millis() -> Result<u32> {
     Ok(u32::try_from(millis & u64::from(u32::MAX))?)
 }
 
-fn button_index(button: u32) -> Option<usize> {
-    (0x110..=0x114)
-        .contains(&button)
-        .then_some((button - 0x110) as usize)
+fn button_index(button: PointerButton) -> usize {
+    (button.get() - 0x110) as usize
 }
 
 fn button_at(index: usize) -> u32 {
@@ -334,7 +351,7 @@ fn button_at(index: usize) -> u32 {
     BUTTONS[index]
 }
 
-pub fn valid_layout(layout: &str) -> bool {
+pub(crate) fn valid_layout(layout: &str) -> bool {
     !layout.is_empty()
         && layout.len() <= 32
         && layout

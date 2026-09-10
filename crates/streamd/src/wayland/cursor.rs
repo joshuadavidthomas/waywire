@@ -9,6 +9,8 @@ use memmap2::MmapOptions;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
+use sprite_desktop_protocol::pipe::CursorSize;
+use sprite_desktop_protocol::pipe::Event;
 use wayland_client::QueueHandle;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_buffer;
@@ -23,8 +25,6 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 
 use super::State;
 use crate::event_writer::EventSink;
-use crate::protocol::Event;
-use crate::protocol::cursor_byte_count;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Hotspot {
@@ -49,21 +49,22 @@ enum Visibility {
     Hidden,
 }
 
-pub struct Cursor {
-    pub source_manager:
+pub(crate) struct Cursor {
+    pub(crate) source_manager:
         Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
-    pub capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
-    pub pointer_session:
+    pub(crate) capture_manager:
+        Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
+    pub(crate) pointer_session:
         Option<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1>,
-    pub session: Option<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1>,
-    pub frame: Option<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1>,
+    pub(crate) session: Option<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1>,
+    pub(crate) frame: Option<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1>,
     buffer: Option<wl_buffer::WlBuffer>,
     mapping: Option<MmapMut>,
     width: u32,
     height: u32,
     has_pointer: bool,
-    pub(super) batch_width: Option<u32>,
-    pub(super) batch_height: Option<u32>,
+    pub(crate) batch_width: Option<u32>,
+    pub(crate) batch_height: Option<u32>,
     constraint_batch: ConstraintBatch,
     pending_hotspot: Hotspot,
     committed_hotspot: Hotspot,
@@ -75,7 +76,7 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub fn new(events: EventSink) -> Self {
+    pub(crate) fn new(events: EventSink) -> Self {
         Self {
             source_manager: None,
             capture_manager: None,
@@ -100,14 +101,14 @@ impl Cursor {
         }
     }
 
-    pub fn seat_capabilities(&mut self, capabilities: WEnum<wl_seat::Capability>) {
+    pub(crate) fn seat_capabilities(&mut self, capabilities: WEnum<wl_seat::Capability>) {
         self.has_pointer = match capabilities {
             WEnum::Value(value) => value.contains(wl_seat::Capability::Pointer),
             WEnum::Unknown(_) => false,
         };
     }
 
-    pub fn start(
+    pub(crate) fn start(
         &mut self,
         seat: &wl_seat::WlSeat,
         output: &wl_output::WlOutput,
@@ -136,7 +137,7 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn begin_constraints(&mut self) {
+    pub(crate) fn begin_constraints(&mut self) {
         if self.constraint_batch == ConstraintBatch::Idle {
             self.batch_width = None;
             self.batch_height = None;
@@ -144,12 +145,12 @@ impl Cursor {
         }
     }
 
-    pub fn accept_argb(&mut self) {
+    pub(crate) fn accept_argb(&mut self) {
         self.begin_constraints();
         self.constraint_batch = ConstraintBatch::Collecting { argb: true };
     }
 
-    pub fn finish_constraints(
+    pub(crate) fn finish_constraints(
         &mut self,
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<State>,
@@ -178,7 +179,8 @@ impl Cursor {
         height: u32,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
-        let length = cursor_byte_count(width, height)?;
+        let size = CursorSize::new(width, height)?;
+        let length = size.byte_count();
         if self.buffer.is_some() && self.width == width && self.height == height {
             return Ok(());
         }
@@ -209,7 +211,7 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn request(&mut self, qh: &QueueHandle<State>) -> Result<()> {
+    pub(crate) fn request(&mut self, qh: &QueueHandle<State>) -> Result<()> {
         if self.frame.is_some() {
             bail!("cursor frame already pending");
         }
@@ -232,7 +234,7 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn frame_ready(&mut self, qh: &QueueHandle<State>) -> Result<()> {
+    pub(crate) fn frame_ready(&mut self, qh: &QueueHandle<State>) -> Result<()> {
         if !self.transform_normal {
             bail!("cursor frame omitted normal transform");
         }
@@ -251,8 +253,7 @@ impl Cursor {
         });
         if changed || self.force_publish {
             self.events.send(&Event::CursorImage {
-                width: self.width,
-                height: self.height,
+                size: CursorSize::new(self.width, self.height)?,
                 hotspot_x: self.committed_hotspot.x,
                 hotspot_y: self.committed_hotspot.y,
                 bgra: pixels.clone(),
@@ -263,7 +264,7 @@ impl Cursor {
         self.request(qh)
     }
 
-    pub fn frame_failed(
+    pub(crate) fn frame_failed(
         &mut self,
         constraints_changed: bool,
         shm: &wl_shm::WlShm,
@@ -287,7 +288,7 @@ impl Cursor {
         }
     }
 
-    pub fn transform(&mut self, transform: WEnum<wl_output::Transform>) -> Result<()> {
+    pub(crate) fn transform(&mut self, transform: WEnum<wl_output::Transform>) -> Result<()> {
         if transform != WEnum::Value(wl_output::Transform::Normal) {
             bail!("cursor transform is not normal");
         }
@@ -295,11 +296,14 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn hotspot(&mut self, x: i32, y: i32) {
-        self.pending_hotspot = Hotspot { x, y };
+    pub(crate) fn hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) {
+        self.pending_hotspot = Hotspot {
+            x: hotspot_x,
+            y: hotspot_y,
+        };
     }
 
-    pub fn visibility(&mut self, visible: bool) -> Result<()> {
+    pub(crate) fn visibility(&mut self, visible: bool) -> Result<()> {
         let visibility = if visible {
             Visibility::Visible
         } else {
@@ -316,7 +320,7 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn destroy_frame(&mut self) {
+    pub(crate) fn destroy_frame(&mut self) {
         if let Some(frame) = self.frame.take() {
             frame.destroy();
         }

@@ -19,7 +19,8 @@ clone_on_ref_ptr = "warn"
 dbg_macro = "warn"
 expect_used = "warn"
 get_unwrap = "warn"
-let_underscore_must_use = "warn"
+# Explicit `let _ =` marks deliberately discarded results across both binaries.
+let_underscore_must_use = "allow"
 map_err_ignore = "warn"
 mem_forget = "warn"
 mod_module_files = "warn"
@@ -48,9 +49,12 @@ rust-embed = { version = "8.11.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 socket2 = "0.6.1"
+sprite-desktop-protocol = { path = "crates/protocol" }
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 wayland-client = "=0.31.15"
 wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"] }
