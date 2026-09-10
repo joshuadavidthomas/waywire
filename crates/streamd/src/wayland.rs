@@ -28,6 +28,7 @@ use nix::fcntl::fcntl;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::CursorVisibility;
+use sprite_desktop_protocol::pipe::Decoder;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Generation;
@@ -35,6 +36,7 @@ use sprite_desktop_protocol::pipe::Hotspot;
 use sprite_desktop_protocol::pipe::InputSequence;
 use sprite_desktop_protocol::pipe::Kbps;
 use sprite_desktop_protocol::pipe::KeyframeState;
+use sprite_desktop_protocol::pipe::ResizeApplied;
 use sprite_desktop_protocol::pipe::ScalePercent;
 use wayland_client::Connection;
 use wayland_client::Dispatch;
@@ -83,7 +85,6 @@ use self::output::OutputManager;
 use self::output::OutputMode;
 use self::output::ResizeRequest;
 use crate::Options;
-use crate::command_reader::CommandReader;
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
 use crate::video::Notification;
@@ -215,7 +216,7 @@ fn register_stdin(handle: &LoopHandle<'_, State>) -> Result<()> {
     let stdin = File::open("/dev/stdin").context("open daemon command pipe")?;
     let flags = OFlag::from_bits_truncate(fcntl(&stdin, FcntlArg::F_GETFL)?);
     fcntl(&stdin, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-    let mut reader = Some(CommandReader::new());
+    let mut reader = Some(Decoder::<Command>::new());
     handle.insert_source(
         Generic::new(stdin, Interest::READ, Mode::Level),
         move |readiness, input, state| {
@@ -479,12 +480,12 @@ impl State {
             self.replace_media_generation()?;
         }
         self.capture.can_wait_for_damage = false;
-        self.event_sink.send(&Event::ResizeApplied {
+        self.event_sink.send(&Event::ResizeApplied(ResizeApplied {
             request_id: applied.request_id,
             size: applied.mode.size,
             scale_v120: applied.mode.scale_v120,
             generation: self.generation,
-        })?;
+        }))?;
         self.start_queued_resize_or_capture()
     }
 

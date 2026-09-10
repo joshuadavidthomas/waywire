@@ -1,4 +1,3 @@
-mod command_reader;
 mod event_writer;
 mod video;
 mod wayland;

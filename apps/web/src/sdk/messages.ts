@@ -13,14 +13,21 @@ export class ProtocolVersionMismatchError extends Error {
   }
 }
 
+export type CursorBitmap = {
+  readonly width: number;
+  readonly height: number;
+  readonly hotspot: {
+    readonly x: number;
+    readonly y: number;
+  };
+  readonly image: string;
+};
+
 export type CursorState = {
   readonly type: "cursor";
   readonly visible: boolean;
-  readonly width: number;
-  readonly height: number;
-  readonly hotspotX: number;
-  readonly hotspotY: number;
-  readonly image: string;
+  // Null until the server has sent its first cursor image.
+  readonly bitmap: CursorBitmap | null;
 };
 
 export type VideoConfiguration = {
@@ -99,20 +106,25 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
           }
         : null;
     case "cursor":
-      return typeof value.visible === "boolean" &&
-        typeof value.width === "number" &&
+      if (typeof value.visible !== "boolean") return null;
+      if (value.image === undefined) {
+        return { type: value.type, visible: value.visible, bitmap: null };
+      }
+      return typeof value.width === "number" &&
         typeof value.height === "number" &&
-        typeof value.hotspotX === "number" &&
-        typeof value.hotspotY === "number" &&
+        isRecord(value.hotspot) &&
+        typeof value.hotspot.x === "number" &&
+        typeof value.hotspot.y === "number" &&
         typeof value.image === "string"
         ? {
             type: value.type,
             visible: value.visible,
-            width: value.width,
-            height: value.height,
-            hotspotX: value.hotspotX,
-            hotspotY: value.hotspotY,
-            image: value.image,
+            bitmap: {
+              width: value.width,
+              height: value.height,
+              hotspot: { x: value.hotspot.x, y: value.hotspot.y },
+              image: value.image,
+            },
           }
         : null;
     case "clipboard":

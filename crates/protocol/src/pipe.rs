@@ -2,6 +2,7 @@
 //! Values use little-endian byte order. Command records have a 16-byte header plus an optional
 //! text payload, while event records have an 8-byte header plus a payload.
 
+use std::marker::PhantomData;
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
 
@@ -22,6 +23,144 @@ pub const MAX_RAW_PIXELS: u64 = 3840 * 2160;
 #[error("{0}")]
 pub struct InvalidValue(&'static str);
 
+pub(crate) trait Wire: Sized {
+    fn write(&self, out: &mut Writer);
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue>;
+}
+
+pub(crate) struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], InvalidValue> {
+        let (head, tail) = self
+            .0
+            .split_first_chunk::<N>()
+            .ok_or(InvalidValue("payload is too short"))?;
+        self.0 = tail;
+        Ok(*head)
+    }
+
+    fn get<T: Wire>(&mut self) -> Result<T, InvalidValue> {
+        T::read(self)
+    }
+
+    fn reserved<const N: usize>(&mut self) -> Result<(), InvalidValue> {
+        if self.take::<N>()?.iter().all(|byte| *byte == 0) {
+            Ok(())
+        } else {
+            Err(InvalidValue("reserved bytes must be zero"))
+        }
+    }
+
+    fn rest(&mut self) -> &'a [u8] {
+        let rest = self.0;
+        self.0 = &[];
+        rest
+    }
+
+    fn rest_utf8(&mut self) -> Result<&'a str, InvalidValue> {
+        let Ok(text) = std::str::from_utf8(self.rest()) else {
+            return Err(InvalidValue("text is not UTF-8"));
+        };
+        Ok(text)
+    }
+
+    fn finish(&self) -> Result<(), InvalidValue> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(InvalidValue("payload has trailing bytes"))
+        }
+    }
+}
+
+pub(crate) struct Writer(Vec<u8>);
+
+impl Writer {
+    #[must_use]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    pub(crate) fn put<T: Wire>(&mut self, value: &T) {
+        value.write(self);
+    }
+
+    pub(crate) fn reserved<const N: usize>(&mut self) {
+        self.0.extend_from_slice(&[0; N]);
+    }
+
+    pub(crate) fn bytes(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    /// Writes a payload length. Payloads are bounded where their values are constructed
+    /// (`MAX_CLIPBOARD_BYTES`, `MAX_TEXT_BYTES`, `CursorSize`), so every length fits the slot.
+    pub(crate) fn length(&mut self, length: usize) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "payload lengths are bounded at construction"
+        )]
+        let length = length as u32;
+        self.put(&length);
+    }
+
+    #[must_use]
+    pub(crate) fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl Wire for u8 {
+    fn write(&self, out: &mut Writer) {
+        out.bytes(&self.to_le_bytes());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self::from_le_bytes(input.take()?))
+    }
+}
+
+impl Wire for u16 {
+    fn write(&self, out: &mut Writer) {
+        out.bytes(&self.to_le_bytes());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self::from_le_bytes(input.take()?))
+    }
+}
+
+impl Wire for u32 {
+    fn write(&self, out: &mut Writer) {
+        out.bytes(&self.to_le_bytes());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self::from_le_bytes(input.take()?))
+    }
+}
+
+impl Wire for i32 {
+    fn write(&self, out: &mut Writer) {
+        out.bytes(&self.to_le_bytes());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self::from_le_bytes(input.take()?))
+    }
+}
+
+impl Wire for u64 {
+    fn write(&self, out: &mut Writer) {
+        out.bytes(&self.to_le_bytes());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self::from_le_bytes(input.take()?))
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtocolError {
     #[error("pipe stream ended halfway through a record")]
@@ -34,6 +173,70 @@ pub enum ProtocolError {
     InvalidEvent { kind: u8, reason: InvalidValue },
     #[error("record payload exceeds its limit")]
     PayloadTooLarge,
+}
+
+pub trait Record: Sized {
+    const HEADER_BYTES: usize;
+
+    /// Total record length, given exactly `HEADER_BYTES` bytes.
+    fn record_len(header: &[u8]) -> Result<usize, ProtocolError>;
+
+    fn decode(record: &[u8]) -> Result<Self, ProtocolError>;
+
+    fn encode(&self) -> Vec<u8>;
+}
+
+pub struct Decoder<R: Record> {
+    buffer: Vec<u8>,
+    record: PhantomData<R>,
+}
+
+impl<R: Record> Decoder<R> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            record: PhantomData,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<R>, ProtocolError> {
+        self.buffer.extend_from_slice(bytes);
+        let mut records = Vec::new();
+        loop {
+            if self.buffer.len() < R::HEADER_BYTES {
+                break;
+            }
+            let record_len = R::record_len(&self.buffer[..R::HEADER_BYTES])?;
+            if self.buffer.len() < record_len {
+                break;
+            }
+            records.push(R::decode(&self.buffer[..record_len])?);
+            drop(self.buffer.drain(..record_len));
+        }
+        Ok(records)
+    }
+
+    /// Bytes of the record still being received, zero when none.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Errors with `ProtocolError::Truncated` if a record is half received.
+    pub fn finish(self) -> Result<(), ProtocolError> {
+        if self.buffer.is_empty() {
+            Ok(())
+        } else {
+            Err(ProtocolError::Truncated)
+        }
+    }
+}
+
+impl<R: Record> Default for Decoder<R> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 macro_rules! nonzero_newtype {
@@ -50,6 +253,29 @@ macro_rules! nonzero_newtype {
             #[must_use]
             pub const fn get(self) -> $inner {
                 self.0.get()
+            }
+        }
+
+        impl Wire for $name {
+            fn write(&self, out: &mut Writer) {
+                out.put(&self.get());
+            }
+
+            fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+                Self::new(input.get()?)
+            }
+        }
+
+        impl Wire for Option<$name> {
+            fn write(&self, out: &mut Writer) {
+                out.put(&self.map_or(0, $name::get));
+            }
+
+            fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+                match input.get()? {
+                    0 => Ok(None),
+                    value => $name::new(value).map(Some),
+                }
             }
         }
     };
@@ -73,6 +299,16 @@ macro_rules! ranged_newtype {
             #[must_use]
             pub const fn get(self) -> $inner {
                 self.0
+            }
+        }
+
+        impl Wire for $name {
+            fn write(&self, out: &mut Writer) {
+                out.put(&self.get());
+            }
+
+            fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+                Self::new(input.get()?)
             }
         }
     };
@@ -162,7 +398,18 @@ impl FrameSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Wire for FrameSize {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.width);
+        out.put(&self.height);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Self::new(input.get()?, input.get()?)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CursorSize {
     width: u32,
     height: u32,
@@ -190,6 +437,17 @@ impl CursorSize {
     #[must_use]
     pub const fn byte_count(self) -> usize {
         self.width as usize * self.height as usize * 4
+    }
+}
+
+impl Wire for CursorSize {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.width);
+        out.put(&self.height);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Self::new(input.get()?, input.get()?)
     }
 }
 
@@ -251,6 +509,16 @@ impl PointerDelta {
     }
 }
 
+impl Wire for PointerDelta {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.0.to_bits());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Self::new(f32::from_bits(input.get()?))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
     Left,
@@ -261,25 +529,32 @@ pub enum PointerButton {
 }
 
 impl PointerButton {
-    const fn from_wire(value: u32) -> Option<Self> {
-        match value {
-            0x110 => Some(Self::Left),
-            0x111 => Some(Self::Right),
-            0x112 => Some(Self::Middle),
-            0x113 => Some(Self::Side),
-            0x114 => Some(Self::Extra),
-            _ => None,
-        }
-    }
-
+    /// The Linux input event code, which is also the wire value.
     #[must_use]
-    pub const fn wire(self) -> u32 {
+    pub const fn evdev_code(self) -> u32 {
         match self {
             Self::Left => 0x110,
             Self::Right => 0x111,
             Self::Middle => 0x112,
             Self::Side => 0x113,
             Self::Extra => 0x114,
+        }
+    }
+}
+
+impl Wire for PointerButton {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.evdev_code());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0x110_u32 => Ok(Self::Left),
+            0x111 => Ok(Self::Right),
+            0x112 => Ok(Self::Middle),
+            0x113 => Ok(Self::Side),
+            0x114 => Ok(Self::Extra),
+            _ => Err(InvalidValue("unknown pointer button")),
         }
     }
 }
@@ -314,6 +589,93 @@ pub enum CursorVisibility {
 pub enum TextAction {
     Preedit,
     Commit,
+}
+
+impl Wire for ButtonState {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Released => 0_u8,
+            Self::Pressed => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Released),
+            1 => Ok(Self::Pressed),
+            _ => Err(InvalidValue("state must be zero or one")),
+        }
+    }
+}
+
+impl Wire for KeyState {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Released => 0_u8,
+            Self::Pressed => 1,
+            Self::Repeated => 2,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Released),
+            1 => Ok(Self::Pressed),
+            2 => Ok(Self::Repeated),
+            _ => Err(InvalidValue("state must be zero, one, or two")),
+        }
+    }
+}
+
+impl Wire for KeyframeState {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Missing => 0_u8,
+            Self::Cached => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Missing),
+            1 => Ok(Self::Cached),
+            _ => Err(InvalidValue("state must be zero or one")),
+        }
+    }
+}
+
+impl Wire for CursorVisibility {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Hidden => 0_u8,
+            Self::Visible => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Hidden),
+            1 => Ok(Self::Visible),
+            _ => Err(InvalidValue("visibility must be zero or one")),
+        }
+    }
+}
+
+impl Wire for TextAction {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Commit => 0_u8,
+            Self::Preedit => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Commit),
+            1 => Ok(Self::Preedit),
+            _ => Err(InvalidValue("action must be zero or one")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -402,285 +764,258 @@ impl Command {
             }
     }
 
-    // Keeping the exhaustive wire mapping together makes kind drift visible in review.
-    #[allow(clippy::too_many_lines)]
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub(crate) fn kind(&self) -> CommandKind {
         match self {
-            Self::PointerAbsolute { x, y, sequence } => command_bytes(
-                CommandKind::PointerAbsolute,
-                0,
-                x.get(),
-                y.get(),
-                sequence.get(),
-            ),
+            Self::PointerAbsolute { .. } => CommandKind::PointerAbsolute,
+            Self::PointerButton { .. } => CommandKind::PointerButton,
+            Self::PointerScroll { .. } => CommandKind::PointerScroll,
+            Self::KeyboardKey { .. } => CommandKind::KeyboardKey,
+            Self::ReleaseAll => CommandKind::ReleaseAll,
+            Self::Resize { .. } => CommandKind::Resize,
+            Self::Clipboard(_) => CommandKind::Clipboard,
+            Self::PointerRelative { .. } => CommandKind::PointerRelative,
+            Self::Quality { .. } => CommandKind::Quality,
+            Self::Text { .. } => CommandKind::Text,
+            Self::KeyframeReadiness { .. } => CommandKind::KeyframeReadiness,
+        }
+    }
+
+    /// Reads the raw kind byte, the kind, and the whole record length from a header.
+    fn header(bytes: &[u8]) -> Result<(u8, CommandKind, usize), ProtocolError> {
+        let &[PROTOCOL_VERSION, kind, _, 0, a0, a1, a2, a3, ..] = bytes else {
+            return Err(ProtocolError::InvalidHeader);
+        };
+        let command_kind = CommandKind::from_wire(kind).ok_or(ProtocolError::InvalidFields {
+            kind,
+            reason: InvalidValue("unknown command kind"),
+        })?;
+        let text_len = match command_kind.payload_limit() {
+            Some(limit) => usize::try_from(u32::from_le_bytes([a0, a1, a2, a3]))
+                .ok()
+                .filter(|length| *length <= limit)
+                .ok_or(ProtocolError::PayloadTooLarge)?,
+            None => 0,
+        };
+        Ok((kind, command_kind, COMMAND_HEADER_BYTES + text_len))
+    }
+
+    /// Reads everything after the version and kind bytes. `header` already matched the length
+    /// slot of a text kind against the record, so the rest of the record is the text.
+    fn decode_fields(kind: CommandKind, input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let command = match kind {
+            CommandKind::PointerAbsolute => {
+                input.reserved::<2>()?;
+                Self::PointerAbsolute {
+                    x: input.get()?,
+                    y: input.get()?,
+                    sequence: input.get()?,
+                }
+            }
+            CommandKind::PointerButton => {
+                let state = input.get()?;
+                input.reserved::<1>()?;
+                let button = input.get()?;
+                input.reserved::<4>()?;
+                Self::PointerButton {
+                    button,
+                    state,
+                    sequence: input.get()?,
+                }
+            }
+            CommandKind::PointerScroll => {
+                input.reserved::<2>()?;
+                Self::PointerScroll {
+                    dx: input.get()?,
+                    dy: input.get()?,
+                    sequence: input.get()?,
+                }
+            }
+            CommandKind::KeyboardKey => {
+                let state = input.get()?;
+                input.reserved::<1>()?;
+                let key = input.get()?;
+                input.reserved::<4>()?;
+                Self::KeyboardKey {
+                    key,
+                    state,
+                    sequence: input.get()?,
+                }
+            }
+            CommandKind::ReleaseAll => {
+                input.reserved::<14>()?;
+                Self::ReleaseAll
+            }
+            CommandKind::Resize => {
+                input.reserved::<2>()?;
+                Self::Resize {
+                    size: input.get()?,
+                    scale_v120: input.get()?,
+                    request_id: input.get()?,
+                }
+            }
+            CommandKind::Clipboard => {
+                input.reserved::<2>()?;
+                let _length: u32 = input.get()?;
+                input.reserved::<8>()?;
+                Self::Clipboard(ClipboardText::new(input.rest_utf8()?.to_owned())?)
+            }
+            CommandKind::PointerRelative => {
+                input.reserved::<2>()?;
+                Self::PointerRelative {
+                    dx: input.get()?,
+                    dy: input.get()?,
+                    sequence: input.get()?,
+                }
+            }
+            CommandKind::Quality => {
+                input.reserved::<2>()?;
+                Self::Quality {
+                    bitrate_kbps: input.get()?,
+                    fps: input.get()?,
+                    scale_percent: input.get()?,
+                }
+            }
+            CommandKind::Text => {
+                let action = input.get()?;
+                input.reserved::<1>()?;
+                let _length: u32 = input.get()?;
+                let sequence = input.get()?;
+                input.reserved::<4>()?;
+                Self::Text {
+                    action,
+                    text: InputText::new(input.rest_utf8()?.to_owned())?,
+                    sequence,
+                }
+            }
+            CommandKind::KeyframeReadiness => {
+                let state = input.get()?;
+                input.reserved::<1>()?;
+                let generation = input.get()?;
+                input.reserved::<8>()?;
+                Self::KeyframeReadiness { generation, state }
+            }
+        };
+        input.finish()?;
+        Ok(command)
+    }
+}
+
+impl Record for Command {
+    const HEADER_BYTES: usize = COMMAND_HEADER_BYTES;
+
+    fn record_len(header: &[u8]) -> Result<usize, ProtocolError> {
+        if header.len() != Self::HEADER_BYTES {
+            return Err(ProtocolError::InvalidHeader);
+        }
+        Self::header(header).map(|(_, _, record_len)| record_len)
+    }
+
+    fn decode(record: &[u8]) -> Result<Self, ProtocolError> {
+        let Some(header) = record.get(..Self::HEADER_BYTES) else {
+            return Err(ProtocolError::Truncated);
+        };
+        let (kind, command_kind, record_len) = Self::header(header)?;
+        if record.len() != record_len {
+            return Err(ProtocolError::Truncated);
+        }
+        Self::decode_fields(command_kind, &mut Reader(&record[2..]))
+            .map_err(|reason| ProtocolError::InvalidFields { kind, reason })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Writer::with_capacity(self.encoded_len());
+        out.put(&PROTOCOL_VERSION);
+        out.put(&self.kind().wire());
+        match self {
+            Self::PointerAbsolute { x, y, sequence } => {
+                out.reserved::<2>();
+                out.put(x);
+                out.put(y);
+                out.put(sequence);
+            }
             Self::PointerButton {
                 button,
                 state,
                 sequence,
-            } => command_bytes(
-                CommandKind::PointerButton,
-                match state {
-                    ButtonState::Released => 0,
-                    ButtonState::Pressed => 1,
-                },
-                button.wire(),
-                0,
-                sequence.get(),
-            ),
-            Self::PointerScroll { dx, dy, sequence } => command_bytes(
-                CommandKind::PointerScroll,
-                0,
-                dx.get().to_bits(),
-                dy.get().to_bits(),
-                sequence.get(),
-            ),
+            } => {
+                out.put(state);
+                out.reserved::<1>();
+                out.put(button);
+                out.reserved::<4>();
+                out.put(sequence);
+            }
+            Self::PointerScroll { dx, dy, sequence }
+            | Self::PointerRelative { dx, dy, sequence } => {
+                out.reserved::<2>();
+                out.put(dx);
+                out.put(dy);
+                out.put(sequence);
+            }
             Self::KeyboardKey {
                 key,
                 state,
                 sequence,
-            } => command_bytes(
-                CommandKind::KeyboardKey,
-                match state {
-                    KeyState::Released => 0,
-                    KeyState::Pressed => 1,
-                    KeyState::Repeated => 2,
-                },
-                key.get(),
-                0,
-                sequence.get(),
-            ),
-            Self::ReleaseAll => command_bytes(CommandKind::ReleaseAll, 0, 0, 0, 0),
+            } => {
+                out.put(state);
+                out.reserved::<1>();
+                out.put(key);
+                out.reserved::<4>();
+                out.put(sequence);
+            }
+            Self::ReleaseAll => out.reserved::<14>(),
             Self::Resize {
                 size,
                 scale_v120,
                 request_id,
             } => {
-                let packed = u32::from(scale_v120.get()) | (u32::from(request_id.get()) << 16);
-                command_bytes(CommandKind::Resize, 0, size.width(), size.height(), packed)
+                out.reserved::<2>();
+                out.put(size);
+                out.put(scale_v120);
+                out.put(request_id);
             }
             Self::Clipboard(text) => {
-                let length = u32::try_from(text.as_str().len()).unwrap_or(u32::MAX);
-                let mut bytes = command_bytes(CommandKind::Clipboard, 0, length, 0, 0);
-                bytes.extend_from_slice(text.as_str().as_bytes());
-                bytes
+                out.reserved::<2>();
+                out.length(text.as_str().len());
+                out.reserved::<8>();
+                out.bytes(text.as_str().as_bytes());
             }
-            Self::PointerRelative { dx, dy, sequence } => command_bytes(
-                CommandKind::PointerRelative,
-                0,
-                dx.get().to_bits(),
-                dy.get().to_bits(),
-                sequence.get(),
-            ),
             Self::Quality {
                 bitrate_kbps,
                 fps,
                 scale_percent,
-            } => command_bytes(
-                CommandKind::Quality,
-                0,
-                bitrate_kbps.get(),
-                fps.get(),
-                scale_percent.get(),
-            ),
+            } => {
+                out.reserved::<2>();
+                out.put(bitrate_kbps);
+                out.put(fps);
+                out.put(scale_percent);
+            }
             Self::Text {
                 action,
                 text,
                 sequence,
             } => {
-                let length = u32::try_from(text.as_str().len()).unwrap_or(u32::MAX);
-                let mut bytes = command_bytes(
-                    CommandKind::Text,
-                    match action {
-                        TextAction::Preedit => 1,
-                        TextAction::Commit => 0,
-                    },
-                    length,
-                    sequence.get(),
-                    0,
-                );
-                bytes.extend_from_slice(text.as_str().as_bytes());
-                bytes
+                out.put(action);
+                out.reserved::<1>();
+                out.length(text.as_str().len());
+                out.put(sequence);
+                out.reserved::<4>();
+                out.bytes(text.as_str().as_bytes());
             }
-            Self::KeyframeReadiness { generation, state } => command_bytes(
-                CommandKind::KeyframeReadiness,
-                match state {
-                    KeyframeState::Missing => 0,
-                    KeyframeState::Cached => 1,
-                },
-                generation.get(),
-                0,
-                0,
-            ),
-        }
-    }
-
-    pub fn decode(header: CommandHeader, text: &[u8]) -> Result<Self, ProtocolError> {
-        // Kinds without a text payload have no length in the header, so this also
-        // rejects any bytes after their 16-byte header.
-        if text.len() != header.text_payload_len().unwrap_or(0) {
-            return Err(ProtocolError::Truncated);
-        }
-        Self::decode_fields(header, text).map_err(|reason| ProtocolError::InvalidFields {
-            kind: header.kind.wire(),
-            reason,
-        })
-    }
-
-    // One exhaustive decoder keeps every command invariant beside its wire fields.
-    #[allow(clippy::too_many_lines)]
-    fn decode_fields(header: CommandHeader, text: &[u8]) -> Result<Self, InvalidValue> {
-        match header.kind {
-            CommandKind::PointerAbsolute => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                Ok(Self::PointerAbsolute {
-                    x: PointerCoordinate::new(header.a)?,
-                    y: PointerCoordinate::new(header.b)?,
-                    sequence: InputSequence::new(header.c)?,
-                })
-            }
-            CommandKind::PointerButton => {
-                if header.b != 0 {
-                    return Err(InvalidValue("slot b must be zero"));
-                }
-                Ok(Self::PointerButton {
-                    button: PointerButton::from_wire(header.a)
-                        .ok_or(InvalidValue("unknown pointer button"))?,
-                    state: match header.state {
-                        0 => ButtonState::Released,
-                        1 => ButtonState::Pressed,
-                        _ => return Err(InvalidValue("state must be zero or one")),
-                    },
-                    sequence: InputSequence::new(header.c)?,
-                })
-            }
-            CommandKind::PointerScroll => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                Ok(Self::PointerScroll {
-                    dx: PointerDelta::new(f32::from_bits(header.a))?,
-                    dy: PointerDelta::new(f32::from_bits(header.b))?,
-                    sequence: InputSequence::new(header.c)?,
-                })
-            }
-            CommandKind::KeyboardKey => {
-                if header.b != 0 {
-                    return Err(InvalidValue("slot b must be zero"));
-                }
-                Ok(Self::KeyboardKey {
-                    key: KeyCode::new(header.a)?,
-                    state: match header.state {
-                        0 => KeyState::Released,
-                        1 => KeyState::Pressed,
-                        2 => KeyState::Repeated,
-                        _ => return Err(InvalidValue("state must be zero, one, or two")),
-                    },
-                    sequence: InputSequence::new(header.c)?,
-                })
-            }
-            CommandKind::ReleaseAll => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                if header.a != 0 {
-                    return Err(InvalidValue("slot a must be zero"));
-                }
-                if header.b != 0 {
-                    return Err(InvalidValue("slot b must be zero"));
-                }
-                if header.c != 0 {
-                    return Err(InvalidValue("slot c must be zero"));
-                }
-                Ok(Self::ReleaseAll)
-            }
-            CommandKind::Resize => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                Ok(Self::Resize {
-                    size: FrameSize::new(header.a, header.b)?,
-                    scale_v120: ScaleV120::new((header.c & 0xffff) as u16)?,
-                    request_id: RequestId::new((header.c >> 16) as u16)?,
-                })
-            }
-            CommandKind::Clipboard => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                if header.b != 0 {
-                    return Err(InvalidValue("slot b must be zero"));
-                }
-                if header.c != 0 {
-                    return Err(InvalidValue("slot c must be zero"));
-                }
-                let Ok(text) = String::from_utf8(text.to_vec()) else {
-                    return Err(InvalidValue("text is not UTF-8"));
-                };
-                Ok(Self::Clipboard(ClipboardText::new(text)?))
-            }
-            CommandKind::PointerRelative => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                Ok(Self::PointerRelative {
-                    dx: PointerDelta::new(f32::from_bits(header.a))?,
-                    dy: PointerDelta::new(f32::from_bits(header.b))?,
-                    sequence: InputSequence::new(header.c)?,
-                })
-            }
-            CommandKind::Quality => {
-                if header.state != 0 {
-                    return Err(InvalidValue("state must be zero"));
-                }
-                Ok(Self::Quality {
-                    bitrate_kbps: Kbps::new(header.a)?,
-                    fps: Fps::new(header.b)?,
-                    scale_percent: ScalePercent::new(header.c)?,
-                })
-            }
-            CommandKind::Text => {
-                if header.c != 0 {
-                    return Err(InvalidValue("slot c must be zero"));
-                }
-                let Ok(text) = String::from_utf8(text.to_vec()) else {
-                    return Err(InvalidValue("text is not UTF-8"));
-                };
-                Ok(Self::Text {
-                    action: match header.state {
-                        0 => TextAction::Commit,
-                        1 => TextAction::Preedit,
-                        _ => return Err(InvalidValue("action must be zero or one")),
-                    },
-                    text: InputText::new(text)?,
-                    sequence: InputSequence::new(header.b)?,
-                })
-            }
-            CommandKind::KeyframeReadiness => {
-                if header.b != 0 {
-                    return Err(InvalidValue("slot b must be zero"));
-                }
-                if header.c != 0 {
-                    return Err(InvalidValue("slot c must be zero"));
-                }
-                Ok(Self::KeyframeReadiness {
-                    generation: Generation::new(header.a)?,
-                    state: match header.state {
-                        0 => KeyframeState::Missing,
-                        1 => KeyframeState::Cached,
-                        _ => return Err(InvalidValue("state must be zero or one")),
-                    },
-                })
+            Self::KeyframeReadiness { generation, state } => {
+                out.put(state);
+                out.reserved::<1>();
+                out.put(generation);
+                out.reserved::<8>();
             }
         }
+        out.into_inner()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-enum CommandKind {
+pub(crate) enum CommandKind {
     PointerAbsolute = 1,
     PointerButton = 2,
     PointerScroll = 3,
@@ -712,7 +1047,7 @@ impl CommandKind {
         }
     }
 
-    const fn wire(self) -> u8 {
+    pub(crate) const fn wire(self) -> u8 {
         self as u8
     }
 
@@ -732,7 +1067,7 @@ impl CommandKind {
         }
     }
 
-    const fn browser_input(self) -> bool {
+    pub(crate) const fn browser_input(self) -> bool {
         matches!(
             self,
             Self::PointerAbsolute
@@ -743,96 +1078,6 @@ impl CommandKind {
                 | Self::Resize
                 | Self::PointerRelative
         )
-    }
-}
-
-/// A 16-byte header: version at 0, kind at 1, state at 2, zero at 3, `a` at 4, `b` at 8, and `c` at 12.
-///
-/// What `state`, `a`, `b`, and `c` hold for each kind:
-///
-/// | kind               | state          | a              | b        | c                                 |
-/// |--------------------|----------------|----------------|----------|-----------------------------------|
-/// | pointer absolute   | 0              | x              | y        | sequence                          |
-/// | pointer button     | button state   | button         | 0        | sequence                          |
-/// | pointer scroll     | 0              | dx bits        | dy bits  | sequence                          |
-/// | keyboard key       | key state      | key            | 0        | sequence                          |
-/// | release all        | 0              | 0              | 0        | 0                                 |
-/// | resize             | 0              | width          | height   | scale (low 16), request (high 16) |
-/// | clipboard          | 0              | payload length | 0        | 0                                 |
-/// | pointer relative   | 0              | dx bits        | dy bits  | sequence                          |
-/// | quality            | 0              | bitrate        | fps      | scale percent                     |
-/// | text               | action         | payload length | sequence | 0                                 |
-/// | keyframe readiness | keyframe state | generation     | 0        | 0                                 |
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CommandHeader {
-    kind: CommandKind,
-    state: u8,
-    a: u32,
-    b: u32,
-    c: u32,
-    text_payload_len: Option<usize>,
-}
-
-impl CommandHeader {
-    pub fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        let &[
-            PROTOCOL_VERSION,
-            kind,
-            state,
-            0,
-            a0,
-            a1,
-            a2,
-            a3,
-            b0,
-            b1,
-            b2,
-            b3,
-            c0,
-            c1,
-            c2,
-            c3,
-        ] = bytes
-        else {
-            return Err(ProtocolError::InvalidHeader);
-        };
-        let kind = CommandKind::from_wire(kind).ok_or(ProtocolError::InvalidFields {
-            kind,
-            reason: InvalidValue("unknown command kind"),
-        })?;
-        let a = u32::from_le_bytes([a0, a1, a2, a3]);
-        let text_payload_len = match kind.payload_limit() {
-            Some(limit) => Some(
-                usize::try_from(a)
-                    .ok()
-                    .filter(|length| *length <= limit)
-                    .ok_or(ProtocolError::PayloadTooLarge)?,
-            ),
-            None => None,
-        };
-        Ok(Self {
-            kind,
-            state,
-            a,
-            b: u32::from_le_bytes([b0, b1, b2, b3]),
-            c: u32::from_le_bytes([c0, c1, c2, c3]),
-            text_payload_len,
-        })
-    }
-
-    #[must_use]
-    pub(crate) const fn wire_kind(self) -> u8 {
-        self.kind.wire()
-    }
-
-    #[must_use]
-    pub(crate) const fn is_browser_input(self) -> bool {
-        self.kind.browser_input()
-    }
-
-    #[must_use]
-    pub const fn text_payload_len(self) -> Option<usize> {
-        self.text_payload_len
     }
 }
 
@@ -847,10 +1092,48 @@ pub struct FrameMetadata {
     pub fps: Fps,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Wire for FrameMetadata {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.generation);
+        out.put(&self.width);
+        out.put(&self.height);
+        out.put(&self.capture_nanos);
+        out.put(&self.sequence);
+        out.put(&self.input_sequence);
+        out.put(&self.fps);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self {
+            generation: input.get()?,
+            width: input.get()?,
+            height: input.get()?,
+            capture_nanos: input.get()?,
+            sequence: input.get()?,
+            input_sequence: input.get()?,
+            fps: input.get()?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Hotspot {
     pub x: i32,
     pub y: i32,
+}
+
+impl Wire for Hotspot {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.x);
+        out.put(&self.y);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self {
+            x: input.get()?,
+            y: input.get()?,
+        })
+    }
 }
 
 /// A cursor bitmap as Wayland shared memory provides it: one byte each of blue, green, red,
@@ -891,214 +1174,157 @@ impl CursorImage {
     }
 }
 
+impl Wire for CursorImage {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.size);
+        out.put(&self.hotspot);
+        out.bytes(&self.pixels);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let size = input.get()?;
+        let hotspot = input.get()?;
+        let pixels = input.rest().to_vec();
+        Self::new(size, hotspot, pixels)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ResizeApplied {
+    #[serde(rename = "request")]
+    pub request_id: RequestId,
+    #[serde(flatten)]
+    pub size: FrameSize,
+    #[serde(rename = "scale")]
+    pub scale_v120: ScaleV120,
+    pub generation: Generation,
+}
+
+impl Wire for ResizeApplied {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.request_id);
+        out.reserved::<2>();
+        out.put(&self.size);
+        out.put(&self.scale_v120);
+        out.reserved::<2>();
+        out.put(&self.generation);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let request_id = input.get()?;
+        input.reserved::<2>()?;
+        let size = input.get()?;
+        let scale_v120 = input.get()?;
+        input.reserved::<2>()?;
+        let generation = input.get()?;
+        Ok(Self {
+            request_id,
+            size,
+            scale_v120,
+            generation,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// UTF-8 clipboard bytes starting at payload offset 0.
+    /// UTF-8 clipboard text.
     Clipboard(ClipboardText),
-    /// A 32-byte payload: generation at 0, width at 4, height at 6, capture nanoseconds at 8,
-    /// sequence at 16, input sequence at 24, and FPS at 28.
+    /// Metadata for one captured frame.
     Frame(FrameMetadata),
-    /// A 20-byte payload: request ID at 0, zero at 2, width at 4, height at 8, scale at 12,
-    /// zero at 14, and generation at 16.
-    ResizeApplied {
-        request_id: RequestId,
-        size: FrameSize,
-        scale_v120: ScaleV120,
-        generation: Generation,
-    },
-    /// A payload with width at 0, height at 4, hotspot x at 8, hotspot y at 12, and BGRA bytes at 16.
+    /// The output settings applied for a resize request.
+    ResizeApplied(ResizeApplied),
+    /// A cursor bitmap and hotspot.
     CursorImage(CursorImage),
-    /// A one-byte payload at offset 0: 0 is hidden and 1 is visible.
+    /// Whether the cursor is hidden or visible.
     CursorVisibility(CursorVisibility),
 }
 
-struct Fields<'a>(&'a [u8]);
-
-impl<'a> Fields<'a> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], InvalidValue> {
-        let (head, tail) = self
-            .0
-            .split_first_chunk::<N>()
-            .ok_or(InvalidValue("payload is too short"))?;
-        self.0 = tail;
-        Ok(*head)
-    }
-
-    fn u8(&mut self) -> Result<u8, InvalidValue> {
-        self.take().map(|[value]| value)
-    }
-
-    fn u16(&mut self) -> Result<u16, InvalidValue> {
-        self.take().map(u16::from_le_bytes)
-    }
-
-    fn u32(&mut self) -> Result<u32, InvalidValue> {
-        self.take().map(u32::from_le_bytes)
-    }
-
-    fn i32(&mut self) -> Result<i32, InvalidValue> {
-        self.take().map(i32::from_le_bytes)
-    }
-
-    fn u64(&mut self) -> Result<u64, InvalidValue> {
-        self.take().map(u64::from_le_bytes)
-    }
-
-    fn reserved<const N: usize>(&mut self) -> Result<(), InvalidValue> {
-        if self.take::<N>()?.iter().all(|byte| *byte == 0) {
-            Ok(())
-        } else {
-            Err(InvalidValue("reserved bytes must be zero"))
+impl Event {
+    const fn kind(&self) -> EventKind {
+        match self {
+            Self::Clipboard(_) => EventKind::Clipboard,
+            Self::Frame(_) => EventKind::Frame,
+            Self::ResizeApplied(_) => EventKind::ResizeApplied,
+            Self::CursorImage(_) => EventKind::CursorImage,
+            Self::CursorVisibility(_) => EventKind::CursorVisibility,
         }
     }
 
-    fn rest(self) -> &'a [u8] {
-        self.0
+    /// Reads the raw kind byte, the kind, and the whole record length from a header.
+    fn header(bytes: &[u8]) -> Result<(u8, EventKind, usize), ProtocolError> {
+        let &[PROTOCOL_VERSION, kind, 0, 0, l0, l1, l2, l3] = bytes else {
+            return Err(ProtocolError::InvalidHeader);
+        };
+        let event_kind = EventKind::from_wire(kind).ok_or(ProtocolError::InvalidEvent {
+            kind,
+            reason: InvalidValue("unknown event kind"),
+        })?;
+        let payload_len = usize::try_from(u32::from_le_bytes([l0, l1, l2, l3]))
+            .ok()
+            .filter(|length| *length <= MAX_EVENT_BYTES)
+            .ok_or(ProtocolError::PayloadTooLarge)?;
+        Ok((kind, event_kind, EVENT_HEADER_BYTES + payload_len))
     }
 
-    fn finish(self) -> Result<(), InvalidValue> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(InvalidValue("payload has trailing bytes"))
-        }
+    fn decode_payload(kind: EventKind, input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let event = match kind {
+            EventKind::Clipboard => {
+                Self::Clipboard(ClipboardText::new(input.rest_utf8()?.to_owned())?)
+            }
+            EventKind::Frame => Self::Frame(input.get()?),
+            EventKind::ResizeApplied => Self::ResizeApplied(input.get()?),
+            EventKind::CursorImage => Self::CursorImage(input.get()?),
+            EventKind::CursorVisibility => Self::CursorVisibility(input.get()?),
+        };
+        input.finish()?;
+        Ok(event)
     }
 }
-impl Event {
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let (kind, payload) = match self {
-            Self::Clipboard(text) => (EventKind::Clipboard, text.as_str().as_bytes().to_vec()),
-            Self::Frame(frame) => {
-                let mut payload = Vec::with_capacity(32);
-                payload.extend_from_slice(&frame.generation.get().to_le_bytes());
-                payload.extend_from_slice(&frame.width.get().to_le_bytes());
-                payload.extend_from_slice(&frame.height.get().to_le_bytes());
-                payload.extend_from_slice(&frame.capture_nanos.to_le_bytes());
-                payload.extend_from_slice(&frame.sequence.to_le_bytes());
-                payload.extend_from_slice(
-                    &frame
-                        .input_sequence
-                        .map_or(0, InputSequence::get)
-                        .to_le_bytes(),
-                );
-                payload.extend_from_slice(&frame.fps.get().to_le_bytes());
-                (EventKind::Frame, payload)
-            }
-            Self::ResizeApplied {
-                request_id,
-                size,
-                scale_v120,
-                generation,
-            } => {
-                let mut payload = Vec::with_capacity(20);
-                payload.extend_from_slice(&request_id.get().to_le_bytes());
-                payload.extend_from_slice(&[0, 0]);
-                payload.extend_from_slice(&size.width().to_le_bytes());
-                payload.extend_from_slice(&size.height().to_le_bytes());
-                payload.extend_from_slice(&scale_v120.get().to_le_bytes());
-                payload.extend_from_slice(&[0, 0]);
-                payload.extend_from_slice(&generation.get().to_le_bytes());
-                (EventKind::ResizeApplied, payload)
-            }
-            Self::CursorImage(image) => {
-                let size = image.size();
-                let mut payload = Vec::with_capacity(16 + image.pixels().len());
-                payload.extend_from_slice(&size.width().to_le_bytes());
-                payload.extend_from_slice(&size.height().to_le_bytes());
-                payload.extend_from_slice(&image.hotspot.x.to_le_bytes());
-                payload.extend_from_slice(&image.hotspot.y.to_le_bytes());
-                payload.extend_from_slice(image.pixels());
-                (EventKind::CursorImage, payload)
-            }
-            Self::CursorVisibility(visibility) => {
-                let visible = match visibility {
-                    CursorVisibility::Hidden => 0,
-                    CursorVisibility::Visible => 1,
-                };
-                (EventKind::CursorVisibility, vec![visible])
-            }
-        };
-        let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-        let mut bytes = Vec::with_capacity(EVENT_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&[PROTOCOL_VERSION, kind.wire(), 0, 0]);
-        bytes.extend_from_slice(&length.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        bytes
+
+impl Record for Event {
+    const HEADER_BYTES: usize = EVENT_HEADER_BYTES;
+
+    fn record_len(header: &[u8]) -> Result<usize, ProtocolError> {
+        Self::header(header).map(|(_, _, record_len)| record_len)
     }
 
-    pub fn decode(header: EventHeader, payload: &[u8]) -> Result<Self, ProtocolError> {
-        if payload.len() != header.payload_len {
+    fn decode(record: &[u8]) -> Result<Self, ProtocolError> {
+        let Some(header) = record.get(..Self::HEADER_BYTES) else {
+            return Err(ProtocolError::Truncated);
+        };
+        let (kind, event_kind, record_len) = Self::header(header)?;
+        if record.len() != record_len {
             return Err(ProtocolError::Truncated);
         }
-        Self::decode_payload(header, payload).map_err(|reason| ProtocolError::InvalidEvent {
-            kind: header.kind.wire(),
-            reason,
-        })
+        Self::decode_payload(event_kind, &mut Reader(&record[Self::HEADER_BYTES..]))
+            .map_err(|reason| ProtocolError::InvalidEvent { kind, reason })
     }
 
-    fn decode_payload(header: EventHeader, payload: &[u8]) -> Result<Self, InvalidValue> {
-        match header.kind {
-            EventKind::Clipboard => {
-                let Ok(text) = String::from_utf8(payload.to_vec()) else {
-                    return Err(InvalidValue("text is not UTF-8"));
-                };
-                Ok(Self::Clipboard(ClipboardText::new(text)?))
-            }
-            EventKind::Frame => {
-                let mut fields = Fields(payload);
-                let frame = FrameMetadata {
-                    generation: Generation::new(fields.u32()?)?,
-                    width: FrameDimension::new(fields.u16()?)?,
-                    height: FrameDimension::new(fields.u16()?)?,
-                    capture_nanos: fields.u64()?,
-                    sequence: fields.u64()?,
-                    input_sequence: match fields.u32()? {
-                        0 => None,
-                        value => Some(InputSequence::new(value)?),
-                    },
-                    fps: Fps::new(fields.u32()?)?,
-                };
-                fields.finish()?;
-                Ok(Self::Frame(frame))
-            }
-            EventKind::ResizeApplied => {
-                let mut fields = Fields(payload);
-                let request_id = RequestId::new(fields.u16()?)?;
-                fields.reserved::<2>()?;
-                let size = FrameSize::new(fields.u32()?, fields.u32()?)?;
-                let scale_v120 = ScaleV120::new(fields.u16()?)?;
-                fields.reserved::<2>()?;
-                let generation = Generation::new(fields.u32()?)?;
-                fields.finish()?;
-                Ok(Self::ResizeApplied {
-                    request_id,
-                    size,
-                    scale_v120,
-                    generation,
-                })
-            }
-            EventKind::CursorImage => {
-                let mut fields = Fields(payload);
-                let size = CursorSize::new(fields.u32()?, fields.u32()?)?;
-                let hotspot = Hotspot {
-                    x: fields.i32()?,
-                    y: fields.i32()?,
-                };
-                let pixels = fields.rest().to_vec();
-                Ok(Self::CursorImage(CursorImage::new(size, hotspot, pixels)?))
-            }
-            EventKind::CursorVisibility => {
-                let mut fields = Fields(payload);
-                let visibility = match fields.u8()? {
-                    0 => CursorVisibility::Hidden,
-                    1 => CursorVisibility::Visible,
-                    _ => return Err(InvalidValue("visibility must be zero or one")),
-                };
-                fields.finish()?;
-                Ok(Self::CursorVisibility(visibility))
-            }
+    fn encode(&self) -> Vec<u8> {
+        let capacity = match self {
+            Self::Clipboard(text) => text.as_str().len(),
+            Self::Frame(_) => 32,
+            Self::ResizeApplied(_) => 20,
+            Self::CursorImage(image) => 16 + image.pixels().len(),
+            Self::CursorVisibility(_) => 1,
+        };
+        let mut payload = Writer::with_capacity(capacity);
+        match self {
+            Self::Clipboard(text) => payload.bytes(text.as_str().as_bytes()),
+            Self::Frame(frame) => payload.put(frame),
+            Self::ResizeApplied(applied) => payload.put(applied),
+            Self::CursorImage(image) => payload.put(image),
+            Self::CursorVisibility(visibility) => payload.put(visibility),
         }
+        let payload = payload.into_inner();
+        let mut out = Writer::with_capacity(Self::HEADER_BYTES + payload.len());
+        out.put(&PROTOCOL_VERSION);
+        out.put(&self.kind().wire());
+        out.reserved::<2>();
+        out.length(payload.len());
+        out.bytes(&payload);
+        out.into_inner()
     }
 }
 
@@ -1127,43 +1353,6 @@ impl EventKind {
     const fn wire(self) -> u8 {
         self as u8
     }
-}
-
-/// An 8-byte header: version at 0, kind at 1, zero at 2..4, and payload length at 4..8.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EventHeader {
-    kind: EventKind,
-    payload_len: usize,
-}
-
-impl EventHeader {
-    pub fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        let &[PROTOCOL_VERSION, kind, 0, 0, l0, l1, l2, l3] = bytes else {
-            return Err(ProtocolError::InvalidHeader);
-        };
-        let kind = EventKind::from_wire(kind).ok_or(ProtocolError::InvalidEvent {
-            kind,
-            reason: InvalidValue("unknown event kind"),
-        })?;
-        let payload_len = usize::try_from(u32::from_le_bytes([l0, l1, l2, l3]))
-            .ok()
-            .filter(|length| *length <= MAX_EVENT_BYTES)
-            .ok_or(ProtocolError::PayloadTooLarge)?;
-        Ok(Self { kind, payload_len })
-    }
-
-    #[must_use]
-    pub const fn payload_len(self) -> usize {
-        self.payload_len
-    }
-}
-
-fn command_bytes(kind: CommandKind, state: u8, a: u32, b: u32, c: u32) -> Vec<u8> {
-    let mut bytes = vec![PROTOCOL_VERSION, kind.wire(), state, 0];
-    bytes.extend(a.to_le_bytes());
-    bytes.extend(b.to_le_bytes());
-    bytes.extend(c.to_le_bytes());
-    bytes
 }
 
 #[cfg(test)]
@@ -1299,12 +1488,12 @@ mod tests {
             ),
             (
                 "resize applied",
-                Event::ResizeApplied {
+                Event::ResizeApplied(ResizeApplied {
                     request_id: value(RequestId::new(9)),
                     size: value(FrameSize::new(1280, 720)),
                     scale_v120: value(ScaleV120::new(180)),
                     generation: value(Generation::new(4)),
-                },
+                }),
                 vec![
                     2, 3, 0, 0, 20, 0, 0, 0, 9, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 0, 0, 4,
                     0, 0, 0,
@@ -1330,16 +1519,6 @@ mod tests {
         ]
     }
 
-    fn decode_command(bytes: &[u8]) -> Result<Command, ProtocolError> {
-        let header = CommandHeader::parse(&bytes[..COMMAND_HEADER_BYTES])?;
-        Command::decode(header, &bytes[COMMAND_HEADER_BYTES..])
-    }
-
-    fn decode_event(bytes: &[u8]) -> Result<Event, ProtocolError> {
-        let header = EventHeader::parse(&bytes[..EVENT_HEADER_BYTES])?;
-        Event::decode(header, &bytes[EVENT_HEADER_BYTES..])
-    }
-
     #[test]
     fn every_command_encodes_to_its_pinned_bytes() {
         for (name, command, bytes) in command_cases() {
@@ -1350,7 +1529,7 @@ mod tests {
     #[test]
     fn every_pinned_command_record_decodes() {
         for (name, command, bytes) in command_cases() {
-            assert_eq!(decode_command(&bytes), Ok(command), "{name}");
+            assert_eq!(Command::decode(&bytes), Ok(command), "{name}");
         }
     }
 
@@ -1364,7 +1543,7 @@ mod tests {
     #[test]
     fn every_pinned_event_record_decodes() {
         for (name, event, bytes) in event_cases() {
-            assert_eq!(decode_event(&bytes), Ok(event), "{name}");
+            assert_eq!(Event::decode(&bytes), Ok(event), "{name}");
         }
     }
 
@@ -1386,17 +1565,10 @@ mod tests {
         let release_all = [2, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
         assert_eq!(
-            CommandHeader::parse(&empty_clipboard)
-                .expect("empty clipboard header should parse")
-                .text_payload_len(),
-            Some(0)
+            Command::record_len(&empty_clipboard),
+            Ok(COMMAND_HEADER_BYTES)
         );
-        assert_eq!(
-            CommandHeader::parse(&release_all)
-                .expect("release-all header should parse")
-                .text_payload_len(),
-            None
-        );
+        assert_eq!(Command::record_len(&release_all), Ok(COMMAND_HEADER_BYTES));
     }
 
     #[test]
@@ -1405,7 +1577,7 @@ mod tests {
         header[0] = PROTOCOL_VERSION - 1;
         header[1] = 5;
         assert_eq!(
-            CommandHeader::parse(&header),
+            Command::record_len(&header),
             Err(ProtocolError::InvalidHeader)
         );
     }
@@ -1416,7 +1588,7 @@ mod tests {
         header[0] = PROTOCOL_VERSION;
         header[1] = 99;
         assert!(matches!(
-            CommandHeader::parse(&header),
+            Command::record_len(&header),
             Err(ProtocolError::InvalidFields { kind: 99, .. })
         ));
     }
@@ -1425,7 +1597,7 @@ mod tests {
     fn unknown_event_kind_is_invalid_event() {
         let header = [PROTOCOL_VERSION, 99, 0, 0, 0, 0, 0, 0];
         assert!(matches!(
-            EventHeader::parse(&header),
+            Event::record_len(&header),
             Err(ProtocolError::InvalidEvent { kind: 99, .. })
         ));
     }
@@ -1439,7 +1611,7 @@ mod tests {
             &(u32::try_from(MAX_TEXT_BYTES).expect("limit fits u32") + 1).to_le_bytes(),
         );
         assert_eq!(
-            CommandHeader::parse(&header),
+            Command::record_len(&header),
             Err(ProtocolError::PayloadTooLarge)
         );
     }
@@ -1451,60 +1623,59 @@ mod tests {
             &(u32::try_from(MAX_EVENT_BYTES).expect("limit fits u32") + 1).to_le_bytes(),
         );
         assert_eq!(
-            EventHeader::parse(&header),
+            Event::record_len(&header),
             Err(ProtocolError::PayloadTooLarge)
         );
     }
 
     #[test]
     fn clipboard_payload_must_be_utf8() {
-        let header = EventHeader::parse(&[PROTOCOL_VERSION, 1, 0, 0, 1, 0, 0, 0])
-            .expect("clipboard event header should parse");
+        let record = [PROTOCOL_VERSION, 1, 0, 0, 1, 0, 0, 0, 0xff];
         assert!(matches!(
-            Event::decode(header, &[0xff]),
+            Event::decode(&record),
             Err(ProtocolError::InvalidEvent { kind: 1, .. })
         ));
     }
 
     #[test]
     fn short_frame_payload_is_an_invalid_event() {
-        let header = EventHeader::parse(&[PROTOCOL_VERSION, 2, 0, 0, 31, 0, 0, 0])
-            .expect("frame event header should parse");
+        let mut record = vec![PROTOCOL_VERSION, 2, 0, 0, 31, 0, 0, 0];
         let mut payload = [0; 31];
         payload[0] = 1;
         payload[4] = 1;
         payload[6] = 1;
         payload[28] = 10;
+        record.extend_from_slice(&payload);
         assert!(matches!(
-            Event::decode(header, &payload),
+            Event::decode(&record),
             Err(ProtocolError::InvalidEvent { kind: 2, .. })
         ));
     }
 
     #[test]
     fn frame_payload_with_trailing_byte_is_an_invalid_event() {
-        let header = EventHeader::parse(&[PROTOCOL_VERSION, 2, 0, 0, 33, 0, 0, 0])
-            .expect("frame event header should parse");
+        let mut record = vec![PROTOCOL_VERSION, 2, 0, 0, 33, 0, 0, 0];
         let mut payload = [0; 33];
         payload[0] = 1;
         payload[4] = 1;
         payload[6] = 1;
         payload[28] = 10;
+        record.extend_from_slice(&payload);
         assert!(matches!(
-            Event::decode(header, &payload),
+            Event::decode(&record),
             Err(ProtocolError::InvalidEvent { kind: 2, .. })
         ));
     }
 
     #[test]
     fn cursor_image_payload_length_must_match_its_size() {
-        let header = EventHeader::parse(&[PROTOCOL_VERSION, 4, 0, 0, 16, 0, 0, 0])
-            .expect("cursor image event header should parse");
+        let mut record = vec![PROTOCOL_VERSION, 4, 0, 0, 16, 0, 0, 0];
         let mut payload = [0; 16];
         payload[0..4].copy_from_slice(&1_u32.to_le_bytes());
         payload[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        record.extend_from_slice(&payload);
         assert!(matches!(
-            Event::decode(header, &payload),
+            Event::decode(&record),
             Err(ProtocolError::InvalidEvent { kind: 4, .. })
         ));
     }
@@ -1515,9 +1686,50 @@ mod tests {
         clipboard_with_one_byte[0] = PROTOCOL_VERSION;
         clipboard_with_one_byte[1] = 7;
         clipboard_with_one_byte[4] = 1;
-        let header = CommandHeader::parse(&clipboard_with_one_byte)
-            .expect("clipboard command header should parse");
-        assert_eq!(Command::decode(header, &[]), Err(ProtocolError::Truncated));
+        assert_eq!(
+            Command::decode(&clipboard_with_one_byte),
+            Err(ProtocolError::Truncated)
+        );
+    }
+
+    #[test]
+    fn empty_text_payload_command_does_not_consume_the_next_header() {
+        let clipboard = Command::Clipboard(
+            ClipboardText::new(String::new()).expect("empty clipboard text should be valid"),
+        );
+        let release = Command::ReleaseAll;
+        let bytes = [clipboard.encode(), release.encode()].concat();
+        let mut decoder = Decoder::<Command>::new();
+
+        assert_eq!(
+            decoder
+                .push(&bytes)
+                .expect("two valid commands should parse"),
+            vec![clipboard, release]
+        );
+        assert!(decoder.finish().is_ok());
+    }
+
+    #[test]
+    fn event_decoder_returns_two_records_split_across_pushes() {
+        let clipboard = Event::Clipboard(value(ClipboardText::new("clip".into())));
+        let visible = Event::CursorVisibility(CursorVisibility::Visible);
+        let first = clipboard.encode();
+        let split = first.len() + 3;
+        let mut bytes = first;
+        bytes.extend(visible.encode());
+        let mut decoder = Decoder::<Event>::new();
+        let mut events = decoder
+            .push(&bytes[..split])
+            .expect("first event and partial second event should parse");
+        events.extend(
+            decoder
+                .push(&bytes[split..])
+                .expect("second event should finish"),
+        );
+
+        assert_eq!(events, vec![clipboard, visible]);
+        assert!(decoder.finish().is_ok());
     }
 
     #[test]

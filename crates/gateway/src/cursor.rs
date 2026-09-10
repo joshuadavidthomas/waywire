@@ -4,27 +4,18 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use sprite_desktop_protocol::browser::CursorBitmap;
 use sprite_desktop_protocol::browser::CursorState;
 use sprite_desktop_protocol::pipe::CursorImage;
 use sprite_desktop_protocol::pipe::CursorSize;
 use sprite_desktop_protocol::pipe::CursorVisibility;
-use sprite_desktop_protocol::pipe::Hotspot;
 
 pub(crate) enum CursorUpdate {
     Visibility(CursorVisibility),
-    Image {
-        width: u32,
-        height: u32,
-        hotspot: Hotspot,
-        image: String,
-    },
+    Bitmap(CursorBitmap),
 }
 
 impl CursorUpdate {
-    pub(crate) fn visibility(visibility: CursorVisibility) -> Self {
-        Self::Visibility(visibility)
-    }
-
     pub(crate) async fn image(cursor: CursorImage) -> Result<Self> {
         let size = cursor.size();
         let hotspot = cursor.hotspot;
@@ -32,29 +23,17 @@ impl CursorUpdate {
         let image = tokio::task::spawn_blocking(move || encode(size, &pixels))
             .await
             .context("cursor encoder task failed")??;
-        Ok(Self::Image {
-            width: size.width(),
-            height: size.height(),
+        Ok(Self::Bitmap(CursorBitmap {
+            size,
             hotspot,
             image,
-        })
+        }))
     }
 
     pub(crate) fn apply(self, current: &mut CursorState) {
         match self {
             Self::Visibility(visibility) => current.visibility = visibility,
-            Self::Image {
-                width,
-                height,
-                hotspot,
-                image,
-            } => {
-                current.width = width;
-                current.height = height;
-                current.hotspot_x = hotspot.x;
-                current.hotspot_y = hotspot.y;
-                current.image = image;
-            }
+            Self::Bitmap(bitmap) => current.bitmap = Some(bitmap),
         }
     }
 }
@@ -90,6 +69,8 @@ fn encode(size: CursorSize, pixels: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use sprite_desktop_protocol::pipe::Hotspot;
+
     use super::*;
 
     #[tokio::test]
@@ -97,7 +78,7 @@ mod tests {
         let size = CursorSize::new(1, 1).expect("test cursor size should be valid");
         let mut state = CursorState {
             visibility: CursorVisibility::Hidden,
-            ..CursorState::default()
+            bitmap: None,
         };
         let cursor = CursorImage::new(size, Hotspot { x: -3, y: 4 }, vec![16, 32, 64, 128])
             .expect("test cursor image should be valid");
@@ -107,12 +88,11 @@ mod tests {
             .apply(&mut state);
 
         assert_eq!(state.visibility, CursorVisibility::Hidden);
-        assert_eq!(state.width, 1);
-        assert_eq!(state.height, 1);
-        assert_eq!(state.hotspot_x, -3);
-        assert_eq!(state.hotspot_y, 4);
+        let bitmap = state.bitmap.expect("cursor image should set the bitmap");
+        assert_eq!(bitmap.size, size);
+        assert_eq!(bitmap.hotspot, Hotspot { x: -3, y: 4 });
 
-        let encoded = state
+        let encoded = bitmap
             .image
             .strip_prefix("data:image/png;base64,")
             .expect("cursor image should use a PNG data URL");

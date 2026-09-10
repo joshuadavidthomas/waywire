@@ -13,15 +13,18 @@ use crate::PROTOCOL_VERSION;
 use crate::pipe;
 use crate::pipe::ClipboardText;
 use crate::pipe::Command;
-use crate::pipe::CommandHeader;
+use crate::pipe::CursorSize;
 use crate::pipe::CursorVisibility;
 use crate::pipe::Fps;
 use crate::pipe::FrameMetadata;
+use crate::pipe::Hotspot;
 use crate::pipe::InputSequence;
 use crate::pipe::InputText;
 use crate::pipe::Kbps;
+use crate::pipe::Record;
 use crate::pipe::ScalePercent;
 pub use crate::pipe::TextAction;
+use crate::pipe::Writer;
 
 pub const VIDEO_FRAME_HEADER_BYTES: usize = 40;
 const VIDEO_RECORD_KIND: u8 = 1;
@@ -39,7 +42,7 @@ pub enum ClientEvent {
     Clipboard {
         text: ClipboardText,
     },
-    ResizeApplied(ResizeApplied),
+    ResizeApplied(pipe::ResizeApplied),
     Quality(QualityLevels),
     ControlState {
         state: ControlState,
@@ -49,15 +52,6 @@ pub enum ClientEvent {
         id: u64,
         server_nanos: String,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ResizeApplied {
-    pub request: pipe::RequestId,
-    #[serde(flatten)]
-    pub size: pipe::FrameSize,
-    pub scale: pipe::ScaleV120,
-    pub generation: pipe::Generation,
 }
 
 impl ClientEvent {
@@ -80,14 +74,20 @@ pub enum ControlState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CursorState {
     #[serde(rename = "visible")]
     pub visibility: CursorVisibility,
-    pub width: u32,
-    pub height: u32,
-    pub hotspot_x: i32,
-    pub hotspot_y: i32,
+    /// `None` until streamd has sent its first cursor image.
+    #[serde(flatten)]
+    pub bitmap: Option<CursorBitmap>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CursorBitmap {
+    #[serde(flatten)]
+    pub size: CursorSize,
+    pub hotspot: Hotspot,
+    /// A PNG data URL.
     pub image: String,
 }
 
@@ -104,11 +104,7 @@ impl Default for CursorState {
     fn default() -> Self {
         Self {
             visibility: CursorVisibility::Visible,
-            width: 0,
-            height: 0,
-            hotspot_x: 0,
-            hotspot_y: 0,
-            image: String::new(),
+            bitmap: None,
         }
     }
 }
@@ -260,16 +256,10 @@ impl Feedback {
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
-    #[error("invalid browser control header")]
-    InvalidControlHeader(#[source] pipe::ProtocolError),
+    #[error("invalid browser control record")]
+    InvalidControl(#[source] pipe::ProtocolError),
     #[error("browser may not send control kind {0}")]
     PrivateControlKind(u8),
-    #[error("invalid browser control fields for kind {kind}")]
-    InvalidControlFields {
-        kind: u8,
-        #[source]
-        source: pipe::ProtocolError,
-    },
     #[error("invalid JSON control")]
     InvalidJson(#[source] serde_json::Error),
     #[error("invalid feedback: {0}")]
@@ -283,13 +273,12 @@ pub enum BrowserError {
 }
 
 pub fn parse_browser_record(bytes: &[u8]) -> Result<Command, BrowserError> {
-    let header = CommandHeader::parse(bytes).map_err(BrowserError::InvalidControlHeader)?;
-    let kind = header.wire_kind();
-    if !header.is_browser_input() {
-        return Err(BrowserError::PrivateControlKind(kind));
+    let command = Command::decode(bytes).map_err(BrowserError::InvalidControl)?;
+    let kind = command.kind();
+    if !kind.browser_input() {
+        return Err(BrowserError::PrivateControlKind(kind.wire()));
     }
-    Command::decode(header, &[])
-        .map_err(|source| BrowserError::InvalidControlFields { kind, source })
+    Ok(command)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,35 +302,31 @@ pub struct VideoSample {
 }
 
 impl VideoSample {
-    /// Encodes a `VIDEO_FRAME_HEADER_BYTES`-byte header: version at 0, `VIDEO_RECORD_KIND` at 1,
-    /// flags at 2, zero at 3, sequence at 4, capture time in microseconds at 12, generation at 20,
-    /// width at 24, height at 26, capture time in nanoseconds at 28, and input sequence at 36.
+    /// Encodes a `VIDEO_FRAME_HEADER_BYTES`-byte header.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let metadata = &self.metadata;
         let flags = match self.kind {
-            FrameKind::Delta => 0,
+            FrameKind::Delta => 0_u8,
             FrameKind::Key => 1,
         } | match self.continuity {
             Continuity::Continuous => 0,
             Continuity::AfterGap => 2,
         };
-        let mut bytes = Vec::with_capacity(VIDEO_FRAME_HEADER_BYTES + self.data.len());
-        bytes.extend_from_slice(&[PROTOCOL_VERSION, VIDEO_RECORD_KIND, flags, 0]);
-        bytes.extend_from_slice(&metadata.sequence.to_le_bytes());
-        bytes.extend_from_slice(&(metadata.capture_nanos / 1_000).to_le_bytes());
-        bytes.extend_from_slice(&metadata.generation.get().to_le_bytes());
-        bytes.extend_from_slice(&metadata.width.get().to_le_bytes());
-        bytes.extend_from_slice(&metadata.height.get().to_le_bytes());
-        bytes.extend_from_slice(&metadata.capture_nanos.to_le_bytes());
-        bytes.extend_from_slice(
-            &metadata
-                .input_sequence
-                .map_or(0, InputSequence::get)
-                .to_le_bytes(),
-        );
-        bytes.extend_from_slice(&self.data);
-        bytes
+        let capture_micros = self.metadata.capture_nanos / 1_000;
+        let mut out = Writer::with_capacity(VIDEO_FRAME_HEADER_BYTES + self.data.len());
+        out.put(&PROTOCOL_VERSION);
+        out.put(&VIDEO_RECORD_KIND);
+        out.put(&flags);
+        out.reserved::<1>();
+        out.put(&self.metadata.sequence);
+        out.put(&capture_micros);
+        out.put(&self.metadata.generation);
+        out.put(&self.metadata.width);
+        out.put(&self.metadata.height);
+        out.put(&self.metadata.capture_nanos);
+        out.put(&self.metadata.input_sequence);
+        out.bytes(&self.data);
+        out.into_inner()
     }
 }
 
@@ -378,15 +363,23 @@ mod tests {
     fn cursor_json_is_exact() {
         let cursor = CursorState {
             visibility: CursorVisibility::Visible,
-            width: 1,
-            height: 2,
-            hotspot_x: -3,
-            hotspot_y: 4,
-            image: "data:image/png;base64,AA==".into(),
+            bitmap: Some(CursorBitmap {
+                size: value(CursorSize::new(1, 2)),
+                hotspot: Hotspot { x: -3, y: 4 },
+                image: "data:image/png;base64,AA==".into(),
+            }),
         };
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
-            r#"{"type":"cursor","visible":true,"width":1,"height":2,"hotspotX":-3,"hotspotY":4,"image":"data:image/png;base64,AA=="}"#
+            r#"{"type":"cursor","visible":true,"width":1,"height":2,"hotspot":{"x":-3,"y":4},"image":"data:image/png;base64,AA=="}"#
+        );
+    }
+
+    #[test]
+    fn cursor_without_a_bitmap_json_is_exact() {
+        assert_eq!(
+            json(&ClientEvent::Cursor(CursorState::default())),
+            r#"{"type":"cursor","visible":true}"#
         );
     }
 
@@ -402,10 +395,10 @@ mod tests {
 
     #[test]
     fn resize_applied_json_is_exact() {
-        let event = ClientEvent::ResizeApplied(ResizeApplied {
-            request: value(pipe::RequestId::new(9)),
+        let event = ClientEvent::ResizeApplied(pipe::ResizeApplied {
+            request_id: value(pipe::RequestId::new(9)),
             size: value(pipe::FrameSize::new(1280, 720)),
-            scale: value(pipe::ScaleV120::new(180)),
+            scale_v120: value(pipe::ScaleV120::new(180)),
             generation: value(pipe::Generation::new(4)),
         });
         assert_eq!(
@@ -518,10 +511,29 @@ mod tests {
 
     #[test]
     fn browser_records_reject_private_kinds() {
-        for kind in [7, 9, 10, 11] {
+        let commands = [
+            Command::Clipboard(value(ClipboardText::new(String::new()))),
+            Command::Quality {
+                bitrate_kbps: value(Kbps::new(8_000)),
+                fps: value(Fps::new(60)),
+                scale_percent: value(ScalePercent::new(100)),
+            },
+            Command::Text {
+                action: TextAction::Commit,
+                text: value(InputText::new(String::new())),
+                sequence: value(InputSequence::new(1)),
+            },
+            Command::KeyframeReadiness {
+                generation: value(pipe::Generation::new(1)),
+                state: pipe::KeyframeState::Cached,
+            },
+        ];
+        for command in commands {
+            let kind = command.kind().wire();
+            let record = command.encode();
             assert!(
                 matches!(
-                    parse_browser_record(&record(kind, 0, 0, 0, 0)),
+                    parse_browser_record(&record),
                     Err(BrowserError::PrivateControlKind(actual)) if actual == kind
                 ),
                 "private kind {kind} should be rejected"

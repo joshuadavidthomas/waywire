@@ -13,6 +13,7 @@ use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use sprite_desktop_protocol::pipe::Event;
+use sprite_desktop_protocol::pipe::Record;
 use thiserror::Error;
 
 const MAX_QUEUED_EVENTS: usize = 256;
@@ -40,7 +41,7 @@ impl Replacement {
         match event {
             Event::CursorImage(_) => Some(Self::CursorImage),
             Event::CursorVisibility(_) => Some(Self::CursorVisibility),
-            Event::Clipboard(_) | Event::Frame(_) | Event::ResizeApplied { .. } => None,
+            Event::Clipboard(_) | Event::Frame(_) | Event::ResizeApplied(_) => None,
         }
     }
 }

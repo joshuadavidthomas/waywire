@@ -1,9 +1,9 @@
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use sprite_desktop_protocol::pipe::EVENT_HEADER_BYTES;
+use sprite_desktop_protocol::pipe::Decoder;
 use sprite_desktop_protocol::pipe::Event;
-use sprite_desktop_protocol::pipe::EventHeader;
 use sprite_desktop_protocol::pipe::ProtocolError as DecodeError;
 use thiserror::Error;
 use tokio::io::AsyncRead;
@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 const PARTIAL_EVENT_DEADLINE: Duration = Duration::from_secs(2);
+const READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum EventReadError {
@@ -24,46 +25,44 @@ pub(crate) enum EventReadError {
 
 pub(crate) struct EventReader<R> {
     input: R,
+    decoder: Decoder<Event>,
+    ready: VecDeque<Event>,
 }
 
 impl<R: AsyncRead + Unpin> EventReader<R> {
     pub(crate) fn new(input: R) -> Self {
-        Self { input }
+        Self {
+            input,
+            decoder: Decoder::new(),
+            ready: VecDeque::new(),
+        }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<Event>, EventReadError> {
-        let mut bytes = [0; EVENT_HEADER_BYTES];
-        let first = self
-            .input
-            .read(&mut bytes[..1])
-            .await
-            .map_err(EventReadError::Io)?;
-        if first == 0 {
-            return Ok(None);
+        loop {
+            if let Some(event) = self.ready.pop_front() {
+                return Ok(Some(event));
+            }
+            let mut bytes = [0; READ_BUFFER_BYTES];
+            let count = if self.decoder.pending() > 0 {
+                timeout(PARTIAL_EVENT_DEADLINE, self.input.read(&mut bytes))
+                    .await
+                    .map_err(|_elapsed| EventReadError::Truncated)?
+                    .map_err(EventReadError::Io)?
+            } else {
+                self.input
+                    .read(&mut bytes)
+                    .await
+                    .map_err(EventReadError::Io)?
+            };
+            if count == 0 {
+                return if self.decoder.pending() == 0 {
+                    Ok(None)
+                } else {
+                    Err(EventReadError::Truncated)
+                };
+            }
+            self.ready.extend(self.decoder.push(&bytes[..count])?);
         }
-        timeout(
-            PARTIAL_EVENT_DEADLINE,
-            self.input.read_exact(&mut bytes[1..]),
-        )
-        .await
-        .map_err(|_elapsed| EventReadError::Truncated)?
-        .map_err(map_eof)?;
-        let header = EventHeader::parse(&bytes)?;
-        let mut payload = vec![0; header.payload_len()];
-        timeout(PARTIAL_EVENT_DEADLINE, self.input.read_exact(&mut payload))
-            .await
-            .map_err(|_elapsed| EventReadError::Truncated)?
-            .map_err(map_eof)?;
-        Event::decode(header, &payload)
-            .map(Some)
-            .map_err(Into::into)
-    }
-}
-
-fn map_eof(error: io::Error) -> EventReadError {
-    if error.kind() == io::ErrorKind::UnexpectedEof {
-        EventReadError::Truncated
-    } else {
-        EventReadError::Io(error)
     }
 }

@@ -20,12 +20,12 @@ use nix::sys::wait::waitid;
 use nix::unistd::Pid;
 use sprite_desktop_protocol::browser::ClientEvent;
 use sprite_desktop_protocol::browser::CursorState;
-use sprite_desktop_protocol::browser::ResizeApplied;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Kbps;
+use sprite_desktop_protocol::pipe::Record;
 use thiserror::Error;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -537,19 +537,11 @@ async fn read_events(
                 *lock(&events.latest_clipboard, "daemon clipboard state") = Some(text.clone());
                 events.publish(ClientEvent::Clipboard { text });
             }
-            Event::ResizeApplied {
-                request_id,
-                size,
-                scale_v120,
-                generation,
-            } => events.publish(ClientEvent::ResizeApplied(ResizeApplied {
-                request: request_id,
-                size,
-                scale: scale_v120,
-                generation,
-            })),
+            Event::ResizeApplied(applied) => {
+                events.publish(ClientEvent::ResizeApplied(applied));
+            }
             Event::CursorVisibility(visibility) => {
-                publish_cursor_update(&events, CursorUpdate::visibility(visibility));
+                publish_cursor_update(&events, CursorUpdate::Visibility(visibility));
             }
             Event::CursorImage(image) => {
                 let update = CursorUpdate::image(image).await?;

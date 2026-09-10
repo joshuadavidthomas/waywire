@@ -43,15 +43,13 @@ function fixture() {
     () => scale,
     (error) => errors.push(error),
   );
-  const state = {
-    type: "cursor" as const,
-    visible: true,
+  const bitmap = {
     width: 32,
     height: 32,
-    hotspotX: 4,
-    hotspotY: 6,
+    hotspot: { x: 4, y: 6 },
     image: "data:image/png;base64,AQ==",
   };
+  const state = { type: "cursor" as const, visible: true, bitmap };
   return { cursor, element, scale, state, images, draws, errors };
 }
 
@@ -82,8 +80,11 @@ test("late cursor images cannot replace a newer version or disposed cursor", asy
   f.cursor.update(f.state);
   f.cursor.update({
     ...f.state,
-    image: "data:image/png;base64,Ag==",
-    hotspotX: 10,
+    bitmap: {
+      ...f.state.bitmap,
+      image: "data:image/png;base64,Ag==",
+      hotspot: { ...f.state.bitmap.hotspot, x: 10 },
+    },
   });
   f.images[1]?.resolve();
   await flush();
@@ -92,7 +93,10 @@ test("late cursor images cannot replace a newer version or disposed cursor", asy
   await flush();
   assert.match(f.element.style.cursor, / 5 3, default$/);
 
-  f.cursor.update({ ...f.state, image: "data:image/png;base64,Aw==" });
+  f.cursor.update({
+    ...f.state,
+    bitmap: { ...f.state.bitmap, image: "data:image/png;base64,Aw==" },
+  });
   f.cursor.dispose();
   f.images[2]?.resolve();
   await flush();

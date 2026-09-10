@@ -201,7 +201,7 @@ impl Input {
             .context("virtual pointer unavailable")?;
         pointer.button(
             time,
-            button.wire(),
+            button.evdev_code(),
             match state {
                 ButtonState::Released => wl_pointer::ButtonState::Released,
                 ButtonState::Pressed => wl_pointer::ButtonState::Pressed,
@@ -271,7 +271,7 @@ impl Input {
                 let pressed = &mut self.pressed_buttons[button_index(button)];
                 if *pressed {
                     *pressed = false;
-                    pointer.button(time, button.wire(), wl_pointer::ButtonState::Released);
+                    pointer.button(time, button.evdev_code(), wl_pointer::ButtonState::Released);
                 }
             }
             pointer.frame();
