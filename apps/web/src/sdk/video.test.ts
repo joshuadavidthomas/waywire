@@ -149,7 +149,7 @@ test("decode queue overflow drops stale data and waits for a keyframe", async ()
 
   fixture.videoSocket.dispatch("message", { data: videoPacket(2_024) });
   await flush();
-  assert.equal(decoder.resetCalls, 1);
+  assert.equal(decoder.resetCalls, 2);
   assert.equal(decoder.decodeQueueSize, 0);
   fixture.videoSocket.dispatch("message", { data: videoPacket(2_026) });
   await flush();

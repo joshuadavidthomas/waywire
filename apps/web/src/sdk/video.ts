@@ -6,8 +6,7 @@ import {
   type VideoConfiguration,
 } from "./messages.ts";
 import type { WaymoteStats } from "./session.ts";
-
-export const videoPacketHeaderSize = 40;
+import { decodeRecord, readFrameMetadata } from "./wire.ts";
 export const maximumPendingVideoFrames = 24;
 export const maximumVideoDecodeQueueSize = maximumPendingVideoFrames;
 const busyDecodeQueueSize = 5;
@@ -64,7 +63,7 @@ export interface VideoOwner {
 }
 
 export type VideoPacket = Readonly<{
-  buffer: ArrayBuffer;
+  data: Uint8Array;
   keyframe: boolean;
   discontinuity: boolean;
   timestamp: number;
@@ -75,25 +74,33 @@ export type VideoPacket = Readonly<{
 }>;
 
 export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
-  if (
-    !(buffer instanceof ArrayBuffer) ||
-    buffer.byteLength < videoPacketHeaderSize
-  ) {
+  try {
+    const { kind, payload } = decodeRecord(buffer);
+    if (kind !== 1) return null;
+    const frameKind = payload.u8();
+    const continuity = payload.u8();
+    if (
+      (frameKind !== 0 && frameKind !== 1) ||
+      (continuity !== 0 && continuity !== 1)
+    ) {
+      return null;
+    }
+    const metadata = readFrameMetadata(payload);
+    const data = payload.rest();
+    payload.finish();
+    return {
+      data,
+      keyframe: frameKind === 1,
+      discontinuity: continuity === 1,
+      timestamp: Number(metadata.captureNanos / 1000n),
+      generation: metadata.generation,
+      latestAppliedInput: metadata.inputSequence,
+      width: metadata.width,
+      height: metadata.height,
+    };
+  } catch {
     return null;
   }
-  const view = new DataView(buffer);
-  if (view.getUint8(0) !== PROTOCOL_VERSION || view.getUint8(1) !== 1)
-    return null;
-  return {
-    buffer,
-    keyframe: (view.getUint8(2) & 1) !== 0,
-    discontinuity: (view.getUint8(2) & 2) !== 0,
-    timestamp: Number(view.getBigUint64(12, true)),
-    generation: view.getUint32(20, true),
-    latestAppliedInput: view.getUint32(36, true),
-    width: view.getUint16(24, true),
-    height: view.getUint16(26, true),
-  };
 }
 
 export class VideoRuntime {
@@ -486,7 +493,7 @@ export class VideoRuntime {
       new EncodedVideoChunk({
         type: packet.keyframe ? "key" : "delta",
         timestamp: packet.timestamp,
-        data: new Uint8Array(buffer, videoPacketHeaderSize),
+        data: packet.data,
       }),
     );
     this.observeDecodeQueue(decoder.decodeQueueSize);

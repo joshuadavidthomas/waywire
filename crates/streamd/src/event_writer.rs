@@ -12,8 +12,8 @@ use std::time::Instant;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
+use sprite_desktop_protocol::Record;
 use sprite_desktop_protocol::pipe::Event;
-use sprite_desktop_protocol::pipe::Record;
 use thiserror::Error;
 
 const MAX_QUEUED_EVENTS: usize = 256;

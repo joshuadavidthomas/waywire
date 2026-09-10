@@ -1,3 +1,13 @@
+import {
+  keyboardKey,
+  pointerAbsolute,
+  pointerButton,
+  pointerRelative,
+  pointerScroll,
+  releaseAll,
+  type Button,
+} from "./wire.ts";
+
 export class SurfaceListeners {
   private readonly cleanup: Array<() => void> = [];
 
@@ -20,14 +30,12 @@ export class SurfaceListeners {
 type PointerPosition = Readonly<{ x: number; y: number }>;
 
 const maximumPointerDelta = 4096;
-const controlPointerMotion = 1;
-const controlPointerButton = 2;
-const controlPointerScroll = 3;
-const controlPointerRelative = 8;
 const keyReleased = 0;
 const keyPressed = 1;
 const keyRepeated = 2;
-const linuxPointerButtons = [0x110, 0x112, 0x111, 0x113, 0x114];
+const linuxPointerButtons: readonly Button[] = [
+  0x110, 0x112, 0x111, 0x113, 0x114,
+];
 const linuxKeyCodes = new Map([
   ["Escape", 1],
   ["Digit1", 2],
@@ -181,15 +189,7 @@ export interface InputOwner {
   inputElement(): HTMLElement | null;
   imeProxy(): HTMLInputElement | HTMLTextAreaElement | null;
   contentPosition(event: PointerEvent): PointerPosition | null;
-  sendRecord(
-    type: number,
-    pressed?: boolean,
-    a?: number,
-    b?: number,
-    c?: number,
-  ): boolean;
-  sendFloatRecord(type: number, x: number, y: number): boolean;
-  sendKey(key: number, state: number): boolean;
+  sendRecord(record: ArrayBuffer): boolean;
   nextSequence(): number;
   requestControl(): void;
   releaseControl(): void;
@@ -276,7 +276,7 @@ export class InputRuntime {
 
   release = (): void => {
     this.resetPressed();
-    this.owner.sendRecord(5, false, 0, 0, 0);
+    this.owner.sendRecord(releaseAll());
   };
 
   cancelAnimation(): void {
@@ -312,11 +312,7 @@ export class InputRuntime {
       this.pendingPointerPosition = null;
       if (position)
         this.owner.sendRecord(
-          controlPointerMotion,
-          false,
-          position.x,
-          position.y,
-          this.owner.nextSequence(),
+          pointerAbsolute(position.x, position.y, this.owner.nextSequence()),
         );
     });
   };
@@ -331,7 +327,7 @@ export class InputRuntime {
       -maximumPointerDelta,
       Math.min(maximumPointerDelta, event.movementY),
     );
-    this.owner.sendFloatRecord(controlPointerRelative, dx, dy);
+    this.owner.sendRecord(pointerRelative(dx, dy, this.owner.nextSequence()));
   };
 
   private handlePointerLockChange = (): void => {
@@ -351,21 +347,13 @@ export class InputRuntime {
     if (!locked) input.setPointerCapture(event.pointerId);
     if (position)
       this.owner.sendRecord(
-        controlPointerMotion,
-        false,
-        position.x,
-        position.y,
-        this.owner.nextSequence(),
+        pointerAbsolute(position.x, position.y, this.owner.nextSequence()),
       );
     const button = linuxPointerButtons[event.button];
     if (button !== undefined && !this.pressedButtons.has(event.button)) {
       this.pressedButtons.add(event.button);
       this.owner.sendRecord(
-        controlPointerButton,
-        true,
-        button,
-        0,
-        this.owner.nextSequence(),
+        pointerButton(button, keyPressed, this.owner.nextSequence()),
       );
     }
     event.preventDefault();
@@ -376,11 +364,7 @@ export class InputRuntime {
     const button = linuxPointerButtons[event.button];
     if (button !== undefined && this.pressedButtons.delete(event.button)) {
       this.owner.sendRecord(
-        controlPointerButton,
-        false,
-        button,
-        0,
-        this.owner.nextSequence(),
+        pointerButton(button, keyReleased, this.owner.nextSequence()),
       );
     }
     const input = this.owner.inputElement();
@@ -405,7 +389,7 @@ export class InputRuntime {
       -maximumPointerDelta,
       Math.min(maximumPointerDelta, event.deltaY * scale),
     );
-    this.owner.sendFloatRecord(controlPointerScroll, dx, dy);
+    this.owner.sendRecord(pointerScroll(dx, dy, this.owner.nextSequence()));
     event.preventDefault();
   };
 
@@ -425,12 +409,21 @@ export class InputRuntime {
   }
 
   private tap(key: number, modifiers: readonly number[]): void {
-    for (const modifier of modifiers) this.owner.sendKey(modifier, keyPressed);
-    this.owner.sendKey(key, keyPressed);
-    this.owner.sendKey(key, keyReleased);
+    for (const modifier of modifiers)
+      this.owner.sendRecord(
+        keyboardKey(modifier, keyPressed, this.owner.nextSequence()),
+      );
+    this.owner.sendRecord(
+      keyboardKey(key, keyPressed, this.owner.nextSequence()),
+    );
+    this.owner.sendRecord(
+      keyboardKey(key, keyReleased, this.owner.nextSequence()),
+    );
     for (const modifier of modifiers)
       if (!this.pressedKeys.has(modifier))
-        this.owner.sendKey(modifier, keyReleased);
+        this.owner.sendRecord(
+          keyboardKey(modifier, keyReleased, this.owner.nextSequence()),
+        );
   }
 
   private handleKeyDown = (event: KeyboardEvent): void => {
@@ -471,8 +464,13 @@ export class InputRuntime {
     }
     if (!this.pressedKeys.has(key)) {
       this.pressedKeys.add(key);
-      this.owner.sendKey(key, keyPressed);
-    } else if (event.repeat) this.owner.sendKey(key, keyRepeated);
+      this.owner.sendRecord(
+        keyboardKey(key, keyPressed, this.owner.nextSequence()),
+      );
+    } else if (event.repeat)
+      this.owner.sendRecord(
+        keyboardKey(key, keyRepeated, this.owner.nextSequence()),
+      );
     this.physicalTextPending =
       event.key?.length === 1 && !event.ctrlKey && !event.metaKey;
     event.preventDefault();
@@ -495,7 +493,10 @@ export class InputRuntime {
       ].includes(event.code)
     )
       this.owner.completeRemoteCopy();
-    if (this.pressedKeys.delete(key)) this.owner.sendKey(key, keyReleased);
+    if (this.pressedKeys.delete(key))
+      this.owner.sendRecord(
+        keyboardKey(key, keyReleased, this.owner.nextSequence()),
+      );
     this.physicalTextPending = false;
     event.preventDefault();
     event.stopPropagation();

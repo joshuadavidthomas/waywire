@@ -8,11 +8,11 @@ use anyhow::bail;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
+use sprite_desktop_protocol::pipe::Button;
 use sprite_desktop_protocol::pipe::ButtonState;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::KeyCode;
 use sprite_desktop_protocol::pipe::KeyState;
-use sprite_desktop_protocol::pipe::PointerButton;
 use sprite_desktop_protocol::pipe::TextAction;
 use wayland_client::Proxy;
 use wayland_client::QueueHandle;
@@ -132,63 +132,67 @@ impl Input {
     pub(crate) fn apply(&mut self, command: &Command) -> Result<()> {
         let time = monotonic_millis()?;
         match command {
-            Command::PointerAbsolute {
-                x: horizontal,
-                y: vertical,
-                ..
-            } => {
+            Command::PointerAbsolute(payload) => {
                 let pointer = self
                     .pointer
                     .as_ref()
                     .context("virtual pointer unavailable")?;
-                pointer.motion_absolute(time, horizontal.get(), vertical.get(), 65_535, 65_535);
+                pointer.motion_absolute(time, payload.x.get(), payload.y.get(), 65_535, 65_535);
                 pointer.frame();
             }
-            Command::PointerRelative { dx, dy, .. } => {
+            Command::PointerRelative(payload) => {
                 let pointer = self
                     .pointer
                     .as_ref()
                     .context("virtual pointer unavailable")?;
-                pointer.motion(time, f64::from(dx.get()), f64::from(dy.get()));
+                pointer.motion(
+                    time,
+                    f64::from(payload.dx.get()),
+                    f64::from(payload.dy.get()),
+                );
                 pointer.frame();
             }
-            Command::PointerButton { button, state, .. } => {
-                self.button(time, *button, *state)?;
+            Command::PointerButton(payload) => {
+                self.button(time, payload.button, payload.state)?;
             }
-            Command::PointerScroll { dx, dy, .. } => {
+            Command::PointerScroll(payload) => {
                 let pointer = self
                     .pointer
                     .as_ref()
                     .context("virtual pointer unavailable")?;
                 pointer.axis_source(wl_pointer::AxisSource::Continuous);
-                if dx.get() != 0.0 {
+                if payload.dx.get() != 0.0 {
                     pointer.axis(
                         time,
                         wl_pointer::Axis::HorizontalScroll,
-                        f64::from(dx.get()),
+                        f64::from(payload.dx.get()),
                     );
                 }
-                if dy.get() != 0.0 {
-                    pointer.axis(time, wl_pointer::Axis::VerticalScroll, f64::from(dy.get()));
+                if payload.dy.get() != 0.0 {
+                    pointer.axis(
+                        time,
+                        wl_pointer::Axis::VerticalScroll,
+                        f64::from(payload.dy.get()),
+                    );
                 }
                 pointer.frame();
             }
-            Command::KeyboardKey { key, state, .. } => self.key(time, *key, *state)?,
-            Command::ReleaseAll => self.release_all()?,
-            Command::Text { action, text, .. } => {
-                self.send_text(*action, text.as_str())?;
+            Command::KeyboardKey(payload) => self.key(time, payload.key, payload.state)?,
+            Command::ReleaseAll(_) => self.release_all()?,
+            Command::Text(payload) => {
+                self.send_text(payload.action, payload.text.as_str())?;
             }
-            Command::Resize { .. }
+            Command::Resize(_)
             | Command::Clipboard(_)
-            | Command::Quality { .. }
-            | Command::KeyframeReadiness { .. } => {
+            | Command::Quality(_)
+            | Command::KeyframeReadiness(_) => {
                 bail!("non-input command passed to input module")
             }
         }
         Ok(())
     }
 
-    fn button(&mut self, time: u32, button: PointerButton, state: ButtonState) -> Result<()> {
+    fn button(&mut self, time: u32, button: Button, state: ButtonState) -> Result<()> {
         let index = button_index(button);
         let pressed = state == ButtonState::Pressed;
         if self.pressed_buttons[index] == pressed {
@@ -342,21 +346,21 @@ fn monotonic_millis() -> Result<u32> {
     Ok(u32::try_from(millis & u64::from(u32::MAX))?)
 }
 
-const TRACKED_BUTTONS: [PointerButton; 5] = [
-    PointerButton::Left,
-    PointerButton::Right,
-    PointerButton::Middle,
-    PointerButton::Side,
-    PointerButton::Extra,
+const TRACKED_BUTTONS: [Button; 5] = [
+    Button::Left,
+    Button::Right,
+    Button::Middle,
+    Button::Side,
+    Button::Extra,
 ];
 
-const fn button_index(button: PointerButton) -> usize {
+const fn button_index(button: Button) -> usize {
     match button {
-        PointerButton::Left => 0,
-        PointerButton::Right => 1,
-        PointerButton::Middle => 2,
-        PointerButton::Side => 3,
-        PointerButton::Extra => 4,
+        Button::Left => 0,
+        Button::Right => 1,
+        Button::Middle => 2,
+        Button::Side => 3,
+        Button::Extra => 4,
     }
 }
 

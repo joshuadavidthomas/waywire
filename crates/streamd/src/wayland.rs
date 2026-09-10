@@ -25,10 +25,10 @@ use calloop_wayland_source::WaylandSource;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
+use sprite_desktop_protocol::Decoder;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::CursorVisibility;
-use sprite_desktop_protocol::pipe::Decoder;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Generation;
@@ -337,19 +337,15 @@ impl State {
 
     fn apply_command(&mut self, command: &Command) -> Result<()> {
         match command {
-            Command::Resize {
-                size,
-                scale_v120,
-                request_id,
-            } => {
+            Command::Resize(payload) => {
                 self.capture.cancel();
                 if let Err(error) = self.outputs.configure(
                     self.output_name.as_deref(),
                     OutputMode {
-                        size: *size,
-                        scale_v120: *scale_v120,
+                        size: payload.size,
+                        scale_v120: payload.scale_v120,
                     },
-                    *request_id,
+                    payload.request_id,
                     self.fps,
                     &self.qh,
                 ) {
@@ -360,28 +356,24 @@ impl State {
             Command::Clipboard(text) => {
                 self.clipboard.set_text(text, &self.qh)?;
             }
-            Command::Quality {
-                bitrate_kbps,
-                fps,
-                scale_percent,
-            } => {
-                if (*bitrate_kbps, *fps, *scale_percent)
+            Command::Quality(payload) => {
+                if (payload.bitrate_kbps, payload.fps, payload.scale_percent)
                     != (self.bitrate_kbps, self.fps, self.encoded_scale)
                 {
-                    self.bitrate_kbps = *bitrate_kbps;
-                    self.fps = *fps;
-                    self.encoded_scale = *scale_percent;
+                    self.bitrate_kbps = payload.bitrate_kbps;
+                    self.fps = payload.fps;
+                    self.encoded_scale = payload.scale_percent;
                     self.advance_generation()?;
                 }
             }
-            Command::KeyframeReadiness { generation, state } => {
-                if *generation == self.generation {
-                    match state {
+            Command::KeyframeReadiness(payload) => {
+                if payload.generation == self.generation {
+                    match payload.state {
                         KeyframeState::Cached => {
-                            self.acknowledged_generation = Some(*generation);
+                            self.acknowledged_generation = Some(payload.generation);
                         }
                         KeyframeState::Missing => {
-                            if self.acknowledged_generation == Some(*generation) {
+                            if self.acknowledged_generation == Some(payload.generation) {
                                 self.acknowledged_generation = None;
                                 self.capture.cancel();
                                 self.request_capture()?;
@@ -390,17 +382,17 @@ impl State {
                     }
                 }
             }
-            Command::PointerRelative { .. }
-            | Command::PointerAbsolute { .. }
-            | Command::PointerButton { .. }
-            | Command::PointerScroll { .. }
-            | Command::KeyboardKey { .. }
-            | Command::ReleaseAll
-            | Command::Text { .. } => {
-                let overlay = matches!(command, Command::PointerRelative { .. });
+            Command::PointerRelative(_)
+            | Command::PointerAbsolute(_)
+            | Command::PointerButton(_)
+            | Command::PointerScroll(_)
+            | Command::KeyboardKey(_)
+            | Command::ReleaseAll(_)
+            | Command::Text(_) => {
+                let overlay = matches!(command, Command::PointerRelative(_));
                 let disables_overlay = matches!(
                     command,
-                    Command::PointerAbsolute { .. } | Command::ReleaseAll
+                    Command::PointerAbsolute(_) | Command::ReleaseAll(_)
                 );
                 if (overlay && !self.capture.cursor_overlay)
                     || (disables_overlay && self.capture.cursor_overlay)

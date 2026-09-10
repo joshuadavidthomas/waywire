@@ -26,6 +26,7 @@ use futures_util::stream::SplitSink;
 use nix::time::ClockId;
 use nix::time::clock_gettime;
 use rust_embed::Embed;
+use sprite_desktop_protocol::Record;
 use sprite_desktop_protocol::browser::ClientEvent;
 use sprite_desktop_protocol::browser::ClientMessage;
 use sprite_desktop_protocol::browser::ControlState;
@@ -35,6 +36,7 @@ use sprite_desktop_protocol::browser::parse_browser_record;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::MAX_CLIPBOARD_BYTES;
+use sprite_desktop_protocol::pipe::Text as TextCommand;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
@@ -654,11 +656,11 @@ async fn handle_text(
                 .sessions
                 .input(
                     socket_id,
-                    Command::Text {
+                    Command::Text(TextCommand {
                         action,
-                        text,
                         sequence,
-                    },
+                        text,
+                    }),
                 )
                 .await
                 .map_err(|error| SocketEnd::Failed(error.context("send text input"))),

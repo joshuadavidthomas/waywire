@@ -18,6 +18,7 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitid;
 use nix::unistd::Pid;
+use sprite_desktop_protocol::Record;
 use sprite_desktop_protocol::browser::ClientEvent;
 use sprite_desktop_protocol::browser::CursorState;
 use sprite_desktop_protocol::pipe::ClipboardText;
@@ -25,7 +26,6 @@ use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Kbps;
-use sprite_desktop_protocol::pipe::Record;
 use thiserror::Error;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -154,13 +154,13 @@ enum Authority {
 
 struct Request {
     authority: Authority,
-    command: Command,
-    bytes: OwnedSemaphorePermit,
+    encoded: Vec<u8>,
+    permit: OwnedSemaphorePermit,
 }
 
 struct AuthorizedCommand {
-    command: Command,
-    bytes: OwnedSemaphorePermit,
+    encoded: Vec<u8>,
+    permit: OwnedSemaphorePermit,
 }
 
 struct CommandReader {
@@ -177,8 +177,8 @@ impl CommandReader {
             };
             if authorized {
                 return Some(AuthorizedCommand {
-                    command: request.command,
-                    bytes: request.bytes,
+                    encoded: request.encoded,
+                    permit: request.permit,
                 });
             }
         }
@@ -234,9 +234,11 @@ impl CommandSink {
     }
 
     async fn send(&self, authority: Authority, command: Command) -> Result<(), CommandSinkError> {
-        let length = command.encoded_len();
-        let count = u32::try_from(length)
-            .map_err(|_overflow| CommandSinkError::LengthOverflow { length })?;
+        let encoded = command.encode();
+        let length = encoded.len();
+        let Ok(count) = u32::try_from(length) else {
+            return Err(CommandSinkError::LengthOverflow { length });
+        };
         let permit = match timeout(
             PIPE_DEADLINE,
             Arc::clone(&self.budget).acquire_many_owned(count),
@@ -249,8 +251,8 @@ impl CommandSink {
         };
         let request = Request {
             authority,
-            command,
-            bytes: permit,
+            encoded,
+            permit,
         };
         match timeout(PIPE_DEADLINE, self.tx.send(request)).await {
             Ok(Ok(())) => Ok(()),
@@ -508,13 +510,9 @@ where
     W: AsyncWrite + Unpin,
 {
     while let Some(command) = commands.recv().await {
-        let AuthorizedCommand {
-            command,
-            bytes: byte_permit,
-        } = command;
-        let encoded = command.encode();
+        let AuthorizedCommand { encoded, permit } = command;
         let write_result = timeout(PIPE_DEADLINE, output.write_all(&encoded)).await;
-        drop(byte_permit);
+        drop(permit);
         match write_result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(CommandWriterError::Write(error)),
@@ -625,7 +623,10 @@ mod tests {
     use sprite_desktop_protocol::browser::Feedback;
     use sprite_desktop_protocol::browser::FeedbackValues;
     use sprite_desktop_protocol::pipe::Generation;
+    use sprite_desktop_protocol::pipe::KeyframeReadiness;
     use sprite_desktop_protocol::pipe::KeyframeState;
+    use sprite_desktop_protocol::pipe::Quality;
+    use sprite_desktop_protocol::pipe::ReleaseAll;
     use sprite_desktop_protocol::pipe::ScalePercent;
     use tokio::io::AsyncReadExt;
 
@@ -648,10 +649,10 @@ mod tests {
         let second = first.next();
 
         commands.set_active_lease(first);
-        let first_input = Command::KeyframeReadiness {
+        let first_input = Command::KeyframeReadiness(KeyframeReadiness {
             generation: Generation::new(1).expect("test generation should be valid"),
             state: KeyframeState::Cached,
-        };
+        });
         let first_bytes = first_input.encode();
         commands
             .input(first, first_input)
@@ -666,25 +667,25 @@ mod tests {
 
         commands.set_active_lease(second);
         commands
-            .system(Command::ReleaseAll)
+            .system(Command::ReleaseAll(ReleaseAll))
             .await
             .expect("lease transition reset should queue");
         commands
             .input(
                 first,
-                Command::KeyframeReadiness {
+                Command::KeyframeReadiness(KeyframeReadiness {
                     generation: Generation::new(2).expect("test generation should be valid"),
                     state: KeyframeState::Missing,
-                },
+                }),
             )
             .await
             .expect("stale lease input should enter the queue before filtering");
-        let second_input = Command::Quality {
+        let second_input = Command::Quality(Quality {
             bitrate_kbps: Kbps::new(8_000).expect("test bitrate should be valid"),
             fps: Fps::new(60).expect("test frame rate should be valid"),
             scale_percent: ScalePercent::new(100).expect("test scale should be valid"),
-        };
-        let mut expected = Command::ReleaseAll.encode();
+        });
+        let mut expected = Command::ReleaseAll(ReleaseAll).encode();
         expected.extend_from_slice(&second_input.encode());
         commands
             .input(second, second_input)
@@ -732,14 +733,17 @@ mod tests {
             .recv()
             .await
             .expect("initial release should queue");
-        assert!(matches!(initial_release.command, Command::ReleaseAll));
+        assert!(matches!(
+            Command::decode(&initial_release.encoded),
+            Ok(Command::ReleaseAll(_))
+        ));
 
         sessions
             .feedback(socket, feedback)
             .await
             .expect("first feedback should be accepted");
         commands
-            .system(Command::ReleaseAll)
+            .system(Command::ReleaseAll(ReleaseAll))
             .await
             .expect("fill command queue");
 
@@ -762,7 +766,10 @@ mod tests {
             .recv()
             .await
             .expect("queue filler should remain first");
-        assert!(matches!(filler.command, Command::ReleaseAll));
+        assert!(matches!(
+            Command::decode(&filler.encoded),
+            Ok(Command::ReleaseAll(_))
+        ));
         feedback_task
             .await
             .expect("feedback task should run")
@@ -771,18 +778,13 @@ mod tests {
             .recv()
             .await
             .expect("quality command should queue");
-        assert!(matches!(&quality.command, Command::Quality { .. }));
-        let Command::Quality {
-            bitrate_kbps,
-            fps,
-            scale_percent,
-        } = quality.command
-        else {
+        let decoded = Command::decode(&quality.encoded).expect("quality command should decode");
+        let Command::Quality(payload) = decoded else {
             return;
         };
-        assert_eq!(bitrate_kbps.get(), 6_400);
-        assert_eq!(fps.get(), 60);
-        assert_eq!(scale_percent.get(), 100);
+        assert_eq!(payload.bitrate_kbps.get(), 6_400);
+        assert_eq!(payload.fps.get(), 60);
+        assert_eq!(payload.scale_percent.get(), 100);
 
         release_task
             .await
@@ -792,7 +794,10 @@ mod tests {
             .recv()
             .await
             .expect("final release should queue");
-        assert!(matches!(final_release.command, Command::ReleaseAll));
+        assert!(matches!(
+            Command::decode(&final_release.encoded),
+            Ok(Command::ReleaseAll(_))
+        ));
         assert!(!sessions.owns(socket).await);
     }
 
@@ -802,7 +807,7 @@ mod tests {
         commands.budget.close();
 
         let error = commands
-            .system(Command::ReleaseAll)
+            .system(Command::ReleaseAll(ReleaseAll))
             .await
             .expect_err("closed byte budget should reject a command");
 

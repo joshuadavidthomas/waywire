@@ -9,11 +9,13 @@ use anyhow::Result;
 use anyhow::anyhow;
 use sprite_desktop_protocol::browser::Continuity;
 use sprite_desktop_protocol::browser::FrameKind;
+use sprite_desktop_protocol::browser::MAX_VIDEO_DATA_BYTES;
 use sprite_desktop_protocol::browser::VideoSample;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::FrameMetadata;
 use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::KeyframeReadiness;
 use sprite_desktop_protocol::pipe::KeyframeState;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
@@ -30,7 +32,7 @@ use crate::daemon::CommandSink;
 use crate::daemon::Readiness;
 use crate::daemon::lock;
 
-const MAX_ACCESS_UNIT: usize = 16 << 20;
+const MAX_ACCESS_UNIT: usize = MAX_VIDEO_DATA_BYTES;
 const MAX_PENDING_RECORDS: u64 = 120;
 const PENDING_RECORD_CAPACITY: usize = 120;
 const MAX_PENDING_UNIT_BYTES: usize = 32 << 20;
@@ -943,7 +945,10 @@ impl VideoWorker {
                 };
                 if let Some((generation, state)) = transition {
                     self.commands
-                        .system(Command::KeyframeReadiness { generation, state })
+                        .system(Command::KeyframeReadiness(KeyframeReadiness {
+                            generation,
+                            state,
+                        }))
                         .await?;
                 }
             }

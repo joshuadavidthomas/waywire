@@ -11,6 +11,8 @@ use sprite_desktop_protocol::browser::QualityLevels;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Kbps;
+use sprite_desktop_protocol::pipe::Quality as QualityCommand;
+use sprite_desktop_protocol::pipe::ReleaseAll;
 use sprite_desktop_protocol::pipe::ScalePercent;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -95,7 +97,9 @@ impl Sessions {
 
         // ReleaseAll enters the FIFO before the new epoch becomes valid, so
         // no command from the new owner can overtake the reset.
-        self.commands.system(Command::ReleaseAll).await?;
+        self.commands
+            .system(Command::ReleaseAll(ReleaseAll))
+            .await?;
         let epoch = book.next_epoch;
         book.next_epoch = epoch.next();
         book.owner = Some(Lease { socket, epoch });
@@ -115,7 +119,9 @@ impl Sessions {
 
         // The reset follows every command already queued by this epoch. Once
         // the authority is cleared, the writer drops any late stale command.
-        self.commands.system(Command::ReleaseAll).await?;
+        self.commands
+            .system(Command::ReleaseAll(ReleaseAll))
+            .await?;
         self.commands.clear_active_lease();
         book.owner = None;
         info!(socket = ?owner.socket, epoch = ?owner.epoch, "input lease released");
@@ -174,11 +180,11 @@ impl Sessions {
             // Quality is daemon state, not user input. Holding the lease lock
             // puts this command before a release and any later acquisition.
             self.commands
-                .system(Command::Quality {
+                .system(Command::Quality(QualityCommand {
                     bitrate_kbps: change.new.bitrate,
                     fps: change.new.fps,
                     scale_percent: change.new.scale,
-                })
+                }))
                 .await?;
         }
 

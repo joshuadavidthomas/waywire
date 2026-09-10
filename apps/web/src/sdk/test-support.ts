@@ -1,5 +1,5 @@
-import { PROTOCOL_VERSION } from "./messages.ts";
 import type { SurfaceOptions, WaymoteSessionOptions } from "./session.ts";
+import { videoFrame } from "./wire.ts";
 
 export class FakeTarget {
   readonly listeners = new Map<string, Set<(event: unknown) => void>>();
@@ -158,19 +158,20 @@ export function videoPacket(
     readonly generation?: number;
   } = {},
 ): ArrayBuffer {
-  const packet = new ArrayBuffer(41);
-  const view = new DataView(packet);
-  view.setUint8(0, PROTOCOL_VERSION);
-  view.setUint8(1, 1);
-  view.setUint8(
-    2,
-    (options.keyframe ? 1 : 0) | (options.discontinuity ? 2 : 0),
+  return videoFrame(
+    options.keyframe ? 1 : 0,
+    options.discontinuity ? 1 : 0,
+    {
+      generation: options.generation ?? 1,
+      width: 1280,
+      height: 720,
+      captureNanos: BigInt(timestamp) * 1000n,
+      sequence: 0n,
+      inputSequence: 0,
+      fps: 60,
+    },
+    new Uint8Array([0]),
   );
-  view.setBigUint64(12, BigInt(timestamp), true);
-  view.setUint32(20, options.generation ?? 0, true);
-  view.setUint16(24, 1280, true);
-  view.setUint16(26, 720, true);
-  return packet;
 }
 
 export type QueueDecoder = {

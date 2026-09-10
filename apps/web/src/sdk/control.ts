@@ -1,10 +1,6 @@
 import { LocalCursor } from "./cursor.ts";
 import { InputRuntime, SurfaceListeners } from "./input.ts";
-import {
-  PROTOCOL_VERSION,
-  parseControlMessage,
-  parseJson,
-} from "./messages.ts";
+import { parseControlMessage, parseJson } from "./messages.ts";
 import {
   automaticResizeAlignment,
   fitObservedResize,
@@ -12,6 +8,7 @@ import {
   type RemoteDisplayPolicy,
 } from "./resize.ts";
 import { VideoRuntime } from "./video.ts";
+import { resize as resizeRecord } from "./wire.ts";
 import type {
   SurfaceHandle,
   SurfaceOptions,
@@ -197,15 +194,9 @@ export class ControlRuntime {
   private disposePromise: Promise<void> | null = null;
   private readonly clock = new ClockSynchronizer();
 
-  private readonly controlRecordSize = 16;
   private readonly normalizedPointerExtent = 65_535;
-  private readonly controlKeyboardKey = 4;
-  private readonly controlReleaseAll = 5;
-  private readonly controlResize = 6;
   private readonly maximumClipboardBytes = 1024 * 1024;
   private readonly clipboardCopyTimeoutMilliseconds = 2000;
-  private readonly keyReleased = 0;
-  private readonly keyPressed = 1;
 
   private controlSocket: WebSocket | null = null;
   private controlReconnectDelay = 250;
@@ -281,22 +272,7 @@ export class ControlRuntime {
     inputElement: () => this.inputElement,
     imeProxy: () => this.imeProxy,
     contentPosition: (event) => this.contentPosition(event),
-    sendRecord: (type, pressed = false, a = 0, b = 0, c = 0) =>
-      this.sendControl(this.controlRecord(type, pressed, a, b, c)),
-    sendFloatRecord: (type, x, y) => {
-      const record = this.controlRecord(
-        type,
-        false,
-        0,
-        0,
-        this.nextInputSequence(),
-      );
-      const view = new DataView(record);
-      view.setFloat32(4, x, true);
-      view.setFloat32(8, y, true);
-      return this.sendControl(record);
-    },
-    sendKey: (key, state) => this.sendControl(this.keyboardRecord(key, state)),
+    sendRecord: (record) => this.sendControl(record),
     nextSequence: () => this.nextInputSequence(),
     requestControl: () => this.requestControl(),
     releaseControl: () => this.releaseControl(),
@@ -567,36 +543,6 @@ export class ControlRuntime {
     }
   }
 
-  private controlRecord(
-    type: number,
-    pressed = false,
-    a = 0,
-    b = 0,
-    c = 0,
-  ): ArrayBuffer {
-    const record = new ArrayBuffer(this.controlRecordSize);
-    const view = new DataView(record);
-    view.setUint8(0, PROTOCOL_VERSION);
-    view.setUint8(1, type);
-    view.setUint8(2, pressed ? 1 : 0);
-    view.setUint32(4, a, true);
-    view.setUint32(8, b, true);
-    view.setUint32(12, c, true);
-    return record;
-  }
-
-  private keyboardRecord(key: number, state: number): ArrayBuffer {
-    const record = this.controlRecord(
-      this.controlKeyboardKey,
-      state === this.keyPressed,
-      key,
-      0,
-      this.nextInputSequence(),
-    );
-    new DataView(record).setUint8(2, state);
-    return record;
-  }
-
   private nextInputSequence(): number {
     this.inputSequence = (this.inputSequence + 1) >>> 0;
     if (this.inputSequence === 0) {
@@ -709,15 +655,8 @@ export class ControlRuntime {
     if (this.resizeRequestID === 0) {
       this.resizeRequestID = 1;
     }
-    const packed = (this.resizeRequestID << 16) | scale;
-    const record = this.controlRecord(
-      this.controlResize,
-      false,
-      width,
-      height,
-      packed >>> 0,
-    );
-    this.resizeRequests.set((packed >>> 16) & 0xffff, {
+    const record = resizeRecord(width, height, scale, this.resizeRequestID);
+    this.resizeRequests.set(this.resizeRequestID, {
       requested: performance.now(),
       generation: 0,
     });

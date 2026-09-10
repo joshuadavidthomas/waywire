@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use sprite_desktop_protocol::pipe::Decoder;
+use sprite_desktop_protocol::Decoder;
+use sprite_desktop_protocol::ProtocolError as DecodeError;
 use sprite_desktop_protocol::pipe::Event;
-use sprite_desktop_protocol::pipe::ProtocolError as DecodeError;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;

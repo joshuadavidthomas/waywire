@@ -1,6 +1,5 @@
 //! Browser-to-gateway and gateway-to-browser protocol vocabulary.
-//! It covers JSON control messages, 16-byte binary control records that reuse the pipe command
-//! header, and binary video frames.
+//! It covers JSON control messages, binary control records, and binary video frames.
 
 use std::sync::Arc;
 
@@ -10,6 +9,7 @@ use serde::Serializer;
 use thiserror::Error;
 
 use crate::PROTOCOL_VERSION;
+use crate::ProtocolError;
 use crate::pipe;
 use crate::pipe::ClipboardText;
 use crate::pipe::Command;
@@ -21,13 +21,17 @@ use crate::pipe::Hotspot;
 use crate::pipe::InputSequence;
 use crate::pipe::InputText;
 use crate::pipe::Kbps;
-use crate::pipe::Record;
 use crate::pipe::ScalePercent;
 pub use crate::pipe::TextAction;
-use crate::pipe::Writer;
+use crate::wire::InvalidValue;
+use crate::wire::Reader;
+use crate::wire::Record;
+use crate::wire::RecordKind;
+use crate::wire::Wire;
+use crate::wire::Writer;
 
-pub const VIDEO_FRAME_HEADER_BYTES: usize = 40;
-const VIDEO_RECORD_KIND: u8 = 1;
+/// Matches the gateway RTP assembler's largest accepted access unit.
+pub const MAX_VIDEO_DATA_BYTES: usize = 16 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -257,7 +261,7 @@ impl Feedback {
 #[derive(Debug, Error)]
 pub enum BrowserError {
     #[error("invalid browser control record")]
-    InvalidControl(#[source] pipe::ProtocolError),
+    InvalidControl(#[source] ProtocolError),
     #[error("browser may not send control kind {0}")]
     PrivateControlKind(u8),
     #[error("invalid JSON control")]
@@ -265,18 +269,18 @@ pub enum BrowserError {
     #[error("invalid feedback: {0}")]
     InvalidFeedback(&'static str),
     #[error("invalid text")]
-    InvalidText(#[source] pipe::InvalidValue),
+    InvalidText(#[source] InvalidValue),
     #[error("invalid input sequence")]
-    InvalidSequence(#[source] pipe::InvalidValue),
+    InvalidSequence(#[source] InvalidValue),
     #[error("invalid clipboard")]
-    InvalidClipboard(#[source] pipe::InvalidValue),
+    InvalidClipboard(#[source] InvalidValue),
 }
 
 pub fn parse_browser_record(bytes: &[u8]) -> Result<Command, BrowserError> {
     let command = Command::decode(bytes).map_err(BrowserError::InvalidControl)?;
     let kind = command.kind();
     if !kind.browser_input() {
-        return Err(BrowserError::PrivateControlKind(kind.wire()));
+        return Err(BrowserError::PrivateControlKind(RecordKind::wire(kind)));
     }
     Ok(command)
 }
@@ -287,13 +291,75 @@ pub enum FrameKind {
     Key,
 }
 
+impl Wire for FrameKind {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Delta => 0_u8,
+            Self::Key => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Delta),
+            1 => Ok(Self::Key),
+            _ => Err(InvalidValue("frame kind must be zero or one")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Continuity {
     Continuous,
     AfterGap,
 }
 
-#[derive(Clone, Debug)]
+impl Wire for Continuity {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Continuous => 0_u8,
+            Self::AfterGap => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Continuous),
+            1 => Ok(Self::AfterGap),
+            _ => Err(InvalidValue("continuity must be zero or one")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BrowserKind {
+    Frame = 1,
+}
+
+impl RecordKind for BrowserKind {
+    fn wire(self) -> u8 {
+        match self {
+            Self::Frame => 1,
+        }
+    }
+
+    fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Frame),
+            _ => None,
+        }
+    }
+
+    fn max_payload(self) -> usize {
+        match self {
+            // Frame kind u8, continuity u8, 32-byte metadata, then the encoded access unit.
+            Self::Frame => 34 + MAX_VIDEO_DATA_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSample {
     pub data: Arc<[u8]>,
     pub kind: FrameKind,
@@ -301,32 +367,29 @@ pub struct VideoSample {
     pub metadata: FrameMetadata,
 }
 
-impl VideoSample {
-    /// Encodes a `VIDEO_FRAME_HEADER_BYTES`-byte header.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let flags = match self.kind {
-            FrameKind::Delta => 0_u8,
-            FrameKind::Key => 1,
-        } | match self.continuity {
-            Continuity::Continuous => 0,
-            Continuity::AfterGap => 2,
-        };
-        let capture_micros = self.metadata.capture_nanos / 1_000;
-        let mut out = Writer::with_capacity(VIDEO_FRAME_HEADER_BYTES + self.data.len());
-        out.put(&PROTOCOL_VERSION);
-        out.put(&VIDEO_RECORD_KIND);
-        out.put(&flags);
-        out.reserved::<1>();
-        out.put(&self.metadata.sequence);
-        out.put(&capture_micros);
-        out.put(&self.metadata.generation);
-        out.put(&self.metadata.width);
-        out.put(&self.metadata.height);
-        out.put(&self.metadata.capture_nanos);
-        out.put(&self.metadata.input_sequence);
+impl Record for VideoSample {
+    type Kind = BrowserKind;
+
+    fn kind(&self) -> Self::Kind {
+        BrowserKind::Frame
+    }
+
+    fn write_payload(&self, out: &mut Writer) {
+        out.put(&self.kind);
+        out.put(&self.continuity);
+        out.put(&self.metadata);
         out.bytes(&self.data);
-        out.into_inner()
+    }
+
+    fn read_payload(kind: Self::Kind, input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match kind {
+            BrowserKind::Frame => Ok(Self {
+                kind: input.get()?,
+                continuity: input.get()?,
+                metadata: input.get()?,
+                data: Arc::from(input.rest()),
+            }),
+        }
     }
 }
 
@@ -334,7 +397,7 @@ impl VideoSample {
 mod tests {
     use super::*;
 
-    fn value<T>(result: Result<T, pipe::InvalidValue>) -> T {
+    fn value<T>(result: Result<T, InvalidValue>) -> T {
         result.expect("test protocol value should be valid")
     }
 
@@ -342,11 +405,14 @@ mod tests {
         serde_json::to_string(event).expect("test client event should serialize")
     }
 
-    fn record(kind: u8, state: u8, a: u32, b: u32, c: u32) -> Vec<u8> {
-        let mut bytes = vec![2, kind, state, 0];
-        bytes.extend(a.to_le_bytes());
-        bytes.extend(b.to_le_bytes());
-        bytes.extend(c.to_le_bytes());
+    fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![3, kind, 0, 0];
+        bytes.extend(
+            u32::try_from(payload.len())
+                .expect("test payload length should fit u32")
+                .to_le_bytes(),
+        );
+        bytes.extend(payload);
         bytes
     }
 
@@ -355,7 +421,7 @@ mod tests {
         let event = ClientEvent::video_config("avc1.F40034".into(), value(Fps::new(60)));
         assert_eq!(
             json(&event),
-            r#"{"type":"video-config","version":2,"codec":"avc1.F40034","frameRate":60}"#
+            r#"{"type":"video-config","version":3,"codec":"avc1.F40034","frameRate":60}"#
         );
     }
 
@@ -445,46 +511,34 @@ mod tests {
         vec![
             (
                 "pointer absolute",
-                record(1, 0, 12, 34, 7),
-                record(1, 1, 12, 34, 7),
+                record(1, &[12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0]),
+                record(1, &[0, 0, 1, 0, 34, 0, 0, 0, 7, 0, 0, 0]),
             ),
             (
                 "pointer button",
-                record(2, 1, 0x110, 0, 7),
-                record(2, 1, 0x115, 0, 7),
+                record(2, &[16, 1, 0, 0, 1, 7, 0, 0, 0]),
+                record(2, &[21, 1, 0, 0, 1, 7, 0, 0, 0]),
             ),
             (
                 "pointer scroll",
-                record(3, 0, 1.5_f32.to_bits(), (-2.25_f32).to_bits(), 7),
-                record(3, 0, f32::NAN.to_bits(), 0, 7),
+                record(3, &[0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0]),
+                record(3, &[0, 0, 192, 127, 0, 0, 0, 0, 7, 0, 0, 0]),
             ),
             (
                 "keyboard key",
-                record(4, 2, 30, 0, 7),
-                record(4, 2, 256, 0, 7),
+                record(4, &[30, 0, 0, 0, 2, 7, 0, 0, 0]),
+                record(4, &[0, 1, 0, 0, 2, 7, 0, 0, 0]),
             ),
-            ("release all", record(5, 0, 0, 0, 0), record(5, 0, 1, 0, 0)),
+            ("release all", record(5, &[]), record(5, &[1])),
             (
                 "resize",
-                record(
-                    6,
-                    0,
-                    1280,
-                    720,
-                    u32::from(180_u16) | (u32::from(9_u16) << 16),
-                ),
-                record(
-                    6,
-                    0,
-                    1281,
-                    720,
-                    u32::from(180_u16) | (u32::from(9_u16) << 16),
-                ),
+                record(6, &[0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0]),
+                record(6, &[1, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0]),
             ),
             (
                 "pointer relative",
-                record(8, 0, 1.5_f32.to_bits(), (-2.25_f32).to_bits(), 7),
-                record(8, 0, 0, 0, 0),
+                record(8, &[0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0]),
+                record(8, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             ),
         ]
     }
@@ -513,24 +567,24 @@ mod tests {
     fn browser_records_reject_private_kinds() {
         let commands = [
             Command::Clipboard(value(ClipboardText::new(String::new()))),
-            Command::Quality {
+            Command::Quality(pipe::Quality {
                 bitrate_kbps: value(Kbps::new(8_000)),
                 fps: value(Fps::new(60)),
                 scale_percent: value(ScalePercent::new(100)),
-            },
-            Command::Text {
+            }),
+            Command::Text(pipe::Text {
                 action: TextAction::Commit,
-                text: value(InputText::new(String::new())),
                 sequence: value(InputSequence::new(1)),
-            },
-            Command::KeyframeReadiness {
+                text: value(InputText::new(String::new())),
+            }),
+            Command::KeyframeReadiness(pipe::KeyframeReadiness {
                 generation: value(pipe::Generation::new(1)),
                 state: pipe::KeyframeState::Cached,
-            },
+            }),
         ];
         for command in commands {
-            let kind = command.kind().wire();
             let record = command.encode();
+            let kind = record[1];
             assert!(
                 matches!(
                     parse_browser_record(&record),
@@ -614,12 +668,11 @@ mod tests {
                 fps: value(Fps::new(60)),
             },
         };
-        assert_eq!(
-            sample.encode(),
-            vec![
-                2, 1, 3, 0, 17, 0, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 5,
-                208, 2, 184, 130, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 1, 2
-            ]
-        );
+        let bytes = vec![
+            3, 1, 0, 0, 36, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 2,
+        ];
+        assert_eq!(sample.encode(), bytes);
+        assert_eq!(VideoSample::decode(&bytes), Ok(sample));
     }
 }
