@@ -191,6 +191,7 @@ export class WaymoteSession {
           this.stats = snapshot;
           this.#emit("stats", snapshot);
         },
+        halt: (error) => this.#halt(error),
         remoteDisplayPolicy: () => this.#remoteDisplayPolicy,
         controlOnFocus: () => this.#controlOnFocus,
         setControlOnFocus: (enabled) => {
@@ -288,6 +289,15 @@ export class WaymoteSession {
 
   #assertActive(): void {
     if (this.#disposed) throw new Error("The session has been disposed");
+  }
+
+  #halt(error: Error): void {
+    this.#runtime.disconnect();
+    this.#updateState("video", {
+      state: "error",
+      message: error.message,
+    });
+    this.#emit("error", error);
   }
 
   #updateState<K extends keyof WaymoteSessionState>(

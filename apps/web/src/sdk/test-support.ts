@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "./messages.ts";
 import type { SurfaceOptions, WaymoteSessionOptions } from "./session.ts";
 
 export class FakeTarget {
@@ -61,14 +62,19 @@ export class FakeWebSocket extends FakeTarget {
   readyState = FakeWebSocket.CONNECTING;
   binaryType = "";
   closeCalls = 0;
+  readonly closes: Array<{
+    code: number | undefined;
+    reason: string | undefined;
+  }> = [];
   readonly sent: unknown[] = [];
 
   send(value: unknown): void {
     this.sent.push(value);
   }
 
-  close(): void {
+  close(code?: number, reason?: string): void {
     this.closeCalls += 1;
+    this.closes.push({ code, reason });
     this.readyState = FakeWebSocket.CLOSED;
   }
 }
@@ -154,7 +160,7 @@ export function videoPacket(
 ): ArrayBuffer {
   const packet = new ArrayBuffer(41);
   const view = new DataView(packet);
-  view.setUint8(0, 2);
+  view.setUint8(0, PROTOCOL_VERSION);
   view.setUint8(1, 1);
   view.setUint8(
     2,

@@ -9,7 +9,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
-pub const VERSION: u8 = 2;
+use crate::PROTOCOL_VERSION;
+
 pub const COMMAND_HEADER_BYTES: usize = 16;
 pub const EVENT_HEADER_BYTES: usize = 8;
 pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
@@ -720,7 +721,7 @@ pub struct CommandHeader {
 
 impl CommandHeader {
     pub fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() != COMMAND_HEADER_BYTES || bytes[0] != VERSION || bytes[3] != 0 {
+        if bytes.len() != COMMAND_HEADER_BYTES || bytes[0] != PROTOCOL_VERSION || bytes[3] != 0 {
             return Err(ProtocolError::InvalidHeader);
         }
         let kind =
@@ -881,7 +882,7 @@ impl Event {
         };
         let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         let mut bytes = Vec::with_capacity(EVENT_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&[VERSION, kind.wire(), 0, 0]);
+        bytes.extend_from_slice(&[PROTOCOL_VERSION, kind.wire(), 0, 0]);
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
@@ -992,7 +993,7 @@ pub struct EventHeader {
 impl EventHeader {
     pub fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() != EVENT_HEADER_BYTES
-            || bytes[0] != VERSION
+            || bytes[0] != PROTOCOL_VERSION
             || bytes[2] != 0
             || bytes[3] != 0
         {
@@ -1024,7 +1025,7 @@ fn field<T>(result: Result<T, InvalidValue>, invalid: ProtocolError) -> Result<T
 }
 
 fn command(kind: CommandKind, state: u8, a: u32, b: u32, c: u32) -> Vec<u8> {
-    let mut bytes = vec![VERSION, kind.wire(), state, 0];
+    let mut bytes = vec![PROTOCOL_VERSION, kind.wire(), state, 0];
     bytes.extend(a.to_le_bytes());
     bytes.extend(b.to_le_bytes());
     bytes.extend(c.to_le_bytes());

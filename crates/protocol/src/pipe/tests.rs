@@ -233,7 +233,7 @@ fn command_header_names_text_payload_presence_even_when_empty() {
 #[test]
 fn wrong_version_is_an_invalid_header() {
     let mut header = [0; COMMAND_HEADER_BYTES];
-    header[0] = VERSION - 1;
+    header[0] = PROTOCOL_VERSION - 1;
     header[1] = 5;
     assert_eq!(
         CommandHeader::parse(&header),
@@ -244,7 +244,7 @@ fn wrong_version_is_an_invalid_header() {
 #[test]
 fn unknown_command_kind_is_invalid_fields() {
     let mut header = [0; COMMAND_HEADER_BYTES];
-    header[0] = VERSION;
+    header[0] = PROTOCOL_VERSION;
     header[1] = 99;
     assert_eq!(
         CommandHeader::parse(&header),
@@ -254,7 +254,7 @@ fn unknown_command_kind_is_invalid_fields() {
 
 #[test]
 fn unknown_event_kind_is_invalid_event() {
-    let header = [VERSION, 99, 0, 0, 0, 0, 0, 0];
+    let header = [PROTOCOL_VERSION, 99, 0, 0, 0, 0, 0, 0];
     assert_eq!(
         EventHeader::parse(&header),
         Err(ProtocolError::InvalidEvent(99))
@@ -264,7 +264,7 @@ fn unknown_event_kind_is_invalid_event() {
 #[test]
 fn command_text_payload_over_limit_is_too_large() {
     let mut header = [0; COMMAND_HEADER_BYTES];
-    header[0] = VERSION;
+    header[0] = PROTOCOL_VERSION;
     header[1] = 10;
     header[4..8].copy_from_slice(
         &(u32::try_from(MAX_TEXT_BYTES).expect("limit fits u32") + 1).to_le_bytes(),
@@ -277,7 +277,7 @@ fn command_text_payload_over_limit_is_too_large() {
 
 #[test]
 fn event_payload_over_limit_is_too_large() {
-    let mut header = [VERSION, 1, 0, 0, 0, 0, 0, 0];
+    let mut header = [PROTOCOL_VERSION, 1, 0, 0, 0, 0, 0, 0];
     header[4..8].copy_from_slice(
         &(u32::try_from(MAX_EVENT_BYTES).expect("limit fits u32") + 1).to_le_bytes(),
     );
@@ -289,14 +289,14 @@ fn event_payload_over_limit_is_too_large() {
 
 #[test]
 fn clipboard_payload_must_be_utf8() {
-    let header = EventHeader::parse(&[VERSION, 1, 0, 0, 1, 0, 0, 0])
+    let header = EventHeader::parse(&[PROTOCOL_VERSION, 1, 0, 0, 1, 0, 0, 0])
         .expect("clipboard event header should parse");
     assert_eq!(Event::decode(header, &[0xff]), Err(ProtocolError::NotUtf8));
 }
 
 #[test]
 fn cursor_image_payload_length_must_match_its_size() {
-    let header = EventHeader::parse(&[VERSION, 4, 0, 0, 16, 0, 0, 0])
+    let header = EventHeader::parse(&[PROTOCOL_VERSION, 4, 0, 0, 16, 0, 0, 0])
         .expect("cursor image event header should parse");
     let mut payload = [0; 16];
     payload[0..4].copy_from_slice(&1_u32.to_le_bytes());
@@ -309,7 +309,11 @@ fn cursor_image_payload_length_must_match_its_size() {
 
 #[test]
 fn command_payload_length_must_match_its_header() {
-    let header = CommandHeader::parse(&[VERSION, 7, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    let mut clipboard_with_one_byte = [0; COMMAND_HEADER_BYTES];
+    clipboard_with_one_byte[0] = PROTOCOL_VERSION;
+    clipboard_with_one_byte[1] = 7;
+    clipboard_with_one_byte[4] = 1;
+    let header = CommandHeader::parse(&clipboard_with_one_byte)
         .expect("clipboard command header should parse");
     assert_eq!(Command::decode(header, &[]), Err(ProtocolError::Truncated));
 }

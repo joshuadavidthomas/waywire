@@ -1,6 +1,10 @@
 import { LocalCursor } from "./cursor.ts";
 import { InputRuntime, SurfaceListeners } from "./input.ts";
-import { parseControlMessage, parseJson } from "./messages.ts";
+import {
+  PROTOCOL_VERSION,
+  parseControlMessage,
+  parseJson,
+} from "./messages.ts";
 import {
   automaticResizeAlignment,
   fitObservedResize,
@@ -147,6 +151,7 @@ type RuntimeOwner = {
     changes: Partial<WaymoteSessionState[K]>,
   ): void;
   setStats(stats: WaymoteStats): void;
+  halt(error: Error): void;
   remoteDisplayPolicy(): RemoteDisplayPolicy;
   controlOnFocus(): boolean;
   setControlOnFocus(enabled: boolean): void;
@@ -238,6 +243,7 @@ export class ControlRuntime {
         setStatus: (text, connected) => this.setStatus(text, connected),
         updateState: (changes) => this.owner.updateState("video", changes),
         emitError: (error) => this.emit("error", error),
+        halt: (error) => this.owner.halt(error),
         expectedPresentationTime: (captureMicros, latencyMilliseconds) =>
           this.clock.expectedPresentationTime(
             captureMicros,
@@ -570,7 +576,7 @@ export class ControlRuntime {
   ): ArrayBuffer {
     const record = new ArrayBuffer(this.controlRecordSize);
     const view = new DataView(record);
-    view.setUint8(0, 2);
+    view.setUint8(0, PROTOCOL_VERSION);
     view.setUint8(1, type);
     view.setUint8(2, pressed ? 1 : 0);
     view.setUint32(4, a, true);

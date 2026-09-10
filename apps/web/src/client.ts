@@ -1,3 +1,4 @@
+import { ProtocolVersionMismatchError } from "./sdk/messages.ts";
 import { WaymoteSession, type SurfaceHandle } from "./sdk/waymote.ts";
 import {
   installViewerListeners,
@@ -63,12 +64,14 @@ function startViewer(): void {
   const listeners = new AbortController();
   let surface: SurfaceHandle | undefined;
   let removeViewerListeners: (() => void) | undefined;
+  let removeProtocolVersionListener: (() => void) | undefined;
   let disposed = false;
   function dispose(): void {
     if (disposed) return;
     disposed = true;
     listeners.abort();
     removeViewerListeners?.();
+    removeProtocolVersionListener?.();
     surface?.dispose();
     void session
       .dispose()
@@ -116,6 +119,17 @@ function startViewer(): void {
       session,
       attachedSurface,
     );
+    removeProtocolVersionListener = session.on("error", (error) => {
+      if (!(error instanceof ProtocolVersionMismatchError)) return;
+      const storageKey = "sprite-desktop.reloaded-for-protocol";
+      try {
+        if (sessionStorage.getItem(storageKey) === String(error.actual)) return;
+        sessionStorage.setItem(storageKey, String(error.actual));
+      } catch {
+        // Reloading can still replace stale assets when storage is unavailable.
+      }
+      location.reload();
+    });
     onPermissionClick(elements.pointerLockButton, async () => {
       if (document.pointerLockElement === elements.display) {
         attachedSurface.exitPointerLock();

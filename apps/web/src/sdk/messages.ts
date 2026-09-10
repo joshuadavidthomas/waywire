@@ -1,3 +1,18 @@
+// Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
+export const PROTOCOL_VERSION = 2;
+
+export class ProtocolVersionMismatchError extends Error {
+  constructor(
+    readonly expected: number,
+    readonly actual: number,
+  ) {
+    super(
+      `server speaks protocol version ${actual}, this page speaks ${expected}`,
+    );
+    this.name = "ProtocolVersionMismatchError";
+  }
+}
+
 export type CursorState = {
   readonly type: "cursor";
   readonly visible: boolean;
@@ -10,6 +25,7 @@ export type CursorState = {
 
 export type VideoConfiguration = {
   readonly type: "video-config";
+  readonly version: number;
   readonly codec: string;
 };
 
@@ -124,7 +140,8 @@ export function parseVideoConfiguration(
 ): VideoConfiguration | null {
   return isRecord(value) &&
     value.type === "video-config" &&
+    typeof value.version === "number" &&
     typeof value.codec === "string"
-    ? { type: value.type, codec: value.codec }
+    ? { type: value.type, version: value.version, codec: value.codec }
     : null;
 }

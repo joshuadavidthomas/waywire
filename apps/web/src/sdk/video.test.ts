@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+  PROTOCOL_VERSION,
+  ProtocolVersionMismatchError,
+  parseVideoConfiguration,
+} from "./messages.ts";
 import { WaymoteSession } from "./session.ts";
 import {
   FakeTarget,
@@ -17,12 +22,14 @@ import {
 type VideoFixture = {
   readonly session: WaymoteSession;
   readonly videoSocket: FakeWebSocket;
+  readonly socketAttempts: Array<{ path: string; socket: FakeWebSocket }>;
   readonly draws: number[];
 };
 
 async function videoFixture(): Promise<VideoFixture> {
   installBrowser();
   const sockets = new Map<string, FakeWebSocket>();
+  const socketAttempts: Array<{ path: string; socket: FakeWebSocket }> = [];
   const draws: number[] = [];
   const canvas = new FakeTarget();
   canvas.getContext = () => ({
@@ -35,6 +42,7 @@ async function videoFixture(): Promise<VideoFixture> {
     createWebSocket(path) {
       const created = new FakeWebSocket();
       sockets.set(path, created);
+      socketAttempts.push({ path, socket: created });
       return socket(created);
     },
   });
@@ -43,14 +51,55 @@ async function videoFixture(): Promise<VideoFixture> {
   await flush();
   const videoSocket = sockets.get("/stream");
   if (!videoSocket) throw new Error("video socket was not opened");
-  return { session, videoSocket, draws };
+  return { session, videoSocket, socketAttempts, draws };
 }
 
 function configure(socket: FakeWebSocket): void {
   socket.dispatch("message", {
-    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+    data: JSON.stringify({
+      type: "video-config",
+      version: PROTOCOL_VERSION,
+      codec: "avc1.42E01E",
+    }),
   });
 }
+
+test("protocol mismatch is terminal for both sockets", async () => {
+  assert.equal(
+    parseVideoConfiguration({ type: "video-config", codec: "avc1.42E01E" }),
+    null,
+  );
+  const fixture = await videoFixture();
+  const errors: Error[] = [];
+  fixture.session.on("error", (error) => errors.push(error));
+  const socketAttemptCount = fixture.socketAttempts.length;
+
+  fixture.videoSocket.dispatch("message", {
+    data: JSON.stringify({
+      type: "video-config",
+      version: PROTOCOL_VERSION + 1,
+      codec: "avc1.42E01E",
+    }),
+  });
+  await flush();
+
+  assert.equal(fixture.session.state.video.state, "error");
+  assert.equal(
+    fixture.session.state.video.message,
+    `server speaks protocol version ${PROTOCOL_VERSION + 1}, this page speaks ${PROTOCOL_VERSION}`,
+  );
+  assert.equal(errors.length, 1);
+  const [error] = errors;
+  assert.ok(error instanceof ProtocolVersionMismatchError);
+  assert.equal(error.expected, PROTOCOL_VERSION);
+  assert.equal(error.actual, PROTOCOL_VERSION + 1);
+  assert.deepEqual(fixture.videoSocket.closes[0], {
+    code: 4002,
+    reason: "protocol version mismatch",
+  });
+  assert.equal(fixture.socketAttempts.length, socketAttemptCount);
+  await fixture.session.dispose();
+});
 
 test("keyframes wait for decoder configuration and old sessions are ignored", async () => {
   const decoder = installDelayedVideoDecoder();

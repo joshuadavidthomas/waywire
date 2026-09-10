@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::PROTOCOL_VERSION;
 use crate::pipe;
 use crate::pipe::ClipboardText;
 use crate::pipe::Command;
@@ -58,7 +59,7 @@ impl ClientEvent {
     #[must_use]
     pub fn video_config(codec: String, frame_rate: Fps) -> Self {
         Self::VideoConfig {
-            version: pipe::VERSION,
+            version: PROTOCOL_VERSION,
             codec,
             frame_rate,
         }
@@ -291,7 +292,7 @@ pub struct VideoSample {
 pub fn encode_video_frame(sample: &VideoSample) -> Vec<u8> {
     let metadata = &sample.metadata;
     let mut bytes = vec![0; 40 + sample.data.len()];
-    bytes[0] = pipe::VERSION;
+    bytes[0] = PROTOCOL_VERSION;
     bytes[1] = 1;
     bytes[2] = u8::from(sample.key) | (u8::from(sample.discontinuity) << 1);
     bytes[4..12].copy_from_slice(&metadata.sequence.to_le_bytes());

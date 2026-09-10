@@ -1,4 +1,6 @@
 import {
+  PROTOCOL_VERSION,
+  ProtocolVersionMismatchError,
   parseVideoConfiguration,
   parseJson,
   type VideoConfiguration,
@@ -45,6 +47,7 @@ export interface VideoOwner {
   setStatus(text: string, connected?: boolean): void;
   updateState(changes: Partial<import("./session.ts").VideoState>): void;
   emitError(error: Error): void;
+  halt(error: Error): void;
   expectedPresentationTime(
     captureMicros: number,
     latencyMilliseconds: number,
@@ -79,7 +82,8 @@ export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
     return null;
   }
   const view = new DataView(buffer);
-  if (view.getUint8(0) !== 2 || view.getUint8(1) !== 1) return null;
+  if (view.getUint8(0) !== PROTOCOL_VERSION || view.getUint8(1) !== 1)
+    return null;
   return {
     buffer,
     keyframe: (view.getUint8(2) & 1) !== 0,
@@ -238,6 +242,17 @@ export class VideoRuntime {
         const message = parseVideoConfiguration(parseJson(event.data));
         if (!message) {
           socket.close(1003, "invalid video configuration");
+          return;
+        }
+        if (message.version !== PROTOCOL_VERSION) {
+          const error = new ProtocolVersionMismatchError(
+            PROTOCOL_VERSION,
+            message.version,
+          );
+          this.socket = null;
+          this.owner.setStatus("Protocol version mismatch");
+          socket.close(4002, "protocol version mismatch");
+          this.owner.halt(error);
           return;
         }
         decoderSetup = this.configureDecoder(message).catch((error) => {
