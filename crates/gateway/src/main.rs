@@ -1,4 +1,3 @@
-mod cursor;
 mod daemon;
 mod http;
 mod protocol;

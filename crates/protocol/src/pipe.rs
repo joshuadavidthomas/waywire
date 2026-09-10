@@ -1,4 +1,4 @@
-//! Gateway-to-streamd pipe vocabulary for protocol version 3.
+//! Gateway-to-streamd pipe vocabulary for protocol version 4.
 
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
@@ -187,48 +187,6 @@ impl Wire for FrameSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct CursorSize {
-    width: u32,
-    height: u32,
-}
-
-impl CursorSize {
-    pub fn new(width: u32, height: u32) -> Result<Self, InvalidValue> {
-        if (1..=256).contains(&width) && (1..=256).contains(&height) {
-            Ok(Self { width, height })
-        } else {
-            Err(InvalidValue("cursor dimensions must be between 1 and 256"))
-        }
-    }
-
-    #[must_use]
-    pub const fn width(self) -> u32 {
-        self.width
-    }
-
-    #[must_use]
-    pub const fn height(self) -> u32 {
-        self.height
-    }
-
-    #[must_use]
-    pub const fn byte_count(self) -> usize {
-        self.width as usize * self.height as usize * 4
-    }
-}
-
-impl Wire for CursorSize {
-    fn write(&self, out: &mut Writer) {
-        out.put(&self.width);
-        out.put(&self.height);
-    }
-
-    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
-        Self::new(input.get()?, input.get()?)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClipboardText(String);
 
@@ -380,6 +338,243 @@ pub enum KeyframeState {
 pub enum CursorVisibility {
     Hidden,
     Visible,
+}
+
+/// Named cursor shapes drawn from CSS `cursor` and `wp_cursor_shape_v1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(into = "&'static str")]
+pub enum CursorShape {
+    Default,
+    ContextMenu,
+    Help,
+    Pointer,
+    Progress,
+    Wait,
+    Cell,
+    Crosshair,
+    Text,
+    VerticalText,
+    Alias,
+    Copy,
+    Move,
+    NoDrop,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    EResize,
+    NResize,
+    NeResize,
+    NwResize,
+    SResize,
+    SeResize,
+    SwResize,
+    WResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ColResize,
+    RowResize,
+    AllScroll,
+    ZoomIn,
+    ZoomOut,
+    DndAsk,
+    AllResize,
+}
+
+impl CursorShape {
+    pub const ALL: [Self; 36] = [
+        Self::Default,
+        Self::ContextMenu,
+        Self::Help,
+        Self::Pointer,
+        Self::Progress,
+        Self::Wait,
+        Self::Cell,
+        Self::Crosshair,
+        Self::Text,
+        Self::VerticalText,
+        Self::Alias,
+        Self::Copy,
+        Self::Move,
+        Self::NoDrop,
+        Self::NotAllowed,
+        Self::Grab,
+        Self::Grabbing,
+        Self::EResize,
+        Self::NResize,
+        Self::NeResize,
+        Self::NwResize,
+        Self::SResize,
+        Self::SeResize,
+        Self::SwResize,
+        Self::WResize,
+        Self::EwResize,
+        Self::NsResize,
+        Self::NeswResize,
+        Self::NwseResize,
+        Self::ColResize,
+        Self::RowResize,
+        Self::AllScroll,
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::DndAsk,
+        Self::AllResize,
+    ];
+
+    #[must_use]
+    pub const fn css_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ContextMenu => "context-menu",
+            Self::Help => "help",
+            Self::Pointer => "pointer",
+            Self::Progress => "progress",
+            Self::Wait => "wait",
+            Self::Cell => "cell",
+            Self::Crosshair => "crosshair",
+            Self::Text => "text",
+            Self::VerticalText => "vertical-text",
+            Self::Alias => "alias",
+            Self::Copy => "copy",
+            Self::Move => "move",
+            Self::NoDrop => "no-drop",
+            Self::NotAllowed => "not-allowed",
+            Self::Grab => "grab",
+            Self::Grabbing => "grabbing",
+            Self::EResize => "e-resize",
+            Self::NResize => "n-resize",
+            Self::NeResize => "ne-resize",
+            Self::NwResize => "nw-resize",
+            Self::SResize => "s-resize",
+            Self::SeResize => "se-resize",
+            Self::SwResize => "sw-resize",
+            Self::WResize => "w-resize",
+            Self::EwResize => "ew-resize",
+            Self::NsResize => "ns-resize",
+            Self::NeswResize => "nesw-resize",
+            Self::NwseResize => "nwse-resize",
+            Self::ColResize => "col-resize",
+            Self::RowResize => "row-resize",
+            Self::AllScroll => "all-scroll",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
+            Self::DndAsk => "dnd-ask",
+            Self::AllResize => "all-resize",
+        }
+    }
+}
+
+impl From<CursorShape> for &'static str {
+    fn from(shape: CursorShape) -> Self {
+        shape.css_name()
+    }
+}
+
+impl Wire for CursorShape {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Default => 1_u8,
+            Self::ContextMenu => 2,
+            Self::Help => 3,
+            Self::Pointer => 4,
+            Self::Progress => 5,
+            Self::Wait => 6,
+            Self::Cell => 7,
+            Self::Crosshair => 8,
+            Self::Text => 9,
+            Self::VerticalText => 10,
+            Self::Alias => 11,
+            Self::Copy => 12,
+            Self::Move => 13,
+            Self::NoDrop => 14,
+            Self::NotAllowed => 15,
+            Self::Grab => 16,
+            Self::Grabbing => 17,
+            Self::EResize => 18,
+            Self::NResize => 19,
+            Self::NeResize => 20,
+            Self::NwResize => 21,
+            Self::SResize => 22,
+            Self::SeResize => 23,
+            Self::SwResize => 24,
+            Self::WResize => 25,
+            Self::EwResize => 26,
+            Self::NsResize => 27,
+            Self::NeswResize => 28,
+            Self::NwseResize => 29,
+            Self::ColResize => 30,
+            Self::RowResize => 31,
+            Self::AllScroll => 32,
+            Self::ZoomIn => 33,
+            Self::ZoomOut => 34,
+            Self::DndAsk => 35,
+            Self::AllResize => 36,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            1_u8 => Ok(Self::Default),
+            2 => Ok(Self::ContextMenu),
+            3 => Ok(Self::Help),
+            4 => Ok(Self::Pointer),
+            5 => Ok(Self::Progress),
+            6 => Ok(Self::Wait),
+            7 => Ok(Self::Cell),
+            8 => Ok(Self::Crosshair),
+            9 => Ok(Self::Text),
+            10 => Ok(Self::VerticalText),
+            11 => Ok(Self::Alias),
+            12 => Ok(Self::Copy),
+            13 => Ok(Self::Move),
+            14 => Ok(Self::NoDrop),
+            15 => Ok(Self::NotAllowed),
+            16 => Ok(Self::Grab),
+            17 => Ok(Self::Grabbing),
+            18 => Ok(Self::EResize),
+            19 => Ok(Self::NResize),
+            20 => Ok(Self::NeResize),
+            21 => Ok(Self::NwResize),
+            22 => Ok(Self::SResize),
+            23 => Ok(Self::SeResize),
+            24 => Ok(Self::SwResize),
+            25 => Ok(Self::WResize),
+            26 => Ok(Self::EwResize),
+            27 => Ok(Self::NsResize),
+            28 => Ok(Self::NeswResize),
+            29 => Ok(Self::NwseResize),
+            30 => Ok(Self::ColResize),
+            31 => Ok(Self::RowResize),
+            32 => Ok(Self::AllScroll),
+            33 => Ok(Self::ZoomIn),
+            34 => Ok(Self::ZoomOut),
+            35 => Ok(Self::DndAsk),
+            36 => Ok(Self::AllResize),
+            _ => Err(InvalidValue("unknown cursor shape")),
+        }
+    }
+}
+
+/// Cursor position in output pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CursorPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Wire for CursorPosition {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.x);
+        out.put(&self.y);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self {
+            x: input.get()?,
+            y: input.get()?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -899,79 +1094,6 @@ impl Wire for FrameMetadata {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct Hotspot {
-    pub x: i32,
-    pub y: i32,
-}
-
-impl Wire for Hotspot {
-    fn write(&self, out: &mut Writer) {
-        out.put(&self.x);
-        out.put(&self.y);
-    }
-
-    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
-        Ok(Self {
-            x: input.get()?,
-            y: input.get()?,
-        })
-    }
-}
-
-/// A cursor bitmap as Wayland shared memory provides it: one byte each of blue, green, red,
-/// and alpha per pixel, row-major, with color premultiplied by alpha. `pixels` holds exactly
-/// `size.byte_count()` bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CursorImage {
-    size: CursorSize,
-    pub hotspot: Hotspot,
-    pixels: Vec<u8>,
-}
-
-impl CursorImage {
-    pub fn new(size: CursorSize, hotspot: Hotspot, pixels: Vec<u8>) -> Result<Self, InvalidValue> {
-        if pixels.len() != size.byte_count() {
-            return Err(InvalidValue("cursor pixels must match its size"));
-        }
-        Ok(Self {
-            size,
-            hotspot,
-            pixels,
-        })
-    }
-
-    #[must_use]
-    pub const fn size(&self) -> CursorSize {
-        self.size
-    }
-
-    #[must_use]
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-
-    #[must_use]
-    pub fn into_pixels(self) -> Vec<u8> {
-        self.pixels
-    }
-}
-
-impl Wire for CursorImage {
-    fn write(&self, out: &mut Writer) {
-        out.put(&self.size);
-        out.put(&self.hotspot);
-        out.bytes(&self.pixels);
-    }
-
-    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
-        let size = input.get()?;
-        let hotspot = input.get()?;
-        let pixels = input.rest().to_vec();
-        Self::new(size, hotspot, pixels)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ResizeApplied {
     #[serde(rename = "request")]
     pub request_id: RequestId,
@@ -1005,8 +1127,9 @@ pub enum Event {
     Clipboard(ClipboardText),
     Frame(FrameMetadata),
     ResizeApplied(ResizeApplied),
-    CursorImage(CursorImage),
+    CursorShape(CursorShape),
     CursorVisibility(CursorVisibility),
+    CursorPosition(CursorPosition),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1015,8 +1138,9 @@ pub enum EventKind {
     Clipboard = 1,
     Frame = 2,
     ResizeApplied = 3,
-    CursorImage = 4,
+    CursorShape = 4,
     CursorVisibility = 5,
+    CursorPosition = 6,
 }
 
 impl RecordKind for EventKind {
@@ -1025,8 +1149,9 @@ impl RecordKind for EventKind {
             Self::Clipboard => 1,
             Self::Frame => 2,
             Self::ResizeApplied => 3,
-            Self::CursorImage => 4,
+            Self::CursorShape => 4,
             Self::CursorVisibility => 5,
+            Self::CursorPosition => 6,
         }
     }
 
@@ -1035,8 +1160,9 @@ impl RecordKind for EventKind {
             1 => Some(Self::Clipboard),
             2 => Some(Self::Frame),
             3 => Some(Self::ResizeApplied),
-            4 => Some(Self::CursorImage),
+            4 => Some(Self::CursorShape),
             5 => Some(Self::CursorVisibility),
+            6 => Some(Self::CursorPosition),
             _ => None,
         }
     }
@@ -1044,10 +1170,10 @@ impl RecordKind for EventKind {
     fn max_payload(self) -> usize {
         match self {
             Self::Clipboard => MAX_CLIPBOARD_BYTES,
-            Self::Frame => 32,            // FrameMetadata
-            Self::ResizeApplied => 16,    // request u16, size 2*u32, scale u16, generation u32
-            Self::CursorImage => 262_160, // size 2*u32, hotspot 2*i32, 256*256*4 pixels
-            Self::CursorVisibility => 1,
+            Self::Frame => 32,
+            Self::ResizeApplied => 16,
+            Self::CursorShape | Self::CursorVisibility => 1,
+            Self::CursorPosition => 8,
         }
     }
 }
@@ -1058,8 +1184,9 @@ impl Event {
             Self::Clipboard(_) => EventKind::Clipboard,
             Self::Frame(_) => EventKind::Frame,
             Self::ResizeApplied(_) => EventKind::ResizeApplied,
-            Self::CursorImage(_) => EventKind::CursorImage,
+            Self::CursorShape(_) => EventKind::CursorShape,
             Self::CursorVisibility(_) => EventKind::CursorVisibility,
+            Self::CursorPosition(_) => EventKind::CursorPosition,
         }
     }
 }
@@ -1076,8 +1203,9 @@ impl Record for Event {
             Self::Clipboard(payload) => out.put(payload),
             Self::Frame(payload) => out.put(payload),
             Self::ResizeApplied(payload) => out.put(payload),
-            Self::CursorImage(payload) => out.put(payload),
+            Self::CursorShape(payload) => out.put(payload),
             Self::CursorVisibility(payload) => out.put(payload),
+            Self::CursorPosition(payload) => out.put(payload),
         }
     }
 
@@ -1086,8 +1214,9 @@ impl Record for Event {
             EventKind::Clipboard => Ok(Self::Clipboard(input.get()?)),
             EventKind::Frame => Ok(Self::Frame(input.get()?)),
             EventKind::ResizeApplied => Ok(Self::ResizeApplied(input.get()?)),
-            EventKind::CursorImage => Ok(Self::CursorImage(input.get()?)),
+            EventKind::CursorShape => Ok(Self::CursorShape(input.get()?)),
             EventKind::CursorVisibility => Ok(Self::CursorVisibility(input.get()?)),
+            EventKind::CursorPosition => Ok(Self::CursorPosition(input.get()?)),
         }
     }
 }
@@ -1114,7 +1243,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    3, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
+                    4, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1124,7 +1253,7 @@ mod tests {
                     state: ButtonState::Pressed,
                     sequence,
                 }),
-                vec![3, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
+                vec![4, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
             ),
             (
                 "pointer scroll",
@@ -1134,7 +1263,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    3, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    4, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1144,12 +1273,12 @@ mod tests {
                     state: KeyState::Repeated,
                     sequence,
                 }),
-                vec![3, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
+                vec![4, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
             ),
             (
                 "release all",
                 Command::ReleaseAll(ReleaseAll),
-                vec![3, 5, 0, 0, 0, 0, 0, 0],
+                vec![4, 5, 0, 0, 0, 0, 0, 0],
             ),
             (
                 "resize",
@@ -1159,7 +1288,7 @@ mod tests {
                     request_id: value(RequestId::new(9)),
                 }),
                 vec![
-                    3, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
+                    4, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
                 ],
             ),
         ]
@@ -1171,7 +1300,7 @@ mod tests {
             (
                 "clipboard",
                 Command::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![3, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![4, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "pointer relative",
@@ -1181,7 +1310,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    3, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    4, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1192,7 +1321,7 @@ mod tests {
                     scale_percent: value(ScalePercent::new(75)),
                 }),
                 vec![
-                    3, 9, 0, 0, 12, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0,
+                    4, 9, 0, 0, 12, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0,
                 ],
             ),
             (
@@ -1202,7 +1331,7 @@ mod tests {
                     sequence,
                     text: value(InputText::new("hey".into())),
                 }),
-                vec![3, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
+                vec![4, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
             ),
             (
                 "keyframe readiness",
@@ -1210,7 +1339,7 @@ mod tests {
                     generation: value(Generation::new(4)),
                     state: KeyframeState::Cached,
                 }),
-                vec![3, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
+                vec![4, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
             ),
         ]
     }
@@ -1226,7 +1355,7 @@ mod tests {
             (
                 "clipboard",
                 Event::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![3, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![4, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "frame",
@@ -1240,7 +1369,7 @@ mod tests {
                     fps: value(Fps::new(60)),
                 }),
                 vec![
-                    3, 2, 0, 0, 32, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
+                    4, 2, 0, 0, 32, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
                     0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0,
                 ],
             ),
@@ -1253,25 +1382,23 @@ mod tests {
                     generation: value(Generation::new(4)),
                 }),
                 vec![
-                    3, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
+                    4, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
                 ],
             ),
             (
-                "cursor image",
-                Event::CursorImage(value(CursorImage::new(
-                    value(CursorSize::new(1, 1)),
-                    Hotspot { x: -1, y: 2 },
-                    vec![1, 2, 3, 4],
-                ))),
-                vec![
-                    3, 4, 0, 0, 20, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 255, 255, 255, 255, 2, 0, 0,
-                    0, 1, 2, 3, 4,
-                ],
+                "cursor shape",
+                Event::CursorShape(CursorShape::Pointer),
+                vec![4, 4, 0, 0, 1, 0, 0, 0, 4],
             ),
             (
                 "cursor visibility",
-                Event::CursorVisibility(CursorVisibility::Visible),
-                vec![3, 5, 0, 0, 1, 0, 0, 0, 1],
+                Event::CursorVisibility(CursorVisibility::Hidden),
+                vec![4, 5, 0, 0, 1, 0, 0, 0, 0],
+            ),
+            (
+                "cursor position",
+                Event::CursorPosition(CursorPosition { x: 10, y: 20 }),
+                vec![4, 6, 0, 0, 8, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0],
             ),
         ]
     }
@@ -1318,8 +1445,8 @@ mod tests {
 
     #[test]
     fn record_length_uses_the_common_header() {
-        let clipboard = [3, 7, 0, 0, 0, 0, 0, 0];
-        let release_all = [3, 5, 0, 0, 0, 0, 0, 0];
+        let clipboard = [4, 7, 0, 0, 0, 0, 0, 0];
+        let release_all = [4, 5, 0, 0, 0, 0, 0, 0];
 
         assert_eq!(Command::record_len(&clipboard), Ok(HEADER_BYTES));
         assert_eq!(Command::record_len(&release_all), Ok(HEADER_BYTES));
@@ -1336,7 +1463,7 @@ mod tests {
 
     #[test]
     fn nonzero_reserved_byte_is_an_invalid_header() {
-        let header = [3, 5, 1, 0, 0, 0, 0, 0];
+        let header = [4, 5, 1, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidHeader)
@@ -1345,7 +1472,7 @@ mod tests {
 
     #[test]
     fn unknown_command_kind_is_invalid_kind() {
-        let header = [3, 99, 0, 0, 0, 0, 0, 0];
+        let header = [4, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -1354,7 +1481,7 @@ mod tests {
 
     #[test]
     fn unknown_event_kind_is_invalid_kind() {
-        let header = [3, 99, 0, 0, 0, 0, 0, 0];
+        let header = [4, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Event::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -1363,7 +1490,7 @@ mod tests {
 
     #[test]
     fn command_text_payload_over_limit_is_too_large() {
-        let mut header = [3, 10, 0, 0, 0, 0, 0, 0];
+        let mut header = [4, 10, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_TEXT_BYTES + 6).expect("limit fits u32")).to_le_bytes(),
         );
@@ -1375,7 +1502,7 @@ mod tests {
 
     #[test]
     fn event_payload_over_limit_is_too_large() {
-        let mut header = [3, 1, 0, 0, 0, 0, 0, 0];
+        let mut header = [4, 1, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_CLIPBOARD_BYTES + 1).expect("limit fits u32")).to_le_bytes(),
         );
@@ -1387,7 +1514,7 @@ mod tests {
 
     #[test]
     fn clipboard_payload_must_be_utf8() {
-        let record = [3, 1, 0, 0, 1, 0, 0, 0, 0xff];
+        let record = [4, 1, 0, 0, 1, 0, 0, 0, 0xff];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 1, .. })
@@ -1396,7 +1523,7 @@ mod tests {
 
     #[test]
     fn text_payload_must_not_contain_nul() {
-        let record = [3, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let record = [4, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         assert!(matches!(
             Command::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 10, .. })
@@ -1405,7 +1532,7 @@ mod tests {
 
     #[test]
     fn short_frame_payload_is_invalid() {
-        let mut record = vec![3, 2, 0, 0, 31, 0, 0, 0];
+        let mut record = vec![4, 2, 0, 0, 31, 0, 0, 0];
         let mut payload = [0; 31];
         payload[0] = 1;
         payload[4] = 1;
@@ -1426,21 +1553,8 @@ mod tests {
     }
 
     #[test]
-    fn cursor_image_payload_length_must_match_its_size() {
-        let mut record = vec![3, 4, 0, 0, 16, 0, 0, 0];
-        let mut payload = [0; 16];
-        payload[0..4].copy_from_slice(&1_u32.to_le_bytes());
-        payload[4..8].copy_from_slice(&1_u32.to_le_bytes());
-        record.extend_from_slice(&payload);
-        assert!(matches!(
-            Event::decode(&record),
-            Err(ProtocolError::InvalidPayload { kind: 4, .. })
-        ));
-    }
-
-    #[test]
     fn command_payload_length_must_match_its_header() {
-        let record = [3, 7, 0, 0, 1, 0, 0, 0];
+        let record = [4, 7, 0, 0, 1, 0, 0, 0];
         assert_eq!(Command::decode(&record), Err(ProtocolError::Truncated));
     }
 
@@ -1495,8 +1609,30 @@ mod tests {
     }
 
     #[test]
-    fn cursor_image_rejects_wrong_length_buffer() {
-        let size = value(CursorSize::new(1, 1));
-        assert!(CursorImage::new(size, Hotspot { x: 0, y: 0 }, Vec::new()).is_err());
+    fn every_cursor_shape_has_its_pinned_wire_byte() {
+        for (index, shape) in CursorShape::ALL.into_iter().enumerate() {
+            let wire = u8::try_from(index + 1).expect("36 cursor shapes fit in a byte");
+            let bytes = vec![4, 4, 0, 0, 1, 0, 0, 0, wire];
+            assert_eq!(Event::CursorShape(shape).encode(), bytes);
+            assert_eq!(Event::decode(&bytes), Ok(Event::CursorShape(shape)));
+        }
+    }
+
+    #[test]
+    fn unknown_cursor_shape_wire_byte_is_invalid() {
+        let record = [4, 4, 0, 0, 1, 0, 0, 0, 37];
+        assert!(matches!(
+            Event::decode(&record),
+            Err(ProtocolError::InvalidPayload { kind: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn cursor_shape_json_names_are_exact() {
+        assert_eq!(
+            serde_json::to_string(CursorShape::ALL.as_slice())
+                .expect("cursor shape names should serialize"),
+            r#"["default","context-menu","help","pointer","progress","wait","cell","crosshair","text","vertical-text","alias","copy","move","no-drop","not-allowed","grab","grabbing","e-resize","n-resize","ne-resize","nw-resize","s-resize","se-resize","sw-resize","w-resize","ew-resize","ns-resize","nesw-resize","nwse-resize","col-resize","row-resize","all-scroll","zoom-in","zoom-out","dnd-ask","all-resize"]"#
+        );
     }
 }

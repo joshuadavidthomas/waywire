@@ -1,3 +1,5 @@
+mod shapes;
+
 use std::fs::File;
 use std::os::fd::AsFd;
 
@@ -9,11 +11,11 @@ use memmap2::MmapOptions;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
-use sprite_desktop_protocol::pipe::CursorImage;
-use sprite_desktop_protocol::pipe::CursorSize;
+use sprite_desktop_protocol::pipe::CursorPosition;
+use sprite_desktop_protocol::pipe::CursorShape;
 use sprite_desktop_protocol::pipe::CursorVisibility;
 use sprite_desktop_protocol::pipe::Event;
-use sprite_desktop_protocol::pipe::Hotspot;
+use tracing::debug;
 use wayland_client::QueueHandle;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_buffer;
@@ -26,8 +28,32 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
 
+use self::shapes::ImageKey;
+pub(super) use self::shapes::ShapeTable;
 use super::State;
 use crate::event_writer::EventSink;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct CursorSize {
+    width: u16,
+    height: u16,
+}
+
+impl CursorSize {
+    fn new(width: u32, height: u32) -> Result<Self> {
+        if !(1..=256).contains(&width) || !(1..=256).contains(&height) {
+            bail!("cursor dimensions must be between 1 and 256");
+        }
+        Ok(Self {
+            width: u16::try_from(width)?,
+            height: u16::try_from(height)?,
+        })
+    }
+
+    fn byte_count(self) -> usize {
+        usize::from(self.width) * usize::from(self.height) * 4
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ConstraintBatch {
@@ -49,24 +75,23 @@ pub(crate) struct Cursor {
     pub(crate) frame: Option<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1>,
     buffer: Option<wl_buffer::WlBuffer>,
     mapping: Option<MmapMut>,
-    width: u32,
-    height: u32,
+    size: Option<CursorSize>,
     has_pointer: bool,
     pub(crate) batch_width: Option<u32>,
     pub(crate) batch_height: Option<u32>,
     constraint_batch: ConstraintBatch,
-    pending_hotspot: Hotspot,
-    committed_hotspot: Hotspot,
     transform_normal: bool,
-    force_publish: bool,
-    published: Option<(u32, u32, Hotspot, Vec<u8>)>,
+    published_shape: Option<CursorShape>,
+    shapes: ShapeTable,
     /// `None` until the compositor has reported the cursor either way.
     visibility: Option<CursorVisibility>,
+    /// `None` until the cursor capture session has reported a position.
+    position: Option<CursorPosition>,
     events: EventSink,
 }
 
 impl Cursor {
-    pub(crate) fn new(events: EventSink) -> Self {
+    pub(crate) fn new(events: EventSink, shapes: ShapeTable) -> Self {
         Self {
             source_manager: None,
             capture_manager: None,
@@ -75,18 +100,16 @@ impl Cursor {
             frame: None,
             buffer: None,
             mapping: None,
-            width: 0,
-            height: 0,
+            size: None,
             has_pointer: false,
             batch_width: None,
             batch_height: None,
             constraint_batch: ConstraintBatch::Idle,
-            pending_hotspot: Hotspot { x: 0, y: 0 },
-            committed_hotspot: Hotspot { x: 0, y: 0 },
             transform_normal: false,
-            force_publish: true,
-            published: None,
+            published_shape: None,
+            shapes,
             visibility: None,
+            position: None,
             events,
         }
     }
@@ -158,20 +181,18 @@ impl Cursor {
             bail!("cursor capture does not support ARGB8888 SHM");
         }
         self.destroy_frame();
-        self.allocate(shm, width, height, qh)?;
+        self.allocate(shm, CursorSize::new(width, height)?, qh)?;
         self.request(qh)
     }
 
     fn allocate(
         &mut self,
         shm: &wl_shm::WlShm,
-        width: u32,
-        height: u32,
+        size: CursorSize,
         qh: &QueueHandle<State>,
     ) -> Result<()> {
-        let size = CursorSize::new(width, height)?;
         let length = size.byte_count();
-        if self.buffer.is_some() && self.width == width && self.height == height {
+        if self.buffer.is_some() && self.size == Some(size) {
             return Ok(());
         }
         if let Some(buffer) = self.buffer.take() {
@@ -186,9 +207,9 @@ impl Cursor {
         let pool = shm.create_pool(file.as_fd(), i32::try_from(length)?, qh, ());
         let buffer = pool.create_buffer(
             0,
-            i32::try_from(width)?,
-            i32::try_from(height)?,
-            i32::try_from(width.checked_mul(4).context("cursor stride overflow")?)?,
+            i32::from(size.width),
+            i32::from(size.height),
+            i32::from(size.width) * 4,
             wl_shm::Format::Argb8888,
             qh,
             (),
@@ -196,8 +217,7 @@ impl Cursor {
         pool.destroy();
         self.mapping = Some(mapping);
         self.buffer = Some(buffer);
-        self.width = width;
-        self.height = height;
+        self.size = Some(size);
         Ok(())
     }
 
@@ -210,14 +230,10 @@ impl Cursor {
             .as_ref()
             .context("cursor session unavailable")?;
         let buffer = self.buffer.as_ref().context("cursor buffer unavailable")?;
+        let size = self.size.context("cursor size unavailable")?;
         let frame = session.create_frame(qh, ());
         frame.attach_buffer(buffer);
-        frame.damage_buffer(
-            0,
-            0,
-            i32::try_from(self.width).context("cursor width exceeds protocol range")?,
-            i32::try_from(self.height).context("cursor height exceeds protocol range")?,
-        );
+        frame.damage_buffer(0, 0, i32::from(size.width), i32::from(size.height));
         frame.capture();
         self.transform_normal = false;
         self.frame = Some(frame);
@@ -229,27 +245,23 @@ impl Cursor {
             bail!("cursor frame omitted normal transform");
         }
         self.destroy_frame();
-        self.committed_hotspot = self.pending_hotspot;
         let pixels = self
             .mapping
             .as_ref()
-            .context("cursor mapping unavailable")?
-            .to_vec();
-        let changed = self.published.as_ref().is_none_or(|published| {
-            published.0 != self.width
-                || published.1 != self.height
-                || published.2 != self.committed_hotspot
-                || published.3 != pixels
+            .context("cursor mapping unavailable")?;
+        let size = self.size.context("cursor size unavailable")?;
+        let key = ImageKey::new(size, pixels);
+        let shape = self.shapes.get(&key).unwrap_or_else(|| {
+            debug!(
+                width = size.width,
+                height = size.height,
+                "captured cursor image has no shape match"
+            );
+            CursorShape::Default
         });
-        if changed || self.force_publish {
-            let image = CursorImage::new(
-                CursorSize::new(self.width, self.height)?,
-                self.committed_hotspot,
-                pixels.clone(),
-            )?;
-            self.events.send(&Event::CursorImage(image))?;
-            self.published = Some((self.width, self.height, self.committed_hotspot, pixels));
-            self.force_publish = false;
+        if self.published_shape != Some(shape) {
+            self.events.send(&Event::CursorShape(shape))?;
+            self.published_shape = Some(shape);
         }
         self.request(qh)
     }
@@ -272,7 +284,10 @@ impl Cursor {
                     buffer.destroy();
                 }
                 self.mapping = None;
-                self.allocate(shm, self.width, self.height, qh)?;
+                let size = self
+                    .size
+                    .context("cursor size unavailable after frame failure")?;
+                self.allocate(shm, size, qh)?;
                 self.request(qh)
             }
         }
@@ -286,8 +301,15 @@ impl Cursor {
         Ok(())
     }
 
-    pub(crate) fn hotspot(&mut self, hotspot: Hotspot) {
-        self.pending_hotspot = hotspot;
+    /// The protocol reports positions from the transformed capture buffer's top-left in pixels;
+    /// an output capture source therefore uses output pixels.
+    pub(crate) fn position(&mut self, position: CursorPosition) -> Result<()> {
+        if self.position == Some(position) {
+            return Ok(());
+        }
+        self.events.send(&Event::CursorPosition(position))?;
+        self.position = Some(position);
+        Ok(())
     }
 
     pub(crate) fn visibility(&mut self, visibility: CursorVisibility) -> Result<()> {
@@ -295,7 +317,7 @@ impl Cursor {
             return Ok(());
         }
         if visibility == CursorVisibility::Visible {
-            self.force_publish = true;
+            self.published_shape = None;
         }
         self.events.send(&Event::CursorVisibility(visibility))?;
         self.visibility = Some(visibility);
@@ -328,6 +350,16 @@ fn failure_recovery(constraints_changed: bool, collecting_constraints: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_size_enforces_capture_and_theme_bounds() {
+        let size = CursorSize::new(256, 256).expect("maximum cursor size should be valid");
+        assert_eq!(size.byte_count(), 256 * 256 * 4);
+        assert!(CursorSize::new(0, 1).is_err());
+        assert!(CursorSize::new(1, 0).is_err());
+        assert!(CursorSize::new(257, 1).is_err());
+        assert!(CursorSize::new(1, 257).is_err());
+    }
 
     #[test]
     fn constraint_failure_without_a_new_batch_reallocates_and_retries() {

@@ -16,10 +16,13 @@ serde.workspace = true
 serde_json.workspace = true
 sprite-desktop-protocol.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-misc.workspace = true
 wayland-protocols-wlr.workspace = true
+xcursor.workspace = true
 xkbcommon.workspace = true
 
 [lints]

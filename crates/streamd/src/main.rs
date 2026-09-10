@@ -2,10 +2,14 @@ mod event_writer;
 mod video;
 mod wayland;
 
+use std::env;
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Kbps;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +28,15 @@ struct Options {
     rtp_port: u16,
     #[arg(long, default_value = "us", value_parser = parse_layout)]
     xkb_layout: String,
+    #[arg(long, env = "XCURSOR_THEME", default_value = "breeze_cursors")]
+    cursor_theme: String,
+    #[arg(
+        long,
+        env = "XCURSOR_PATH",
+        value_delimiter = ':',
+        default_values_os_t = default_cursor_theme_paths()
+    )]
+    cursor_theme_path: Vec<PathBuf>,
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -48,6 +61,47 @@ fn parse_layout(value: &str) -> Result<String, String> {
     }
 }
 
+fn default_cursor_theme_paths() -> Vec<PathBuf> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut paths = Vec::new();
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        paths.push(PathBuf::from(data_home).join("icons"));
+    } else if let Some(home) = &home {
+        paths.push(home.join(".local/share/icons"));
+    }
+    if let Some(home) = &home {
+        paths.push(home.join(".icons"));
+    }
+    if let Some(data_dirs) = env::var_os("XDG_DATA_DIRS").filter(|value| !value.is_empty()) {
+        paths.extend(
+            env::split_paths(&data_dirs)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.join("icons")),
+        );
+    } else {
+        paths.extend([
+            PathBuf::from("/usr/local/share/icons"),
+            PathBuf::from("/usr/share/icons"),
+        ]);
+    }
+    paths.push(PathBuf::from("/usr/share/pixmaps"));
+    if let Some(home) = home {
+        paths.push(home.join(".cursors"));
+    }
+    paths.push(PathBuf::from("/usr/share/cursors/xorg-x11"));
+    paths
+}
+
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     wayland::run(Options::parse())
 }

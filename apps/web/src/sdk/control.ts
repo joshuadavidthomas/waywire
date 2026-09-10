@@ -259,7 +259,6 @@ export class ControlRuntime {
         },
         presentResizeGeneration: (generation, width, height) =>
           this.presentResizeGeneration(generation, width, height),
-        refreshCursor: () => this.localCursor?.refresh(),
         publishStats: (stats) => this.owner.setStats(stats),
       },
       this.options.latency,
@@ -685,7 +684,6 @@ export class ControlRuntime {
   }
 
   private scheduleResize(): void {
-    this.localCursor?.refresh();
     const policy = this.owner.remoteDisplayPolicy();
     if (policy.mode !== "observe") return;
     if (this.resizeTimer === null) {
@@ -902,7 +900,7 @@ export class ControlRuntime {
           try {
             this.localCursor?.update(message);
           } catch {
-            socket.close(1003, "invalid cursor image");
+            socket.close(1003, "invalid cursor state");
           }
         }
         if (message.type === "clipboard")
@@ -910,7 +908,6 @@ export class ControlRuntime {
         if (message.type === "quality") {
           this.qualityBitrate = message.bitrate;
           this.qualityScale = message.scale;
-          this.localCursor?.refresh();
           this.emit(
             "quality",
             Object.freeze({
@@ -1134,22 +1131,7 @@ export class ControlRuntime {
     }
 
     this.video.attach(attachedCanvas, this.context);
-    this.localCursor = new LocalCursor(
-      attachedInput,
-      () => {
-        if (this.video.renderedFrameCount === 0) return { x: 0, y: 0 };
-        const bounds = this.visibleContentBounds();
-        return {
-          x: ((bounds.width / attachedCanvas.width) * this.qualityScale) / 100,
-          y:
-            ((bounds.height / attachedCanvas.height) * this.qualityScale) / 100,
-        };
-      },
-      (error) => this.emit("error", error),
-    );
-    this.addSurfaceListener(window, "resize", () =>
-      this.localCursor?.refresh(),
-    );
+    this.localCursor = new LocalCursor(attachedInput);
     this.clipboardAutoSync = Boolean(surfaceOptions.clipboardAutoSync);
     this.owner.setControlOnFocus(Boolean(surfaceOptions.controlOnFocus));
     if (surfaceOptions.remoteDisplay) {

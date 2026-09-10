@@ -1,5 +1,5 @@
 // Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export class ProtocolVersionMismatchError extends Error {
   constructor(
@@ -13,21 +13,59 @@ export class ProtocolVersionMismatchError extends Error {
   }
 }
 
-export type CursorBitmap = {
-  readonly width: number;
-  readonly height: number;
-  readonly hotspot: {
-    readonly x: number;
-    readonly y: number;
-  };
-  readonly image: string;
-};
+const cursorShapeNames = [
+  "default",
+  "context-menu",
+  "help",
+  "pointer",
+  "progress",
+  "wait",
+  "cell",
+  "crosshair",
+  "text",
+  "vertical-text",
+  "alias",
+  "copy",
+  "move",
+  "no-drop",
+  "not-allowed",
+  "grab",
+  "grabbing",
+  "e-resize",
+  "n-resize",
+  "ne-resize",
+  "nw-resize",
+  "s-resize",
+  "se-resize",
+  "sw-resize",
+  "w-resize",
+  "ew-resize",
+  "ns-resize",
+  "nesw-resize",
+  "nwse-resize",
+  "col-resize",
+  "row-resize",
+  "all-scroll",
+  "zoom-in",
+  "zoom-out",
+  "dnd-ask",
+  "all-resize",
+] as const;
+
+export type CursorShape = (typeof cursorShapeNames)[number];
+
+const cursorShapes: ReadonlySet<string> = new Set(cursorShapeNames);
+
+function isCursorShape(value: unknown): value is CursorShape {
+  return typeof value === "string" && cursorShapes.has(value);
+}
 
 export type CursorState = {
   readonly type: "cursor";
   readonly visible: boolean;
-  // Null until the server has sent its first cursor image.
-  readonly bitmap: CursorBitmap | null;
+  readonly shape: CursorShape;
+  // Null until the server has sent its first cursor position.
+  readonly position: { readonly x: number; readonly y: number } | null;
 };
 
 export type VideoConfiguration = {
@@ -105,28 +143,28 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
             generation: value.generation,
           }
         : null;
-    case "cursor":
-      if (typeof value.visible !== "boolean") return null;
-      if (value.image === undefined) {
-        return { type: value.type, visible: value.visible, bitmap: null };
+    case "cursor": {
+      if (typeof value.visible !== "boolean" || !isCursorShape(value.shape))
+        return null;
+      if (value.position === undefined || value.position === null) {
+        return {
+          type: value.type,
+          visible: value.visible,
+          shape: value.shape,
+          position: null,
+        };
       }
-      return typeof value.width === "number" &&
-        typeof value.height === "number" &&
-        isRecord(value.hotspot) &&
-        typeof value.hotspot.x === "number" &&
-        typeof value.hotspot.y === "number" &&
-        typeof value.image === "string"
+      return isRecord(value.position) &&
+        typeof value.position.x === "number" &&
+        typeof value.position.y === "number"
         ? {
             type: value.type,
             visible: value.visible,
-            bitmap: {
-              width: value.width,
-              height: value.height,
-              hotspot: { x: value.hotspot.x, y: value.hotspot.y },
-              image: value.image,
-            },
+            shape: value.shape,
+            position: { x: value.position.x, y: value.position.y },
           }
         : null;
+    }
     case "clipboard":
       return typeof value.text === "string"
         ? { type: value.type, text: value.text }

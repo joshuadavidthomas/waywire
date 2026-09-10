@@ -37,6 +37,7 @@ use sprite_desktop_protocol::pipe::Kbps;
 use sprite_desktop_protocol::pipe::MAX_RAW_PIXELS;
 use sprite_desktop_protocol::pipe::ScalePercent;
 use thiserror::Error;
+use tracing::error;
 
 const SLOT_COUNT: usize = 3;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
@@ -502,7 +503,7 @@ impl Worker<'_> {
         frame: RawFrame,
         error: &io::Error,
     ) -> ControlFlow<()> {
-        eprintln!("sprite-desktop-streamd: could not start ffmpeg: {error}");
+        error!(%error, "could not start ffmpeg");
         self.consecutive_spawn_failures = self.consecutive_spawn_failures.saturating_add(1);
         if self.consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
             release_slot(self.shared, slot, frame);
@@ -567,7 +568,12 @@ impl Worker<'_> {
         frame: RawFrame,
         error: &io::Error,
     ) -> ControlFlow<()> {
-        eprintln!("sprite-desktop-streamd: ffmpeg frame write failed: {error}");
+        error!(
+            %error,
+            ?generation,
+            ?frame_generation,
+            "ffmpeg frame write failed"
+        );
         stop_process(self.shared, self.process.take());
         release_slot(self.shared, slot, frame);
         if is_stopping(self.shared) {

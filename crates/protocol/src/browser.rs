@@ -13,11 +13,11 @@ use crate::ProtocolError;
 use crate::pipe;
 use crate::pipe::ClipboardText;
 use crate::pipe::Command;
-use crate::pipe::CursorSize;
+use crate::pipe::CursorPosition;
+use crate::pipe::CursorShape;
 use crate::pipe::CursorVisibility;
 use crate::pipe::Fps;
 use crate::pipe::FrameMetadata;
-use crate::pipe::Hotspot;
 use crate::pipe::InputSequence;
 use crate::pipe::InputText;
 use crate::pipe::Kbps;
@@ -81,18 +81,10 @@ pub enum ControlState {
 pub struct CursorState {
     #[serde(rename = "visible")]
     pub visibility: CursorVisibility,
-    /// `None` until streamd has sent its first cursor image.
-    #[serde(flatten)]
-    pub bitmap: Option<CursorBitmap>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct CursorBitmap {
-    #[serde(flatten)]
-    pub size: CursorSize,
-    pub hotspot: Hotspot,
-    /// A PNG data URL.
-    pub image: String,
+    pub shape: CursorShape,
+    /// `None` until streamd has reported a position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<CursorPosition>,
 }
 
 impl Serialize for CursorVisibility {
@@ -108,7 +100,8 @@ impl Default for CursorState {
     fn default() -> Self {
         Self {
             visibility: CursorVisibility::Visible,
-            bitmap: None,
+            shape: CursorShape::Default,
+            position: None,
         }
     }
 }
@@ -406,7 +399,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![3, kind, 0, 0];
+        let mut bytes = vec![4, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -421,7 +414,7 @@ mod tests {
         let event = ClientEvent::video_config("avc1.F40034".into(), value(Fps::new(60)));
         assert_eq!(
             json(&event),
-            r#"{"type":"video-config","version":3,"codec":"avc1.F40034","frameRate":60}"#
+            r#"{"type":"video-config","version":4,"codec":"avc1.F40034","frameRate":60}"#
         );
     }
 
@@ -429,23 +422,20 @@ mod tests {
     fn cursor_json_is_exact() {
         let cursor = CursorState {
             visibility: CursorVisibility::Visible,
-            bitmap: Some(CursorBitmap {
-                size: value(CursorSize::new(1, 2)),
-                hotspot: Hotspot { x: -3, y: 4 },
-                image: "data:image/png;base64,AA==".into(),
-            }),
+            shape: CursorShape::Pointer,
+            position: Some(CursorPosition { x: 10, y: 20 }),
         };
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
-            r#"{"type":"cursor","visible":true,"width":1,"height":2,"hotspot":{"x":-3,"y":4},"image":"data:image/png;base64,AA=="}"#
+            r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20}}"#
         );
     }
 
     #[test]
-    fn cursor_without_a_bitmap_json_is_exact() {
+    fn cursor_without_a_position_json_is_exact() {
         assert_eq!(
             json(&ClientEvent::Cursor(CursorState::default())),
-            r#"{"type":"cursor","visible":true}"#
+            r#"{"type":"cursor","visible":true,"shape":"default"}"#
         );
     }
 
@@ -669,7 +659,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            3, 1, 0, 0, 36, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            4, 1, 0, 0, 36, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

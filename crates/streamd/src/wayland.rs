@@ -28,16 +28,17 @@ use nix::fcntl::fcntl;
 use sprite_desktop_protocol::Decoder;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::CursorPosition;
 use sprite_desktop_protocol::pipe::CursorVisibility;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Generation;
-use sprite_desktop_protocol::pipe::Hotspot;
 use sprite_desktop_protocol::pipe::InputSequence;
 use sprite_desktop_protocol::pipe::Kbps;
 use sprite_desktop_protocol::pipe::KeyframeState;
 use sprite_desktop_protocol::pipe::ResizeApplied;
 use sprite_desktop_protocol::pipe::ScalePercent;
+use tracing::warn;
 use wayland_client::Connection;
 use wayland_client::Dispatch;
 use wayland_client::QueueHandle;
@@ -79,6 +80,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1;
 use self::capture::Capture;
 use self::clipboard::Clipboard;
 use self::cursor::Cursor;
+use self::cursor::ShapeTable;
 use self::input::Input;
 use self::output::Head;
 use self::output::OutputManager;
@@ -120,6 +122,7 @@ pub(crate) struct State {
 }
 
 pub(crate) fn run(options: Options) -> Result<()> {
+    let shapes = ShapeTable::load(&options.cursor_theme, &options.cursor_theme_path)?;
     // Signals::new blocks these signals in this thread. Do this before any
     // native worker starts so every worker inherits the blocked mask.
     let signal_source =
@@ -128,6 +131,7 @@ pub(crate) fn run(options: Options) -> Result<()> {
     let mut event_queue = connection.new_event_queue();
     let qh = event_queue.handle();
     let (event_writer, event_sink) = EventWriter::start().context("start stdout event writer")?;
+    let cursor = Cursor::new(event_sink.clone(), shapes);
     let mut video = VideoEncoder::start(options.ffmpeg, options.rtp_port)?;
     let notification_source = video
         .take_notification_source()
@@ -144,7 +148,7 @@ pub(crate) fn run(options: Options) -> Result<()> {
         input: Input::new(options.xkb_layout),
         outputs: OutputManager::new(),
         clipboard: Clipboard::new(internal_sender),
-        cursor: Cursor::new(event_sink.clone()),
+        cursor,
         video: Some(video),
         event_sink,
         generation: Generation::new(1)?,
@@ -422,7 +426,7 @@ impl State {
                             }
                         }
                         Err(error) => {
-                            eprintln!("sprite-desktop-streamd: clipboard read failed: {error}");
+                            warn!(%error, "clipboard read failed");
                         }
                     }
                 }
@@ -828,7 +832,7 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for State 
             ext_data_control_device_v1::Event::PrimarySelection { .. } | _ => Ok(()),
         };
         if let Err(error) = result {
-            eprintln!("sprite-desktop-streamd: clipboard event failed: {error}");
+            warn!(%error, "clipboard event failed");
         }
     }
     event_created_child!(State, ext_data_control_device_v1::ExtDataControlDeviceV1, [
@@ -863,7 +867,7 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for State 
         match event {
             ext_data_control_source_v1::Event::Send { fd, .. } => {
                 if let Err(error) = state.clipboard.send_requested(proxy, fd) {
-                    eprintln!("sprite-desktop-streamd: clipboard send failed: {error}");
+                    warn!(%error, "clipboard send failed");
                 }
             }
             ext_data_control_source_v1::Event::Cancelled => state.clipboard.cancel_source(proxy),
@@ -940,11 +944,10 @@ impl Dispatch<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCurso
             ext_image_copy_capture_cursor_session_v1::Event::Leave => {
                 state.cursor.visibility(CursorVisibility::Hidden)
             }
-            ext_image_copy_capture_cursor_session_v1::Event::Hotspot { x, y } => {
-                state.cursor.hotspot(Hotspot { x, y });
-                Ok(())
+            ext_image_copy_capture_cursor_session_v1::Event::Position { x, y } => {
+                state.cursor.position(CursorPosition { x, y })
             }
-            ext_image_copy_capture_cursor_session_v1::Event::Position { .. } | _ => Ok(()),
+            ext_image_copy_capture_cursor_session_v1::Event::Hotspot { .. } | _ => Ok(()),
         };
         if let Err(error) = result {
             state.fail(error);

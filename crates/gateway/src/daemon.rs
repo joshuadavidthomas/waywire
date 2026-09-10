@@ -1,3 +1,4 @@
+use std::future::pending;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use sprite_desktop_protocol::browser::ClientEvent;
 use sprite_desktop_protocol::browser::CursorState;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::CursorPosition;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Kbps;
@@ -40,11 +42,11 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::sleep_until;
 use tokio::time::timeout;
 use tracing::info;
 use tracing::warn;
 
-use crate::cursor::CursorUpdate;
 use crate::protocol::EventReader;
 use crate::session::LeaseEpoch;
 use crate::video::VideoHub;
@@ -56,6 +58,57 @@ const COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const PIPE_DEADLINE: Duration = Duration::from_secs(2);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(15);
 const GROUP_EXIT_DEADLINE: Duration = Duration::from_secs(2);
+const CURSOR_POSITION_PERIOD: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorPositionGate {
+    Open,
+    Quiet {
+        until: Instant,
+        pending: Option<CursorPosition>,
+    },
+}
+
+impl CursorPositionGate {
+    fn push(&mut self, position: CursorPosition, now: Instant) -> Option<CursorPosition> {
+        match self {
+            Self::Open => {
+                *self = Self::Quiet {
+                    until: now + CURSOR_POSITION_PERIOD,
+                    pending: None,
+                };
+                Some(position)
+            }
+            Self::Quiet { pending, .. } => {
+                *pending = Some(position);
+                None
+            }
+        }
+    }
+
+    const fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Open => None,
+            Self::Quiet { until, .. } => Some(*until),
+        }
+    }
+
+    fn flush(&mut self, now: Instant) -> Option<CursorPosition> {
+        match std::mem::replace(self, Self::Open) {
+            Self::Open | Self::Quiet { pending: None, .. } => None,
+            Self::Quiet {
+                pending: Some(position),
+                ..
+            } => {
+                *self = Self::Quiet {
+                    until: now + CURSOR_POSITION_PERIOD,
+                    pending: None,
+                };
+                Some(position)
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Readiness {
@@ -528,32 +581,57 @@ async fn read_events(
     pipeline: VideoPipeline,
 ) -> Result<()> {
     let mut reader = EventReader::new(stdout);
-    while let Some(event) = reader.next().await? {
-        match event {
-            Event::Frame(metadata) => pipeline.metadata(metadata).await?,
-            Event::Clipboard(text) => {
-                *lock(&events.latest_clipboard, "daemon clipboard state") = Some(text.clone());
-                events.publish(ClientEvent::Clipboard { text });
+    let mut position_gate = CursorPositionGate::Open;
+    loop {
+        let position_deadline = position_gate.deadline();
+        tokio::select! {
+            event = reader.next() => {
+                let Some(event) = event? else {
+                    return Err(anyhow!("daemon event pipe closed"));
+                };
+                match event {
+                    Event::Frame(metadata) => pipeline.metadata(metadata).await?,
+                    Event::Clipboard(text) => {
+                        *lock(&events.latest_clipboard, "daemon clipboard state") = Some(text.clone());
+                        events.publish(ClientEvent::Clipboard { text });
+                    }
+                    Event::ResizeApplied(applied) => {
+                        events.publish(ClientEvent::ResizeApplied(applied));
+                    }
+                    Event::CursorShape(shape) => {
+                        publish_cursor(&events, |cursor| cursor.shape = shape);
+                    }
+                    Event::CursorVisibility(visibility) => {
+                        publish_cursor(&events, |cursor| cursor.visibility = visibility);
+                    }
+                    Event::CursorPosition(position) => {
+                        if let Some(position) = position_gate.push(position, Instant::now()) {
+                            publish_cursor(&events, |cursor| cursor.position = Some(position));
+                        }
+                    }
+                }
             }
-            Event::ResizeApplied(applied) => {
-                events.publish(ClientEvent::ResizeApplied(applied));
-            }
-            Event::CursorVisibility(visibility) => {
-                publish_cursor_update(&events, CursorUpdate::Visibility(visibility));
-            }
-            Event::CursorImage(image) => {
-                let update = CursorUpdate::image(image).await?;
-                publish_cursor_update(&events, update);
+            () = async move {
+                match position_deadline {
+                    Some(until) => sleep_until(until).await,
+                    None => pending::<()>().await,
+                }
+            } => {
+                if let Some(position) = position_gate.flush(Instant::now()) {
+                    publish_cursor(&events, |cursor| cursor.position = Some(position));
+                }
             }
         }
     }
-    Err(anyhow!("daemon event pipe closed"))
 }
 
-fn publish_cursor_update(events: &AppEvents, update: CursorUpdate) {
+fn publish_cursor<F>(events: &AppEvents, update: F)
+where
+    F: FnOnce(&mut CursorState),
+{
     let event = {
         let mut cursor = lock(&events.latest_cursor, "daemon cursor state");
-        update.apply(&mut cursor);
+        update(&mut cursor);
         ClientEvent::Cursor(cursor.clone())
     };
     events.publish(event);
@@ -638,6 +716,31 @@ mod tests {
     fn command_sink(capacity: usize) -> (CommandSink, CommandReader) {
         let (fatal, _) = mpsc::channel(1);
         CommandSink::new(capacity, COMMAND_BYTES, fatal, Readiness::new())
+    }
+
+    #[test]
+    fn cursor_position_gate_publishes_first_and_latest_without_idle_deadline() {
+        let now = Instant::now();
+        let first = CursorPosition { x: 1, y: 2 };
+        let replaced = CursorPosition { x: 3, y: 4 };
+        let latest = CursorPosition { x: 5, y: 6 };
+        let mut gate = CursorPositionGate::Open;
+
+        assert_eq!(gate.push(first, now), Some(first));
+        assert_eq!(gate.deadline(), Some(now + CURSOR_POSITION_PERIOD));
+        assert_eq!(gate.push(replaced, now), None);
+        assert_eq!(gate.push(latest, now), None);
+        let first_deadline = gate.deadline().expect("quiet gate should have a deadline");
+        assert_eq!(gate.flush(first_deadline), Some(latest));
+        assert_eq!(
+            gate.deadline(),
+            Some(first_deadline + CURSOR_POSITION_PERIOD)
+        );
+        let final_deadline = gate
+            .deadline()
+            .expect("rearmed gate should have a deadline");
+        assert_eq!(gate.flush(final_deadline), None);
+        assert_eq!(gate.deadline(), None);
     }
 
     #[tokio::test]

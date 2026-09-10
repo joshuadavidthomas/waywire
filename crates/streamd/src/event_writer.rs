@@ -32,15 +32,17 @@ pub(crate) enum EventWriterError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Replacement {
-    CursorImage,
-    CursorVisibility,
+    Shape,
+    Visibility,
+    Position,
 }
 
 impl Replacement {
     fn for_event(event: &Event) -> Option<Self> {
         match event {
-            Event::CursorImage(_) => Some(Self::CursorImage),
-            Event::CursorVisibility(_) => Some(Self::CursorVisibility),
+            Event::CursorShape(_) => Some(Self::Shape),
+            Event::CursorVisibility(_) => Some(Self::Visibility),
+            Event::CursorPosition(_) => Some(Self::Position),
             Event::Clipboard(_) | Event::Frame(_) | Event::ResizeApplied(_) => None,
         }
     }
@@ -245,14 +247,13 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use sprite_desktop_protocol::pipe::CursorImage;
-    use sprite_desktop_protocol::pipe::CursorSize;
+    use sprite_desktop_protocol::pipe::CursorPosition;
+    use sprite_desktop_protocol::pipe::CursorShape;
     use sprite_desktop_protocol::pipe::CursorVisibility;
     use sprite_desktop_protocol::pipe::Fps;
     use sprite_desktop_protocol::pipe::FrameDimension;
     use sprite_desktop_protocol::pipe::FrameMetadata;
     use sprite_desktop_protocol::pipe::Generation;
-    use sprite_desktop_protocol::pipe::Hotspot;
 
     use super::*;
 
@@ -299,44 +300,29 @@ mod tests {
     }
 
     #[test]
-    fn replaceable_cursor_cannot_break_the_byte_budget() {
-        let old = Event::CursorImage(
-            CursorImage::new(
-                CursorSize::new(1, 1).expect("test cursor size should be valid"),
-                Hotspot { x: 0, y: 0 },
-                vec![0; 4],
-            )
-            .expect("test cursor image should be valid"),
-        )
-        .encode();
-        let filler_len = MAX_QUEUED_BYTES - old.len();
-        let records = VecDeque::from([
-            QueuedEvent {
-                bytes: vec![0; filler_len],
-                replacement: None,
-            },
-            QueuedEvent {
-                bytes: old.clone(),
-                replacement: Some(Replacement::CursorImage),
-            },
-        ]);
-        let sink = sink_with_queue(records, MAX_QUEUED_BYTES);
+    fn cursor_updates_replace_only_the_same_kind() {
+        let sink = sink_with_queue(VecDeque::new(), 0);
+        sink.send(&Event::CursorShape(CursorShape::Default))
+            .expect("first cursor shape should queue");
+        let shape = Event::CursorShape(CursorShape::Pointer);
+        sink.send(&shape)
+            .expect("new cursor shape should replace old shape");
+        sink.send(&Event::CursorVisibility(CursorVisibility::Visible))
+            .expect("cursor visibility should queue separately");
+        sink.send(&Event::CursorPosition(CursorPosition { x: 1, y: 2 }))
+            .expect("first cursor position should queue");
+        let position = Event::CursorPosition(CursorPosition { x: 3, y: 4 });
+        sink.send(&position)
+            .expect("new cursor position should replace old position");
 
-        let image = CursorImage::new(
-            CursorSize::new(2, 2).expect("test cursor size should be valid"),
-            Hotspot { x: 0, y: 0 },
-            vec![0; 16],
-        )
-        .expect("test cursor image should be valid");
-        let result = sink.send(&Event::CursorImage(image));
-
-        assert!(matches!(result, Err(EventWriterError::QueueFull)));
         let queue = sink
             .shared
             .queue
             .lock()
             .expect("queue lock should not be poisoned");
-        assert_eq!(queue.bytes, MAX_QUEUED_BYTES);
-        assert_eq!(queue.records.back().map(|record| &record.bytes), Some(&old));
+        assert_eq!(queue.records.len(), 3);
+        assert_eq!(queue.records[0].bytes, shape.encode());
+        assert_eq!(queue.records[1].replacement, Some(Replacement::Visibility));
+        assert_eq!(queue.records[2].bytes, position.encode());
     }
 }

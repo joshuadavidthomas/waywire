@@ -58,7 +58,6 @@ export interface VideoOwner {
     width: number,
     height: number,
   ): WaymoteStats["resizeState"];
-  refreshCursor(): void;
   publishStats(stats: WaymoteStats): void;
 }
 
@@ -616,7 +615,6 @@ export class VideoRuntime {
     context.drawImage(frame, 0, 0, display.width, display.height);
     const drawCompletedAtMs = performance.now();
     this.renderedFrames += 1;
-    if (dimensionsChanged) this.owner.refreshCursor();
     const presentation = this.owner.expectedPresentationTime(
       frame.timestamp,
       this.targetLatencyMilliseconds,
