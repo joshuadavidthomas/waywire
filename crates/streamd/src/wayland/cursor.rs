@@ -11,7 +11,9 @@ use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
 use sprite_desktop_protocol::pipe::CursorImage;
 use sprite_desktop_protocol::pipe::CursorSize;
+use sprite_desktop_protocol::pipe::CursorVisibility;
 use sprite_desktop_protocol::pipe::Event;
+use sprite_desktop_protocol::pipe::Hotspot;
 use wayland_client::QueueHandle;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_buffer;
@@ -28,26 +30,12 @@ use super::State;
 use crate::event_writer::EventSink;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Hotspot {
-    x: i32,
-    y: i32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ConstraintBatch {
     #[default]
     Idle,
     Collecting {
         argb: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Visibility {
-    #[default]
-    Unknown,
-    Visible,
-    Hidden,
 }
 
 pub(crate) struct Cursor {
@@ -72,7 +60,8 @@ pub(crate) struct Cursor {
     transform_normal: bool,
     force_publish: bool,
     published: Option<(u32, u32, Hotspot, Vec<u8>)>,
-    visibility: Visibility,
+    /// `None` until the compositor has reported the cursor either way.
+    visibility: Option<CursorVisibility>,
     events: EventSink,
 }
 
@@ -92,12 +81,12 @@ impl Cursor {
             batch_width: None,
             batch_height: None,
             constraint_batch: ConstraintBatch::Idle,
-            pending_hotspot: Hotspot::default(),
-            committed_hotspot: Hotspot::default(),
+            pending_hotspot: Hotspot { x: 0, y: 0 },
+            committed_hotspot: Hotspot { x: 0, y: 0 },
             transform_normal: false,
             force_publish: true,
             published: None,
-            visibility: Visibility::Unknown,
+            visibility: None,
             events,
         }
     }
@@ -255,8 +244,7 @@ impl Cursor {
         if changed || self.force_publish {
             let image = CursorImage::new(
                 CursorSize::new(self.width, self.height)?,
-                self.committed_hotspot.x,
-                self.committed_hotspot.y,
+                self.committed_hotspot,
                 pixels.clone(),
             )?;
             self.events.send(&Event::CursorImage(image))?;
@@ -298,27 +286,19 @@ impl Cursor {
         Ok(())
     }
 
-    pub(crate) fn hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) {
-        self.pending_hotspot = Hotspot {
-            x: hotspot_x,
-            y: hotspot_y,
-        };
+    pub(crate) fn hotspot(&mut self, hotspot: Hotspot) {
+        self.pending_hotspot = hotspot;
     }
 
-    pub(crate) fn visibility(&mut self, visible: bool) -> Result<()> {
-        let visibility = if visible {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
-        if self.visibility == visibility {
+    pub(crate) fn visibility(&mut self, visibility: CursorVisibility) -> Result<()> {
+        if self.visibility == Some(visibility) {
             return Ok(());
         }
-        if visible {
+        if visibility == CursorVisibility::Visible {
             self.force_publish = true;
         }
-        self.events.send(&Event::CursorVisibility(visible))?;
-        self.visibility = visibility;
+        self.events.send(&Event::CursorVisibility(visibility))?;
+        self.visibility = Some(visibility);
         Ok(())
     }
 

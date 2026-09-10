@@ -31,7 +31,6 @@ use sprite_desktop_protocol::browser::ClientMessage;
 use sprite_desktop_protocol::browser::ControlState;
 use sprite_desktop_protocol::browser::QualityLevels;
 use sprite_desktop_protocol::browser::VideoSample;
-use sprite_desktop_protocol::browser::encode_video_frame;
 use sprite_desktop_protocol::browser::parse_browser_record;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Fps;
@@ -677,7 +676,7 @@ async fn send_video(
     frame: &VideoSample,
     cancellation: &CancellationToken,
 ) -> Result<(), SocketEnd> {
-    let bytes = encode_video_frame(frame);
+    let bytes = frame.encode();
     send(socket, Message::Binary(bytes.into()), cancellation).await
 }
 

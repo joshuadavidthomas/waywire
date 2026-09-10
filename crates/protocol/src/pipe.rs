@@ -291,6 +291,24 @@ pub enum KeyState {
     Repeated,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonState {
+    Released,
+    Pressed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyframeState {
+    Missing,
+    Cached,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorVisibility {
+    Hidden,
+    Visible,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TextAction {
@@ -307,7 +325,7 @@ pub enum Command {
     },
     PointerButton {
         button: PointerButton,
-        pressed: bool,
+        state: ButtonState,
         sequence: InputSequence,
     },
     PointerScroll {
@@ -344,7 +362,7 @@ pub enum Command {
     },
     KeyframeReadiness {
         generation: Generation,
-        ready: bool,
+        state: KeyframeState,
     },
 }
 
@@ -398,11 +416,14 @@ impl Command {
             ),
             Self::PointerButton {
                 button,
-                pressed,
+                state,
                 sequence,
             } => command_bytes(
                 CommandKind::PointerButton,
-                u8::from(*pressed),
+                match state {
+                    ButtonState::Released => 0,
+                    ButtonState::Pressed => 1,
+                },
                 button.wire(),
                 0,
                 sequence.get(),
@@ -481,9 +502,12 @@ impl Command {
                 bytes.extend_from_slice(text.as_str().as_bytes());
                 bytes
             }
-            Self::KeyframeReadiness { generation, ready } => command_bytes(
+            Self::KeyframeReadiness { generation, state } => command_bytes(
                 CommandKind::KeyframeReadiness,
-                u8::from(*ready),
+                match state {
+                    KeyframeState::Missing => 0,
+                    KeyframeState::Cached => 1,
+                },
                 generation.get(),
                 0,
                 0,
@@ -524,9 +548,9 @@ impl Command {
                 Ok(Self::PointerButton {
                     button: PointerButton::from_wire(header.a)
                         .ok_or(InvalidValue("unknown pointer button"))?,
-                    pressed: match header.state {
-                        0 => false,
-                        1 => true,
+                    state: match header.state {
+                        0 => ButtonState::Released,
+                        1 => ButtonState::Pressed,
                         _ => return Err(InvalidValue("state must be zero or one")),
                     },
                     sequence: InputSequence::new(header.c)?,
@@ -643,9 +667,9 @@ impl Command {
                 }
                 Ok(Self::KeyframeReadiness {
                     generation: Generation::new(header.a)?,
-                    ready: match header.state {
-                        0 => false,
-                        1 => true,
+                    state: match header.state {
+                        0 => KeyframeState::Missing,
+                        1 => KeyframeState::Cached,
                         _ => return Err(InvalidValue("state must be zero or one")),
                     },
                 })
@@ -726,19 +750,19 @@ impl CommandKind {
 ///
 /// What `state`, `a`, `b`, and `c` hold for each kind:
 ///
-/// | kind               | state     | a              | b        | c                               |
-/// |--------------------|-----------|----------------|----------|---------------------------------|
-/// | pointer absolute   | 0         | x              | y        | sequence                        |
-/// | pointer button     | pressed   | button         | 0        | sequence                        |
-/// | pointer scroll     | 0         | dx bits        | dy bits  | sequence                        |
-/// | keyboard key       | key state | key            | 0        | sequence                        |
-/// | release all        | 0         | 0              | 0        | 0                               |
-/// | resize             | 0         | width          | height   | scale (low 16), request (high 16) |
-/// | clipboard          | 0         | payload length | 0        | 0                               |
-/// | pointer relative   | 0         | dx bits        | dy bits  | sequence                        |
-/// | quality            | 0         | bitrate        | fps      | scale percent                   |
-/// | text               | action    | payload length | sequence | 0                               |
-/// | keyframe readiness | ready     | generation     | 0        | 0                               |
+/// | kind               | state          | a              | b        | c                                 |
+/// |--------------------|----------------|----------------|----------|-----------------------------------|
+/// | pointer absolute   | 0              | x              | y        | sequence                          |
+/// | pointer button     | button state   | button         | 0        | sequence                          |
+/// | pointer scroll     | 0              | dx bits        | dy bits  | sequence                          |
+/// | keyboard key       | key state      | key            | 0        | sequence                          |
+/// | release all        | 0              | 0              | 0        | 0                                 |
+/// | resize             | 0              | width          | height   | scale (low 16), request (high 16) |
+/// | clipboard          | 0              | payload length | 0        | 0                                 |
+/// | pointer relative   | 0              | dx bits        | dy bits  | sequence                          |
+/// | quality            | 0              | bitrate        | fps      | scale percent                     |
+/// | text               | action         | payload length | sequence | 0                                 |
+/// | keyframe readiness | keyframe state | generation     | 0        | 0                                 |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandHeader {
     kind: CommandKind,
@@ -823,29 +847,31 @@ pub struct FrameMetadata {
     pub fps: Fps,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hotspot {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// A cursor bitmap as Wayland shared memory provides it: one byte each of blue, green, red,
+/// and alpha per pixel, row-major, with color premultiplied by alpha. `pixels` holds exactly
+/// `size.byte_count()` bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorImage {
     size: CursorSize,
-    pub hotspot_x: i32,
-    pub hotspot_y: i32,
-    bgra: Vec<u8>,
+    pub hotspot: Hotspot,
+    pixels: Vec<u8>,
 }
 
 impl CursorImage {
-    pub fn new(
-        size: CursorSize,
-        hotspot_x: i32,
-        hotspot_y: i32,
-        bgra: Vec<u8>,
-    ) -> Result<Self, InvalidValue> {
-        if bgra.len() != size.byte_count() {
-            return Err(InvalidValue("cursor image bytes must match its size"));
+    pub fn new(size: CursorSize, hotspot: Hotspot, pixels: Vec<u8>) -> Result<Self, InvalidValue> {
+        if pixels.len() != size.byte_count() {
+            return Err(InvalidValue("cursor pixels must match its size"));
         }
         Ok(Self {
             size,
-            hotspot_x,
-            hotspot_y,
-            bgra,
+            hotspot,
+            pixels,
         })
     }
 
@@ -855,13 +881,13 @@ impl CursorImage {
     }
 
     #[must_use]
-    pub fn bgra(&self) -> &[u8] {
-        &self.bgra
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
     }
 
     #[must_use]
-    pub fn into_bgra(self) -> Vec<u8> {
-        self.bgra
+    pub fn into_pixels(self) -> Vec<u8> {
+        self.pixels
     }
 }
 
@@ -882,8 +908,8 @@ pub enum Event {
     },
     /// A payload with width at 0, height at 4, hotspot x at 8, hotspot y at 12, and BGRA bytes at 16.
     CursorImage(CursorImage),
-    /// A one-byte payload at offset 0: 0 means hidden and 1 means visible.
-    CursorVisibility(bool),
+    /// A one-byte payload at offset 0: 0 is hidden and 1 is visible.
+    CursorVisibility(CursorVisibility),
 }
 
 struct Fields<'a>(&'a [u8]);
@@ -977,16 +1003,20 @@ impl Event {
             }
             Self::CursorImage(image) => {
                 let size = image.size();
-                let mut payload = Vec::with_capacity(16 + image.bgra().len());
+                let mut payload = Vec::with_capacity(16 + image.pixels().len());
                 payload.extend_from_slice(&size.width().to_le_bytes());
                 payload.extend_from_slice(&size.height().to_le_bytes());
-                payload.extend_from_slice(&image.hotspot_x.to_le_bytes());
-                payload.extend_from_slice(&image.hotspot_y.to_le_bytes());
-                payload.extend_from_slice(image.bgra());
+                payload.extend_from_slice(&image.hotspot.x.to_le_bytes());
+                payload.extend_from_slice(&image.hotspot.y.to_le_bytes());
+                payload.extend_from_slice(image.pixels());
                 (EventKind::CursorImage, payload)
             }
-            Self::CursorVisibility(visible) => {
-                (EventKind::CursorVisibility, vec![u8::from(*visible)])
+            Self::CursorVisibility(visibility) => {
+                let visible = match visibility {
+                    CursorVisibility::Hidden => 0,
+                    CursorVisibility::Visible => 1,
+                };
+                (EventKind::CursorVisibility, vec![visible])
             }
         };
         let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
@@ -1051,22 +1081,22 @@ impl Event {
             EventKind::CursorImage => {
                 let mut fields = Fields(payload);
                 let size = CursorSize::new(fields.u32()?, fields.u32()?)?;
-                let hotspot_x = fields.i32()?;
-                let hotspot_y = fields.i32()?;
-                let bgra = fields.rest().to_vec();
-                Ok(Self::CursorImage(CursorImage::new(
-                    size, hotspot_x, hotspot_y, bgra,
-                )?))
+                let hotspot = Hotspot {
+                    x: fields.i32()?,
+                    y: fields.i32()?,
+                };
+                let pixels = fields.rest().to_vec();
+                Ok(Self::CursorImage(CursorImage::new(size, hotspot, pixels)?))
             }
             EventKind::CursorVisibility => {
                 let mut fields = Fields(payload);
-                let visible = match fields.u8()? {
-                    0 => false,
-                    1 => true,
+                let visibility = match fields.u8()? {
+                    0 => CursorVisibility::Hidden,
+                    1 => CursorVisibility::Visible,
                     _ => return Err(InvalidValue("visibility must be zero or one")),
                 };
                 fields.finish()?;
-                Ok(Self::CursorVisibility(visible))
+                Ok(Self::CursorVisibility(visibility))
             }
         }
     }
@@ -1160,7 +1190,7 @@ mod tests {
                 "pointer button",
                 Command::PointerButton {
                     button: PointerButton::Left,
-                    pressed: true,
+                    state: ButtonState::Pressed,
                     sequence,
                 },
                 vec![2, 2, 1, 0, 16, 1, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0],
@@ -1237,7 +1267,7 @@ mod tests {
                 "keyframe readiness",
                 Command::KeyframeReadiness {
                     generation: value(Generation::new(4)),
-                    ready: true,
+                    state: KeyframeState::Cached,
                 },
                 vec![2, 11, 1, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             ),
@@ -1284,8 +1314,7 @@ mod tests {
                 "cursor image",
                 Event::CursorImage(value(CursorImage::new(
                     value(CursorSize::new(1, 1)),
-                    -1,
-                    2,
+                    Hotspot { x: -1, y: 2 },
                     vec![1, 2, 3, 4],
                 ))),
                 vec![
@@ -1295,7 +1324,7 @@ mod tests {
             ),
             (
                 "cursor visibility",
-                Event::CursorVisibility(true),
+                Event::CursorVisibility(CursorVisibility::Visible),
                 vec![2, 5, 0, 0, 1, 0, 0, 0, 1],
             ),
         ]
@@ -1504,6 +1533,6 @@ mod tests {
     #[test]
     fn cursor_image_rejects_wrong_length_buffer() {
         let size = value(CursorSize::new(1, 1));
-        assert!(CursorImage::new(size, 0, 0, Vec::new()).is_err());
+        assert!(CursorImage::new(size, Hotspot { x: 0, y: 0 }, Vec::new()).is_err());
     }
 }

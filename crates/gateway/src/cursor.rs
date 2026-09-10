@@ -7,65 +7,61 @@ use base64::engine::general_purpose::STANDARD;
 use sprite_desktop_protocol::browser::CursorState;
 use sprite_desktop_protocol::pipe::CursorImage;
 use sprite_desktop_protocol::pipe::CursorSize;
+use sprite_desktop_protocol::pipe::CursorVisibility;
+use sprite_desktop_protocol::pipe::Hotspot;
 
 pub(crate) enum CursorUpdate {
-    Visibility {
-        visible: bool,
-    },
+    Visibility(CursorVisibility),
     Image {
         width: u32,
         height: u32,
-        hotspot_x: i32,
-        hotspot_y: i32,
+        hotspot: Hotspot,
         image: String,
     },
 }
 
 impl CursorUpdate {
-    pub(crate) fn visibility(visible: bool) -> Self {
-        Self::Visibility { visible }
+    pub(crate) fn visibility(visibility: CursorVisibility) -> Self {
+        Self::Visibility(visibility)
     }
 
     pub(crate) async fn image(cursor: CursorImage) -> Result<Self> {
         let size = cursor.size();
-        let hotspot_x = cursor.hotspot_x;
-        let hotspot_y = cursor.hotspot_y;
-        let bgra = cursor.into_bgra();
-        let image = tokio::task::spawn_blocking(move || encode(size, &bgra))
+        let hotspot = cursor.hotspot;
+        let pixels = cursor.into_pixels();
+        let image = tokio::task::spawn_blocking(move || encode(size, &pixels))
             .await
             .context("cursor encoder task failed")??;
         Ok(Self::Image {
             width: size.width(),
             height: size.height(),
-            hotspot_x,
-            hotspot_y,
+            hotspot,
             image,
         })
     }
 
     pub(crate) fn apply(self, current: &mut CursorState) {
         match self {
-            Self::Visibility { visible } => current.visible = visible,
+            Self::Visibility(visibility) => current.visibility = visibility,
             Self::Image {
                 width,
                 height,
-                hotspot_x,
-                hotspot_y,
+                hotspot,
                 image,
             } => {
                 current.width = width;
                 current.height = height;
-                current.hotspot_x = hotspot_x;
-                current.hotspot_y = hotspot_y;
+                current.hotspot_x = hotspot.x;
+                current.hotspot_y = hotspot.y;
                 current.image = image;
             }
         }
     }
 }
 
-fn encode(size: CursorSize, bgra: &[u8]) -> Result<String> {
-    let mut rgba = Vec::with_capacity(bgra.len());
-    for pixel in bgra.chunks_exact(4) {
+fn encode(size: CursorSize, pixels: &[u8]) -> Result<String> {
+    let mut rgba = Vec::with_capacity(pixels.len());
+    for pixel in pixels.chunks_exact(4) {
         let alpha = pixel[3];
         let unpremultiply = |value: u8| {
             if alpha == 0 {
@@ -100,17 +96,17 @@ mod tests {
     async fn builds_cursor_state_with_unpremultiplied_png_pixels() {
         let size = CursorSize::new(1, 1).expect("test cursor size should be valid");
         let mut state = CursorState {
-            visible: false,
+            visibility: CursorVisibility::Hidden,
             ..CursorState::default()
         };
-        let cursor = CursorImage::new(size, -3, 4, vec![16, 32, 64, 128])
+        let cursor = CursorImage::new(size, Hotspot { x: -3, y: 4 }, vec![16, 32, 64, 128])
             .expect("test cursor image should be valid");
         CursorUpdate::image(cursor)
             .await
             .expect("test cursor image should encode")
             .apply(&mut state);
 
-        assert!(!state.visible);
+        assert_eq!(state.visibility, CursorVisibility::Hidden);
         assert_eq!(state.width, 1);
         assert_eq!(state.height, 1);
         assert_eq!(state.hotspot_x, -3);

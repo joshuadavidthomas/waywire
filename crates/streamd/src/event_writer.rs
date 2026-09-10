@@ -246,10 +246,12 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 mod tests {
     use sprite_desktop_protocol::pipe::CursorImage;
     use sprite_desktop_protocol::pipe::CursorSize;
+    use sprite_desktop_protocol::pipe::CursorVisibility;
     use sprite_desktop_protocol::pipe::Fps;
     use sprite_desktop_protocol::pipe::FrameDimension;
     use sprite_desktop_protocol::pipe::FrameMetadata;
     use sprite_desktop_protocol::pipe::Generation;
+    use sprite_desktop_protocol::pipe::Hotspot;
 
     use super::*;
 
@@ -281,9 +283,9 @@ mod tests {
             fps: Fps::new(60).expect("test frame rate should be valid"),
         }))
         .expect("frame metadata should queue");
-        sink.send(&Event::CursorVisibility(false))
+        sink.send(&Event::CursorVisibility(CursorVisibility::Hidden))
             .expect("cursor hide should queue");
-        let visible = Event::CursorVisibility(true);
+        let visible = Event::CursorVisibility(CursorVisibility::Visible);
         sink.send(&visible).expect("cursor show should queue");
         let expected = visible.encode();
         let queue = shared
@@ -300,8 +302,7 @@ mod tests {
         let old = Event::CursorImage(
             CursorImage::new(
                 CursorSize::new(1, 1).expect("test cursor size should be valid"),
-                0,
-                0,
+                Hotspot { x: 0, y: 0 },
                 vec![0; 4],
             )
             .expect("test cursor image should be valid"),
@@ -322,8 +323,7 @@ mod tests {
 
         let image = CursorImage::new(
             CursorSize::new(2, 2).expect("test cursor size should be valid"),
-            0,
-            0,
+            Hotspot { x: 0, y: 0 },
             vec![0; 16],
         )
         .expect("test cursor image should be valid");

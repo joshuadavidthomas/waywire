@@ -548,8 +548,8 @@ async fn read_events(
                 scale: scale_v120,
                 generation,
             })),
-            Event::CursorVisibility(visible) => {
-                publish_cursor_update(&events, CursorUpdate::visibility(visible));
+            Event::CursorVisibility(visibility) => {
+                publish_cursor_update(&events, CursorUpdate::visibility(visibility));
             }
             Event::CursorImage(image) => {
                 let update = CursorUpdate::image(image).await?;
@@ -633,6 +633,7 @@ mod tests {
     use sprite_desktop_protocol::browser::Feedback;
     use sprite_desktop_protocol::browser::FeedbackValues;
     use sprite_desktop_protocol::pipe::Generation;
+    use sprite_desktop_protocol::pipe::KeyframeState;
     use sprite_desktop_protocol::pipe::ScalePercent;
     use tokio::io::AsyncReadExt;
 
@@ -657,7 +658,7 @@ mod tests {
         commands.set_active_lease(first);
         let first_input = Command::KeyframeReadiness {
             generation: Generation::new(1).expect("test generation should be valid"),
-            ready: true,
+            state: KeyframeState::Cached,
         };
         let first_bytes = first_input.encode();
         commands
@@ -681,7 +682,7 @@ mod tests {
                 first,
                 Command::KeyframeReadiness {
                     generation: Generation::new(2).expect("test generation should be valid"),
-                    ready: false,
+                    state: KeyframeState::Missing,
                 },
             )
             .await

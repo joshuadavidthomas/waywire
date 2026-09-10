@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::Serialize;
+use serde::Serializer;
 use thiserror::Error;
 
 use crate::PROTOCOL_VERSION;
@@ -13,6 +14,7 @@ use crate::pipe;
 use crate::pipe::ClipboardText;
 use crate::pipe::Command;
 use crate::pipe::CommandHeader;
+use crate::pipe::CursorVisibility;
 use crate::pipe::Fps;
 use crate::pipe::FrameMetadata;
 use crate::pipe::InputSequence;
@@ -20,6 +22,9 @@ use crate::pipe::InputText;
 use crate::pipe::Kbps;
 use crate::pipe::ScalePercent;
 pub use crate::pipe::TextAction;
+
+pub const VIDEO_FRAME_HEADER_BYTES: usize = 40;
+const VIDEO_RECORD_KIND: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -77,7 +82,8 @@ pub enum ControlState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorState {
-    pub visible: bool,
+    #[serde(rename = "visible")]
+    pub visibility: CursorVisibility,
     pub width: u32,
     pub height: u32,
     pub hotspot_x: i32,
@@ -85,10 +91,19 @@ pub struct CursorState {
     pub image: String,
 }
 
+impl Serialize for CursorVisibility {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bool(matches!(self, Self::Visible))
+    }
+}
+
 impl Default for CursorState {
     fn default() -> Self {
         Self {
-            visible: true,
+            visibility: CursorVisibility::Visible,
             width: 0,
             height: 0,
             hotspot_x: 0,
@@ -277,37 +292,57 @@ pub fn parse_browser_record(bytes: &[u8]) -> Result<Command, BrowserError> {
         .map_err(|source| BrowserError::InvalidControlFields { kind, source })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    Delta,
+    Key,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Continuity {
+    Continuous,
+    AfterGap,
+}
+
 #[derive(Clone, Debug)]
 pub struct VideoSample {
     pub data: Arc<[u8]>,
-    pub key: bool,
-    pub discontinuity: bool,
+    pub kind: FrameKind,
+    pub continuity: Continuity,
     pub metadata: FrameMetadata,
 }
 
-/// Encodes a 40-byte header: version at 0, record type at 1 (1 = video), flags at 2, zero at 3,
-/// sequence at 4, capture time in microseconds at 12, generation at 20, width at 24, height at 26,
-/// capture time in nanoseconds at 28, and input sequence at 36.
-#[must_use]
-pub fn encode_video_frame(sample: &VideoSample) -> Vec<u8> {
-    let metadata = &sample.metadata;
-    let flags = u8::from(sample.key) | (u8::from(sample.discontinuity) << 1);
-    let mut bytes = Vec::with_capacity(40 + sample.data.len());
-    bytes.extend_from_slice(&[PROTOCOL_VERSION, 1, flags, 0]);
-    bytes.extend_from_slice(&metadata.sequence.to_le_bytes());
-    bytes.extend_from_slice(&(metadata.capture_nanos / 1_000).to_le_bytes());
-    bytes.extend_from_slice(&metadata.generation.get().to_le_bytes());
-    bytes.extend_from_slice(&metadata.width.get().to_le_bytes());
-    bytes.extend_from_slice(&metadata.height.get().to_le_bytes());
-    bytes.extend_from_slice(&metadata.capture_nanos.to_le_bytes());
-    bytes.extend_from_slice(
-        &metadata
-            .input_sequence
-            .map_or(0, InputSequence::get)
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(&sample.data);
-    bytes
+impl VideoSample {
+    /// Encodes a `VIDEO_FRAME_HEADER_BYTES`-byte header: version at 0, `VIDEO_RECORD_KIND` at 1,
+    /// flags at 2, zero at 3, sequence at 4, capture time in microseconds at 12, generation at 20,
+    /// width at 24, height at 26, capture time in nanoseconds at 28, and input sequence at 36.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let metadata = &self.metadata;
+        let flags = match self.kind {
+            FrameKind::Delta => 0,
+            FrameKind::Key => 1,
+        } | match self.continuity {
+            Continuity::Continuous => 0,
+            Continuity::AfterGap => 2,
+        };
+        let mut bytes = Vec::with_capacity(VIDEO_FRAME_HEADER_BYTES + self.data.len());
+        bytes.extend_from_slice(&[PROTOCOL_VERSION, VIDEO_RECORD_KIND, flags, 0]);
+        bytes.extend_from_slice(&metadata.sequence.to_le_bytes());
+        bytes.extend_from_slice(&(metadata.capture_nanos / 1_000).to_le_bytes());
+        bytes.extend_from_slice(&metadata.generation.get().to_le_bytes());
+        bytes.extend_from_slice(&metadata.width.get().to_le_bytes());
+        bytes.extend_from_slice(&metadata.height.get().to_le_bytes());
+        bytes.extend_from_slice(&metadata.capture_nanos.to_le_bytes());
+        bytes.extend_from_slice(
+            &metadata
+                .input_sequence
+                .map_or(0, InputSequence::get)
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&self.data);
+        bytes
+    }
 }
 
 #[cfg(test)]
@@ -342,7 +377,7 @@ mod tests {
     #[test]
     fn cursor_json_is_exact() {
         let cursor = CursorState {
-            visible: true,
+            visibility: CursorVisibility::Visible,
             width: 1,
             height: 2,
             hotspot_x: -3,
@@ -555,8 +590,8 @@ mod tests {
     fn video_frame_header_is_exact() {
         let sample = VideoSample {
             data: vec![1, 2].into(),
-            key: true,
-            discontinuity: true,
+            kind: FrameKind::Key,
+            continuity: Continuity::AfterGap,
             metadata: FrameMetadata {
                 generation: value(pipe::Generation::new(4)),
                 width: value(pipe::FrameDimension::new(1280)),
@@ -568,7 +603,7 @@ mod tests {
             },
         };
         assert_eq!(
-            encode_video_frame(&sample),
+            sample.encode(),
             vec![
                 2, 1, 3, 0, 17, 0, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 5,
                 208, 2, 184, 130, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 1, 2

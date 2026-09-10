@@ -7,11 +7,14 @@ use std::sync::Mutex;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use sprite_desktop_protocol::browser::Continuity;
+use sprite_desktop_protocol::browser::FrameKind;
 use sprite_desktop_protocol::browser::VideoSample;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::FrameMetadata;
 use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::KeyframeState;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -128,7 +131,7 @@ impl VideoHub {
     fn broadcast(&self, sample: VideoSample) -> GopState {
         let generation = sample.metadata.generation;
         let mut hub = lock(&self.inner, "video hub");
-        let stream_reset = sample.discontinuity
+        let stream_reset = sample.continuity == Continuity::AfterGap
             || hub.gop.first().is_some_and(|first_cached| {
                 first_cached.metadata.generation != sample.metadata.generation
             });
@@ -146,7 +149,7 @@ impl VideoHub {
                 }
                 let recovering = subscriber.waiting_for_keyframe;
                 if recovering {
-                    if !sample.key {
+                    if sample.kind != FrameKind::Key {
                         continue;
                     }
                     subscriber.waiting_for_keyframe = false;
@@ -156,7 +159,7 @@ impl VideoHub {
                 if overflow {
                     queue.frames.clear();
                     queue.bytes = 0;
-                    if !sample.key {
+                    if sample.kind != FrameKind::Key {
                         subscriber.waiting_for_keyframe = true;
                         continue;
                     }
@@ -164,14 +167,14 @@ impl VideoHub {
                 }
                 let mut outgoing = sample.clone();
                 if stream_reset || recovering || overflow {
-                    outgoing.discontinuity = true;
+                    outgoing.continuity = Continuity::AfterGap;
                 }
                 queue.bytes += outgoing.data.len();
                 queue.frames.push_back(outgoing);
             }
             subscriber.notify.notify_one();
         }
-        if sample.key {
+        if sample.kind == FrameKind::Key {
             hub.gop.clear();
             hub.gop_bytes = sample.data.len();
             hub.gop.push(sample);
@@ -185,11 +188,9 @@ impl VideoHub {
                 hub.gop_bytes = 0;
             }
         }
-        if hub
-            .gop
-            .first()
-            .is_some_and(|frame| frame.key && frame.metadata.generation == generation)
-        {
+        if hub.gop.first().is_some_and(|frame| {
+            frame.kind == FrameKind::Key && frame.metadata.generation == generation
+        }) {
             GopState::KeyframeCached
         } else {
             GopState::Recovering
@@ -248,10 +249,9 @@ fn decode_packet(data: &[u8]) -> Result<Packet> {
     })
 }
 
-#[derive(Default)]
 struct Assembler {
     data: Vec<u8>,
-    key: bool,
+    kind: FrameKind,
     fu_kind: Option<u8>,
     timestamp: Option<u32>,
     next_sequence: Option<u16>,
@@ -260,11 +260,26 @@ struct Assembler {
     recovering: bool,
 }
 
+impl Default for Assembler {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            kind: FrameKind::Delta,
+            fu_kind: None,
+            timestamp: None,
+            next_sequence: None,
+            generation: None,
+            buffered_packets: 0,
+            recovering: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Unit {
     data: Arc<[u8]>,
-    key: bool,
-    discontinuity: bool,
+    kind: FrameKind,
+    continuity: Continuity,
     timestamp: u32,
     generation: Generation,
 }
@@ -414,23 +429,27 @@ impl Assembler {
             return AssemblyResult::rejected(anyhow!("RTP marker ended an incomplete FU-A"), drops);
         }
         let data = std::mem::take(&mut self.data);
-        let key = std::mem::take(&mut self.key);
+        let kind = std::mem::replace(&mut self.kind, FrameKind::Delta);
         let access_unit_packets = std::mem::take(&mut self.buffered_packets);
         self.timestamp = None;
         if data.is_empty() {
             drops.record(access_unit_packets, AssemblyDrop::EmptyAccessUnit);
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
-        if self.recovering && !key {
+        if self.recovering && kind != FrameKind::Key {
             drops.record(access_unit_packets, AssemblyDrop::RecoveringWithoutKeyframe);
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
-        let discontinuity = std::mem::take(&mut self.recovering);
+        let continuity = if std::mem::take(&mut self.recovering) {
+            Continuity::AfterGap
+        } else {
+            Continuity::Continuous
+        };
         AssemblyResult::accepted(
             AssemblyOutcome::Complete(Unit {
                 data: data.into(),
-                key,
-                discontinuity,
+                kind,
+                continuity,
                 timestamp: packet.timestamp,
                 generation: packet.generation,
             }),
@@ -490,7 +509,7 @@ impl Assembler {
         }
         self.push(&payload[2..])?;
         if kind == 5 {
-            self.key = true;
+            self.kind = FrameKind::Key;
         }
         if end {
             self.fu_kind = None;
@@ -500,7 +519,7 @@ impl Assembler {
 
     fn append_nal(&mut self, nal: &[u8]) -> Result<()> {
         if nal[0] & 31 == 5 {
-            self.key = true;
+            self.kind = FrameKind::Key;
         }
         self.push(&[0, 0, 0, 1])?;
         self.push(nal)
@@ -516,7 +535,7 @@ impl Assembler {
 
     fn clear_access_unit(&mut self) -> u64 {
         self.data.clear();
-        self.key = false;
+        self.kind = FrameKind::Delta;
         self.fu_kind = None;
         self.timestamp = None;
         std::mem::take(&mut self.buffered_packets)
@@ -637,14 +656,19 @@ impl Correlator {
             let metadata = self.take_metadata_through(index)?;
             debug_assert_eq!(metadata.generation, unit.generation);
             let generation_changed = self.last_generation != Some(metadata.generation);
-            let discontinuity = unit.discontinuity || index > 0 || generation_changed;
+            let continuity =
+                if unit.continuity == Continuity::AfterGap || index > 0 || generation_changed {
+                    Continuity::AfterGap
+                } else {
+                    Continuity::Continuous
+                };
             self.last_timestamp = Some(unit.timestamp);
             self.last_generation = Some(metadata.generation);
             self.last_fps = Some(metadata.fps);
             samples.push(VideoSample {
                 data: unit.data,
-                key: unit.key,
-                discontinuity,
+                kind: unit.kind,
+                continuity,
                 metadata,
             });
         }
@@ -907,19 +931,19 @@ impl VideoWorker {
                             None
                         } else {
                             ready_generation = Some(generation);
-                            Some((generation, true))
+                            Some((generation, KeyframeState::Cached))
                         }
                     }
                     GopState::Recovering => {
                         self.readiness.await_keyframe();
                         ready_generation
                             .take()
-                            .map(|generation| (generation, false))
+                            .map(|generation| (generation, KeyframeState::Missing))
                     }
                 };
-                if let Some((generation, ready)) = transition {
+                if let Some((generation, state)) = transition {
                     self.commands
-                        .system(Command::KeyframeReadiness { generation, ready })
+                        .system(Command::KeyframeReadiness { generation, state })
                         .await?;
                 }
             }

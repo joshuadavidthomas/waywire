@@ -8,6 +8,7 @@ use anyhow::bail;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
+use sprite_desktop_protocol::pipe::ButtonState;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::KeyCode;
 use sprite_desktop_protocol::pipe::KeyState;
@@ -151,10 +152,8 @@ impl Input {
                 pointer.motion(time, f64::from(dx.get()), f64::from(dy.get()));
                 pointer.frame();
             }
-            Command::PointerButton {
-                button, pressed, ..
-            } => {
-                self.button(time, *button, *pressed)?;
+            Command::PointerButton { button, state, .. } => {
+                self.button(time, *button, *state)?;
             }
             Command::PointerScroll { dx, dy, .. } => {
                 let pointer = self
@@ -189,8 +188,9 @@ impl Input {
         Ok(())
     }
 
-    fn button(&mut self, time: u32, button: PointerButton, pressed: bool) -> Result<()> {
+    fn button(&mut self, time: u32, button: PointerButton, state: ButtonState) -> Result<()> {
         let index = button_index(button);
+        let pressed = state == ButtonState::Pressed;
         if self.pressed_buttons[index] == pressed {
             return Ok(());
         }
@@ -202,10 +202,9 @@ impl Input {
         pointer.button(
             time,
             button.wire(),
-            if pressed {
-                wl_pointer::ButtonState::Pressed
-            } else {
-                wl_pointer::ButtonState::Released
+            match state {
+                ButtonState::Released => wl_pointer::ButtonState::Released,
+                ButtonState::Pressed => wl_pointer::ButtonState::Pressed,
             },
         );
         pointer.frame();

@@ -27,11 +27,14 @@ use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
+use sprite_desktop_protocol::pipe::CursorVisibility;
 use sprite_desktop_protocol::pipe::Event;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::Hotspot;
 use sprite_desktop_protocol::pipe::InputSequence;
 use sprite_desktop_protocol::pipe::Kbps;
+use sprite_desktop_protocol::pipe::KeyframeState;
 use sprite_desktop_protocol::pipe::ScalePercent;
 use wayland_client::Connection;
 use wayland_client::Dispatch;
@@ -370,14 +373,19 @@ impl State {
                     self.advance_generation()?;
                 }
             }
-            Command::KeyframeReadiness { generation, ready } => {
+            Command::KeyframeReadiness { generation, state } => {
                 if *generation == self.generation {
-                    if *ready {
-                        self.acknowledged_generation = Some(*generation);
-                    } else if self.acknowledged_generation == Some(*generation) {
-                        self.acknowledged_generation = None;
-                        self.capture.cancel();
-                        self.request_capture()?;
+                    match state {
+                        KeyframeState::Cached => {
+                            self.acknowledged_generation = Some(*generation);
+                        }
+                        KeyframeState::Missing => {
+                            if self.acknowledged_generation == Some(*generation) {
+                                self.acknowledged_generation = None;
+                                self.capture.cancel();
+                                self.request_capture()?;
+                            }
+                        }
                     }
                 }
             }
@@ -933,15 +941,14 @@ impl Dispatch<ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCurso
             return;
         }
         let result = match event {
-            ext_image_copy_capture_cursor_session_v1::Event::Enter => state.cursor.visibility(true),
-            ext_image_copy_capture_cursor_session_v1::Event::Leave => {
-                state.cursor.visibility(false)
+            ext_image_copy_capture_cursor_session_v1::Event::Enter => {
+                state.cursor.visibility(CursorVisibility::Visible)
             }
-            ext_image_copy_capture_cursor_session_v1::Event::Hotspot {
-                x: hotspot_x,
-                y: hotspot_y,
-            } => {
-                state.cursor.hotspot(hotspot_x, hotspot_y);
+            ext_image_copy_capture_cursor_session_v1::Event::Leave => {
+                state.cursor.visibility(CursorVisibility::Hidden)
+            }
+            ext_image_copy_capture_cursor_session_v1::Event::Hotspot { x, y } => {
+                state.cursor.hotspot(Hotspot { x, y });
                 Ok(())
             }
             ext_image_copy_capture_cursor_session_v1::Event::Position { .. } | _ => Ok(()),
