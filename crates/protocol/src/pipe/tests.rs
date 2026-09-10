@@ -246,19 +246,19 @@ fn unknown_command_kind_is_invalid_fields() {
     let mut header = [0; COMMAND_HEADER_BYTES];
     header[0] = PROTOCOL_VERSION;
     header[1] = 99;
-    assert_eq!(
+    assert!(matches!(
         CommandHeader::parse(&header),
-        Err(ProtocolError::InvalidFields(99))
-    );
+        Err(ProtocolError::InvalidFields { kind: 99, .. })
+    ));
 }
 
 #[test]
 fn unknown_event_kind_is_invalid_event() {
     let header = [PROTOCOL_VERSION, 99, 0, 0, 0, 0, 0, 0];
-    assert_eq!(
+    assert!(matches!(
         EventHeader::parse(&header),
-        Err(ProtocolError::InvalidEvent(99))
-    );
+        Err(ProtocolError::InvalidEvent { kind: 99, .. })
+    ));
 }
 
 #[test]
@@ -291,7 +291,40 @@ fn event_payload_over_limit_is_too_large() {
 fn clipboard_payload_must_be_utf8() {
     let header = EventHeader::parse(&[PROTOCOL_VERSION, 1, 0, 0, 1, 0, 0, 0])
         .expect("clipboard event header should parse");
-    assert_eq!(Event::decode(header, &[0xff]), Err(ProtocolError::NotUtf8));
+    assert!(matches!(
+        Event::decode(header, &[0xff]),
+        Err(ProtocolError::InvalidEvent { kind: 1, .. })
+    ));
+}
+
+#[test]
+fn short_frame_payload_is_an_invalid_event() {
+    let header = EventHeader::parse(&[PROTOCOL_VERSION, 2, 0, 0, 31, 0, 0, 0])
+        .expect("frame event header should parse");
+    let mut payload = [0; 31];
+    payload[0] = 1;
+    payload[4] = 1;
+    payload[6] = 1;
+    payload[28] = 10;
+    assert!(matches!(
+        Event::decode(header, &payload),
+        Err(ProtocolError::InvalidEvent { kind: 2, .. })
+    ));
+}
+
+#[test]
+fn frame_payload_with_trailing_byte_is_an_invalid_event() {
+    let header = EventHeader::parse(&[PROTOCOL_VERSION, 2, 0, 0, 33, 0, 0, 0])
+        .expect("frame event header should parse");
+    let mut payload = [0; 33];
+    payload[0] = 1;
+    payload[4] = 1;
+    payload[6] = 1;
+    payload[28] = 10;
+    assert!(matches!(
+        Event::decode(header, &payload),
+        Err(ProtocolError::InvalidEvent { kind: 2, .. })
+    ));
 }
 
 #[test]
@@ -301,10 +334,10 @@ fn cursor_image_payload_length_must_match_its_size() {
     let mut payload = [0; 16];
     payload[0..4].copy_from_slice(&1_u32.to_le_bytes());
     payload[4..8].copy_from_slice(&1_u32.to_le_bytes());
-    assert_eq!(
+    assert!(matches!(
         Event::decode(header, &payload),
-        Err(ProtocolError::InvalidEvent(4))
-    );
+        Err(ProtocolError::InvalidEvent { kind: 4, .. })
+    ));
 }
 
 #[test]

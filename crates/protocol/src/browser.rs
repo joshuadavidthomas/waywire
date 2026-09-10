@@ -291,23 +291,22 @@ pub struct VideoSample {
 #[must_use]
 pub fn encode_video_frame(sample: &VideoSample) -> Vec<u8> {
     let metadata = &sample.metadata;
-    let mut bytes = vec![0; 40 + sample.data.len()];
-    bytes[0] = PROTOCOL_VERSION;
-    bytes[1] = 1;
-    bytes[2] = u8::from(sample.key) | (u8::from(sample.discontinuity) << 1);
-    bytes[4..12].copy_from_slice(&metadata.sequence.to_le_bytes());
-    bytes[12..20].copy_from_slice(&(metadata.capture_nanos / 1_000).to_le_bytes());
-    bytes[20..24].copy_from_slice(&metadata.generation.get().to_le_bytes());
-    bytes[24..26].copy_from_slice(&metadata.width.get().to_le_bytes());
-    bytes[26..28].copy_from_slice(&metadata.height.get().to_le_bytes());
-    bytes[28..36].copy_from_slice(&metadata.capture_nanos.to_le_bytes());
-    bytes[36..40].copy_from_slice(
+    let flags = u8::from(sample.key) | (u8::from(sample.discontinuity) << 1);
+    let mut bytes = Vec::with_capacity(40 + sample.data.len());
+    bytes.extend_from_slice(&[PROTOCOL_VERSION, 1, flags, 0]);
+    bytes.extend_from_slice(&metadata.sequence.to_le_bytes());
+    bytes.extend_from_slice(&(metadata.capture_nanos / 1_000).to_le_bytes());
+    bytes.extend_from_slice(&metadata.generation.get().to_le_bytes());
+    bytes.extend_from_slice(&metadata.width.get().to_le_bytes());
+    bytes.extend_from_slice(&metadata.height.get().to_le_bytes());
+    bytes.extend_from_slice(&metadata.capture_nanos.to_le_bytes());
+    bytes.extend_from_slice(
         &metadata
             .input_sequence
             .map_or(0, InputSequence::get)
             .to_le_bytes(),
     );
-    bytes[40..].copy_from_slice(&sample.data);
+    bytes.extend_from_slice(&sample.data);
     bytes
 }
 
