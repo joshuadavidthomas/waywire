@@ -5,6 +5,7 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sprite_desktop_protocol::browser::CursorState;
+use sprite_desktop_protocol::pipe::CursorImage;
 use sprite_desktop_protocol::pipe::CursorSize;
 
 pub(crate) enum CursorUpdate {
@@ -25,12 +26,11 @@ impl CursorUpdate {
         Self::Visibility { visible }
     }
 
-    pub(crate) async fn image(
-        size: CursorSize,
-        hotspot_x: i32,
-        hotspot_y: i32,
-        bgra: Vec<u8>,
-    ) -> Result<Self> {
+    pub(crate) async fn image(cursor: CursorImage) -> Result<Self> {
+        let size = cursor.size();
+        let hotspot_x = cursor.hotspot_x;
+        let hotspot_y = cursor.hotspot_y;
+        let bgra = cursor.into_bgra();
         let image = tokio::task::spawn_blocking(move || encode(size, &bgra))
             .await
             .context("cursor encoder task failed")??;
@@ -99,8 +99,13 @@ mod tests {
     #[tokio::test]
     async fn builds_cursor_state_with_unpremultiplied_png_pixels() {
         let size = CursorSize::new(1, 1).expect("test cursor size should be valid");
-        let mut state = CursorState::new().with_visibility(false);
-        CursorUpdate::image(size, -3, 4, vec![16, 32, 64, 128])
+        let mut state = CursorState {
+            visible: false,
+            ..CursorState::default()
+        };
+        let cursor = CursorImage::new(size, -3, 4, vec![16, 32, 64, 128])
+            .expect("test cursor image should be valid");
+        CursorUpdate::image(cursor)
             .await
             .expect("test cursor image should encode")
             .apply(&mut state);

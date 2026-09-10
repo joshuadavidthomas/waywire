@@ -177,7 +177,7 @@ impl Input {
             Command::KeyboardKey { key, state, .. } => self.key(time, *key, *state)?,
             Command::ReleaseAll => self.release_all()?,
             Command::Text { action, text, .. } => {
-                self.send_text(*action, text.get())?;
+                self.send_text(*action, text.as_str())?;
             }
             Command::Resize { .. }
             | Command::Clipboard(_)
@@ -201,7 +201,7 @@ impl Input {
             .context("virtual pointer unavailable")?;
         pointer.button(
             time,
-            button.get(),
+            button.wire(),
             if pressed {
                 wl_pointer::ButtonState::Pressed
             } else {
@@ -268,10 +268,11 @@ impl Input {
     pub(crate) fn release_all(&mut self) -> Result<()> {
         let time = monotonic_millis()?;
         if let Some(pointer) = &self.pointer {
-            for (index, pressed) in self.pressed_buttons.iter_mut().enumerate() {
+            for button in TRACKED_BUTTONS {
+                let pressed = &mut self.pressed_buttons[button_index(button)];
                 if *pressed {
                     *pressed = false;
-                    pointer.button(time, button_at(index), wl_pointer::ButtonState::Released);
+                    pointer.button(time, button.wire(), wl_pointer::ButtonState::Released);
                 }
             }
             pointer.frame();
@@ -342,13 +343,22 @@ fn monotonic_millis() -> Result<u32> {
     Ok(u32::try_from(millis & u64::from(u32::MAX))?)
 }
 
-fn button_index(button: PointerButton) -> usize {
-    (button.get() - 0x110) as usize
-}
+const TRACKED_BUTTONS: [PointerButton; 5] = [
+    PointerButton::Left,
+    PointerButton::Right,
+    PointerButton::Middle,
+    PointerButton::Side,
+    PointerButton::Extra,
+];
 
-fn button_at(index: usize) -> u32 {
-    const BUTTONS: [u32; 5] = [0x110, 0x111, 0x112, 0x113, 0x114];
-    BUTTONS[index]
+const fn button_index(button: PointerButton) -> usize {
+    match button {
+        PointerButton::Left => 0,
+        PointerButton::Right => 1,
+        PointerButton::Middle => 2,
+        PointerButton::Side => 3,
+        PointerButton::Extra => 4,
+    }
 }
 
 pub(crate) fn valid_layout(layout: &str) -> bool {

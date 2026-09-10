@@ -9,6 +9,7 @@ use memmap2::MmapOptions;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
+use sprite_desktop_protocol::pipe::CursorImage;
 use sprite_desktop_protocol::pipe::CursorSize;
 use sprite_desktop_protocol::pipe::Event;
 use wayland_client::QueueHandle;
@@ -252,12 +253,13 @@ impl Cursor {
                 || published.3 != pixels
         });
         if changed || self.force_publish {
-            self.events.send(&Event::CursorImage {
-                size: CursorSize::new(self.width, self.height)?,
-                hotspot_x: self.committed_hotspot.x,
-                hotspot_y: self.committed_hotspot.y,
-                bgra: pixels.clone(),
-            })?;
+            let image = CursorImage::new(
+                CursorSize::new(self.width, self.height)?,
+                self.committed_hotspot.x,
+                self.committed_hotspot.y,
+                pixels.clone(),
+            )?;
+            self.events.send(&Event::CursorImage(image))?;
             self.published = Some((self.width, self.height, self.committed_hotspot, pixels));
             self.force_publish = false;
         }

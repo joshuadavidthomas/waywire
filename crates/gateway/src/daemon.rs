@@ -20,6 +20,7 @@ use nix::sys::wait::waitid;
 use nix::unistd::Pid;
 use sprite_desktop_protocol::browser::ClientEvent;
 use sprite_desktop_protocol::browser::CursorState;
+use sprite_desktop_protocol::browser::ResizeApplied;
 use sprite_desktop_protocol::pipe::ClipboardText;
 use sprite_desktop_protocol::pipe::Command;
 use sprite_desktop_protocol::pipe::Event;
@@ -541,23 +542,17 @@ async fn read_events(
                 size,
                 scale_v120,
                 generation,
-            } => events.publish(ClientEvent::ResizeApplied {
+            } => events.publish(ClientEvent::ResizeApplied(ResizeApplied {
                 request: request_id,
-                width: size.width(),
-                height: size.height(),
+                size,
                 scale: scale_v120,
                 generation,
-            }),
+            })),
             Event::CursorVisibility(visible) => {
                 publish_cursor_update(&events, CursorUpdate::visibility(visible));
             }
-            Event::CursorImage {
-                size,
-                hotspot_x,
-                hotspot_y,
-                bgra,
-            } => {
-                let update = CursorUpdate::image(size, hotspot_x, hotspot_y, bgra).await?;
+            Event::CursorImage(image) => {
+                let update = CursorUpdate::image(image).await?;
                 publish_cursor_update(&events, update);
             }
         }

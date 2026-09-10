@@ -23,8 +23,6 @@ const WRITE_STALL_LIMIT: Duration = Duration::from_secs(2);
 pub(crate) enum EventWriterError {
     #[error("stdout event queue is full")]
     QueueFull,
-    #[error("stdout event encoding failed")]
-    Encode(#[from] sprite_desktop_protocol::pipe::ProtocolError),
     #[error("stdout event writer failed: {0}")]
     Write(String),
     #[error("stdout event writer stopped")]
@@ -40,7 +38,7 @@ enum Replacement {
 impl Replacement {
     fn for_event(event: &Event) -> Option<Self> {
         match event {
-            Event::CursorImage { .. } => Some(Self::CursorImage),
+            Event::CursorImage(_) => Some(Self::CursorImage),
             Event::CursorVisibility(_) => Some(Self::CursorVisibility),
             Event::Clipboard(_) | Event::Frame(_) | Event::ResizeApplied { .. } => None,
         }
@@ -144,7 +142,7 @@ impl Drop for EventWriter {
 impl EventSink {
     pub(crate) fn send(&self, event: &Event) -> Result<(), EventWriterError> {
         let replacement = Replacement::for_event(event);
-        let bytes = event.encode()?;
+        let bytes = event.encode();
         let mut queue = lock_queue(&self.shared.queue);
         if let Some(failure) = &queue.failure {
             return Err(EventWriterError::Write(failure.clone()));
@@ -246,6 +244,7 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use sprite_desktop_protocol::pipe::CursorImage;
     use sprite_desktop_protocol::pipe::CursorSize;
     use sprite_desktop_protocol::pipe::Fps;
     use sprite_desktop_protocol::pipe::FrameDimension;
@@ -286,7 +285,7 @@ mod tests {
             .expect("cursor hide should queue");
         let visible = Event::CursorVisibility(true);
         sink.send(&visible).expect("cursor show should queue");
-        let expected = visible.encode().expect("cursor show should encode");
+        let expected = visible.encode();
         let queue = shared
             .queue
             .lock()
@@ -298,14 +297,16 @@ mod tests {
 
     #[test]
     fn replaceable_cursor_cannot_break_the_byte_budget() {
-        let old = Event::CursorImage {
-            size: CursorSize::new(1, 1).expect("test cursor size should be valid"),
-            hotspot_x: 0,
-            hotspot_y: 0,
-            bgra: vec![0; 4],
-        }
-        .encode()
-        .expect("cursor image should encode");
+        let old = Event::CursorImage(
+            CursorImage::new(
+                CursorSize::new(1, 1).expect("test cursor size should be valid"),
+                0,
+                0,
+                vec![0; 4],
+            )
+            .expect("test cursor image should be valid"),
+        )
+        .encode();
         let filler_len = MAX_QUEUED_BYTES - old.len();
         let records = VecDeque::from([
             QueuedEvent {
@@ -319,12 +320,14 @@ mod tests {
         ]);
         let sink = sink_with_queue(records, MAX_QUEUED_BYTES);
 
-        let result = sink.send(&Event::CursorImage {
-            size: CursorSize::new(2, 2).expect("test cursor size should be valid"),
-            hotspot_x: 0,
-            hotspot_y: 0,
-            bgra: vec![0; 16],
-        });
+        let image = CursorImage::new(
+            CursorSize::new(2, 2).expect("test cursor size should be valid"),
+            0,
+            0,
+            vec![0; 16],
+        )
+        .expect("test cursor image should be valid");
+        let result = sink.send(&Event::CursorImage(image));
 
         assert!(matches!(result, Err(EventWriterError::QueueFull)));
         let queue = sink

@@ -100,7 +100,7 @@ impl Clipboard {
         device.set_selection(Some(&proxy));
         let source = Source {
             proxy,
-            payload: Arc::from(text.get().as_bytes()),
+            payload: Arc::from(text.as_str().as_bytes()),
         };
         if let Some(old) = self.source.replace(source) {
             old.proxy.destroy();
