@@ -1,25 +1,30 @@
 /* The page is the desktop. The canvas fills the viewport, the screen itself
-   shows whether the feed is live and whether you are driving, and one corner
-   key opens the only panel there is. */
+   says whether the feed is live, and one corner key opens the only panel.
+   Panel rules follow ui.sh: whitespace before dividers, ghost items instead
+   of cards, a recessed well for preferences, no shadows in the dark. */
 :root {
   color-scheme: dark;
   --screen: #000;
-  --chassis: #181818;
-  --chassis-raised: #212121;
-  --seam: #2c2c2c;
-  --silkscreen: #dcd7ca;
-  --silkscreen-dim: #928e84;
-  --lamp-live: #6bd47a;
-  --lamp-wait: #e2a53c;
-  --lamp-fault: #e35d4d;
-  --lamp-off: #3c3c3c;
+  --panel: #171717;
+  --well: #111111;
+  --ring: rgba(255, 255, 255, 0.06);
+  --hover: rgba(255, 255, 255, 0.06);
+  --pressed: rgba(255, 255, 255, 0.09);
+  --ink: #e5e5e5;
+  --ink-dim: #a1a1a1;
+  --ink-faint: #737373;
+  --lamp-live: #4ade80;
+  --lamp-wait: #fbbf24;
+  --lamp-fault: #f87171;
+  --lamp-off: #404040;
   --ui: system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --numerals: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --ease: 160ms cubic-bezier(0.2, 0.7, 0.2, 1);
-  font: 13px/1.35 var(--ui);
-  color: var(--silkscreen);
+  --move: 200ms ease-in-out;
+  font: 14px/1.45 var(--ui);
+  color: var(--ink);
   background: var(--screen);
   accent-color: var(--lamp-live);
+  -webkit-font-smoothing: antialiased;
 }
 
 * {
@@ -27,7 +32,7 @@
 }
 
 ::selection {
-  background: var(--silkscreen);
+  background: var(--ink);
   color: var(--screen);
 }
 
@@ -41,6 +46,7 @@ body {
 
 .stage {
   position: relative;
+  isolation: isolate;
   height: 100%;
   background: var(--screen);
 }
@@ -59,17 +65,17 @@ canvas {
   cursor: default;
 }
 
-/* While the panel is open a scrim above the canvas takes the dismissing
-   click, so closing the panel never presses a button on the remote desktop. */
-.stage:has(.panel:popover-open)::before {
+/* While the floating panel is open a scrim above the canvas takes the
+   dismissing click, so closing the panel never presses a button on the remote
+   desktop. A pinned panel is a palette and lets the desktop through. */
+.stage[data-panel="floating"]:has(.panel:popover-open)::before {
   content: "";
   position: absolute;
   inset: 0;
   z-index: 1;
 }
 
-/* Driving is seamless: the screen takes focus when the pointer is over it,
-   so nothing marks the lease. Only someone else holding it is worth a line. */
+/* Only someone else holding the desktop, or your own hands-off, gets a line. */
 .lease-notice {
   position: absolute;
   top: 12px;
@@ -77,11 +83,10 @@ canvas {
   transform: translateX(-50%);
   margin: 0;
   padding: 6px 12px 6px 26px;
-  border: 1px solid var(--seam);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--chassis) 92%, transparent);
-  color: var(--silkscreen);
-  font-size: 12px;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  color: var(--ink);
   pointer-events: none;
 }
 
@@ -101,48 +106,6 @@ canvas {
   background: var(--lamp-wait);
 }
 
-/* Stats: a persistent readout in the top-right, the one corner neither the
-   remote desktop nor the key claims, on when you ask for it. */
-.hud {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 1;
-  margin: 0;
-  padding: 8px 10px;
-  display: grid;
-  grid-template-columns: max-content max-content;
-  column-gap: 12px;
-  row-gap: 2px;
-  border: 1px solid var(--seam);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--chassis) 95%, transparent);
-  font-family: var(--numerals);
-  font-variant-numeric: tabular-nums;
-  font-size: 11.5px;
-  pointer-events: none;
-}
-
-.hud[hidden] {
-  display: none;
-}
-
-.hud dt {
-  color: var(--silkscreen-dim);
-  font-family: var(--ui);
-}
-
-.hud dd {
-  margin: 0;
-  text-align: right;
-  transition: color var(--ease);
-}
-
-.hud dd[data-resize="requested"],
-.hud dd[data-resize="applied"] {
-  color: var(--lamp-wait);
-}
-
 /* Not live: the screen says so, over whatever frame it last held. */
 
 .signal {
@@ -151,7 +114,6 @@ canvas {
   display: grid;
   place-items: center;
   padding: 24px;
-  text-align: center;
   pointer-events: none;
 }
 
@@ -166,11 +128,10 @@ canvas {
   max-width: 52ch;
   display: grid;
   gap: 2px;
-  border: 1px solid var(--seam);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--chassis) 92%, transparent);
-  color: var(--silkscreen);
-  text-align: left;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  color: var(--ink);
 }
 
 .signal p::before {
@@ -186,8 +147,7 @@ canvas {
 }
 
 .signal-detail {
-  color: var(--silkscreen-dim);
-  font-size: 12px;
+  color: var(--ink-dim);
 }
 
 .signal-detail:empty {
@@ -204,6 +164,49 @@ canvas {
   background: var(--lamp-fault);
 }
 
+/* Stats: a persistent readout in the top-right, on when you ask for it. */
+
+.hud {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 1;
+  margin: 0;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 14px;
+  row-gap: 3px;
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  pointer-events: none;
+}
+
+.hud[hidden] {
+  display: none;
+}
+
+.hud dt {
+  color: var(--ink);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.hud dd {
+  margin: 0;
+  text-align: right;
+  color: var(--ink-dim);
+  font-family: var(--numerals);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hud dd[data-resize="requested"],
+.hud dd[data-resize="applied"] {
+  color: var(--lamp-wait);
+}
+
 /* The key */
 
 .menu-key {
@@ -211,31 +214,35 @@ canvas {
   right: 12px;
   bottom: 12px;
   z-index: 2;
-  width: 32px;
-  height: 32px;
+  width: 36px;
+  height: 36px;
   padding: 0;
   display: grid;
   place-items: center;
-  border: 1px solid var(--seam);
+  border: 0;
   border-radius: 50%;
-  background: color-mix(in srgb, var(--chassis) 88%, transparent);
-  color: var(--silkscreen);
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  color: var(--ink);
   cursor: pointer;
   opacity: 0.92;
-  transition:
-    opacity 400ms ease-out,
-    border-color var(--ease);
+  transition: opacity 400ms ease-out;
+}
+
+.menu-key svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
 }
 
 .menu-key:hover,
 .menu-key:focus-visible {
   opacity: 1;
-  border-color: var(--silkscreen-dim);
-  outline: none;
+  background: var(--pressed);
 }
 
 .menu-key:focus-visible {
-  outline: 2px solid var(--silkscreen);
+  outline: 2px solid var(--lamp-live);
   outline-offset: 2px;
 }
 
@@ -244,26 +251,26 @@ canvas {
 }
 
 .stage:has(.panel:popover-open) .menu-key {
-  opacity: 1;
-  border-color: var(--silkscreen-dim);
+  visibility: hidden;
 }
 
 /* The panel */
 
 .panel {
   position: fixed;
-  inset: auto 12px 52px auto;
-  width: min(320px, calc(100vw - 24px));
-  max-height: calc(100dvh - 64px);
+  inset: auto 12px 12px auto;
+  width: min(344px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: var(--seam) transparent;
+  scrollbar-color: var(--ring) transparent;
   margin: 0;
-  padding: 12px 12px 10px;
-  border: 1px solid var(--seam);
+  padding: 14px 12px 10px;
+  border: 0;
   border-radius: 12px;
-  background: var(--chassis);
-  color: var(--silkscreen);
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  color: var(--ink);
 }
 
 .panel::backdrop {
@@ -271,7 +278,7 @@ canvas {
 }
 
 .panel:popover-open {
-  animation: panel-in 160ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  animation: panel-in 160ms ease-out;
 }
 
 @keyframes panel-in {
@@ -281,104 +288,95 @@ canvas {
   }
 }
 
-.lamps {
-  margin: 0 0 10px;
-  padding: 2px 4px;
-  list-style: none;
-  display: grid;
-  gap: 5px;
+/* One status line, not stacked lamps. */
+.status {
+  margin: 0 0 8px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink);
 }
 
-.lamp {
-  position: relative;
-  padding-left: 16px;
+.status > span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.lamp::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 50%;
+.status-sep {
+  color: var(--ink-faint);
+}
+
+.dot {
+  flex-shrink: 0;
   width: 8px;
   height: 8px;
-  margin-top: -4px;
   border-radius: 50%;
   background: var(--lamp-off);
-  transition: background-color var(--ease);
 }
 
-.lamp[data-state="connected"]::before,
-.lamp[data-state="active"]::before {
+.dot[data-state="connected"] {
   background: var(--lamp-live);
-  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--lamp-live) 60%, transparent);
 }
 
-.lamp[data-state="ready"]::before {
-  background: color-mix(in srgb, var(--lamp-live) 55%, var(--lamp-off));
-}
-
-.lamp[data-state="connecting"]::before,
-.lamp[data-state="reconnecting"]::before,
-.lamp[data-state="requesting"]::before,
-.lamp[data-state="busy"]::before {
+.dot[data-state="connecting"],
+.dot[data-state="reconnecting"] {
   background: var(--lamp-wait);
 }
 
-.lamp[data-state="error"]::before {
+.dot[data-state="error"] {
   background: var(--lamp-fault);
 }
 
-/* Actions: four groups seamed apart, keys with a resting edge. */
+/* Menu groups: whitespace between groups, ghost items inside. */
 
-.actions {
-  display: grid;
-  gap: 4px;
-  padding: 8px 0;
-  border-top: 1px solid var(--seam);
+.menu {
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
-.action {
+.menu + .menu {
+  margin-top: 10px;
+}
+
+.item {
   position: relative;
   display: block;
   width: 100%;
-  min-height: 34px;
-  padding: 6px 10px;
-  border: 1px solid var(--seam);
+  min-height: 32px;
+  padding: 6px 8px;
+  border: 0;
   border-radius: 6px;
-  background: var(--chassis-raised);
-  color: var(--silkscreen);
+  background: transparent;
+  color: var(--ink);
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition:
-    border-color var(--ease),
-    background-color var(--ease);
 }
 
-.action:hover:not(:disabled) {
-  border-color: var(--silkscreen-dim);
+.item:hover:not(:disabled) {
+  background: var(--hover);
 }
 
-.action:active:not(:disabled) {
-  background: var(--chassis);
+.item:focus-visible {
+  outline: 2px solid var(--lamp-live);
+  outline-offset: -2px;
 }
 
-.action:focus-visible {
-  outline: 2px solid var(--silkscreen);
-  outline-offset: 1px;
-}
-
-.action:disabled {
-  color: var(--silkscreen-dim);
-  background: var(--chassis);
+.item:disabled {
+  color: var(--ink-faint);
   cursor: default;
 }
 
-/* A held mode shows its lamp at the right edge. */
-.action[aria-pressed]::after {
+.item[aria-pressed="true"] {
+  background: var(--pressed);
+}
+
+.item[aria-pressed="true"]::after {
   content: "";
   position: absolute;
   right: 10px;
@@ -387,59 +385,226 @@ canvas {
   height: 8px;
   margin-top: -4px;
   border-radius: 50%;
-  background: var(--lamp-off);
-  transition: background-color var(--ease);
-}
-
-.action[aria-pressed="true"]::after {
   background: var(--lamp-live);
-  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--lamp-live) 60%, transparent);
 }
 
 .note {
-  margin: 2px 4px 0;
-  color: var(--silkscreen-dim);
-  font-size: 12px;
+  padding: 4px 8px 0;
+  color: var(--ink-dim);
 }
 
 .note:empty {
   display: none;
 }
 
-/* Latency */
+/* Preferences: a recessed well. */
 
-.latency {
-  margin: 0;
-  padding: 10px 4px 10px;
-  border: 0;
-  border-top: 1px solid var(--seam);
+.prefs {
+  margin-top: 12px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: var(--well);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.pref {
   display: flex;
   align-items: center;
-  gap: 14px;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+}
+
+.pref + .pref {
+  box-shadow: 0 -1px 0 var(--ring);
 }
 
 .latency legend {
   float: left;
   padding: 0;
-  margin-right: 4px;
-  color: var(--silkscreen-dim);
 }
 
-.latency label {
+.latency {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  column-gap: 14px;
+  row-gap: 4px;
+}
+
+.latency legend {
+  margin-right: auto;
+}
+
+.radio {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   cursor: pointer;
 }
 
-.latency input {
+.radio-mark {
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  grid-template-columns: 1fr;
+}
+
+.radio-mark input {
+  grid-area: 1 / 1;
+  width: 100%;
+  height: 100%;
   margin: 0;
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+}
+
+.radio-mark input:checked {
+  border-color: var(--lamp-live);
+  background: var(--lamp-live);
+}
+
+.radio-mark input:focus-visible {
+  outline: 2px solid var(--lamp-live);
+  outline-offset: 2px;
+}
+
+.radio-mark::after {
+  content: "";
+  grid-area: 1 / 1;
+  width: 40%;
+  height: 40%;
+  place-self: center;
+  border-radius: 50%;
+  background: var(--screen);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.radio-mark:has(input:checked)::after {
+  opacity: 1;
+}
+
+.toggle {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 36px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  transition: background-color var(--move);
+}
+
+.toggle:has(input:checked) {
+  background: var(--lamp-live);
+}
+
+.toggle-knob {
+  width: 50%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform var(--move);
+}
+
+.toggle:has(input:checked) .toggle-knob {
+  transform: translateX(100%);
+}
+
+.toggle input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  appearance: none;
+  cursor: pointer;
+  outline: none;
+}
+
+.toggle:has(input:focus-visible) {
+  outline: 2px solid var(--lamp-live);
+  outline-offset: 2px;
+}
+
+/* Foot: the hint and the three tools, sitting where the key was. */
+
+.panel-foot {
+  margin-top: 10px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .hint {
-  margin: 8px 4px 0;
-  color: var(--silkscreen-dim);
-  font-size: 11px;
+  margin: 0;
+  padding: 0 8px 4px;
+  min-width: 0;
+  color: var(--ink-faint);
+}
+
+.tools {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.tool {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-dim);
+  cursor: pointer;
+}
+
+.tool svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.tool:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.tool:focus-visible {
+  outline: 2px solid var(--lamp-live);
+  outline-offset: -2px;
+}
+
+.tool[aria-pressed="true"] {
+  background: var(--pressed);
+  color: var(--lamp-live);
+}
+
+/* 48px touch targets on coarse pointers. */
+@media (pointer: coarse) {
+  .tool::after,
+  .menu-key::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100%, 48px);
+    height: max(100%, 48px);
+    transform: translate(-50%, -50%);
+  }
 }
 
 .ime-proxy {
@@ -450,33 +615,52 @@ canvas {
   pointer-events: none;
 }
 
-/* Phones: the panel is a sheet from the bottom edge. */
+/* Phones: larger text and controls, the panel is a sheet, the readout keeps
+   the four rows that matter. */
 
 @media (max-width: 480px) {
+  :root {
+    font-size: 16px;
+  }
+
   .panel {
     inset: auto 0 0 0;
     width: 100%;
-    max-height: 80dvh;
+    max-height: 85dvh;
     border-radius: 12px 12px 0 0;
-    border-bottom: 0;
-    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
 
-  .action {
+  .item {
     min-height: 44px;
+    padding: 10px 8px;
+  }
+
+  .radio-mark {
+    width: 20px;
+    height: 20px;
+  }
+
+  .toggle {
+    width: 44px;
+  }
+
+  .tool {
+    width: 40px;
+    height: 40px;
   }
 
   .menu-key {
-    width: 40px;
-    height: 40px;
+    width: 44px;
+    height: 44px;
     right: 14px;
     bottom: max(14px, env(safe-area-inset-bottom));
   }
 
-  /* Phones get the four rows that matter. */
   .hud {
     top: max(8px, env(safe-area-inset-top));
     right: 8px;
+    font-size: 13px;
   }
 
   .hud > :nth-child(n + 9) {

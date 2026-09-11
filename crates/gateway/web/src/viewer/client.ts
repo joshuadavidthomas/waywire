@@ -37,13 +37,18 @@ function viewerElements(): ViewerElements {
     menuKey: requireElement("#menu-key", button),
     panel: requireElement("#panel", html),
     status: requireElement("#status", html),
+    statusVideo: requireElement("#status-video", html),
     controlStatus: requireElement("#control-status", html),
     controlToggle: requireElement("#control-toggle", button),
     pointerLockButton: requireElement("#pointer-lock", button),
     keyboardButton: requireElement("#keyboard", button),
     sendClipboardButton: requireElement("#send-clipboard", button),
     copyClipboardButton: requireElement("#copy-clipboard", button),
-    hudToggle: requireElement("#hud-toggle", button),
+    hudToggle: requireElement(
+      "#hud-toggle",
+      (element): element is HTMLInputElement =>
+        element instanceof HTMLInputElement,
+    ),
     resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
     latency: requireElement(
@@ -51,6 +56,9 @@ function viewerElements(): ViewerElements {
       (element): element is HTMLFieldSetElement =>
         element instanceof HTMLFieldSetElement,
     ),
+    fullscreenButton: requireElement("#fullscreen", button),
+    pinButton: requireElement("#pin-panel", button),
+    closeButton: requireElement("#close-panel", button),
     imeProxy: requireElement(
       "#ime-proxy",
       (element): element is HTMLInputElement =>

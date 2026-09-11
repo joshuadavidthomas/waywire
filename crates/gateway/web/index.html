@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="/src/viewer/style.css" />
   </head>
   <body>
-    <main id="stage" class="stage" data-pointer="moving">
+    <main id="stage" class="stage" data-pointer="moving" data-panel="floating">
       <canvas
         id="display"
         tabindex="0"
@@ -50,75 +50,139 @@
         popovertarget="panel"
         aria-label="Controls"
       >
-        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-          <g
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-          >
-            <path d="M2 4.5h12M2 11.5h12" />
-          </g>
-          <circle cx="10.5" cy="4.5" r="2" fill="currentColor" />
-          <circle cx="5.5" cy="11.5" r="2" fill="currentColor" />
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path
+            d="M6.5 2.25a.75.75 0 0 0-1.5 0v3a.75.75 0 0 0 1.5 0V4.5h6.75a.75.75 0 0 0 0-1.5H6.5v-.75ZM11 6.5a.75.75 0 0 0-1.5 0v3a.75.75 0 0 0 1.5 0v-.75h2.25a.75.75 0 0 0 0-1.5H11V6.5ZM5.75 10a.75.75 0 0 1 .75.75v.75h6.75a.75.75 0 0 1 0 1.5H6.5v.75a.75.75 0 0 1-1.5 0v-3a.75.75 0 0 1 .75-.75ZM2.75 7.25H8.5v1.5H2.75a.75.75 0 0 1 0-1.5ZM4 3H2.75a.75.75 0 0 0 0 1.5H4V3ZM2.75 11.5H4V13H2.75a.75.75 0 0 1 0-1.5Z"
+          />
         </svg>
       </button>
       <div id="panel" class="panel" popover>
-        <ul class="lamps">
-          <li id="status" class="lamp" data-state="idle">Video connecting</li>
-          <li id="control-status" class="lamp" data-state="idle">Watching</li>
+        <p id="panel-status" class="status" role="status">
+          <span id="status" class="dot" data-state="idle"></span>
+          <span id="status-video">Connecting</span>
+          <span class="status-sep" aria-hidden="true">·</span>
+          <span id="control-status" data-state="idle">Watching</span>
+        </p>
+        <ul class="menu" role="list" aria-label="Control">
+          <li>
+            <button id="control-toggle" class="item" type="button">
+              Stop driving
+            </button>
+          </li>
+          <li>
+            <button
+              id="pointer-lock"
+              class="item"
+              type="button"
+              aria-pressed="false"
+            >
+              Lock pointer
+            </button>
+          </li>
+          <li>
+            <button id="keyboard" class="item" type="button">Keyboard</button>
+          </li>
         </ul>
-        <div class="actions" role="group" aria-label="Control">
-          <button id="control-toggle" class="action" type="button">
-            Stop driving
-          </button>
+        <ul class="menu" role="list" aria-label="Clipboard">
+          <li>
+            <button id="send-clipboard" class="item" type="button">
+              Paste local clipboard to desktop
+            </button>
+          </li>
+          <li>
+            <button id="copy-clipboard" class="item" type="button" disabled>
+              Copy desktop clipboard
+            </button>
+          </li>
+          <li id="clipboard-status" class="note" aria-live="polite"></li>
+        </ul>
+        <ul class="menu" role="list" aria-label="Recovery">
+          <li>
+            <button id="reset-video" class="item" type="button">
+              Reset video
+            </button>
+          </li>
+        </ul>
+        <div class="prefs">
+          <label class="pref" for="hud-toggle">
+            <span>Stats</span>
+            <span class="toggle">
+              <span class="toggle-knob" aria-hidden="true"></span>
+              <input
+                id="hud-toggle"
+                name="stats"
+                type="checkbox"
+                role="switch"
+              />
+            </span>
+          </label>
+          <fieldset id="latency" class="pref latency">
+            <legend>Latency</legend>
+            <label class="radio">
+              <span class="radio-mark">
+                <input name="latency" type="radio" value="60" checked />
+              </span>
+              Low
+            </label>
+            <label class="radio">
+              <span class="radio-mark">
+                <input name="latency" type="radio" value="100" />
+              </span>
+              Balanced
+            </label>
+            <label class="radio">
+              <span class="radio-mark">
+                <input name="latency" type="radio" value="180" />
+              </span>
+              Smooth
+            </label>
+          </fieldset>
         </div>
-        <div class="actions" role="group" aria-label="Input modes">
-          <button
-            id="pointer-lock"
-            class="action"
-            type="button"
-            aria-pressed="false"
-          >
-            Lock pointer
-          </button>
-          <button id="keyboard" class="action" type="button">Keyboard</button>
+        <div class="panel-foot">
+          <p class="hint">Esc twice opens this panel. Esc closes it.</p>
+          <div class="tools">
+            <button
+              id="fullscreen"
+              class="tool"
+              type="button"
+              aria-label="Full screen"
+              aria-pressed="false"
+            >
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path
+                  fill-rule="evenodd"
+                  d="M2.75 9a.75.75 0 0 1 .75.75v1.69l2.22-2.22a.75.75 0 0 1 1.06 1.06L4.56 12.5h1.69a.75.75 0 0 1 0 1.5h-3.5a.75.75 0 0 1-.75-.75v-3.5A.75.75 0 0 1 2.75 9ZM2.75 7a.75.75 0 0 0 .75-.75V4.56l2.22 2.22a.75.75 0 0 0 1.06-1.06L4.56 3.5h1.69a.75.75 0 0 0 0-1.5h-3.5a.75.75 0 0 0-.75.75v3.5c0 .414.336.75.75.75ZM13.25 9a.75.75 0 0 0-.75.75v1.69l-2.22-2.22a.75.75 0 1 0-1.06 1.06l2.22 2.22H9.75a.75.75 0 0 0 0 1.5h3.5a.75.75 0 0 0 .75-.75v-3.5a.75.75 0 0 0-.75-.75ZM13.25 7a.75.75 0 0 1-.75-.75V4.56l-2.22 2.22a.75.75 0 1 1-1.06-1.06l2.22-2.22H9.75a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-.75.75Z"
+                  clip-rule="evenodd"
+                />
+              </svg>
+            </button>
+            <button
+              id="pin-panel"
+              class="tool"
+              type="button"
+              aria-label="Keep the panel open"
+              aria-pressed="false"
+            >
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path
+                  d="M3.75 2a.75.75 0 0 0-.75.75v10.5a.75.75 0 0 0 1.28.53L8 10.06l3.72 3.72a.75.75 0 0 0 1.28-.53V2.75a.75.75 0 0 0-.75-.75h-8.5Z"
+                />
+              </svg>
+            </button>
+            <button
+              id="close-panel"
+              class="tool"
+              type="button"
+              aria-label="Close"
+            >
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path
+                  d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z"
+                />
+              </svg>
+            </button>
+          </div>
         </div>
-        <div class="actions" role="group" aria-label="Clipboard">
-          <button id="send-clipboard" class="action" type="button">
-            Paste local clipboard to desktop
-          </button>
-          <button id="copy-clipboard" class="action" type="button" disabled>
-            Copy desktop clipboard
-          </button>
-          <p id="clipboard-status" class="note" aria-live="polite"></p>
-        </div>
-        <div class="actions" role="group" aria-label="Preferences">
-          <button
-            id="hud-toggle"
-            class="action"
-            type="button"
-            aria-pressed="false"
-          >
-            Show stats
-          </button>
-        </div>
-        <fieldset id="latency" class="latency">
-          <legend>Latency</legend>
-          <label
-            ><input type="radio" name="latency" value="60" checked />Low</label
-          >
-          <label
-            ><input type="radio" name="latency" value="100" />Balanced</label
-          >
-          <label><input type="radio" name="latency" value="180" />Smooth</label>
-        </fieldset>
-        <div class="actions" role="group" aria-label="Recovery">
-          <button id="reset-video" class="action" type="button">
-            Reset video
-          </button>
-        </div>
-        <p class="hint">Esc twice opens this panel; Esc closes it.</p>
       </div>
       <input
         id="ime-proxy"
