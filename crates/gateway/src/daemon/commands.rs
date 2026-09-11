@@ -4,8 +4,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use sprite_desktop_protocol::Record;
-use sprite_desktop_protocol::pipe::Command;
 use thiserror::Error;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -13,6 +11,8 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use waywire_protocol::Record;
+use waywire_protocol::pipe::Command;
 
 use crate::session::LeaseEpoch;
 use crate::video::Readiness;
@@ -232,19 +232,19 @@ where
 mod tests {
     use std::time::Duration;
 
-    use sprite_desktop_protocol::Record;
-    use sprite_desktop_protocol::browser::Feedback;
-    use sprite_desktop_protocol::browser::FeedbackValues;
-    use sprite_desktop_protocol::pipe::Fps;
-    use sprite_desktop_protocol::pipe::Generation;
-    use sprite_desktop_protocol::pipe::Kbps;
-    use sprite_desktop_protocol::pipe::KeyframeReadiness;
-    use sprite_desktop_protocol::pipe::KeyframeState;
-    use sprite_desktop_protocol::pipe::Quality;
-    use sprite_desktop_protocol::pipe::ReleaseAll;
-    use sprite_desktop_protocol::pipe::ScalePercent;
     use tokio::io::AsyncReadExt;
     use tokio::sync::mpsc;
+    use waywire_protocol::Record;
+    use waywire_protocol::browser::Feedback;
+    use waywire_protocol::browser::FeedbackValues;
+    use waywire_protocol::pipe::Fps;
+    use waywire_protocol::pipe::Generation;
+    use waywire_protocol::pipe::Kbps;
+    use waywire_protocol::pipe::KeyframeReadiness;
+    use waywire_protocol::pipe::KeyframeState;
+    use waywire_protocol::pipe::Quality;
+    use waywire_protocol::pipe::ReleaseAll;
+    use waywire_protocol::pipe::ScalePercent;
 
     use super::*;
     use crate::session::InputOutcome;

@@ -9,14 +9,6 @@ use memmap2::MmapOptions;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::FrameDimension;
-use sprite_desktop_protocol::pipe::FrameMetadata;
-use sprite_desktop_protocol::pipe::Generation;
-use sprite_desktop_protocol::pipe::InputSequence;
-use sprite_desktop_protocol::pipe::Kbps;
-use sprite_desktop_protocol::pipe::MAX_RAW_PIXELS;
-use sprite_desktop_protocol::pipe::ScalePercent;
 use wayland_client::Proxy;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_buffer;
@@ -24,6 +16,14 @@ use wayland_client::protocol::wl_output;
 use wayland_client::protocol::wl_shm;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameDimension;
+use waywire_protocol::pipe::FrameMetadata;
+use waywire_protocol::pipe::Generation;
+use waywire_protocol::pipe::InputSequence;
+use waywire_protocol::pipe::Kbps;
+use waywire_protocol::pipe::MAX_RAW_PIXELS;
+use waywire_protocol::pipe::ScalePercent;
 
 use super::State;
 use crate::video::CapturedFrame;
@@ -122,7 +122,7 @@ impl Capture {
         self.mapping = None;
         let length = usize::try_from(u64::from(stride) * u64::from(height))
             .context("capture allocation exceeds address space")?;
-        let fd = memfd_create(c"sprite-desktop-capture", MFdFlags::MFD_CLOEXEC)?;
+        let fd = memfd_create(c"waywire-capture", MFdFlags::MFD_CLOEXEC)?;
         ftruncate(&fd, i64::try_from(length)?)?;
         let file = File::from(fd);
         // SAFETY: the map owns a duplicate of the valid memfd and uses its current length.

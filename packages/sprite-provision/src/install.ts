@@ -41,7 +41,7 @@ if (sprite.urlSettings.privateAccess !== "admins")
 if (!sprite.url) throw new Error("Sprite has no canonical URL");
 const origin = new URL(sprite.url).origin;
 const bundle = resolve(import.meta.dirname, "../../../dist/releases", release);
-const archiveName = `sprite-desktop-${release}-linux-amd64.tar.gz`;
+const archiveName = `waywire-${release}-linux-amd64.tar.gz`;
 const [installer, archive] = await Promise.all([
   readFile(resolve(bundle, "install.sh")),
   readFile(resolve(bundle, archiveName)),
@@ -49,7 +49,7 @@ const [installer, archive] = await Promise.all([
 console.log(
   "The in-Sprite preflight checks package sources before changing apt.",
 );
-const remote = `/tmp/sprite-desktop-upload-${randomBytes(8).toString("hex")}`;
+const remote = `/tmp/waywire-upload-${randomBytes(8).toString("hex")}`;
 const fs = sprite.filesystem("/");
 await fs.mkdir(remote, { recursive: true });
 try {
@@ -72,14 +72,12 @@ try {
 }
 
 const services = await sprite.listServices();
-const service = services.find(
-  (candidate) => candidate.name === "sprite-desktop",
-);
-assert(service, "sprite-desktop service is missing");
+const service = services.find((candidate) => candidate.name === "waywire");
+assert(service, "waywire service is missing");
 assert.equal(service.state?.status, "running");
 assert.equal(service.httpPort, 8080);
 const record = JSON.parse(
-  await fs.readFile("/var/lib/sprite-desktop/install.json", "utf8"),
+  await fs.readFile("/var/lib/waywire/install.json", "utf8"),
 ) as {
   state: string;
   release: string;

@@ -4,8 +4,6 @@ use axum::extract::ws::Message;
 use axum::extract::ws::WebSocket;
 use futures_util::SinkExt;
 use futures_util::stream::SplitSink;
-use sprite_desktop_protocol::browser::ClientEvent;
-use sprite_desktop_protocol::pipe::MAX_CLIPBOARD_BYTES;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
@@ -13,6 +11,8 @@ use tokio::sync::TryAcquireError;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use waywire_protocol::browser::ClientEvent;
+use waywire_protocol::pipe::MAX_CLIPBOARD_BYTES;
 
 use super::socket::SocketEnd;
 use super::socket::WRITE_LIMIT;

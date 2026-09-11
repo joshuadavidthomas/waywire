@@ -2,11 +2,11 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::Instant;
 
-use sprite_desktop_protocol::browser::Feedback;
-use sprite_desktop_protocol::browser::QualityLevels;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::Kbps;
-use sprite_desktop_protocol::pipe::ScalePercent;
+use waywire_protocol::browser::Feedback;
+use waywire_protocol::browser::QualityLevels;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::Kbps;
+use waywire_protocol::pipe::ScalePercent;
 
 const QUALITY_CHANGE_COOLDOWN: Duration = Duration::from_secs(5);
 const BAD_STREAK_THRESHOLD: u8 = 2;

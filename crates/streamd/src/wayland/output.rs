@@ -1,14 +1,14 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::FrameSize;
-use sprite_desktop_protocol::pipe::RequestId;
-use sprite_desktop_protocol::pipe::ScaleV120;
 use wayland_client::QueueHandle;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_head_v1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameSize;
+use waywire_protocol::pipe::RequestId;
+use waywire_protocol::pipe::ScaleV120;
 
 use super::State;
 

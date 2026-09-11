@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
-use sprite_desktop_protocol::browser::Continuity;
-use sprite_desktop_protocol::browser::FrameKind;
-use sprite_desktop_protocol::browser::VideoSample;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::Generation;
 use tokio::sync::Notify;
 use tracing::debug;
+use waywire_protocol::browser::Continuity;
+use waywire_protocol::browser::FrameKind;
+use waywire_protocol::browser::VideoSample;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::Generation;
 
 use super::GopState;
 
@@ -308,7 +308,7 @@ impl VideoHub {
 mod tests {
     use std::time::Duration;
 
-    use sprite_desktop_protocol::pipe::Generation;
+    use waywire_protocol::pipe::Generation;
 
     use super::*;
     use crate::video::tests::fps;

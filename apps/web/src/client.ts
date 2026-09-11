@@ -1,5 +1,5 @@
 import { ProtocolVersionMismatchError } from "./sdk/messages.ts";
-import { WaymoteSession, type SurfaceHandle } from "./sdk/waymote.ts";
+import { WaywireSession, type SurfaceHandle } from "./sdk/waywire.ts";
 import {
   installViewerListeners,
   type ViewerElements,
@@ -52,7 +52,7 @@ function viewerElements(): ViewerElements {
 
 function startViewer(): void {
   const elements = viewerElements();
-  const session = new WaymoteSession({
+  const session = new WaywireSession({
     latency: Number(elements.latency.value),
     statsIntervalMs: 250,
     remoteDisplay: {
@@ -121,7 +121,7 @@ function startViewer(): void {
     );
     removeProtocolVersionListener = session.on("error", (error) => {
       if (!(error instanceof ProtocolVersionMismatchError)) return;
-      const storageKey = "sprite-desktop.reloaded-for-protocol";
+      const storageKey = "waywire.reloaded-for-protocol";
       try {
         if (sessionStorage.getItem(storageKey) === String(error.actual)) return;
         sessionStorage.setItem(storageKey, String(error.actual));

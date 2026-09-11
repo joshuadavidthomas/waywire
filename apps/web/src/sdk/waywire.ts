@@ -1,5 +1,5 @@
 export {
-  WaymoteSession,
+  WaywireSession,
   type ClipboardController,
   type ClipboardUpdateEvent,
   type InputController,
@@ -11,10 +11,10 @@ export {
   type SurfaceOptions,
   type VideoController,
   type VideoState,
-  type WaymoteEventMap,
-  type WaymoteSessionOptions,
-  type WaymoteSessionState,
-  type WaymoteStats,
+  type WaywireEventMap,
+  type WaywireSessionOptions,
+  type WaywireSessionState,
+  type WaywireStats,
 } from "./session.ts";
 export type {
   RemoteDisplayFixedPolicy,

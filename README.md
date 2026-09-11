@@ -1,6 +1,6 @@
-# Sprite Desktop
+# waywire
 
-Sprite Desktop runs a private, single-user LXQt desktop on a Fly Sprite. A Rust gateway serves the embedded browser viewer and WebSocket endpoints, while a Rust stream daemon captures the Wayland desktop, handles input and clipboard control, encodes H.264, and streams it to WebCodecs in the browser. It is ported from [waymote](https://github.com/rockorager/waymote).
+waywire runs a private, single-user LXQt desktop on a Fly Sprite. A Rust gateway serves the embedded browser viewer and WebSocket endpoints, while a Rust stream daemon captures the Wayland desktop, handles input and clipboard control, encodes H.264, and streams it to WebCodecs in the browser. It is ported from [waymote](https://github.com/rockorager/waymote).
 
 ## Requirements
 

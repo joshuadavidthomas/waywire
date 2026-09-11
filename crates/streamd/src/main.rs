@@ -7,13 +7,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::Kbps;
 use tracing_subscriber::EnvFilter;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::Kbps;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sprite-desktop-streamd",
+    name = "waywire-streamd",
     version,
     about = "Captures one Wayland output and streams H.264 RTP"
 )]

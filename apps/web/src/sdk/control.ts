@@ -13,10 +13,10 @@ import type {
   SurfaceHandle,
   SurfaceOptions,
   VideoState,
-  WaymoteEventMap,
-  WaymoteSessionOptions,
-  WaymoteSessionState,
-  WaymoteStats,
+  WaywireEventMap,
+  WaywireSessionOptions,
+  WaywireSessionState,
+  WaywireStats,
 } from "./session.ts";
 
 export type TransportPath = "/stream" | "/control";
@@ -139,15 +139,15 @@ type ShortcutClipboardCopy = {
   timeout: ReturnType<typeof setTimeout>;
 };
 type RuntimeOwner = {
-  emit<K extends keyof WaymoteEventMap>(
+  emit<K extends keyof WaywireEventMap>(
     type: K,
-    value: WaymoteEventMap[K],
+    value: WaywireEventMap[K],
   ): void;
-  updateState<K extends keyof WaymoteSessionState>(
+  updateState<K extends keyof WaywireSessionState>(
     section: K,
-    changes: Partial<WaymoteSessionState[K]>,
+    changes: Partial<WaywireSessionState[K]>,
   ): void;
-  setStats(stats: WaymoteStats): void;
+  setStats(stats: WaywireStats): void;
   halt(error: Error): void;
   remoteDisplayPolicy(): RemoteDisplayPolicy;
   controlOnFocus(): boolean;
@@ -164,11 +164,11 @@ export class ControlRuntime {
   private readonly scheduleResizeBound = () => this.scheduleResize();
 
   private readonly owner: RuntimeOwner;
-  private readonly options: WaymoteSessionOptions;
+  private readonly options: WaywireSessionOptions;
   private readonly transport: SessionTransport;
   private readonly video: VideoRuntime;
 
-  constructor(owner: RuntimeOwner, options: WaymoteSessionOptions) {
+  constructor(owner: RuntimeOwner, options: WaywireSessionOptions) {
     this.owner = owner;
     this.options = options;
     this.transport = new SessionTransport(
@@ -223,7 +223,7 @@ export class ControlRuntime {
   private pingID = 0;
   private readonly pings = new Map<number, number>();
   private readonly resizeRequests = new Map<number, ResizeRequest>();
-  private resizeState: WaymoteStats["resizeState"] = "idle";
+  private resizeState: WaywireStats["resizeState"] = "idle";
   private createVideo(): VideoRuntime {
     return new VideoRuntime(
       {
@@ -305,9 +305,9 @@ export class ControlRuntime {
     visibilityChanged: () => this.handleVisibilityChange(),
     emitError: (error) => this.emit("error", error),
   });
-  private emit<K extends keyof WaymoteEventMap>(
+  private emit<K extends keyof WaywireEventMap>(
     type: K,
-    value: WaymoteEventMap[K],
+    value: WaywireEventMap[K],
   ): void {
     this.owner.emit(type, value);
   }
@@ -578,7 +578,7 @@ export class ControlRuntime {
     generation: number,
     width: number,
     height: number,
-  ): WaymoteStats["resizeState"] {
+  ): WaywireStats["resizeState"] {
     for (const [id, request] of this.resizeRequests) {
       if (request.generation !== generation) continue;
       this.resizeState = "presented";

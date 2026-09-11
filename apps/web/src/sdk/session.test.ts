@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WaymoteSession } from "./session.ts";
+import { WaywireSession } from "./session.ts";
 import {
   deferredSocketOptions,
   FakeTarget,
@@ -28,7 +28,7 @@ async function resolveAttempts(
 test("reconnect creates fresh sockets and closes late old sockets", async () => {
   installBrowser();
   const attempts: SocketAttempt[] = [];
-  const session = new WaymoteSession(deferredSocketOptions(attempts));
+  const session = new WaywireSession(deferredSocketOptions(attempts));
   session.attachSurface(surfaceOptions());
 
   session.connect();
@@ -51,7 +51,7 @@ test("reconnect creates fresh sockets and closes late old sockets", async () => 
 test("visibility change tears down and re-establishes both sockets", async () => {
   const { document } = installBrowser();
   const attempts: SocketAttempt[] = [];
-  const session = new WaymoteSession(deferredSocketOptions(attempts));
+  const session = new WaywireSession(deferredSocketOptions(attempts));
   session.attachSurface(surfaceOptions());
   session.connect();
   await Promise.resolve();
@@ -78,7 +78,7 @@ test("session disposal is terminal, idempotent, and disposes the surface", async
   const { document } = installBrowser();
   const canvas = new FakeTarget();
   const textInput = new FakeTarget();
-  const session = new WaymoteSession();
+  const session = new WaywireSession();
   const surface = session.attachSurface(surfaceOptions(canvas, textInput));
   assert.ok(canvas.listenerCount > 0);
   assert.ok(textInput.listenerCount > 0);

@@ -39,16 +39,16 @@ if (!source || !/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(source)) {
 
 const root = resolve(import.meta.dirname, "..");
 const output = join(root, "dist", "releases", version);
-const temporary = await mkdtemp(join(tmpdir(), "sprite-desktop-release-"));
+const temporary = await mkdtemp(join(tmpdir(), "waywire-release-"));
 const payload = join(temporary, "payload");
-const archiveName = `sprite-desktop-${version}-linux-amd64.tar.gz`;
+const archiveName = `waywire-${version}-linux-amd64.tar.gz`;
 const archive = join(output, archiveName);
 let createdOutput = false;
 let completed = false;
 
 const service = {
-  name: "sprite-desktop",
-  cmd: "/opt/sprite-desktop/current/bin/desktop.sh",
+  name: "waywire",
+  cmd: "/opt/waywire/current/bin/desktop.sh",
   args: [],
   http_port: 8080,
   needs: [],
@@ -84,7 +84,7 @@ try {
   createdOutput = true;
   await mkdir(join(payload, "bin"), { recursive: true });
 
-  await exec("pnpm", ["--filter", "@sprite-desktop/web", "build"], {
+  await exec("pnpm", ["--filter", "@waywire/web", "build"], {
     cwd: root,
   });
   await exec("cargo", ["build", "--locked", "--release", "--workspace"], {
@@ -92,12 +92,12 @@ try {
   });
   await Promise.all([
     copyFile(
-      join(root, "target/release/sprite-desktop-gateway"),
-      join(payload, "bin/sprite-desktop-gateway"),
+      join(root, "target/release/waywire-gateway"),
+      join(payload, "bin/waywire-gateway"),
     ),
     copyFile(
-      join(root, "target/release/sprite-desktop-streamd"),
-      join(payload, "bin/sprite-desktop-streamd"),
+      join(root, "target/release/waywire-streamd"),
+      join(payload, "bin/waywire-streamd"),
     ),
     copyFile(
       join(root, "installer/desktop.sh"),
@@ -109,12 +109,9 @@ try {
     ),
   ]);
   await Promise.all(
-    [
-      "sprite-desktop-gateway",
-      "sprite-desktop-streamd",
-      "desktop.sh",
-      "session.py",
-    ].map((name) => chmod(join(payload, "bin", name), 0o555)),
+    ["waywire-gateway", "waywire-streamd", "desktop.sh", "session.py"].map(
+      (name) => chmod(join(payload, "bin", name), 0o555),
+    ),
   );
 
   const manifest = {
@@ -122,7 +119,7 @@ try {
     release: version,
     source,
     os: { id: "ubuntu", codename: "resolute", architecture: "amd64" },
-    artifacts: ["sprite-desktop-gateway", "sprite-desktop-streamd"],
+    artifacts: ["waywire-gateway", "waywire-streamd"],
     ports: { http: 8080 },
     services: [service],
   };
@@ -183,10 +180,10 @@ try {
 
   const template = await readFile(join(root, "installer/install.sh"), "utf8");
   const installer = template
-    .replaceAll("@SPRITE_DESKTOP_VERSION@", version)
-    .replaceAll("@SPRITE_DESKTOP_ARCHIVE_SIZE@", String(size))
-    .replaceAll("@SPRITE_DESKTOP_ARCHIVE_SHA256@", digest);
-  if (installer.includes("@SPRITE_DESKTOP_"))
+    .replaceAll("@WAYWIRE_VERSION@", version)
+    .replaceAll("@WAYWIRE_ARCHIVE_SIZE@", String(size))
+    .replaceAll("@WAYWIRE_ARCHIVE_SHA256@", digest);
+  if (installer.includes("@WAYWIRE_"))
     throw new Error("installer template has an unreplaced token");
   await writeFile(join(output, "install.sh"), installer, { mode: 0o755 });
   completed = true;

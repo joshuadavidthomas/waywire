@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use sprite_desktop_protocol::pipe::CursorShape;
 use tracing::debug;
 use tracing::warn;
+use waywire_protocol::pipe::CursorShape;
 use xcursor::parser::parse_xcursor;
 
 use super::CursorSize;
@@ -297,10 +297,8 @@ mod tests {
     impl TestDirectory {
         fn new() -> Self {
             let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "sprite-desktop-cursor-shapes-{}-{id}",
-                process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("waywire-cursor-shapes-{}-{id}", process::id()));
             fs::create_dir(&path).expect("test theme root should be created");
             Self(path)
         }

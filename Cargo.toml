@@ -47,7 +47,7 @@ rust-embed = { version = "8.11.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 socket2 = "0.6.1"
-sprite-desktop-protocol = { path = "crates/protocol" }
+waywire-protocol = { path = "crates/protocol" }
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }

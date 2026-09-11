@@ -10,27 +10,27 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::anyhow;
-#[cfg(test)]
-use sprite_desktop_protocol::browser::Continuity;
-#[cfg(test)]
-use sprite_desktop_protocol::browser::FrameKind;
-use sprite_desktop_protocol::browser::MAX_VIDEO_DATA_BYTES;
-#[cfg(test)]
-use sprite_desktop_protocol::browser::VideoSample;
-use sprite_desktop_protocol::pipe::Command;
-#[cfg(test)]
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::FrameMetadata;
-#[cfg(test)]
-use sprite_desktop_protocol::pipe::Generation;
-use sprite_desktop_protocol::pipe::KeyframeReadiness;
-use sprite_desktop_protocol::pipe::KeyframeState;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tracing::warn;
+#[cfg(test)]
+use waywire_protocol::browser::Continuity;
+#[cfg(test)]
+use waywire_protocol::browser::FrameKind;
+use waywire_protocol::browser::MAX_VIDEO_DATA_BYTES;
+#[cfg(test)]
+use waywire_protocol::browser::VideoSample;
+use waywire_protocol::pipe::Command;
+#[cfg(test)]
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameMetadata;
+#[cfg(test)]
+use waywire_protocol::pipe::Generation;
+use waywire_protocol::pipe::KeyframeReadiness;
+use waywire_protocol::pipe::KeyframeState;
 
 use self::assembler::Assembler;
 #[cfg(test)]
@@ -435,9 +435,9 @@ mod tests {
         FrameMetadata {
             generation: Generation::new(generation)
                 .expect("test metadata generation should be valid"),
-            width: sprite_desktop_protocol::pipe::FrameDimension::new(1280)
+            width: waywire_protocol::pipe::FrameDimension::new(1280)
                 .expect("test frame width should be valid"),
-            height: sprite_desktop_protocol::pipe::FrameDimension::new(720)
+            height: waywire_protocol::pipe::FrameDimension::new(720)
                 .expect("test frame height should be valid"),
             capture_nanos: sequence,
             sequence,

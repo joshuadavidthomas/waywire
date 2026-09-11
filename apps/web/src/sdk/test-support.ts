@@ -1,4 +1,4 @@
-import type { SurfaceOptions, WaymoteSessionOptions } from "./session.ts";
+import type { SurfaceOptions, WaywireSessionOptions } from "./session.ts";
 import { videoFrame } from "./wire.ts";
 
 export class FakeTarget {
@@ -125,7 +125,7 @@ export type SocketAttempt = {
 
 export function deferredSocketOptions(
   attempts: SocketAttempt[],
-): WaymoteSessionOptions {
+): WaywireSessionOptions {
   return {
     endpoint: "https://desktop.example.com",
     createWebSocket(path) {

@@ -1,4 +1,4 @@
-import type { SurfaceHandle, WaymoteSession, WaymoteStats } from "./waymote.ts";
+import type { SurfaceHandle, WaywireSession, WaywireStats } from "./waywire.ts";
 
 export type ViewerElements = {
   readonly display: HTMLCanvasElement;
@@ -18,11 +18,11 @@ export type ViewerElements = {
 
 export function installViewerListeners(
   elements: ViewerElements,
-  session: WaymoteSession,
+  session: WaywireSession,
   surface: SurfaceHandle,
 ): () => void {
   let resizeSummary = "resize idle";
-  let pendingMetrics: WaymoteStats | null = null;
+  let pendingMetrics: WaywireStats | null = null;
   let metricsTimer: ReturnType<typeof setTimeout> | null = null;
   let lastMetricsUpdate = Number.NEGATIVE_INFINITY;
   const cleanup: Array<() => void> = [];
@@ -117,7 +117,7 @@ export function installViewerListeners(
     }),
   );
   cleanup.push(
-    session.on("error", (error) => console.warn("Waymote stream error", error)),
+    session.on("error", (error) => console.warn("Waywire stream error", error)),
   );
 
   listen(elements.latency, "change", () =>

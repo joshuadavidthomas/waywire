@@ -1,5 +1,5 @@
 [package]
-name = "sprite-desktop-streamd"
+name = "waywire-streamd"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,7 +14,7 @@ memmap2.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sprite-desktop-protocol.workspace = true
+waywire-protocol.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

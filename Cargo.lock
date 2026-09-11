@@ -1124,61 +1124,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sprite-desktop-gateway"
-version = "0.1.0-dev"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "futures-util",
- "nix",
- "rust-embed",
- "serde",
- "serde_json",
- "socket2",
- "sprite-desktop-protocol",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "sprite-desktop-protocol"
-version = "0.1.0-dev"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "sprite-desktop-streamd"
-version = "0.1.0-dev"
-dependencies = [
- "anyhow",
- "calloop",
- "calloop-wayland-source",
- "clap",
- "memmap2",
- "nix",
- "serde",
- "serde_json",
- "sprite-desktop-protocol",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "xcursor",
- "xkbcommon",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1587,6 +1532,61 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
 dependencies = [
  "pkg-config",
+]
+
+[[package]]
+name = "waywire-gateway"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "nix",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "waywire-protocol",
+]
+
+[[package]]
+name = "waywire-protocol"
+version = "0.1.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "waywire-streamd"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "calloop-wayland-source",
+ "clap",
+ "memmap2",
+ "nix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "waywire-protocol",
+ "xcursor",
+ "xkbcommon",
 ]
 
 [[package]]

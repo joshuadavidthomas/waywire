@@ -12,9 +12,9 @@ use std::time::Instant;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
-use sprite_desktop_protocol::Record;
-use sprite_desktop_protocol::pipe::Event;
 use thiserror::Error;
+use waywire_protocol::Record;
+use waywire_protocol::pipe::Event;
 
 const MAX_QUEUED_EVENTS: usize = 256;
 const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
@@ -255,13 +255,13 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use sprite_desktop_protocol::pipe::CursorPosition;
-    use sprite_desktop_protocol::pipe::CursorShape;
-    use sprite_desktop_protocol::pipe::CursorVisibility;
-    use sprite_desktop_protocol::pipe::Fps;
-    use sprite_desktop_protocol::pipe::FrameDimension;
-    use sprite_desktop_protocol::pipe::FrameMetadata;
-    use sprite_desktop_protocol::pipe::Generation;
+    use waywire_protocol::pipe::CursorPosition;
+    use waywire_protocol::pipe::CursorShape;
+    use waywire_protocol::pipe::CursorVisibility;
+    use waywire_protocol::pipe::Fps;
+    use waywire_protocol::pipe::FrameDimension;
+    use waywire_protocol::pipe::FrameMetadata;
+    use waywire_protocol::pipe::Generation;
 
     use super::*;
 

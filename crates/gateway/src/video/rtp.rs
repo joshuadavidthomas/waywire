@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
-use sprite_desktop_protocol::pipe::Generation;
 use thiserror::Error;
+use waywire_protocol::pipe::Generation;
 
 pub(super) const RTP_CLOCK_HZ: u32 = 90_000;
 const DYNAMIC_PAYLOAD_TYPE: u8 = 96;

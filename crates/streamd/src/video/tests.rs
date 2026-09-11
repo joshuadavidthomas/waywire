@@ -41,14 +41,14 @@ fn wire_metadata(
     fps: Fps,
 ) -> FrameMetadata {
     FrameMetadata {
-        generation: sprite_desktop_protocol::pipe::Generation::new(generation)
+        generation: waywire_protocol::pipe::Generation::new(generation)
             .expect("test generation should be valid"),
         width,
         height,
         capture_nanos: sequence,
         sequence,
         input_sequence: input_sequence.map(|value| {
-            sprite_desktop_protocol::pipe::InputSequence::new(value)
+            waywire_protocol::pipe::InputSequence::new(value)
                 .expect("test input sequence should be valid")
         }),
         fps,
@@ -1266,7 +1266,7 @@ fn dimensions_enforce_level_and_four_k_budget() {
         encoded_dimensions(
             3840,
             2160,
-            sprite_desktop_protocol::pipe::ScalePercent::new(100)
+            waywire_protocol::pipe::ScalePercent::new(100)
                 .expect("full test scale should be valid"),
             fps(60),
         ),

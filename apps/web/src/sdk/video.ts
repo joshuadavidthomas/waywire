@@ -5,7 +5,7 @@ import {
   parseJson,
   type VideoConfiguration,
 } from "./messages.ts";
-import type { WaymoteStats } from "./session.ts";
+import type { WaywireStats } from "./session.ts";
 import { decodeRecord, readFrameMetadata } from "./wire.ts";
 export const maximumPendingVideoFrames = 24;
 export const maximumVideoDecodeQueueSize = maximumPendingVideoFrames;
@@ -35,7 +35,7 @@ export type VideoStatsContext = Readonly<{
   clockConfident: boolean;
   clockUncertaintyMs: number | null;
   pendingInputCount: number;
-  resizeState: WaymoteStats["resizeState"];
+  resizeState: WaywireStats["resizeState"];
 }>;
 
 export interface VideoOwner {
@@ -57,8 +57,8 @@ export interface VideoOwner {
     generation: number,
     width: number,
     height: number,
-  ): WaymoteStats["resizeState"];
-  publishStats(stats: WaymoteStats): void;
+  ): WaywireStats["resizeState"];
+  publishStats(stats: WaywireStats): void;
 }
 
 export type VideoPacket = Readonly<{

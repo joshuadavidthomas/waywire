@@ -1,5 +1,5 @@
 [package]
-name = "sprite-desktop-protocol"
+name = "waywire-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

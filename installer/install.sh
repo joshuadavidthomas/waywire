@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly RELEASE='@SPRITE_DESKTOP_VERSION@'
-readonly ARCHIVE_SIZE='@SPRITE_DESKTOP_ARCHIVE_SIZE@'
-readonly ARCHIVE_SHA256='@SPRITE_DESKTOP_ARCHIVE_SHA256@'
-readonly OWNER_ID='dev.sprite-desktop.runtime'
+readonly RELEASE='@WAYWIRE_VERSION@'
+readonly ARCHIVE_SIZE='@WAYWIRE_ARCHIVE_SIZE@'
+readonly ARCHIVE_SHA256='@WAYWIRE_ARCHIVE_SHA256@'
+readonly OWNER_ID='dev.waywire.runtime'
 readonly API_SOCKET='/.sprite/api.sock'
-readonly INSTALL_RECORD='/var/lib/sprite-desktop/install.json'
-readonly VERSION_FILE='/etc/sprite-desktop/version.json'
-readonly RELEASE_DIR="/opt/sprite-desktop/releases/$RELEASE"
-readonly CURRENT_LINK='/opt/sprite-desktop/current'
+readonly INSTALL_RECORD='/var/lib/waywire/install.json'
+readonly VERSION_FILE='/etc/waywire/version.json'
+readonly RELEASE_DIR="/opt/waywire/releases/$RELEASE"
+readonly CURRENT_LINK='/opt/waywire/current'
 archive_path=
 temporary=
 
-fail() { printf 'sprite-desktop installer: %s\n' "$*" >&2; exit 1; }
-notice() { printf 'sprite-desktop installer: %s\n' "$*"; }
-failpoint() { [ "${SPRITE_DESKTOP_FAILPOINT:-}" != "$1" ] || fail "test failpoint: $1"; }
+fail() { printf 'waywire installer: %s\n' "$*" >&2; exit 1; }
+notice() { printf 'waywire installer: %s\n' "$*"; }
+failpoint() { [ "${WAYWIRE_FAILPOINT:-}" != "$1" ] || fail "test failpoint: $1"; }
 cleanup() { [ -z "$temporary" ] || rm -rf "$temporary"; }
 trap cleanup EXIT
 
@@ -41,7 +41,7 @@ sudo -n true 2>/dev/null || fail 'the sprite user needs passwordless sudo'
 [ "${ID:-}" = ubuntu ] && [ "${VERSION_CODENAME:-}" = resolute ] || fail 'only Ubuntu 26.04 (resolute) is supported'
 [ "$(dpkg --print-architecture)" = amd64 ] || fail 'only amd64 is supported'
 sudo install -d -m 1777 /run/lock
-exec 9>/var/lock/sprite-desktop-install.lock
+exec 9>/var/lock/waywire-install.lock
 flock -x 9
 [ -S "$API_SOCKET" ] || fail "Sprite API socket is missing: $API_SOCKET"
 origin=$(sprite-env info | jq -er '.sprite_url | select(type == "string" and test("^https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$"))') ||
@@ -61,17 +61,17 @@ actual_size=$(stat -c %s "$archive")
 actual_sha=$(sha256sum "$archive" | awk '{print $1}')
 [ "$actual_sha" = "$ARCHIVE_SHA256" ] || fail "archive SHA-256 mismatch: expected $ARCHIVE_SHA256, got $actual_sha"
 tar -xzf "$archive" -C "$staged" --no-same-owner --no-same-permissions
-for path in bin/sprite-desktop-gateway bin/sprite-desktop-streamd bin/desktop.sh bin/session.py manifest.json sources.lock; do
+for path in bin/waywire-gateway bin/waywire-streamd bin/desktop.sh bin/session.py manifest.json sources.lock; do
   [ -f "$staged/$path" ] || fail "archive is missing $path"
 done
-expected_gateway_sha=$(sha256sum "$staged/bin/sprite-desktop-gateway" | awk '{print $1}')
-expected_streamd_sha=$(sha256sum "$staged/bin/sprite-desktop-streamd" | awk '{print $1}')
+expected_gateway_sha=$(sha256sum "$staged/bin/waywire-gateway" | awk '{print $1}')
+expected_streamd_sha=$(sha256sum "$staged/bin/waywire-streamd" | awk '{print $1}')
 jq -e --arg release "$RELEASE" '
   .schema == 1 and .release == $release and (.source | type == "string") and
   .os == {id:"ubuntu",codename:"resolute",architecture:"amd64"} and
-  .artifacts == ["sprite-desktop-gateway","sprite-desktop-streamd"] and
+  .artifacts == ["waywire-gateway","waywire-streamd"] and
   .ports == {http:8080} and
-  .services == [{name:"sprite-desktop",cmd:"/opt/sprite-desktop/current/bin/desktop.sh",args:[],http_port:8080,needs:[],env:{},dir:"/home/sprite"}]
+  .services == [{name:"waywire",cmd:"/opt/waywire/current/bin/desktop.sh",args:[],http_port:8080,needs:[],env:{},dir:"/home/sprite"}]
 ' "$staged/manifest.json" >/dev/null || fail 'manifest release, platform, or service definition is invalid'
 jq -e '.schema == 1 and (.sources | type == "array") and (.sources | length == 2)' "$staged/sources.lock" >/dev/null || fail 'sources.lock is invalid'
 bash -n "$staged/bin/desktop.sh"
@@ -96,19 +96,19 @@ done < <(jq -r '.sources[] | select(.name == "mozilla") | .key_fingerprints[]' "
 api() { curl --unix-socket "$API_SOCKET" -fsS 'http://sprite/v1/services'; }
 running_artifacts_match() {
   local pid cgroup executable digest members gateway_pid='' streamd_pid=''
-  members=$(sudo cat /sys/fs/cgroup/svc.sprite-desktop/cgroup.procs 2>/dev/null) || return 1
+  members=$(sudo cat /sys/fs/cgroup/svc.waywire/cgroup.procs 2>/dev/null) || return 1
   while read -r pid; do
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
     if $service_replacement_requested; then
       case " $previous_service_pids " in *" $pid "*) continue ;; esac
     fi
     cgroup=$(sudo cat "/proc/$pid/cgroup" 2>/dev/null) || continue
-    [ "$cgroup" = '0::/svc.sprite-desktop' ] || continue
+    [ "$cgroup" = '0::/svc.waywire' ] || continue
     # Sprite permits cmdline inspection but denies /proc/PID/exe, even to root.
     # The launcher resolves current before exec, so argv names this release.
     IFS= read -r -d '' executable < <(sudo cat "/proc/$pid/cmdline" 2>/dev/null) || continue
     case "$executable" in
-      "$RELEASE_DIR/bin/sprite-desktop-gateway"|"$RELEASE_DIR/bin/sprite-desktop-streamd") ;;
+      "$RELEASE_DIR/bin/waywire-gateway"|"$RELEASE_DIR/bin/waywire-streamd") ;;
       *) continue ;;
     esac
     digest=$(sudo sha256sum "$executable" 2>/dev/null | awk '{print $1}') || continue
@@ -135,18 +135,18 @@ elif sudo test -e "$CURRENT_LINK" || sudo test -L "$CURRENT_LINK"; then
   fail 'existing runtime pointer has no ownership record'
 fi
 target_service=$(jq -c '.services[0]' "$staged/manifest.json")
-current_service=$(jq -c '.[] | select(.name == "sprite-desktop")' <<<"$live_services")
+current_service=$(jq -c '.[] | select(.name == "waywire")' <<<"$live_services")
 # The API's service PID may not exist in this process namespace after restart.
 # Use actual cgroup members to distinguish replacement processes.
-previous_service_pids=$(sudo cat /sys/fs/cgroup/svc.sprite-desktop/cgroup.procs 2>/dev/null | tr '\n' ' ' || true)
+previous_service_pids=$(sudo cat /sys/fs/cgroup/svc.waywire/cgroup.procs 2>/dev/null | tr '\n' ' ' || true)
 if [ -n "$current_service" ]; then
   if [ -z "$record" ] || ! jq -e --argjson current "$current_service" '.services == [$current]' <<<"$record" >/dev/null; then
-    fail 'service name is foreign: sprite-desktop'
+    fail 'service name is foreign: waywire'
   fi
 fi
 while IFS= read -r definition; do
   name=$(jq -r .name <<<"$definition")
-  if [ "$(jq -r '.http_port != null' <<<"$definition")" = true ] && [ "$name" != sprite-desktop ]; then
+  if [ "$(jq -r '.http_port != null' <<<"$definition")" = true ] && [ "$name" != waywire ]; then
     fail "foreign HTTP service owns the Sprite URL: $name"
   fi
 done < <(jq -c '.[]' <<<"$live_services")
@@ -155,8 +155,8 @@ if [ -n "$listeners" ]; then
   if [ -z "$current_service" ] || [ -z "$record" ] || ! jq -e --argjson current "$current_service" '.services == [$current]' <<<"$record" >/dev/null; then
     fail 'port 8080 is occupied by an unmanaged process'
   fi
-  jq -e 'any(.[]; .name == "sprite-desktop" and .state.status == "running")' <<<"$services_raw" >/dev/null || fail 'port 8080 has no running owner service'
-  awk '{found=0; for (i=1; i<=NF; i++) if ($i == "cgroup:/svc.sprite-desktop") found=1; if (!found) exit 1}' <<<"$listeners" || fail 'port 8080 is occupied by an unmanaged process'
+  jq -e 'any(.[]; .name == "waywire" and .state.status == "running")' <<<"$services_raw" >/dev/null || fail 'port 8080 has no running owner service'
+  awk '{found=0; for (i=1; i<=NF; i++) if ($i == "cgroup:/svc.waywire") found=1; if (!found) exit 1}' <<<"$listeners" || fail 'port 8080 is occupied by an unmanaged process'
 fi
 recovery=false
 release_changed=true
@@ -174,13 +174,13 @@ if [ -n "$record" ]; then
 fi
 
 notice 'configuring verified apt sources and desktop packages'
-sudo install -d -m 0755 /etc/apt/keyrings /etc/sprite-desktop
+sudo install -d -m 0755 /etc/apt/keyrings /etc/waywire
 sudo install -m 0644 "$temporary/mozilla-key" /etc/apt/keyrings/packages.mozilla.org.asc
 jq -r '.sources[] | "Types: deb\nURIs: \(.url)\nSuites: \(.suites | join(" "))\nComponents: \(.components | join(" "))\nSigned-By: \(.keyring)\n"' "$staged/sources.lock" >"$temporary/apt.sources"
 printf '%s\n' 'Package: firefox' 'Pin: origin packages.mozilla.org' 'Pin-Priority: 1001' >"$temporary/apt.preferences"
-sudo install -m 0644 "$temporary/apt.sources" /etc/sprite-desktop/apt.sources
-sudo install -m 0644 "$temporary/apt.preferences" /etc/sprite-desktop/apt.preferences
-apt_options=(-o Dir::Etc::sourcelist=/etc/sprite-desktop/apt.sources -o Dir::Etc::sourceparts=- -o Dir::Etc::preferences=/etc/sprite-desktop/apt.preferences -o Dir::Etc::preferencesparts=)
+sudo install -m 0644 "$temporary/apt.sources" /etc/waywire/apt.sources
+sudo install -m 0644 "$temporary/apt.preferences" /etc/waywire/apt.preferences
+apt_options=(-o Dir::Etc::sourcelist=/etc/waywire/apt.sources -o Dir::Etc::sourceparts=- -o Dir::Etc::preferences=/etc/waywire/apt.preferences -o Dir::Etc::preferencesparts=)
 sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update
 mapfile -t packages < <(jq -r '[.sources[].packages[]] | unique[]' "$staged/sources.lock")
 sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"
@@ -189,12 +189,12 @@ packages_json=$(printf '%s\n' "${packages[@]}" | sort -u | xargs dpkg-query -W -
 jq -n --arg release "$RELEASE" --arg source "$(jq -r .source "$staged/manifest.json")" --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson packages "$packages_json" '{release:$release,source:$source,observed_at:$observed_at,packages:$packages}' >"$temporary/version.json"
 
 pending=$(jq -n --arg owner "$OWNER_ID" --arg release "$RELEASE" --arg archive "$ARCHIVE_SHA256" --argjson service "$target_service" '{schema:1,owner:$owner,state:"pending",release:$release,archive_sha256:$archive,services:[$service]}')
-sudo install -d -o root -g root -m 0755 /var/lib/sprite-desktop /opt/sprite-desktop /opt/sprite-desktop/releases "$RELEASE_DIR" "$RELEASE_DIR/bin"
+sudo install -d -o root -g root -m 0755 /var/lib/waywire /opt/waywire /opt/waywire/releases "$RELEASE_DIR" "$RELEASE_DIR/bin"
 printf '%s\n' "$pending" >"$temporary/install.json"
 sudo install -o root -g root -m 0644 "$temporary/install.json" "$INSTALL_RECORD.tmp"
 sudo mv "$INSTALL_RECORD.tmp" "$INSTALL_RECORD"
 failpoint after-pending
-for path in bin/sprite-desktop-gateway bin/sprite-desktop-streamd bin/desktop.sh bin/session.py manifest.json sources.lock; do
+for path in bin/waywire-gateway bin/waywire-streamd bin/desktop.sh bin/session.py manifest.json sources.lock; do
   mode=444
   [[ "$path" != bin/* ]] || mode=555
   if ! sudo cmp -s "$staged/$path" "$RELEASE_DIR/$path" ||
@@ -206,41 +206,41 @@ for path in bin/sprite-desktop-gateway bin/sprite-desktop-streamd bin/desktop.sh
 done
 sudo install -o root -g root -m 0644 "$temporary/version.json" "$VERSION_FILE.tmp"
 sudo mv "$VERSION_FILE.tmp" "$VERSION_FILE"
-sudo ln -sfn "releases/$RELEASE" /opt/sprite-desktop/current.new
-sudo mv -Tf /opt/sprite-desktop/current.new "$CURRENT_LINK"
+sudo ln -sfn "releases/$RELEASE" /opt/waywire/current.new
+sudo mv -Tf /opt/waywire/current.new "$CURRENT_LINK"
 
 request=$(jq -c 'del(.name)' <<<"$target_service")
 service_replacement_requested=false
 if [ "$current_service" != "$target_service" ]; then
-  curl --unix-socket "$API_SOCKET" -fsS -X PUT -H 'Content-Type: application/json' -d "$request" 'http://sprite/v1/services/sprite-desktop' -o /dev/null || fail 'could not create sprite-desktop service'
+  curl --unix-socket "$API_SOCKET" -fsS -X PUT -H 'Content-Type: application/json' -d "$request" 'http://sprite/v1/services/waywire' -o /dev/null || fail 'could not create waywire service'
   service_replacement_requested=true
 elif $recovery || $release_changed || [ "$(curl -fsS --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)" != ok ]; then
-  curl --unix-socket "$API_SOCKET" -fsS -X POST 'http://sprite/v1/services/sprite-desktop/restart' -o /dev/null || fail 'could not restart sprite-desktop service'
+  curl --unix-socket "$API_SOCKET" -fsS -X POST 'http://sprite/v1/services/waywire/restart' -o /dev/null || fail 'could not restart waywire service'
   service_replacement_requested=true
 fi
 failpoint after-service-1
 healthy=false
 for _ in $(seq 1 120); do
   candidate_services=$(api 2>/dev/null) || { sleep 1; continue; }
-  jq -e 'any(.[]; .name == "sprite-desktop" and .state.status == "running")' <<<"$candidate_services" >/dev/null || { sleep 1; continue; }
+  jq -e 'any(.[]; .name == "waywire" and .state.status == "running")' <<<"$candidate_services" >/dev/null || { sleep 1; continue; }
   candidate_pair=$(running_artifacts_match) || { sleep 1; continue; }
   [ "$(curl -fsS --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)" = ok ] || { sleep 1; continue; }
   # Keep both replacement executables stable across a full observation
   # interval; an old listener can answer while replacement starts.
   sleep 1
-  api 2>/dev/null | jq -e 'any(.[]; .name == "sprite-desktop" and .state.status == "running")' >/dev/null || continue
+  api 2>/dev/null | jq -e 'any(.[]; .name == "waywire" and .state.status == "running")' >/dev/null || continue
   confirmed_pair=$(running_artifacts_match) || continue
   [ "$confirmed_pair" = "$candidate_pair" ] || continue
   [ "$(curl -fsS --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)" = ok ] || continue
   healthy=true
   break
 done
-$healthy || fail 'sprite-desktop did not run the staged gateway and streamd within 120 seconds'
-final=$(api | jq -ce '[.[] | {name,cmd,args:(.args // []),http_port:(.http_port // null),needs:(.needs // []),env:(.env // {}),dir:(.dir // null)} | select(.name == "sprite-desktop")]')
-jq -en --argjson actual "$final" --argjson expected "[$target_service]" '$actual == $expected' >/dev/null || fail 'live sprite-desktop service does not match the release manifest'
+$healthy || fail 'waywire did not run the staged gateway and streamd within 120 seconds'
+final=$(api | jq -ce '[.[] | {name,cmd,args:(.args // []),http_port:(.http_port // null),needs:(.needs // []),env:(.env // {}),dir:(.dir // null)} | select(.name == "waywire")]')
+jq -en --argjson actual "$final" --argjson expected "[$target_service]" '$actual == $expected' >/dev/null || fail 'live waywire service does not match the release manifest'
 final_listeners=$(ss -H -ltne 'sport = :8080')
-[ "$(awk 'NF {count++} END {print count+0}' <<<"$final_listeners")" = 1 ] || fail 'sprite-desktop does not own exactly one HTTP listener'
-awk '{found=0; for (i=1; i<=NF; i++) if ($i == "cgroup:/svc.sprite-desktop") found=1; if (!found) exit 1}' <<<"$final_listeners" || fail 'sprite-desktop HTTP listener is outside its owned service cgroup'
+[ "$(awk 'NF {count++} END {print count+0}' <<<"$final_listeners")" = 1 ] || fail 'waywire does not own exactly one HTTP listener'
+awk '{found=0; for (i=1; i<=NF; i++) if ($i == "cgroup:/svc.waywire") found=1; if (!found) exit 1}' <<<"$final_listeners" || fail 'waywire HTTP listener is outside its owned service cgroup'
 failpoint before-commit
 committed=$(jq -c '.state="committed"' <<<"$pending")
 printf '%s\n' "$committed" >"$temporary/install-committed.json"

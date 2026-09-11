@@ -9,8 +9,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use nix::unistd::Pid;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::Kbps;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::process::Child;
@@ -20,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::info;
 use tracing::warn;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::Kbps;
 
 use self::commands::CommandReader;
 pub(crate) use self::commands::CommandSink;

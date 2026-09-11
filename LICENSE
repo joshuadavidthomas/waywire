@@ -36,7 +36,7 @@ Waymote browser SDK notice
 ==========================
 
 This notice applies to the Waymote-derived files in
-apps/web/src/sdk/.
+apps/web/src/sdk/, including apps/web/src/sdk/waywire.ts.
 
 MIT License
 

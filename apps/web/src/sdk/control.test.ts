@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WaymoteSession } from "./session.ts";
+import { WaywireSession } from "./session.ts";
 import {
   FakeTarget,
   installBrowser,
@@ -16,7 +16,7 @@ test("double-click stays unlocked until pointer lock is requested", async () => 
   canvas.requestPointerLock = async () => {
     lockRequests += 1;
   };
-  const session = new WaymoteSession();
+  const session = new WaywireSession();
   const surface = session.attachSurface(surfaceOptions(canvas));
   try {
     canvas.dispatch("dblclick", {});
@@ -38,7 +38,7 @@ test("dispose cancels an asynchronous clipboard paste", async () => {
     clipboard: { readText: () => clipboardText },
   });
   const canvas = new FakeTarget();
-  const session = new WaymoteSession();
+  const session = new WaywireSession();
   session.attachSurface(surfaceOptions(canvas));
   const originalWarn = console.warn;
   const warnings: unknown[][] = [];

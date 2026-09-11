@@ -31,7 +31,7 @@ test(
         ],
         { cwd: root, timeout: 150_000, maxBuffer: 4 << 20 },
       );
-      const archiveName = `sprite-desktop-${version}-linux-amd64.tar.gz`;
+      const archiveName = `waywire-${version}-linux-amd64.tar.gz`;
       const archive = join(output, archiveName);
       const digest = createHash("sha256")
         .update(await readFile(archive))
@@ -47,21 +47,21 @@ test(
           `readonly ARCHIVE_SIZE='${(await stat(archive)).size}'`,
         ),
       );
-      assert(!installer.includes("@SPRITE_DESKTOP_"));
+      assert(!installer.includes("@WAYWIRE_"));
       await exec("bash", ["-n", join(output, "install.sh")]);
       await exec("tar", ["-xzf", archive, "-C", unpacked]);
       const manifest = JSON.parse(
         await readFile(join(unpacked, "manifest.json"), "utf8"),
       );
       assert.deepEqual(manifest.artifacts, [
-        "sprite-desktop-gateway",
-        "sprite-desktop-streamd",
+        "waywire-gateway",
+        "waywire-streamd",
       ]);
       assert.deepEqual(manifest.ports, { http: 8080 });
       assert.deepEqual(manifest.services, [
         {
-          name: "sprite-desktop",
-          cmd: "/opt/sprite-desktop/current/bin/desktop.sh",
+          name: "waywire",
+          cmd: "/opt/waywire/current/bin/desktop.sh",
           args: [],
           http_port: 8080,
           needs: [],

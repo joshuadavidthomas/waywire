@@ -1,5 +1,5 @@
 [package]
-name = "sprite-desktop-gateway"
+name = "waywire-gateway"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
-sprite-desktop-protocol.workspace = true
+waywire-protocol.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -11,10 +11,6 @@ use memmap2::MmapOptions;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
-use sprite_desktop_protocol::pipe::CursorPosition;
-use sprite_desktop_protocol::pipe::CursorShape;
-use sprite_desktop_protocol::pipe::CursorVisibility;
-use sprite_desktop_protocol::pipe::Event;
 use tracing::debug;
 use wayland_client::QueueHandle;
 use wayland_client::WEnum;
@@ -27,6 +23,10 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_frame_v1;
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
+use waywire_protocol::pipe::CursorPosition;
+use waywire_protocol::pipe::CursorShape;
+use waywire_protocol::pipe::CursorVisibility;
+use waywire_protocol::pipe::Event;
 
 use self::shapes::ImageKey;
 pub(super) use self::shapes::ShapeTable;
@@ -199,7 +199,7 @@ impl Cursor {
             buffer.destroy();
         }
         self.mapping = None;
-        let fd = memfd_create(c"sprite-desktop-cursor", MFdFlags::MFD_CLOEXEC)?;
+        let fd = memfd_create(c"waywire-cursor", MFdFlags::MFD_CLOEXEC)?;
         ftruncate(&fd, i64::try_from(length)?)?;
         let file = File::from(fd);
         // SAFETY: the map owns a duplicate of the valid memfd and uses its current length.

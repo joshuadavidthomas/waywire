@@ -1,15 +1,15 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
-use sprite_desktop_protocol::browser::Continuity;
-use sprite_desktop_protocol::browser::FrameKind;
-use sprite_desktop_protocol::browser::VideoSample;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::FrameMetadata;
-use sprite_desktop_protocol::pipe::Generation;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
+use waywire_protocol::browser::Continuity;
+use waywire_protocol::browser::FrameKind;
+use waywire_protocol::browser::VideoSample;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameMetadata;
+use waywire_protocol::pipe::Generation;
 
 use super::GopState;
 use super::UNMATCHED_DEADLINE;
@@ -269,9 +269,9 @@ fn metadata_gap(ticks: RtpTicks, fps: Fps) -> Option<NonZeroUsize> {
 mod tests {
     use std::sync::Arc;
 
-    use sprite_desktop_protocol::browser::Continuity;
-    use sprite_desktop_protocol::browser::FrameKind;
     use tokio::sync::Semaphore;
+    use waywire_protocol::browser::Continuity;
+    use waywire_protocol::browser::FrameKind;
 
     use super::*;
     use crate::video::assembler::Assembler;
@@ -426,8 +426,7 @@ mod tests {
         assert!(
             metadata_gap(
                 RtpTicks(u32::MAX),
-                sprite_desktop_protocol::pipe::Fps::new(60)
-                    .expect("test frame rate should be valid"),
+                waywire_protocol::pipe::Fps::new(60).expect("test frame rate should be valid"),
             )
             .is_none()
         );

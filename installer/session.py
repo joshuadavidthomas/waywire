@@ -110,7 +110,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     # Use the immutable release path in child argv, including across upgrades.
-    root = Path("/opt/sprite-desktop/current/bin").resolve(strict=True)
+    root = Path("/opt/waywire/current/bin").resolve(strict=True)
     with (runtime / "labwc.log").open("w") as log, contextlib.ExitStack() as owned:
         compositor = owned.enter_context(child(
             ["labwc", "-C", str(Path(os.environ["XDG_CONFIG_HOME"]) / "labwc"),
@@ -137,8 +137,8 @@ def main():
             check=True, timeout=5,
         )
         gateway = owned.enter_context(child([
-            str(root / "sprite-desktop-gateway"), "--listen", "0.0.0.0:8080",
-            "--streamd", str(root / "sprite-desktop-streamd"),
+            str(root / "waywire-gateway"), "--listen", "0.0.0.0:8080",
+            "--streamd", str(root / "waywire-streamd"),
             "--public-url", sys.argv[1], "--frame-rate", "60", "--bitrate", "16000",
             "--xkb-layout", os.environ.get("XKB_DEFAULT_LAYOUT", "us"),
         ]))

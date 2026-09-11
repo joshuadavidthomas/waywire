@@ -8,12 +8,6 @@ use anyhow::bail;
 use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use nix::unistd::ftruncate;
-use sprite_desktop_protocol::pipe::Button;
-use sprite_desktop_protocol::pipe::ButtonState;
-use sprite_desktop_protocol::pipe::Command;
-use sprite_desktop_protocol::pipe::KeyCode;
-use sprite_desktop_protocol::pipe::KeyState;
-use sprite_desktop_protocol::pipe::TextAction;
 use wayland_client::Proxy;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_keyboard;
@@ -26,6 +20,12 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboar
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1;
+use waywire_protocol::pipe::Button;
+use waywire_protocol::pipe::ButtonState;
+use waywire_protocol::pipe::Command;
+use waywire_protocol::pipe::KeyCode;
+use waywire_protocol::pipe::KeyState;
+use waywire_protocol::pipe::TextAction;
 use xkbcommon::xkb;
 
 use super::State;
@@ -116,7 +116,7 @@ impl Input {
             .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
             .into_bytes();
         text.push(0);
-        let fd = memfd_create(c"sprite-desktop-keymap", MFdFlags::MFD_CLOEXEC)?;
+        let fd = memfd_create(c"waywire-keymap", MFdFlags::MFD_CLOEXEC)?;
         ftruncate(&fd, i64::try_from(text.len())?)?;
         let mut file = File::from(fd);
         file.write_all(&text)?;

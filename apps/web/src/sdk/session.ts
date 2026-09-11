@@ -1,4 +1,4 @@
-// Framework-independent browser SDK for a Waymote streaming gateway.
+// Framework-independent browser SDK for a Waywire streaming gateway.
 import { ControlRuntime, type TransportPath } from "./control.ts";
 import {
   normalizeRemoteDisplayPolicy,
@@ -7,7 +7,7 @@ import {
   type RemoteDisplayPolicy,
 } from "./resize.ts";
 
-export interface WaymoteSessionOptions {
+export interface WaywireSessionOptions {
   readonly endpoint?: string | URL;
   readonly latency?: number;
   readonly createWebSocket?: (
@@ -45,12 +45,12 @@ export interface InputState {
   readonly pointerLocked: boolean;
 }
 
-export interface WaymoteSessionState {
+export interface WaywireSessionState {
   readonly video: VideoState;
   readonly input: InputState;
 }
 
-export interface WaymoteStats {
+export interface WaywireStats {
   readonly width: number;
   readonly height: number;
   readonly renderedFps: number;
@@ -100,9 +100,9 @@ export interface QualityEvent {
   readonly scalePercent: number;
 }
 
-export interface WaymoteEventMap {
-  readonly state: WaymoteSessionState;
-  readonly stats: WaymoteStats;
+export interface WaywireEventMap {
+  readonly state: WaywireSessionState;
+  readonly stats: WaywireStats;
   readonly clipboard: ClipboardUpdateEvent;
   readonly resize: ResizeEvent;
   readonly quality: QualityEvent;
@@ -148,9 +148,9 @@ export interface RemoteDisplayController {
   readonly policy: RemoteDisplayPolicy;
 }
 
-/** Framework-free browser client for a Waymote streaming gateway. */
-export class WaymoteSession {
-  #listeners = new Map<keyof WaymoteEventMap, Set<(value: unknown) => void>>();
+/** Framework-free browser client for a Waywire streaming gateway. */
+export class WaywireSession {
+  #listeners = new Map<keyof WaywireEventMap, Set<(value: unknown) => void>>();
   #remoteDisplayPolicy: RemoteDisplayPolicy;
   #controlOnFocus = false;
   #runtime: ControlRuntime;
@@ -161,10 +161,10 @@ export class WaymoteSession {
   readonly input: InputController;
   readonly clipboard: ClipboardController;
   readonly remoteDisplay: RemoteDisplayController;
-  state: WaymoteSessionState;
-  stats: Readonly<Partial<WaymoteStats>>;
+  state: WaywireSessionState;
+  stats: Readonly<Partial<WaywireStats>>;
 
-  constructor(options: WaymoteSessionOptions = {}) {
+  constructor(options: WaywireSessionOptions = {}) {
     this.#remoteDisplayPolicy = normalizeRemoteDisplayPolicy(
       options.remoteDisplay ?? { mode: "manual" },
     );
@@ -248,13 +248,13 @@ export class WaymoteSession {
     return this.#runtime.attachSurface(options);
   }
 
-  on<K extends keyof WaymoteEventMap>(
+  on<K extends keyof WaywireEventMap>(
     type: K,
-    listener: (event: WaymoteEventMap[K]) => void,
+    listener: (event: WaywireEventMap[K]) => void,
   ): () => void {
     this.#assertActive();
     const wrapped = (value: unknown): void =>
-      listener(value as WaymoteEventMap[K]);
+      listener(value as WaywireEventMap[K]);
     let listeners = this.#listeners.get(type);
     if (!listeners) this.#listeners.set(type, (listeners = new Set()));
     listeners.add(wrapped);
@@ -300,24 +300,24 @@ export class WaymoteSession {
     this.#emit("error", error);
   }
 
-  #updateState<K extends keyof WaymoteSessionState>(
+  #updateState<K extends keyof WaywireSessionState>(
     section: K,
-    changes: Partial<WaymoteSessionState[K]>,
+    changes: Partial<WaywireSessionState[K]>,
   ): void {
     const nextSection = Object.freeze({ ...this.state[section], ...changes });
     this.state = Object.freeze({ ...this.state, [section]: nextSection });
     this.#emit("state", this.state);
   }
 
-  #emit<K extends keyof WaymoteEventMap>(
+  #emit<K extends keyof WaywireEventMap>(
     type: K,
-    value: WaymoteEventMap[K],
+    value: WaywireEventMap[K],
   ): void {
     for (const listener of [...(this.#listeners.get(type) ?? [])]) {
       try {
         listener(value);
       } catch (error) {
-        console.error(`Waymote ${type} listener failed`, error);
+        console.error(`Waywire ${type} listener failed`, error);
       }
     }
   }

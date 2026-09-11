@@ -7,15 +7,15 @@ use std::sync::PoisonError;
 use std::time::Instant;
 
 use anyhow::Result;
-use sprite_desktop_protocol::browser::Feedback;
-use sprite_desktop_protocol::browser::QualityLevels;
-use sprite_desktop_protocol::pipe::Command;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::Kbps;
-use sprite_desktop_protocol::pipe::Quality as QualityCommand;
-use sprite_desktop_protocol::pipe::ReleaseAll;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
+use waywire_protocol::browser::Feedback;
+use waywire_protocol::browser::QualityLevels;
+use waywire_protocol::pipe::Command;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::Kbps;
+use waywire_protocol::pipe::Quality as QualityCommand;
+use waywire_protocol::pipe::ReleaseAll;
 
 use self::quality::Quality;
 use crate::daemon::CommandSink;
@@ -217,9 +217,9 @@ pub(crate) enum FeedbackOutcome {
 mod tests {
     use std::time::Duration;
 
-    use sprite_desktop_protocol::InvalidValue;
-    use sprite_desktop_protocol::browser::FeedbackValues;
     use tokio::time::timeout;
+    use waywire_protocol::InvalidValue;
+    use waywire_protocol::browser::FeedbackValues;
 
     use super::*;
     use crate::daemon::TestCommandReceiver;

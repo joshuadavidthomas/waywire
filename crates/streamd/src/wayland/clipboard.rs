@@ -19,14 +19,14 @@ use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use nix::unistd::pipe;
-use sprite_desktop_protocol::pipe::ClipboardText;
-use sprite_desktop_protocol::pipe::MAX_CLIPBOARD_BYTES;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_seat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
+use waywire_protocol::pipe::ClipboardText;
+use waywire_protocol::pipe::MAX_CLIPBOARD_BYTES;
 
 use super::ControlMessage;
 use super::State;

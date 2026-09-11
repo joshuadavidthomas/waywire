@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-fail() { printf 'sprite-desktop launcher: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'waywire launcher: %s\n' "$*" >&2; exit 1; }
 
-readonly root=/opt/sprite-desktop/current
-readonly runtime_dir=/tmp/sprite-desktop
+readonly root=/opt/waywire/current
+readonly runtime_dir=/tmp/waywire
 readonly wayland_display=wayland-0
 readonly wayland_socket="$runtime_dir/$wayland_display"
 
 [ "$(id -un)" = sprite ] || fail 'run as the sprite user'
-[ "$(</proc/self/cgroup)" = '0::/svc.sprite-desktop' ] || fail 'run through the sprite-desktop service'
+[ "$(</proc/self/cgroup)" = '0::/svc.waywire' ] || fail 'run through the waywire service'
 for command in dbus-run-session ffmpeg flock jq labwc lxqt-session python3 sprite-env ss wayland-info wlr-randr; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
-for binary in sprite-desktop-gateway sprite-desktop-streamd; do
+for binary in waywire-gateway waywire-streamd; do
   [ -x "$root/bin/$binary" ] || fail "paired binary is missing: $root/bin/$binary"
 done
 

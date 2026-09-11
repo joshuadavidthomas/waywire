@@ -1,11 +1,11 @@
 use axum::extract::ws::Message;
 use axum::extract::ws::WebSocket;
-use sprite_desktop_protocol::Record;
-use sprite_desktop_protocol::browser::ClientEvent;
-use sprite_desktop_protocol::browser::VideoSample;
-use sprite_desktop_protocol::pipe::H264_PROFILE;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use waywire_protocol::Record;
+use waywire_protocol::browser::ClientEvent;
+use waywire_protocol::browser::VideoSample;
+use waywire_protocol::pipe::H264_PROFILE;
 
 use super::AppState;
 use super::admission::SocketAdmission;

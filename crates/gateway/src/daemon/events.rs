@@ -7,13 +7,6 @@ use std::sync::PoisonError;
 use std::time::Duration;
 
 use anyhow::Result;
-use sprite_desktop_protocol::Decoder;
-use sprite_desktop_protocol::ProtocolError as DecodeError;
-use sprite_desktop_protocol::browser::ClientEvent;
-use sprite_desktop_protocol::browser::CursorState;
-use sprite_desktop_protocol::pipe::ClipboardText;
-use sprite_desktop_protocol::pipe::CursorPosition;
-use sprite_desktop_protocol::pipe::Event;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -21,6 +14,13 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tokio::time::timeout_at;
+use waywire_protocol::Decoder;
+use waywire_protocol::ProtocolError as DecodeError;
+use waywire_protocol::browser::ClientEvent;
+use waywire_protocol::browser::CursorState;
+use waywire_protocol::pipe::ClipboardText;
+use waywire_protocol::pipe::CursorPosition;
+use waywire_protocol::pipe::Event;
 
 use crate::video::VideoPipeline;
 
@@ -282,10 +282,10 @@ impl<R: AsyncRead + Unpin> EventReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use sprite_desktop_protocol::Record;
-    use sprite_desktop_protocol::pipe::CursorPosition;
     use tokio::io::AsyncWriteExt;
     use tokio::time::timeout;
+    use waywire_protocol::Record;
+    use waywire_protocol::pipe::CursorPosition;
 
     use super::*;
 

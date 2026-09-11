@@ -6,7 +6,7 @@ import {
   ProtocolVersionMismatchError,
   parseVideoConfiguration,
 } from "./messages.ts";
-import { WaymoteSession } from "./session.ts";
+import { WaywireSession } from "./session.ts";
 import {
   FakeTarget,
   FakeWebSocket,
@@ -20,7 +20,7 @@ import {
 } from "./test-support.ts";
 
 type VideoFixture = {
-  readonly session: WaymoteSession;
+  readonly session: WaywireSession;
   readonly videoSocket: FakeWebSocket;
   readonly socketAttempts: Array<{ path: string; socket: FakeWebSocket }>;
   readonly draws: number[];
@@ -37,7 +37,7 @@ async function videoFixture(): Promise<VideoFixture> {
       draws.push(frame.timestamp);
     },
   });
-  const session = new WaymoteSession({
+  const session = new WaywireSession({
     endpoint: "https://desktop.example.com",
     createWebSocket(path) {
       const created = new FakeWebSocket();

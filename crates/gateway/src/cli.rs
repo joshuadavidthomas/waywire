@@ -1,17 +1,17 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::Kbps;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::Kbps;
 
 use crate::daemon::XkbLayout;
 use crate::http::Origin;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sprite-desktop-gateway",
+    name = "waywire-gateway",
     version,
-    about = "Private HTTP and WebSocket gateway for sprite-desktop-streamd"
+    about = "Private HTTP and WebSocket gateway for waywire-streamd"
 )]
 pub(super) struct Options {
     #[arg(long, default_value = "127.0.0.1:8080")]

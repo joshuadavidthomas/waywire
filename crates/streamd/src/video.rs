@@ -29,16 +29,16 @@ use nix::poll::poll;
 use nix::sys::signal::SigSet;
 use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
-use sprite_desktop_protocol::pipe::Fps;
-use sprite_desktop_protocol::pipe::FrameDimension;
-use sprite_desktop_protocol::pipe::FrameMetadata;
-use sprite_desktop_protocol::pipe::Generation;
-use sprite_desktop_protocol::pipe::H264_PROFILE;
-use sprite_desktop_protocol::pipe::Kbps;
-use sprite_desktop_protocol::pipe::MAX_RAW_PIXELS;
-use sprite_desktop_protocol::pipe::ScalePercent;
 use thiserror::Error;
 use tracing::error;
+use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameDimension;
+use waywire_protocol::pipe::FrameMetadata;
+use waywire_protocol::pipe::Generation;
+use waywire_protocol::pipe::H264_PROFILE;
+use waywire_protocol::pipe::Kbps;
+use waywire_protocol::pipe::MAX_RAW_PIXELS;
+use waywire_protocol::pipe::ScalePercent;
 
 const SLOT_COUNT: usize = 3;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary

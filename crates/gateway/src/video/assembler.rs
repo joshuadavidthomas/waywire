@@ -2,9 +2,9 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use sprite_desktop_protocol::browser::Continuity;
-use sprite_desktop_protocol::browser::FrameKind;
-use sprite_desktop_protocol::pipe::Generation;
+use waywire_protocol::browser::Continuity;
+use waywire_protocol::browser::FrameKind;
+use waywire_protocol::pipe::Generation;
 
 use super::GopState;
 use super::MAX_ACCESS_UNIT;
