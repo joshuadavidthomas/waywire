@@ -1,27 +1,25 @@
-/* The viewer is a window onto a machine: the screen fills the page and one
-   bezel strip carries the legend, the keys, and the readout. */
+/* The page is the desktop. The canvas fills the viewport, the screen itself
+   shows whether the feed is live and whether you are driving, and one corner
+   key opens the only panel there is. */
 :root {
   color-scheme: dark;
-  --bezel: #0f0f0f;
+  --screen: #000;
   --chassis: #181818;
-  --chassis-raised: #202020;
-  --seam: #2b2b2b;
+  --chassis-raised: #212121;
+  --seam: #2c2c2c;
   --silkscreen: #dcd7ca;
   --silkscreen-dim: #928e84;
   --lamp-live: #6bd47a;
   --lamp-wait: #e2a53c;
   --lamp-fault: #e35d4d;
   --lamp-off: #3c3c3c;
-  --screen: #000;
   --ui: system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --numerals: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --legend-height: 30px;
-  --key-height: 40px;
-  --lamp-ease: 150ms cubic-bezier(0.2, 0.7, 0.2, 1);
-  font: 12px/1.3 var(--ui);
+  --ease: 160ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  font: 13px/1.35 var(--ui);
   color: var(--silkscreen);
-  background: var(--bezel);
-  accent-color: var(--silkscreen);
+  background: var(--screen);
+  accent-color: var(--lamp-live);
 }
 
 * {
@@ -30,29 +28,20 @@
 
 ::selection {
   background: var(--silkscreen);
-  color: var(--bezel);
+  color: var(--screen);
 }
 
 body {
   margin: 0;
-  min-width: 320px;
   height: 100dvh;
   overflow: hidden;
 }
 
-.console {
+/* Stage */
+
+.stage {
   position: relative;
   height: 100%;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) auto;
-}
-
-/* Screen */
-
-.screen {
-  position: relative;
-  min-height: 0;
   background: var(--screen);
 }
 
@@ -70,89 +59,188 @@ canvas {
   cursor: default;
 }
 
+/* While the panel is open a scrim above the canvas takes the dismissing
+   click, so closing the panel never presses a button on the remote desktop. */
+.stage:has(.panel:popover-open)::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+/* Driving: a thin lamp-green edge on the screen while the input lease is
+   held. It is the only chrome the resting page ever shows. */
+.stage::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 2px var(--lamp-live);
+  opacity: 0;
+  transition: opacity var(--ease);
+}
+
+.stage[data-lease="active"]::after {
+  opacity: 1;
+}
+
 canvas:focus-visible {
   outline: 1px solid var(--silkscreen-dim);
   outline-offset: -1px;
 }
 
-.notice {
+/* Not live: the screen says so, over whatever frame it last held. */
+
+.signal {
   position: absolute;
   inset: 0;
-  margin: 0;
   display: grid;
   place-items: center;
   padding: 24px;
-  color: var(--silkscreen-dim);
   text-align: center;
   pointer-events: none;
 }
 
-.notice.hidden {
+.signal[hidden] {
   display: none;
 }
 
-/* Bezel */
-
-.bezel {
+.signal p {
   position: relative;
-  min-width: 0;
-  padding: 0 14px;
-  border-top: 1px solid var(--seam);
-  background: var(--chassis);
-  white-space: nowrap;
+  margin: 0;
+  padding: 9px 16px 9px 32px;
+  max-width: 52ch;
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--seam);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--chassis) 92%, transparent);
+  color: var(--silkscreen);
+  text-align: left;
 }
 
-.legend-row,
-.key-row,
-.keys,
-.meter {
-  display: flex;
-  align-items: center;
-  min-width: 0;
+.signal p::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--lamp-off);
 }
 
-.legend-row {
-  gap: 14px;
-  min-height: var(--legend-height);
-  padding-top: 2px;
-  overflow: hidden;
+.signal-detail {
+  color: var(--silkscreen-dim);
+  font-size: 12px;
 }
 
-.key-row {
-  gap: 14px;
-  min-height: var(--key-height);
-  padding-bottom: 2px;
-  overflow-x: auto;
+.signal-detail:empty {
+  display: none;
+}
+
+.signal[data-state="connecting"] p::before,
+.signal[data-state="reconnecting"] p::before,
+.signal[data-state="connected"] p::before {
+  background: var(--lamp-wait);
+}
+
+.signal[data-state="error"] p::before {
+  background: var(--lamp-fault);
+}
+
+/* The key */
+
+.menu-key {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--seam);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--chassis) 88%, transparent);
+  color: var(--silkscreen);
+  cursor: pointer;
+  opacity: 0.92;
+  transition:
+    opacity 400ms ease-out,
+    border-color var(--ease);
+}
+
+.menu-key:hover,
+.menu-key:focus-visible {
+  opacity: 1;
+  border-color: var(--silkscreen-dim);
+  outline: none;
+}
+
+.menu-key:focus-visible {
+  outline: 2px solid var(--silkscreen);
+  outline-offset: 2px;
+}
+
+.stage[data-pointer="still"] .menu-key:not(:hover):not(:focus-visible) {
+  opacity: 0.22;
+}
+
+.stage:has(.panel:popover-open) .menu-key {
+  opacity: 1;
+  border-color: var(--silkscreen-dim);
+}
+
+/* The panel */
+
+.panel {
+  position: fixed;
+  inset: auto 12px 52px auto;
+  width: min(320px, calc(100vw - 24px));
+  max-height: calc(100dvh - 64px);
+  overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--seam) transparent;
+  margin: 0;
+  padding: 12px 12px 10px;
+  border: 1px solid var(--seam);
+  border-radius: 12px;
+  background: var(--chassis);
+  color: var(--silkscreen);
 }
 
-.keys,
-.meter {
-  gap: 10px;
+.panel::backdrop {
+  background: transparent;
 }
 
-.keys + .keys {
-  padding-left: 14px;
-  border-left: 1px solid var(--seam);
+.panel:popover-open {
+  animation: panel-in 160ms cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
-.mark {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--silkscreen-dim);
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.lamps {
+  margin: 0 0 10px;
+  padding: 2px 4px;
+  list-style: none;
+  display: grid;
+  gap: 5px;
 }
 
 .lamp {
   position: relative;
-  display: inline-block;
-  max-width: 30ch;
-  padding-left: 14px;
+  padding-left: 16px;
   overflow: hidden;
   text-overflow: ellipsis;
-  vertical-align: middle;
+  white-space: nowrap;
 }
 
 .lamp::before {
@@ -160,14 +248,12 @@ canvas:focus-visible {
   position: absolute;
   left: 0;
   top: 50%;
-  width: 7px;
-  height: 7px;
-  margin-top: -3.5px;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
   border-radius: 50%;
   background: var(--lamp-off);
-  transition:
-    background-color var(--lamp-ease),
-    box-shadow var(--lamp-ease);
+  transition: background-color var(--ease);
 }
 
 .lamp[data-state="connected"]::before,
@@ -191,148 +277,145 @@ canvas:focus-visible {
   background: var(--lamp-fault);
 }
 
-/* Keys */
+/* Actions: four groups seamed apart, keys with a resting edge. */
 
-.key {
-  min-height: 26px;
-  padding: 4px 9px;
+.actions {
+  display: grid;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px solid var(--seam);
+}
+
+.action {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 10px;
   border: 1px solid var(--seam);
-  border-radius: 4px;
+  border-radius: 6px;
   background: var(--chassis-raised);
   color: var(--silkscreen);
   font: inherit;
-  line-height: 1;
+  text-align: left;
   cursor: pointer;
   transition:
-    border-color var(--lamp-ease),
-    background-color var(--lamp-ease);
+    border-color var(--ease),
+    background-color var(--ease);
 }
 
-.key:hover:not(:disabled) {
+.action:hover:not(:disabled) {
   border-color: var(--silkscreen-dim);
 }
 
-.key:active:not(:disabled) {
+.action:active:not(:disabled) {
   background: var(--chassis);
 }
 
-.key:focus-visible {
+.action:focus-visible {
   outline: 2px solid var(--silkscreen);
   outline-offset: 1px;
 }
 
-.key:disabled {
+.action:disabled {
   color: var(--silkscreen-dim);
   background: var(--chassis);
   cursor: default;
 }
 
-.key[aria-pressed="true"] {
-  border-color: var(--silkscreen-dim);
-  background: var(--chassis);
-  box-shadow: inset 0 -2px 0 var(--lamp-live);
+/* A held mode shows its lamp at the right edge. */
+.action[aria-pressed]::after {
+  content: "";
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--lamp-off);
+  transition: background-color var(--ease);
 }
 
-select.key {
-  appearance: none;
-  padding-right: 22px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23928e84' stroke-width='1.5'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
+.action[aria-pressed="true"]::after {
+  background: var(--lamp-live);
+  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--lamp-live) 60%, transparent);
 }
+
+.note {
+  margin: 2px 4px 0;
+  color: var(--silkscreen-dim);
+  font-size: 12px;
+}
+
+.note:empty {
+  display: none;
+}
+
+/* Latency */
 
 .latency {
-  display: inline-flex;
+  margin: 0;
+  padding: 10px 4px 10px;
+  border: 0;
+  border-top: 1px solid var(--seam);
+  display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 14px;
+}
+
+.latency legend {
+  float: left;
+  padding: 0;
+  margin-right: 4px;
   color: var(--silkscreen-dim);
 }
 
-.clipboard-status {
-  max-width: 26ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--silkscreen-dim);
+.latency label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.latency input {
+  margin: 0;
 }
 
 /* Readout */
 
-.meter {
-  margin-left: auto;
-  font-family: var(--numerals);
-  font-variant-numeric: tabular-nums;
-  font-size: 11.5px;
-  color: var(--silkscreen);
-}
-
-.slot {
-  flex: none;
-  display: inline-block;
-  text-align: right;
-  transition: color var(--lamp-ease);
-}
-
-.slot[data-slot="size"] {
-  min-width: 8.5ch;
-}
-
-.slot[data-slot="fps"] {
-  min-width: 6ch;
-}
-
-.slot[data-slot="bitrate"] {
-  min-width: 15ch;
-}
-
-.slot[data-slot="rtt"] {
-  min-width: 10ch;
-}
-
-.slot[data-resize="requested"],
-.slot[data-resize="applied"] {
-  color: var(--lamp-wait);
-}
-
 .readout {
-  position: absolute;
-  right: 14px;
-  bottom: calc(100% + 8px);
-  z-index: 1;
-  max-height: calc(100dvh - 140px);
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--seam) transparent;
   margin: 0;
-  padding: 10px 12px;
+  padding: 10px 4px 4px;
+  border-top: 1px solid var(--seam);
   display: grid;
-  grid-template-columns: max-content max-content;
-  column-gap: 18px;
-  row-gap: 5px;
-  border: 1px solid var(--seam);
-  border-radius: 6px;
-  background: var(--chassis);
-  font-family: var(--numerals);
-  font-variant-numeric: tabular-nums;
-  font-size: 11.5px;
-}
-
-.readout[hidden] {
-  display: none;
+  grid-template-columns: max-content 1fr;
+  column-gap: 14px;
+  row-gap: 4px;
+  font-size: 12px;
 }
 
 .readout dt {
   color: var(--silkscreen-dim);
-  font-family: var(--ui);
-}
-
-#readout-toggle[aria-expanded="true"] {
-  border-color: var(--silkscreen-dim);
-  background: var(--chassis);
 }
 
 .readout dd {
   margin: 0;
   text-align: right;
+  font-family: var(--numerals);
+  font-variant-numeric: tabular-nums;
+  transition: color var(--ease);
+}
+
+.readout dd[data-resize="requested"],
+.readout dd[data-resize="applied"] {
+  color: var(--lamp-wait);
+}
+
+.hint {
+  margin: 8px 4px 0;
+  color: var(--silkscreen-dim);
+  font-size: 11px;
 }
 
 .ime-proxy {
@@ -343,55 +426,26 @@ select.key {
   pointer-events: none;
 }
 
-/* Narrow bezel: the readout takes its own line and the key row scrolls
-   sideways instead of stacking. */
+/* Phones: the panel is a sheet from the bottom edge. */
 
-@media (max-width: 900px) {
-  .legend-row {
-    flex-wrap: wrap;
-    gap: 4px 12px;
-    padding-top: 6px;
+@media (max-width: 480px) {
+  .panel {
+    inset: auto 0 0 0;
+    width: 100%;
+    max-height: 80dvh;
+    border-radius: 12px 12px 0 0;
+    border-bottom: 0;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
 
-  .meter {
-    flex-basis: 100%;
-    margin-left: 0;
-    min-height: 30px;
+  .action {
+    min-height: 44px;
   }
 
-  .slot {
-    text-align: left;
-  }
-
-  .keys {
-    flex: none;
-  }
-
-  .key {
-    min-height: 40px;
-  }
-
-  .key-row {
-    min-height: 52px;
-    scrollbar-color: var(--silkscreen-dim) transparent;
-  }
-
-  /* The scrolled key row fades at the chassis edge so the hidden keys
-     announce themselves. */
-  .bezel::after {
-    content: "";
-    position: absolute;
-    right: 0;
-    bottom: 0;
-    width: 32px;
-    height: 52px;
-    background: linear-gradient(to right, transparent, var(--chassis) 70%);
-    pointer-events: none;
-  }
-}
-
-@media (max-width: 600px) {
-  .slot[data-slot="bitrate"] {
-    display: none;
+  .menu-key {
+    width: 40px;
+    height: 40px;
+    right: 14px;
+    bottom: max(14px, env(safe-area-inset-bottom));
   }
 }

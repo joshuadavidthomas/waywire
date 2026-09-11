@@ -22,29 +22,32 @@ function viewerElements(): ViewerElements {
   const button = (element: Element): element is HTMLButtonElement =>
     element instanceof HTMLButtonElement;
   return {
+    stage: requireElement("#stage", html),
     display: requireElement(
       "#display",
       (element): element is HTMLCanvasElement =>
         element instanceof HTMLCanvasElement,
     ),
-    empty: requireElement("#empty", html),
+    signal: requireElement("#signal", html),
+    signalHeadline: requireElement("#signal-headline", html),
+    signalMessage: requireElement("#signal-message", html),
+    menuKey: requireElement("#menu-key", button),
+    panel: requireElement("#panel", html),
     status: requireElement("#status", html),
     controlStatus: requireElement("#control-status", html),
-    codec: requireElement("#codec", html),
-    metrics: requireElement("#metrics", html),
-    readout: requireElement("#readout", html),
-    readoutToggle: requireElement("#readout-toggle", button),
-    latency: requireElement(
-      "#latency",
-      (element): element is HTMLSelectElement =>
-        element instanceof HTMLSelectElement,
-    ),
-    resetVideoButton: requireElement("#reset-video", button),
+    controlToggle: requireElement("#control-toggle", button),
     pointerLockButton: requireElement("#pointer-lock", button),
-    textInputButton: requireElement("#text-input", button),
+    keyboardButton: requireElement("#keyboard", button),
     sendClipboardButton: requireElement("#send-clipboard", button),
     copyClipboardButton: requireElement("#copy-clipboard", button),
+    resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
+    latency: requireElement(
+      "#latency",
+      (element): element is HTMLFieldSetElement =>
+        element instanceof HTMLFieldSetElement,
+    ),
+    readout: requireElement("#readout", html),
     imeProxy: requireElement(
       "#ime-proxy",
       (element): element is HTMLInputElement =>
@@ -53,10 +56,15 @@ function viewerElements(): ViewerElements {
   };
 }
 
+function checkedLatency(latency: HTMLFieldSetElement): number {
+  const checked = latency.querySelector("input:checked");
+  return checked instanceof HTMLInputElement ? Number(checked.value) : 60;
+}
+
 function startViewer(): void {
   const elements = viewerElements();
   const session = new WaywireSession({
-    latency: Number(elements.latency.value),
+    latency: checkedLatency(elements.latency),
     statsIntervalMs: 250,
     remoteDisplay: {
       mode: "observe",
@@ -80,6 +88,9 @@ function startViewer(): void {
       .dispose()
       .catch((error: unknown) => console.error("Viewer stopped", error));
   }
+  function closePanel(): void {
+    if (elements.panel.matches(":popover-open")) elements.panel.hidePopover();
+  }
 
   // Each permission request keeps its user gesture and ignores repeated clicks
   // until it settles. Page teardown cancels listeners and late continuations.
@@ -93,6 +104,7 @@ function startViewer(): void {
       () => {
         if (pending || disposed) return;
         pending = true;
+        closePanel();
         void action()
           .catch((error: unknown) => {
             if (!disposed) {
@@ -151,7 +163,8 @@ function startViewer(): void {
       } catch (error) {
         if (disposed) return;
         console.warn("local clipboard read failed", error);
-        elements.clipboardStatus.textContent = "Local clipboard unavailable";
+        elements.clipboardStatus.textContent =
+          "The browser refused to read the local clipboard";
       }
     });
     onPermissionClick(elements.copyClipboardButton, async () => {
@@ -160,7 +173,7 @@ function startViewer(): void {
       try {
         await navigator.clipboard.writeText(text);
         if (!disposed)
-          elements.clipboardStatus.textContent = "Remote clipboard copied";
+          elements.clipboardStatus.textContent = "Desktop clipboard copied";
       } catch (error) {
         if (disposed) return;
         let copied = false;
@@ -176,8 +189,8 @@ function startViewer(): void {
           document.removeEventListener("copy", handleCopy);
         }
         elements.clipboardStatus.textContent = copied
-          ? "Remote clipboard copied"
-          : "Clipboard write unavailable";
+          ? "Desktop clipboard copied"
+          : "The browser refused to write the local clipboard";
         if (!copied) console.warn("remote clipboard write failed", error);
       }
     });

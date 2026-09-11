@@ -1,50 +1,108 @@
 import type {
   SurfaceHandle,
   WaywireSession,
+  WaywireSessionState,
   WaywireStats,
 } from "../sdk/waywire.ts";
 
 export type ViewerElements = {
+  readonly stage: HTMLElement;
   readonly display: HTMLCanvasElement;
-  readonly empty: HTMLElement;
+  readonly signal: HTMLElement;
+  readonly signalHeadline: HTMLElement;
+  readonly signalMessage: HTMLElement;
+  readonly menuKey: HTMLButtonElement;
+  readonly panel: HTMLElement;
   readonly status: HTMLElement;
   readonly controlStatus: HTMLElement;
-  readonly codec: HTMLElement;
-  readonly metrics: HTMLElement;
-  readonly readout: HTMLElement;
-  readonly readoutToggle: HTMLButtonElement;
-  readonly latency: HTMLSelectElement;
-  readonly resetVideoButton: HTMLButtonElement;
+  readonly controlToggle: HTMLButtonElement;
   readonly pointerLockButton: HTMLButtonElement;
-  readonly textInputButton: HTMLButtonElement;
+  readonly keyboardButton: HTMLButtonElement;
   readonly sendClipboardButton: HTMLButtonElement;
   readonly copyClipboardButton: HTMLButtonElement;
+  readonly resetVideoButton: HTMLButtonElement;
   readonly clipboardStatus: HTMLElement;
+  readonly latency: HTMLFieldSetElement;
+  readonly readout: HTMLElement;
   readonly imeProxy: HTMLInputElement;
 };
 
-type Slot = "size" | "fps" | "bitrate" | "rtt";
 type Field =
+  | "size"
+  | "fps"
   | "bitrate"
-  | "clock"
-  | "target"
+  | "rtt"
   | "late"
-  | "input"
-  | "decode"
+  | "clock"
+  | "queues"
   | "dropped"
-  | "generation"
-  | "resize";
+  | "resize"
+  | "codec";
 
-function child(
-  root: HTMLElement,
-  attribute: string,
-  name: string,
-): HTMLElement {
-  const element = root.querySelector(`[${attribute}="${name}"]`);
+const FIELDS: readonly Field[] = [
+  "size",
+  "fps",
+  "bitrate",
+  "rtt",
+  "late",
+  "clock",
+  "queues",
+  "dropped",
+  "resize",
+  "codec",
+];
+
+const POINTER_STILL_AFTER_MS = 2500;
+const READOUT_INTERVAL_MS = 250;
+const ESCAPE_CHORD_MS = 400;
+
+function signalHeadline(state: WaywireSessionState): string {
+  switch (state.video.state) {
+    case "idle":
+    case "connecting":
+      return "Connecting to the desktop";
+    case "connected":
+      return "Waiting for the first frame";
+    case "reconnecting":
+      return "Connection lost, retrying";
+    case "disconnected":
+      return "Disconnected";
+    case "error":
+      return "Video stopped";
+  }
+}
+
+function readoutField(readout: HTMLElement, name: Field): HTMLElement {
+  const element = readout.querySelector(`[data-field="${name}"]`);
   if (!(element instanceof HTMLElement)) {
-    throw new Error(`Expected [${attribute}="${name}"] under #${root.id}`);
+    throw new Error(`Expected [data-field="${name}"] in the readout`);
   }
   return element;
+}
+
+function titleFor(state: WaywireSessionState): string {
+  if (state.video.state === "error") return "Waywire · fault";
+  if (state.video.state === "reconnecting") return "Waywire · reconnecting";
+  if (state.video.state !== "connected") return "Waywire · offline";
+  if (state.input.state === "active") return "Waywire · driving";
+  return "Waywire · live";
+}
+
+function inputLabel(state: WaywireSessionState): string {
+  switch (state.input.state) {
+    case "active":
+      return "Driving";
+    case "ready":
+      return "Ready to drive";
+    case "requesting":
+    case "connecting":
+      return "Requesting control";
+    case "busy":
+      return "Another viewer is driving";
+    case "idle":
+    case "disconnected":
+      return "Watching";
+  }
 }
 
 export function installViewerListeners(
@@ -52,51 +110,47 @@ export function installViewerListeners(
   session: WaywireSession,
   surface: SurfaceHandle,
 ): () => void {
-  const slot = (name: Slot): HTMLElement =>
-    child(elements.metrics, "data-slot", name);
-  const field = (name: Field): HTMLElement =>
-    child(elements.readout, "data-field", name);
-  const slots = {
-    size: slot("size"),
-    fps: slot("fps"),
-    bitrate: slot("bitrate"),
-    rtt: slot("rtt"),
-  };
-  const fields = {
-    bitrate: field("bitrate"),
-    clock: field("clock"),
-    target: field("target"),
-    late: field("late"),
-    input: field("input"),
-    decode: field("decode"),
-    dropped: field("dropped"),
-    generation: field("generation"),
-    resize: field("resize"),
-  };
-  let pendingMetrics: WaywireStats | null = null;
-  let metricsTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastMetricsUpdate = Number.NEGATIVE_INFINITY;
+  const fields = Object.fromEntries(
+    FIELDS.map((name) => [name, readoutField(elements.readout, name)]),
+  ) as Record<Field, HTMLElement>;
   const cleanup: Array<() => void> = [];
-  const listen = (
-    target: EventTarget,
-    type: string,
-    listener: EventListener,
+  const listen = <K extends keyof HTMLElementEventMap>(
+    target: HTMLElement,
+    type: K,
+    listener: (event: HTMLElementEventMap[K]) => void,
   ): void => {
     target.addEventListener(type, listener);
     cleanup.push(() => target.removeEventListener(type, listener));
   };
+  const panelOpen = (): boolean => elements.panel.matches(":popover-open");
+  const closePanel = (): void => {
+    if (panelOpen()) elements.panel.hidePopover();
+  };
 
+  // The screen speaks for itself until the first frame is drawn, and again
+  // whenever the feed drops.
+  let framesSinceConnect = 0;
+  let lastState: WaywireSessionState | null = null;
   cleanup.push(
     session.on("state", (state) => {
+      lastState = state;
+      if (state.video.state !== "connected") framesSinceConnect = 0;
+      const live = state.video.state === "connected" && framesSinceConnect > 0;
+      elements.signal.hidden = live;
+      elements.signal.dataset["state"] = state.video.state;
+      const headline = signalHeadline(state);
+      elements.signalHeadline.textContent = headline;
+      elements.signalMessage.textContent =
+        state.video.message === headline ? "" : state.video.message;
       elements.status.textContent = state.video.message;
       elements.status.title = state.video.message;
       elements.status.dataset["state"] = state.video.state;
-      elements.controlStatus.textContent = state.input.message;
+      elements.controlStatus.textContent = inputLabel(state);
       elements.controlStatus.title = state.input.message;
       elements.controlStatus.dataset["state"] = state.input.state;
-      elements.codec.textContent = state.video.codec
-        ? `${state.video.codec} · WebCodecs`
-        : "—";
+      elements.stage.dataset["lease"] = state.input.state;
+      elements.controlToggle.textContent =
+        state.input.state === "active" ? "Release control" : "Take control";
       elements.pointerLockButton.textContent = state.input.pointerLocked
         ? "Unlock pointer"
         : "Lock pointer";
@@ -104,50 +158,52 @@ export function installViewerListeners(
         "aria-pressed",
         String(state.input.pointerLocked),
       );
-      if (state.video.state === "error") {
-        elements.empty.textContent = state.video.message;
-        elements.empty.classList.remove("hidden");
-      }
+      fields.codec.textContent = state.video.codec ?? "—";
+      document.title = titleFor(state);
     }),
   );
-  const renderMetrics = (): void => {
-    metricsTimer = null;
-    const stats = pendingMetrics;
+
+  let pendingStats: WaywireStats | null = null;
+  let readoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastReadout = Number.NEGATIVE_INFINITY;
+  const renderReadout = (): void => {
+    readoutTimer = null;
+    const stats = pendingStats;
     if (!stats) return;
-    pendingMetrics = null;
-    lastMetricsUpdate = performance.now();
-    slots.size.textContent = `${stats.width}×${stats.height}`;
-    slots.fps.textContent = `${stats.renderedFps.toFixed(0)} fps`;
-    slots.bitrate.textContent = `${stats.bitrateKbps} kbps · ${stats.scalePercent}%`;
-    slots.rtt.textContent = `${stats.rttMs.toFixed(1)} ms rtt`;
-    fields.bitrate.textContent = `${stats.bitrateKbps} kbps · ${stats.scalePercent}%`;
+    pendingStats = null;
+    lastReadout = performance.now();
+    fields.size.textContent = `${stats.width}×${stats.height}`;
+    fields.fps.textContent = `${stats.renderedFps.toFixed(0)} fps`;
+    fields.bitrate.textContent = `${stats.bitrateKbps} kbps at ${stats.scalePercent}%`;
+    fields.rtt.textContent = `${stats.rttMs.toFixed(1)} ms`;
+    fields.late.textContent = `${stats.latenessMs.toFixed(1)} ms of ${stats.latencyTargetMs} ms`;
     fields.clock.textContent = stats.clockConfident
       ? `±${stats.clockUncertaintyMs?.toFixed(1) ?? "?"} ms`
       : "syncing";
-    fields.target.textContent = `${stats.latencyTargetMs} ms`;
-    fields.late.textContent = `${stats.latenessMs.toFixed(1)} ms`;
-    fields.input.textContent = String(stats.pendingInputCount);
-    fields.decode.textContent = String(stats.decoderQueue);
-    fields.dropped.textContent = String(stats.droppedFrames);
-    fields.generation.textContent = String(stats.generation);
+    fields.queues.textContent = `${stats.pendingInputCount} input · ${stats.decoderQueue} decode`;
+    fields.dropped.textContent = `${stats.droppedFrames} of ${stats.receivedFrames}`;
   };
   cleanup.push(
     session.on("stats", (stats) => {
-      elements.empty.classList.add("hidden");
-      pendingMetrics = stats;
-      const remaining = 250 - (performance.now() - lastMetricsUpdate);
+      if (framesSinceConnect === 0) {
+        framesSinceConnect = 1;
+        elements.signal.hidden = true;
+        if (lastState) document.title = titleFor(lastState);
+      }
+      if (!panelOpen()) return;
+      pendingStats = stats;
+      const remaining = READOUT_INTERVAL_MS - (performance.now() - lastReadout);
       if (remaining <= 0) {
-        if (metricsTimer !== null) clearTimeout(metricsTimer);
-        renderMetrics();
-      } else if (metricsTimer === null) {
-        metricsTimer = setTimeout(renderMetrics, remaining);
+        if (readoutTimer !== null) clearTimeout(readoutTimer);
+        renderReadout();
+      } else if (readoutTimer === null) {
+        readoutTimer = setTimeout(renderReadout, remaining);
       }
     }),
   );
   cleanup.push(
     session.on("clipboard", (event) => {
       elements.clipboardStatus.textContent = event.status;
-      elements.clipboardStatus.title = event.status;
       elements.copyClipboardButton.disabled = event.text === null;
     }),
   );
@@ -159,7 +215,7 @@ export function installViewerListeners(
         event.latencyMs === undefined
           ? ""
           : ` in ${event.latencyMs.toFixed(0)} ms`;
-      slots.size.dataset["resize"] = event.state;
+      fields.size.dataset["resize"] = event.state;
       fields.resize.textContent = `${event.state}${size}${latency}`;
     }),
   );
@@ -167,32 +223,94 @@ export function installViewerListeners(
     session.on("error", (error) => console.warn("Waywire stream error", error)),
   );
 
-  listen(elements.latency, "change", () =>
-    session.video.setLatencyTarget(Number(elements.latency.value)),
-  );
-  listen(elements.resetVideoButton, "click", () => session.video.reset());
-  listen(elements.textInputButton, "click", () => {
+  // The SDK ties the lease to canvas focus, so the key and the panel's
+  // controls never take focus: pressing them leaves the screen focused and
+  // the lease where it was.
+  const keepScreenFocus = (event: PointerEvent): void => event.preventDefault();
+  listen(elements.menuKey, "pointerdown", keepScreenFocus);
+  for (const control of elements.panel.querySelectorAll("button, label")) {
+    if (control instanceof HTMLElement) {
+      listen(control, "pointerdown", keepScreenFocus);
+    }
+  }
+
+  listen(elements.controlToggle, "click", () => {
+    if (elements.stage.dataset["lease"] === "active") {
+      session.input.release();
+    } else {
+      session.input.acquire();
+      surface.focus();
+    }
+    closePanel();
+  });
+  listen(elements.keyboardButton, "click", () => {
     session.input.acquire();
+    closePanel();
     surface.focusTextInput();
   });
-  // The text-input key stays lit while the hidden proxy field holds focus.
-  const textInputPressed = (pressed: boolean): void =>
-    elements.textInputButton.setAttribute("aria-pressed", String(pressed));
-  listen(elements.imeProxy, "focus", () => textInputPressed(true));
-  listen(elements.imeProxy, "blur", () => textInputPressed(false));
-  listen(elements.readoutToggle, "click", () => {
-    const open = elements.readout.hidden;
-    elements.readout.hidden = !open;
-    elements.readoutToggle.setAttribute("aria-expanded", String(open));
+  listen(elements.resetVideoButton, "click", () => {
+    session.video.reset();
+    closePanel();
   });
-  // Keys never take focus from the screen; the lease follows the canvas.
-  for (const button of document.querySelectorAll("button")) {
-    listen(button, "pointerdown", (event) => event.preventDefault());
-  }
+
+  // Escape twice from the screen opens the panel and lets go of the
+  // desktop; a single Escape still reaches the remote. With the panel open,
+  // one Escape closes it. This runs before the SDK's own key handling.
+  // While the panel is open no key reaches the remote desktop.
+  let lastEscapeAt = Number.NEGATIVE_INFINITY;
+  const escapeChord = (event: KeyboardEvent): void => {
+    if (panelOpen()) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (event.key === "Escape" && !event.repeat) closePanel();
+      return;
+    }
+    if (event.key !== "Escape" || event.repeat) return;
+    const now = performance.now();
+    if (now - lastEscapeAt <= ESCAPE_CHORD_MS) {
+      lastEscapeAt = Number.NEGATIVE_INFINITY;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      session.input.release();
+      elements.panel.showPopover();
+      elements.controlToggle.focus();
+      return;
+    }
+    lastEscapeAt = now;
+  };
+  elements.display.addEventListener("keydown", escapeChord, { capture: true });
+  cleanup.push(() =>
+    elements.display.removeEventListener("keydown", escapeChord, {
+      capture: true,
+    }),
+  );
+  listen(elements.latency, "change", (event) => {
+    const input = event.target;
+    if (input instanceof HTMLInputElement && input.checked) {
+      session.video.setLatencyTarget(Number(input.value));
+    }
+  });
+
+  // The key dims while the pointer rests so it stops reading as chrome.
+  let stillTimer: ReturnType<typeof setTimeout> | null = null;
+  const pointerMoved = (): void => {
+    elements.stage.dataset["pointer"] = "moving";
+    if (stillTimer !== null) clearTimeout(stillTimer);
+    stillTimer = setTimeout(() => {
+      stillTimer = null;
+      elements.stage.dataset["pointer"] = "still";
+    }, POINTER_STILL_AFTER_MS);
+  };
+  listen(elements.stage, "pointermove", pointerMoved);
+  listen(elements.stage, "pointerdown", pointerMoved);
+  pointerMoved();
+
   return () => {
-    if (metricsTimer !== null) clearTimeout(metricsTimer);
-    metricsTimer = null;
-    pendingMetrics = null;
+    if (readoutTimer !== null) clearTimeout(readoutTimer);
+    if (stillTimer !== null) clearTimeout(stillTimer);
+    readoutTimer = null;
+    stillTimer = null;
+    pendingStats = null;
     for (const remove of cleanup.splice(0).reverse()) remove();
   };
 }
