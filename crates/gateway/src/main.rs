@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
     SockRef::from(&rtp)
         .set_recv_buffer_size(4 << 20)
         .context("set loopback RTP receive buffer to 4 MiB")?;
-    let hub = VideoHub::new();
+    let hub = VideoHub::new(options.frame_rate);
     let started = Daemon::start(
         &Config {
             path: options.streamd,

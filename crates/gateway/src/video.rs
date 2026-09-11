@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
+use std::net::SocketAddr;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use anyhow::Context;
-use anyhow::Result;
 use anyhow::anyhow;
 use sprite_desktop_protocol::browser::Continuity;
 use sprite_desktop_protocol::browser::FrameKind;
@@ -18,6 +20,7 @@ use sprite_desktop_protocol::pipe::FrameMetadata;
 use sprite_desktop_protocol::pipe::Generation;
 use sprite_desktop_protocol::pipe::KeyframeReadiness;
 use sprite_desktop_protocol::pipe::KeyframeState;
+use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -33,16 +36,15 @@ use crate::daemon::CommandSink;
 use crate::daemon::Readiness;
 
 const MAX_ACCESS_UNIT: usize = MAX_VIDEO_DATA_BYTES;
+const RTP_CLOCK_HZ: u32 = 90_000;
+const DYNAMIC_PAYLOAD_TYPE: u8 = 96;
 const PENDING_RECORD_CAPACITY: usize = 120;
-// Timestamp gaps wider than the queue cannot ever be matched.
-const MAX_PENDING_RECORDS: u64 = PENDING_RECORD_CAPACITY as u64;
 const MAX_PENDING_UNIT_BYTES: usize = 32 << 20;
+// At the protocol maximum this spans two seconds plus their leading keyframe. Production
+// keyframes arrive four times per second, so an oversized GOP reaches the byte bound first.
 const MAX_GOP_FRAMES: usize = 241;
 const MAX_GOP_BYTES: usize = 32 << 20;
-const VIEWER_BOUNDS: ViewerBounds = ViewerBounds {
-    frames: 8,
-    bytes: 32 << 20,
-};
+const VIEWER_BYTES: usize = 32 << 20;
 const UNMATCHED_DEADLINE: Duration = Duration::from_secs(2);
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -57,6 +59,7 @@ struct Hub {
     gop: Vec<VideoSample>,
     gop_bytes: usize,
     generation: Option<Generation>,
+    viewer_bounds: ViewerBounds,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,10 +77,27 @@ enum GopState {
     Recovering,
 }
 
+/// A viewer can hold two GOPs at the configured maximum frame rate. The byte bound is the
+/// same as the GOP cache and exceeds the encoder's 16 MiB maximum access unit.
 #[derive(Clone, Copy)]
 struct ViewerBounds {
     frames: usize,
     bytes: usize,
+}
+
+impl ViewerBounds {
+    fn for_max_fps(fps: Fps) -> Self {
+        let keyframe_interval = fps.keyframe_interval() as usize;
+        Self {
+            frames: keyframe_interval.saturating_mul(2),
+            bytes: VIEWER_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(frames: usize, bytes: usize) -> Self {
+        Self { frames, bytes }
+    }
 }
 
 struct ViewerQueue {
@@ -162,7 +182,6 @@ impl ViewerQueue {
 pub(crate) struct VideoSubscription {
     hub: VideoHub,
     id: SubscriberId,
-    bootstrap: VecDeque<VideoSample>,
     queue: Arc<Mutex<ViewerQueue>>,
     notify: Arc<Notify>,
 }
@@ -170,17 +189,6 @@ pub(crate) struct VideoSubscription {
 impl VideoSubscription {
     pub(crate) async fn next(&mut self) -> VideoSample {
         loop {
-            if let Some(frame) = self.bootstrap.pop_front() {
-                let current_generation = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .generation;
-                if current_generation == Some(frame.metadata.generation) {
-                    return frame;
-                }
-                continue;
-            }
             let notified = self.notify.notified();
             if let Some(frame) = self
                 .queue
@@ -190,8 +198,8 @@ impl VideoSubscription {
             {
                 return frame;
             }
-            // All durable progress lives in the queues. Cancellation can only
-            // discard this waiter, and the next call checks both queues before waiting again.
+            // All durable progress lives in the queue. Cancellation can only discard this
+            // waiter, and the next call checks the queue before waiting again.
             notified.await;
         }
     }
@@ -204,7 +212,7 @@ impl Drop for VideoSubscription {
 }
 
 impl VideoHub {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(max_fps: Fps) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Hub {
                 subscribers: HashMap::new(),
@@ -212,6 +220,7 @@ impl VideoHub {
                 gop: Vec::new(),
                 gop_bytes: 0,
                 generation: None,
+                viewer_bounds: ViewerBounds::for_max_fps(max_fps),
             })),
         }
     }
@@ -220,17 +229,27 @@ impl VideoHub {
         let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let id = SubscriberId(hub.next_subscriber);
         hub.next_subscriber = hub.next_subscriber.wrapping_add(1);
-        let bootstrap = VecDeque::from(hub.gop.clone());
-        let keyframe = if bootstrap.is_empty() {
-            GopState::Recovering
-        } else {
-            GopState::KeyframeCached
-        };
-        let queue = Arc::new(Mutex::new(ViewerQueue::new(
-            keyframe,
-            hub.generation,
-            VIEWER_BOUNDS,
-        )));
+        let bounds = hub.viewer_bounds;
+        let mut viewer_queue = ViewerQueue::new(GopState::Recovering, hub.generation, bounds);
+        // This explicitly accepts a subscriber joining after resync but before the recovery
+        // keyframe. It receives the pre-resync GOP, a valid picture existing viewers saw. At
+        // most one cached GOP is seeded here, and the recovery keyframe clears it.
+        for frame in &hub.gop {
+            match viewer_queue.push(frame.clone()) {
+                Pushed::Queued => {}
+                Pushed::Dropped => {
+                    debug!(
+                        gop_frames = hub.gop.len(),
+                        gop_bytes = hub.gop_bytes,
+                        viewer_frame_bound = bounds.frames,
+                        viewer_byte_bound = bounds.bytes,
+                        "cached GOP exceeds viewer bootstrap bounds"
+                    );
+                    break;
+                }
+            }
+        }
+        let queue = Arc::new(Mutex::new(viewer_queue));
         let notify = Arc::new(Notify::new());
         let _ = hub.subscribers.insert(
             id,
@@ -243,7 +262,6 @@ impl VideoHub {
         VideoSubscription {
             hub: self.clone(),
             id,
-            bootstrap,
             queue,
             notify,
         }
@@ -320,11 +338,32 @@ impl VideoHub {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RtpTimestamp(u32);
+
+impl RtpTimestamp {
+    fn elapsed_since(self, earlier: Self) -> RtpTicks {
+        RtpTicks(self.0.wrapping_sub(earlier.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RtpTicks(u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RtpSequence(u16);
+
+impl RtpSequence {
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
 #[derive(Debug)]
 struct Packet {
     end: AccessUnitEnd,
-    sequence: u16,
-    timestamp: u32,
+    sequence: RtpSequence,
+    timestamp: RtpTimestamp,
     generation: Generation,
     payload: Vec<u8>,
 }
@@ -335,47 +374,91 @@ enum AccessUnitEnd {
     More,
 }
 
-fn decode_packet(data: &[u8]) -> Result<Packet> {
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+enum PacketReject {
+    #[error("invalid RTP header")]
+    InvalidHeader,
+    #[error("truncated RTP CSRC list")]
+    TruncatedCsrc,
+    #[error("truncated RTP extension")]
+    TruncatedExtension,
+    #[error("RTP extension overflow")]
+    ExtensionOverflow,
+    #[error("truncated RTP extension payload")]
+    TruncatedExtensionPayload,
+    #[error("invalid RTP padding")]
+    InvalidPadding,
+    #[error("wrong RTP payload type or empty payload")]
+    WrongPayloadTypeOrEmptyPayload,
+    #[error("RTP SSRC generation must be positive")]
+    ZeroGeneration,
+    #[error("non-loopback RTP source {address}")]
+    NonLoopbackSource { address: SocketAddr },
+    #[error("RTP timestamp changed during FU-A")]
+    TimestampChangedDuringFu,
+    #[error("empty H.264 RTP payload")]
+    EmptyPayload,
+    #[error("NAL packet interleaved with FU-A")]
+    NalInterleavedWithFu,
+    #[error("truncated STAP-A length")]
+    TruncatedStapLength,
+    #[error("invalid STAP-A NAL length")]
+    InvalidStapNalLength,
+    #[error("unsupported H.264 packetization type {kind}")]
+    UnsupportedPacketization { kind: u8 },
+    #[error("truncated FU-A payload")]
+    TruncatedFuPayload,
+    #[error("invalid FU-A header")]
+    InvalidFuHeader,
+    #[error("invalid FU-A sequence")]
+    InvalidFuSequence,
+    #[error("RTP marker ended an incomplete FU-A")]
+    MarkerEndedIncompleteFu,
+    #[error("H.264 access unit exceeds byte limit")]
+    AccessUnitTooLarge,
+}
+
+fn decode_packet(data: &[u8]) -> Result<Packet, PacketReject> {
     if data.len() < 12 || data[0] >> 6 != 2 {
-        return Err(anyhow!("invalid RTP header"));
+        return Err(PacketReject::InvalidHeader);
     }
     let mut start = 12 + usize::from(data[0] & 15) * 4;
     if start > data.len() {
-        return Err(anyhow!("truncated RTP CSRC list"));
+        return Err(PacketReject::TruncatedCsrc);
     }
     if data[0] & 0x10 != 0 {
         if start + 4 > data.len() {
-            return Err(anyhow!("truncated RTP extension"));
+            return Err(PacketReject::TruncatedExtension);
         }
         let words = usize::from(u16::from_be_bytes([data[start + 2], data[start + 3]]));
         start = start
             .checked_add(4 + words * 4)
-            .ok_or_else(|| anyhow!("RTP extension overflow"))?;
+            .ok_or(PacketReject::ExtensionOverflow)?;
         if start > data.len() {
-            return Err(anyhow!("truncated RTP extension payload"));
+            return Err(PacketReject::TruncatedExtensionPayload);
         }
     }
     let mut end = data.len();
     if data[0] & 0x20 != 0 {
         let padding = usize::from(data[data.len() - 1]);
         if padding == 0 || padding > end - start {
-            return Err(anyhow!("invalid RTP padding"));
+            return Err(PacketReject::InvalidPadding);
         }
         end -= padding;
     }
-    if start == end || data[1] & 0x7f != 96 {
-        return Err(anyhow!("wrong RTP payload type or empty payload"));
+    if start == end || data[1] & 0x7f != DYNAMIC_PAYLOAD_TYPE {
+        return Err(PacketReject::WrongPayloadTypeOrEmptyPayload);
     }
     let generation = Generation::new(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
-        .map_err(|_invalid_generation| anyhow!("RTP SSRC generation must be positive"))?;
+        .map_err(|_invalid_generation| PacketReject::ZeroGeneration)?;
     Ok(Packet {
         end: if data[1] & 0x80 == 0 {
             AccessUnitEnd::More
         } else {
             AccessUnitEnd::Final
         },
-        sequence: u16::from_be_bytes([data[2], data[3]]),
-        timestamp: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+        sequence: RtpSequence(u16::from_be_bytes([data[2], data[3]])),
+        timestamp: RtpTimestamp(u32::from_be_bytes([data[4], data[5], data[6], data[7]])),
         generation,
         payload: data[start..end].to_vec(),
     })
@@ -385,8 +468,8 @@ struct Assembler {
     data: Vec<u8>,
     kind: FrameKind,
     fu_kind: Option<u8>,
-    timestamp: Option<u32>,
-    next_sequence: Option<u16>,
+    timestamp: Option<RtpTimestamp>,
+    next_sequence: Option<RtpSequence>,
     generation: Option<Generation>,
     buffered_packets: u64,
     keyframe: GopState,
@@ -412,7 +495,7 @@ struct Unit {
     data: Arc<[u8]>,
     kind: FrameKind,
     continuity: Continuity,
-    timestamp: u32,
+    timestamp: RtpTimestamp,
     generation: Generation,
 }
 
@@ -458,37 +541,36 @@ enum AssemblyOutcome {
     Dropped,
 }
 
-#[derive(Debug, Default)]
-struct AssemblyDrops {
-    packets: u64,
-    last_reason: Option<AssemblyDrop>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DroppedPackets {
+    packets: NonZeroU64,
+    reason: AssemblyDrop,
 }
 
-impl AssemblyDrops {
-    fn record(&mut self, packets: u64, reason: AssemblyDrop) {
-        if packets == 0 {
-            return;
-        }
-        self.packets = self.packets.saturating_add(packets);
-        self.last_reason = Some(reason);
+impl DroppedPackets {
+    fn record(slot: &mut Option<Self>, packets: NonZeroU64, reason: AssemblyDrop) {
+        let packets = slot.map_or(packets, |dropped| {
+            dropped.packets.saturating_add(packets.get())
+        });
+        *slot = Some(Self { packets, reason });
     }
 }
 
 #[derive(Debug)]
 struct AssemblyResult {
-    outcome: Result<AssemblyOutcome>,
-    drops: AssemblyDrops,
+    outcome: Result<AssemblyOutcome, PacketReject>,
+    drops: Option<DroppedPackets>,
 }
 
 impl AssemblyResult {
-    fn accepted(outcome: AssemblyOutcome, drops: AssemblyDrops) -> Self {
+    fn accepted(outcome: AssemblyOutcome, drops: Option<DroppedPackets>) -> Self {
         Self {
             outcome: Ok(outcome),
             drops,
         }
     }
 
-    fn rejected(error: anyhow::Error, drops: AssemblyDrops) -> Self {
+    fn rejected(error: PacketReject, drops: Option<DroppedPackets>) -> Self {
         Self {
             outcome: Err(error),
             drops,
@@ -498,22 +580,23 @@ impl AssemblyResult {
 
 impl Assembler {
     fn consume(&mut self, packet: Packet) -> AssemblyResult {
-        let mut drops = AssemblyDrops::default();
+        let mut drops = None;
         if self
             .generation
             .is_some_and(|generation| packet.generation.get() < generation.get())
         {
             // SSRC is the monotonic frame generation. A packet from an older
             // encoder must not alter access-unit or restart state.
-            drops.record(1, AssemblyDrop::StaleGeneration);
+            DroppedPackets::record(&mut drops, NonZeroU64::MIN, AssemblyDrop::StaleGeneration);
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
         if self
             .generation
             .is_some_and(|generation| packet.generation.get() > generation.get())
         {
-            let discarded = self.clear_access_unit();
-            drops.record(discarded, AssemblyDrop::GenerationDiscontinuity);
+            if let Some(packets) = self.clear_access_unit() {
+                DroppedPackets::record(&mut drops, packets, AssemblyDrop::GenerationDiscontinuity);
+            }
             self.next_sequence = None;
             self.keyframe = GopState::Recovering;
         }
@@ -522,31 +605,31 @@ impl Assembler {
             .next_sequence
             .is_some_and(|next| next != packet.sequence)
         {
-            let discarded = self.clear_access_unit();
-            drops.record(discarded, AssemblyDrop::SequenceDiscontinuity);
+            if let Some(packets) = self.clear_access_unit() {
+                DroppedPackets::record(&mut drops, packets, AssemblyDrop::SequenceDiscontinuity);
+            }
             self.keyframe = GopState::Recovering;
         }
-        self.next_sequence = Some(packet.sequence.wrapping_add(1));
+        self.next_sequence = Some(packet.sequence.next());
         if self
             .timestamp
             .is_some_and(|timestamp| timestamp != packet.timestamp)
         {
             let incomplete = self.fu_kind.is_some();
-            let discarded = self.clear_access_unit();
-            drops.record(discarded, AssemblyDrop::TimestampDiscontinuity);
+            if let Some(packets) = self.clear_access_unit() {
+                DroppedPackets::record(&mut drops, packets, AssemblyDrop::TimestampDiscontinuity);
+            }
             self.keyframe = GopState::Recovering;
             if incomplete {
-                return AssemblyResult::rejected(
-                    anyhow!("RTP timestamp changed during FU-A"),
-                    drops,
-                );
+                return AssemblyResult::rejected(PacketReject::TimestampChangedDuringFu, drops);
             }
         }
         self.timestamp = Some(packet.timestamp);
         let payload = packet.payload;
         if let Err(error) = self.append_payload(&payload) {
-            let discarded = self.clear_access_unit();
-            drops.record(discarded, AssemblyDrop::PacketRejection);
+            if let Some(packets) = self.clear_access_unit() {
+                DroppedPackets::record(&mut drops, packets, AssemblyDrop::PacketRejection);
+            }
             self.keyframe = GopState::Recovering;
             return AssemblyResult::rejected(error, drops);
         }
@@ -555,21 +638,32 @@ impl Assembler {
             return AssemblyResult::accepted(AssemblyOutcome::Incomplete, drops);
         }
         if self.fu_kind.is_some() {
-            let buffered = self.clear_access_unit();
-            drops.record(buffered.saturating_sub(1), AssemblyDrop::PacketRejection);
+            if let Some(buffered) = self.clear_access_unit()
+                && let Some(packets) = NonZeroU64::new(buffered.get().saturating_sub(1))
+            {
+                DroppedPackets::record(&mut drops, packets, AssemblyDrop::PacketRejection);
+            }
             self.keyframe = GopState::Recovering;
-            return AssemblyResult::rejected(anyhow!("RTP marker ended an incomplete FU-A"), drops);
+            return AssemblyResult::rejected(PacketReject::MarkerEndedIncompleteFu, drops);
         }
         let data = std::mem::take(&mut self.data);
         let kind = std::mem::replace(&mut self.kind, FrameKind::Delta);
         let access_unit_packets = std::mem::take(&mut self.buffered_packets);
         self.timestamp = None;
         if data.is_empty() {
-            drops.record(access_unit_packets, AssemblyDrop::EmptyAccessUnit);
+            if let Some(packets) = NonZeroU64::new(access_unit_packets) {
+                DroppedPackets::record(&mut drops, packets, AssemblyDrop::EmptyAccessUnit);
+            }
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
         if self.keyframe == GopState::Recovering && kind != FrameKind::Key {
-            drops.record(access_unit_packets, AssemblyDrop::RecoveringWithoutKeyframe);
+            if let Some(packets) = NonZeroU64::new(access_unit_packets) {
+                DroppedPackets::record(
+                    &mut drops,
+                    packets,
+                    AssemblyDrop::RecoveringWithoutKeyframe,
+                );
+            }
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
         let continuity = if self.keyframe == GopState::Recovering {
@@ -590,13 +684,13 @@ impl Assembler {
         )
     }
 
-    fn append_payload(&mut self, payload: &[u8]) -> Result<()> {
+    fn append_payload(&mut self, payload: &[u8]) -> Result<(), PacketReject> {
         if payload.is_empty() {
-            return Err(anyhow!("empty H.264 RTP payload"));
+            return Err(PacketReject::EmptyPayload);
         }
         let packet_type = payload[0] & 31;
         if self.fu_kind.is_some() && packet_type != 28 {
-            return Err(anyhow!("NAL packet interleaved with FU-A"));
+            return Err(PacketReject::NalInterleavedWithFu);
         }
         match packet_type {
             1..=23 => self.append_nal(payload),
@@ -604,12 +698,12 @@ impl Assembler {
                 let mut rest = &payload[1..];
                 while !rest.is_empty() {
                     if rest.len() < 2 {
-                        return Err(anyhow!("truncated STAP-A length"));
+                        return Err(PacketReject::TruncatedStapLength);
                     }
                     let len = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
                     rest = &rest[2..];
                     if len == 0 || len > rest.len() {
-                        return Err(anyhow!("invalid STAP-A NAL length"));
+                        return Err(PacketReject::InvalidStapNalLength);
                     }
                     self.append_nal(&rest[..len])?;
                     rest = &rest[len..];
@@ -617,20 +711,20 @@ impl Assembler {
                 Ok(())
             }
             28 => self.append_fu(payload),
-            kind => Err(anyhow!("unsupported H.264 packetization type {kind}")),
+            kind => Err(PacketReject::UnsupportedPacketization { kind }),
         }
     }
 
-    fn append_fu(&mut self, payload: &[u8]) -> Result<()> {
+    fn append_fu(&mut self, payload: &[u8]) -> Result<(), PacketReject> {
         if payload.len() < 3 {
-            return Err(anyhow!("truncated FU-A payload"));
+            return Err(PacketReject::TruncatedFuPayload);
         }
         let start = payload[1] & 0x80 != 0;
         let end = payload[1] & 0x40 != 0;
         let reserved = payload[1] & 0x20 != 0;
         let kind = payload[1] & 31;
         if reserved || kind == 0 || kind > 23 || start && end {
-            return Err(anyhow!("invalid FU-A header"));
+            return Err(PacketReject::InvalidFuHeader);
         }
         match (start, self.fu_kind) {
             (true, None) => {
@@ -638,7 +732,7 @@ impl Assembler {
                 self.fu_kind = Some(kind);
             }
             (false, Some(active)) if active == kind => {}
-            _ => return Err(anyhow!("invalid FU-A sequence")),
+            _ => return Err(PacketReject::InvalidFuSequence),
         }
         self.push(&payload[2..])?;
         if kind == 5 {
@@ -650,7 +744,7 @@ impl Assembler {
         Ok(())
     }
 
-    fn append_nal(&mut self, nal: &[u8]) -> Result<()> {
+    fn append_nal(&mut self, nal: &[u8]) -> Result<(), PacketReject> {
         if nal[0] & 31 == 5 {
             self.kind = FrameKind::Key;
         }
@@ -658,20 +752,20 @@ impl Assembler {
         self.push(nal)
     }
 
-    fn push(&mut self, value: &[u8]) -> Result<()> {
+    fn push(&mut self, value: &[u8]) -> Result<(), PacketReject> {
         if self.data.len().saturating_add(value.len()) > MAX_ACCESS_UNIT {
-            return Err(anyhow!("H.264 access unit exceeds byte limit"));
+            return Err(PacketReject::AccessUnitTooLarge);
         }
         self.data.extend_from_slice(value);
         Ok(())
     }
 
-    fn clear_access_unit(&mut self) -> u64 {
+    fn clear_access_unit(&mut self) -> Option<NonZeroU64> {
         self.data.clear();
         self.kind = FrameKind::Delta;
         self.fu_kind = None;
         self.timestamp = None;
-        std::mem::take(&mut self.buffered_packets)
+        NonZeroU64::new(std::mem::take(&mut self.buffered_packets))
     }
 }
 
@@ -685,12 +779,55 @@ struct PendingUnit {
     bytes: OwnedSemaphorePermit,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum MetadataMatch {
+    Matched {
+        metadata: FrameMetadata,
+        unmatched: usize,
+    },
+    NotYetArrived,
+    GenerationPassed,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+enum ResyncReason {
+    #[error("metadata count limit exceeded")]
+    MetadataBacklog,
+    #[error("RTP unit count limit exceeded")]
+    UnitBacklog,
+    #[error("video metadata/RTP correlation stalled")]
+    UnmatchedDeadline,
+    #[error("RTP timestamp gap {ticks:?} exceeds correlation window at {fps:?}")]
+    TimestampGap { ticks: RtpTicks, fps: Fps },
+    #[error("metadata generation passed the pending RTP unit generation")]
+    MetadataGenerationPassed,
+}
+
+#[must_use]
+#[derive(Debug)]
+struct Correlation {
+    outcome: CorrelationOutcome,
+    unmatched_metadata: usize,
+}
+
+#[derive(Debug)]
+enum CorrelationOutcome {
+    Frames(Vec<VideoSample>),
+    Resync(ResyncReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimestampAnchor {
+    Needed,
+    Present { timestamp: RtpTimestamp, fps: Fps },
+}
+
 struct Correlator {
     metadata: VecDeque<Pending<FrameMetadata>>,
     units: VecDeque<Pending<PendingUnit>>,
-    last_timestamp: Option<u32>,
     last_generation: Option<Generation>,
-    last_fps: Option<Fps>,
+    timestamp_anchor: TimestampAnchor,
+    keyframe: GopState,
 }
 
 impl Correlator {
@@ -698,21 +835,15 @@ impl Correlator {
         Self {
             metadata: VecDeque::new(),
             units: VecDeque::new(),
-            last_timestamp: None,
             last_generation: None,
-            last_fps: None,
+            timestamp_anchor: TimestampAnchor::Needed,
+            keyframe: GopState::KeyframeCached,
         }
     }
 
-    fn push_metadata(&mut self, value: FrameMetadata) -> Result<Vec<VideoSample>> {
-        if self
-            .last_generation
-            .is_some_and(|generation| value.generation.get() < generation.get())
-        {
-            return self.drain();
-        }
+    fn push_metadata(&mut self, value: FrameMetadata) -> Correlation {
         if self.metadata.len() == PENDING_RECORD_CAPACITY {
-            return Err(anyhow!("metadata count limit exceeded"));
+            return self.resync(ResyncReason::MetadataBacklog, 1);
         }
         self.metadata.push_back(Pending {
             value,
@@ -721,15 +852,9 @@ impl Correlator {
         self.drain()
     }
 
-    fn push_unit(&mut self, value: PendingUnit) -> Result<Vec<VideoSample>> {
-        if self
-            .last_generation
-            .is_some_and(|generation| value.unit.generation.get() < generation.get())
-        {
-            return self.drain();
-        }
+    fn push_unit(&mut self, value: PendingUnit) -> Correlation {
         if self.units.len() == PENDING_RECORD_CAPACITY {
-            return Err(anyhow!("RTP unit count limit exceeded"));
+            return self.resync(ResyncReason::UnitBacklog, 0);
         }
         self.units.push_back(Pending {
             value,
@@ -738,66 +863,78 @@ impl Correlator {
         self.drain()
     }
 
-    fn drain(&mut self) -> Result<Vec<VideoSample>> {
+    fn deadline_expired(&mut self) -> Correlation {
+        self.resync(ResyncReason::UnmatchedDeadline, 0)
+    }
+
+    fn drain(&mut self) -> Correlation {
         let mut samples = Vec::new();
+        let mut unmatched_metadata = 0_usize;
         loop {
-            self.discard_stale_metadata();
-            let Some(pending) = self.units.front() else {
+            let Some(pending) = self.units.pop_front() else {
                 break;
             };
             let unit = &pending.value.unit;
-            if self
-                .last_generation
-                .is_some_and(|generation| unit.generation.get() < generation.get())
-            {
-                let _ = self.units.pop_front();
-                continue;
-            }
-
             let metadata_count = if self.last_generation == Some(unit.generation) {
-                let last_timestamp = self
-                    .last_timestamp
-                    .ok_or_else(|| anyhow!("current generation has no prior RTP timestamp"))?;
-                let last_fps = self
-                    .last_fps
-                    .ok_or_else(|| anyhow!("current generation has no prior frame rate"))?;
-                metadata_gap(unit.timestamp.wrapping_sub(last_timestamp), last_fps)?
-            } else {
-                1
-            };
-            let (metadata_index, passed_generation) =
-                self.find_nth_generation_metadata(unit.generation, metadata_count);
-            let Some(index) = metadata_index else {
-                if passed_generation {
-                    // Metadata is ordered by generation. This unit's record can
-                    // no longer arrive, so it cannot be correlated safely.
-                    let _ = self.units.pop_front();
-                    continue;
+                match self.timestamp_anchor {
+                    TimestampAnchor::Needed => NonZeroUsize::MIN,
+                    TimestampAnchor::Present { timestamp, fps } => {
+                        let ticks = unit.timestamp.elapsed_since(timestamp);
+                        let Some(gap) = metadata_gap(ticks, fps) else {
+                            return self.resync(
+                                ResyncReason::TimestampGap { ticks, fps },
+                                unmatched_metadata,
+                            );
+                        };
+                        gap
+                    }
                 }
-                break;
+            } else {
+                NonZeroUsize::MIN
+            };
+            let matched = self.take_nth_generation_metadata(unit.generation, metadata_count);
+            let (metadata, unmatched) = match matched {
+                MetadataMatch::Matched {
+                    metadata,
+                    unmatched,
+                } => (metadata, unmatched),
+                MetadataMatch::NotYetArrived => {
+                    self.units.push_front(pending);
+                    break;
+                }
+                MetadataMatch::GenerationPassed => {
+                    return self.resync(ResyncReason::MetadataGenerationPassed, unmatched_metadata);
+                }
             };
 
-            let pending = self
-                .units
-                .pop_front()
-                .ok_or_else(|| anyhow!("front RTP unit disappeared during correlation"))?;
+            unmatched_metadata = unmatched_metadata.saturating_add(unmatched);
             let PendingUnit {
                 unit,
                 bytes: byte_permit,
             } = pending.value;
             drop(byte_permit);
-            let metadata = self.take_metadata_through(index)?;
-            debug_assert_eq!(metadata.generation, unit.generation);
             let generation_changed = self.last_generation != Some(metadata.generation);
-            let continuity =
-                if unit.continuity == Continuity::AfterGap || index > 0 || generation_changed {
-                    Continuity::AfterGap
-                } else {
-                    Continuity::Continuous
-                };
-            self.last_timestamp = Some(unit.timestamp);
+            let recovering = self.keyframe == GopState::Recovering;
+            let continuity = if recovering
+                || unit.continuity == Continuity::AfterGap
+                || unmatched > 0
+                || generation_changed
+            {
+                Continuity::AfterGap
+            } else {
+                Continuity::Continuous
+            };
             self.last_generation = Some(metadata.generation);
-            self.last_fps = Some(metadata.fps);
+            self.timestamp_anchor = TimestampAnchor::Present {
+                timestamp: unit.timestamp,
+                fps: metadata.fps,
+            };
+            if recovering && unit.kind != FrameKind::Key {
+                continue;
+            }
+            if recovering {
+                self.keyframe = GopState::KeyframeCached;
+            }
             samples.push(VideoSample {
                 data: unit.data,
                 kind: unit.kind,
@@ -805,45 +942,48 @@ impl Correlator {
                 metadata,
             });
         }
-        Ok(samples)
-    }
-
-    fn discard_stale_metadata(&mut self) {
-        while self.metadata.front().is_some_and(|item| {
-            self.last_generation
-                .is_some_and(|generation| item.value.generation.get() < generation.get())
-        }) {
-            let _ = self.metadata.pop_front();
+        Correlation {
+            outcome: CorrelationOutcome::Frames(samples),
+            unmatched_metadata,
         }
     }
 
-    fn find_nth_generation_metadata(
-        &self,
+    fn resync(&mut self, reason: ResyncReason, unmatched_metadata: usize) -> Correlation {
+        let unmatched_metadata = unmatched_metadata.saturating_add(self.metadata.len());
+        self.metadata.clear();
+        self.units.clear();
+        self.timestamp_anchor = TimestampAnchor::Needed;
+        self.keyframe = GopState::Recovering;
+        Correlation {
+            outcome: CorrelationOutcome::Resync(reason),
+            unmatched_metadata,
+        }
+    }
+
+    fn take_nth_generation_metadata(
+        &mut self,
         generation: Generation,
-        count: usize,
-    ) -> (Option<usize>, bool) {
+        count: NonZeroUsize,
+    ) -> MetadataMatch {
         let mut matches = 0;
         for (index, item) in self.metadata.iter().enumerate() {
             match item.value.generation.get().cmp(&generation.get()) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => {
                     matches += 1;
-                    if matches == count {
-                        return (Some(index), false);
+                    if matches == count.get() {
+                        let metadata = item.value.clone();
+                        drop(self.metadata.drain(..=index));
+                        return MetadataMatch::Matched {
+                            metadata,
+                            unmatched: index,
+                        };
                     }
                 }
-                std::cmp::Ordering::Greater => return (None, true),
+                std::cmp::Ordering::Greater => return MetadataMatch::GenerationPassed,
             }
         }
-        (None, false)
-    }
-
-    fn take_metadata_through(&mut self, index: usize) -> Result<FrameMetadata> {
-        let mut metadata = None;
-        for _ in 0..=index {
-            metadata = self.metadata.pop_front().map(|item| item.value);
-        }
-        metadata.ok_or_else(|| anyhow!("matched frame metadata disappeared during correlation"))
+        MetadataMatch::NotYetArrived
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -857,18 +997,20 @@ impl Correlator {
     }
 }
 
-fn metadata_gap(delta: u32, fps: Fps) -> Result<usize> {
-    if delta == 0 {
-        return Ok(1);
+fn metadata_gap(ticks: RtpTicks, fps: Fps) -> Option<NonZeroUsize> {
+    if ticks.0 == 0 {
+        return Some(NonZeroUsize::MIN);
     }
-    let count = (u64::from(delta) * u64::from(fps.get()) + 45_000) / 90_000;
+    let count = (u64::from(ticks.0) * u64::from(fps.get()) + u64::from(RTP_CLOCK_HZ / 2))
+        / u64::from(RTP_CLOCK_HZ);
     if count == 0 {
-        return Ok(1);
+        return Some(NonZeroUsize::MIN);
     }
-    if count > MAX_PENDING_RECORDS {
-        return Err(anyhow!("RTP timestamp gap exceeds correlation window"));
+    let count = usize::try_from(count).ok()?;
+    if count > PENDING_RECORD_CAPACITY {
+        return None;
     }
-    usize::try_from(count).context("bounded metadata gap exceeds usize")
+    NonZeroUsize::new(count)
 }
 
 enum PipelineMessage {
@@ -876,62 +1018,116 @@ enum PipelineMessage {
     Unit(PendingUnit),
 }
 
-#[derive(Default)]
-struct PacketDropSummary {
-    dropped_packets: u64,
-    rejected_packets: u64,
-    last_reason: Option<String>,
-    last_report: Option<Instant>,
+enum WorkerWake {
+    Message(PipelineMessage),
+    PipelineClosed,
+    CorrelatorDeadline,
+    MetadataReportDeadline,
 }
 
-impl PacketDropSummary {
-    fn record_drops(&mut self, packets: u64, reason: impl fmt::Display) {
-        debug!(dropped_packets = packets, reason = %reason, "RTP packets dropped");
-        self.dropped_packets = self.dropped_packets.saturating_add(packets);
-        self.last_reason = Some(reason.to_string());
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PacketFailure {
+    Drop(AssemblyDrop),
+    Reject(PacketReject),
+}
 
-    fn record_rejection(&mut self, reason: impl fmt::Display) {
-        debug!(reason = %reason, "RTP packet rejected");
-        self.rejected_packets = self.rejected_packets.saturating_add(1);
-        self.last_reason = Some(reason.to_string());
+impl fmt::Display for PacketFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Drop(reason) => reason.fmt(formatter),
+            Self::Reject(reason) => reason.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PacketDropReport {
+    dropped: u64,
+    rejected: u64,
+    last_failure: PacketFailure,
+}
+
+#[derive(Debug)]
+struct MetadataDropReport {
+    unmatched: usize,
+}
+
+#[derive(Debug)]
+struct DropSummary<R> {
+    pending: Option<R>,
+    last_report: Instant,
+}
+
+impl<R> DropSummary<R> {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            last_report: Instant::now(),
+        }
     }
 
     fn deadline(&self) -> Option<Instant> {
-        if self.dropped_packets == 0 && self.rejected_packets == 0 {
-            None
-        } else {
-            Some(
-                self.last_report
-                    .map_or_else(Instant::now, |at| at + DROP_REPORT_INTERVAL),
-            )
-        }
+        self.pending
+            .as_ref()
+            .map(|_pending| self.last_report + DROP_REPORT_INTERVAL)
     }
 
-    fn report_if_due(&mut self) {
-        let Some(deadline) = self.deadline() else {
-            return;
-        };
+    fn report_if_due(&mut self) -> Option<R> {
+        let deadline = self.deadline()?;
         if deadline > Instant::now() {
-            return;
+            return None;
         }
-        self.report();
+        self.report()
     }
 
-    fn report(&mut self) {
-        let last_reason = self
-            .last_reason
-            .take()
-            .unwrap_or_else(|| "unknown RTP packet failure".to_owned());
-        warn!(
-            dropped_packets = self.dropped_packets,
-            rejected_packets = self.rejected_packets,
-            %last_reason,
-            "RTP packets dropped or rejected"
-        );
-        self.dropped_packets = 0;
-        self.rejected_packets = 0;
-        self.last_report = Some(Instant::now());
+    fn report(&mut self) -> Option<R> {
+        let report = self.pending.take();
+        if report.is_some() {
+            self.last_report = Instant::now();
+        }
+        report
+    }
+
+    fn force_due(&mut self) {
+        self.last_report = Instant::now() - DROP_REPORT_INTERVAL;
+    }
+}
+
+type PacketDropSummary = DropSummary<PacketDropReport>;
+
+impl PacketDropSummary {
+    fn record(&mut self, count: NonZeroU64, reason: PacketFailure) {
+        let pending = self.pending.get_or_insert(PacketDropReport {
+            dropped: 0,
+            rejected: 0,
+            last_failure: reason.clone(),
+        });
+        pending.dropped = pending.dropped.saturating_add(count.get());
+        pending.last_failure = reason;
+    }
+
+    fn record_rejection(&mut self, reason: PacketFailure) {
+        let pending = self.pending.get_or_insert(PacketDropReport {
+            dropped: 0,
+            rejected: 0,
+            last_failure: reason.clone(),
+        });
+        pending.rejected = pending.rejected.saturating_add(1);
+        pending.last_failure = reason;
+    }
+}
+
+type MetadataDropSummary = DropSummary<MetadataDropReport>;
+
+impl MetadataDropSummary {
+    fn record_unmatched(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let pending = self
+            .pending
+            .get_or_insert(MetadataDropReport { unmatched: 0 });
+        pending.unmatched = pending.unmatched.saturating_add(count);
     }
 }
 
@@ -967,14 +1163,14 @@ impl VideoPipeline {
         )
     }
 
-    pub(crate) async fn metadata(&self, value: FrameMetadata) -> Result<()> {
+    pub(crate) async fn metadata(&self, value: FrameMetadata) -> anyhow::Result<()> {
         self.tx
             .send(PipelineMessage::Metadata(value))
             .await
             .context("video pipeline stopped")
     }
 
-    async fn unit(&self, value: Unit) -> Result<()> {
+    async fn unit(&self, value: Unit) -> anyhow::Result<()> {
         let bytes = u32::try_from(value.data.len()).context("access unit size overflow")?;
         let permit = Arc::clone(&self.unit_budget)
             .acquire_many_owned(bytes)
@@ -989,12 +1185,19 @@ impl VideoPipeline {
             .context("video pipeline stopped")
     }
 
-    pub(crate) async fn receive(self, socket: UdpSocket) -> Result<()> {
+    pub(crate) async fn receive(self, socket: UdpSocket) -> anyhow::Result<()> {
         let mut assembler = Assembler::default();
-        let mut summary = PacketDropSummary::default();
+        let mut summary = PacketDropSummary::new();
         let mut buffer = vec![0; 65_536];
         loop {
-            summary.report_if_due();
+            if let Some(report) = summary.report_if_due() {
+                warn!(
+                    dropped_packets = report.dropped,
+                    rejected_packets = report.rejected,
+                    reason = %report.last_failure,
+                    "RTP packets dropped or rejected"
+                );
+            }
             let received = if let Some(deadline) = summary.deadline() {
                 tokio::select! {
                     value = socket.recv_from(&mut buffer) => Some(value),
@@ -1004,55 +1207,124 @@ impl VideoPipeline {
                 Some(socket.recv_from(&mut buffer).await)
             };
             let Some(received) = received else {
-                summary.report();
+                summary.force_due();
                 continue;
             };
             let (length, source) = received?;
             if !source.ip().is_loopback() {
-                summary.record_rejection(format_args!("non-loopback RTP source {source}"));
+                summary.record_rejection(PacketFailure::Reject(PacketReject::NonLoopbackSource {
+                    address: source,
+                }));
                 continue;
             }
             let packet = match decode_packet(&buffer[..length]) {
                 Ok(packet) => packet,
                 Err(error) => {
-                    summary.record_rejection(error);
+                    summary.record_rejection(PacketFailure::Reject(error));
                     continue;
                 }
             };
             let result = assembler.consume(packet);
-            if let Some(reason) = result.drops.last_reason {
-                summary.record_drops(result.drops.packets, reason);
+            if let Some(dropped) = result.drops {
+                summary.record(dropped.packets, PacketFailure::Drop(dropped.reason));
             }
             match result.outcome {
                 Ok(AssemblyOutcome::Complete(unit)) => self.unit(unit).await?,
                 Ok(AssemblyOutcome::Dropped | AssemblyOutcome::Incomplete) => {}
-                Err(error) => summary.record_rejection(error),
+                Err(error) => summary.record_rejection(PacketFailure::Reject(error)),
             }
         }
     }
 }
 
 impl VideoWorker {
-    pub(crate) async fn run(mut self) -> Result<()> {
-        let mut state = Correlator::new();
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one worker loop keeps timer priority, resync recovery, and frame broadcasts ordered"
+    )]
+    pub(crate) async fn run(mut self) -> anyhow::Result<()> {
+        let mut correlator = Correlator::new();
+        let mut metadata_summary = MetadataDropSummary::new();
         let mut ready_generation = None;
         loop {
-            let message = if let Some(deadline) = state.deadline() {
-                tokio::select! {
-                    value = self.rx.recv() => value,
-                    () = sleep_until(deadline) => {
-                        return Err(anyhow!("video metadata/RTP correlation stalled"));
+            let correlation = if correlator
+                .deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
+                // Once correlation work expires, do not poll ready input before resyncing it.
+                correlator.deadline_expired()
+            } else {
+                if let Some(report) = metadata_summary.report_if_due() {
+                    warn!(
+                        unmatched_metadata = report.unmatched,
+                        "frame metadata unmatched"
+                    );
+                }
+                let timer = match (correlator.deadline(), metadata_summary.deadline()) {
+                    (Some(correlation), Some(metadata)) if correlation <= metadata => {
+                        Some((correlation, WorkerWake::CorrelatorDeadline))
+                    }
+                    (Some(_), Some(metadata)) => {
+                        Some((metadata, WorkerWake::MetadataReportDeadline))
+                    }
+                    (Some(correlation), None) => {
+                        Some((correlation, WorkerWake::CorrelatorDeadline))
+                    }
+                    (None, Some(metadata)) => Some((metadata, WorkerWake::MetadataReportDeadline)),
+                    (None, None) => None,
+                };
+                let wake = if let Some((deadline, timer_wake)) = timer {
+                    tokio::select! {
+                        biased;
+                        () = sleep_until(deadline) => timer_wake,
+                        value = self.rx.recv() => match value {
+                            Some(message) => WorkerWake::Message(message),
+                            None => WorkerWake::PipelineClosed,
+                        },
+                    }
+                } else {
+                    match self.rx.recv().await {
+                        Some(message) => WorkerWake::Message(message),
+                        None => WorkerWake::PipelineClosed,
+                    }
+                };
+                match wake {
+                    WorkerWake::Message(PipelineMessage::Metadata(value)) => {
+                        correlator.push_metadata(value)
+                    }
+                    WorkerWake::Message(PipelineMessage::Unit(value)) => {
+                        correlator.push_unit(value)
+                    }
+                    WorkerWake::PipelineClosed => {
+                        return Err(anyhow!("video pipeline closed"));
+                    }
+                    WorkerWake::CorrelatorDeadline => correlator.deadline_expired(),
+                    WorkerWake::MetadataReportDeadline => {
+                        metadata_summary.force_due();
+                        continue;
                     }
                 }
-            } else {
-                self.rx.recv().await
             };
-            let Some(message) = message else {
-                return Err(anyhow!("video pipeline closed"));
-            };
-            let frames = match message {
-                PipelineMessage::Metadata(value) => state.push_metadata(value)?,
-                PipelineMessage::Unit(value) => state.push_unit(value)?,
+            metadata_summary.record_unmatched(correlation.unmatched_metadata);
+
+            let frames = match correlation.outcome {
+                CorrelationOutcome::Frames(frames) => frames,
+                CorrelationOutcome::Resync(reason) => {
+                    warn!(reason = %reason, "video metadata/RTP correlation resynchronised");
+                    self.readiness.await_keyframe();
+                    if let Some(generation) = ready_generation.take()
+                        && let Err(error) = self
+                            .commands
+                            .system(Command::KeyframeReadiness(KeyframeReadiness {
+                                generation,
+                                state: KeyframeState::Missing,
+                            }))
+                            .await
+                    {
+                        warn!(reason = %error, "keyframe readiness command failed");
+                    }
+                    continue;
+                }
             };
             for frame in frames {
                 let generation = frame.metadata.generation;
@@ -1073,13 +1345,16 @@ impl VideoWorker {
                             .map(|generation| (generation, KeyframeState::Missing))
                     }
                 };
-                if let Some((generation, state)) = transition {
-                    self.commands
+                if let Some((generation, state)) = transition
+                    && let Err(error) = self
+                        .commands
                         .system(Command::KeyframeReadiness(KeyframeReadiness {
                             generation,
                             state,
                         }))
-                        .await?;
+                        .await
+                {
+                    warn!(reason = %error, "keyframe readiness command failed");
                 }
             }
         }

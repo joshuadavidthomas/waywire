@@ -246,6 +246,11 @@ impl AppEvents {
     fn publish(&self, value: ClientEvent) {
         let _ = self.tx.send(value);
     }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, value: ClientEvent) {
+        self.publish(value);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +295,24 @@ impl CommandReader {
         }
         None
     }
+}
+
+#[cfg(test)]
+pub(crate) struct TestCommandReceiver(CommandReader);
+
+#[cfg(test)]
+impl TestCommandReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<Command> {
+        let command = self.0.recv().await?;
+        Some(Command::decode(&command.encoded).expect("test command should decode"))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_command_sink() -> (CommandSink, TestCommandReceiver) {
+    let (fatal, _) = mpsc::channel(1);
+    let (sink, receiver) = CommandSink::new(COMMAND_COUNT, COMMAND_BYTES, fatal, Readiness::new());
+    (sink, TestCommandReceiver(receiver))
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -639,9 +662,7 @@ async fn read_events(
         let position_deadline = position_gate.deadline();
         tokio::select! {
             event = reader.next() => {
-                let Some(event) = event? else {
-                    return Err(anyhow!("daemon event pipe closed"));
-                };
+                let event = event?;
                 match event {
                     Event::Frame(metadata) => pipeline.metadata(metadata).await?,
                     Event::Clipboard(text) => {

@@ -198,6 +198,13 @@ impl Fps {
     pub const MINIMUM: Self = Self(10);
     pub const MAXIMUM: Self = Self(120);
 
+    /// The encoder cadence: one keyframe every quarter second at the configured rate. This is
+    /// never below 3 because [`Fps::MINIMUM`] is 10.
+    #[must_use]
+    pub const fn keyframe_interval(self) -> u32 {
+        self.get().div_ceil(4)
+    }
+
     #[must_use]
     pub fn lowered_by(self, step: u32, floor: Self) -> Self {
         Self(self.get().saturating_sub(step).max(floor.get()))

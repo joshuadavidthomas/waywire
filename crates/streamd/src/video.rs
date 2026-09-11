@@ -914,7 +914,7 @@ fn reset_signal_mask_before_exec(command: &mut Command) {
 
 fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> Vec<String> {
     let rate = config.fps.get().to_string();
-    let keyframe_interval = config.fps.get().div_ceil(4).to_string();
+    let keyframe_interval = config.fps.keyframe_interval().to_string();
     let bitrate = format!("{}k", config.bitrate_kbps.get());
     let peak = format!("{}k", config.bitrate_kbps.get() * 2);
     vec![

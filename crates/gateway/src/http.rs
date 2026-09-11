@@ -605,29 +605,13 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                     }
                 }
                 event_result = events.recv() => {
-                    match event_result {
-                        Ok(event) => match (event.audience(), lease) {
-                            (Audience::Everyone, Lease::Held | Lease::NotHeld)
-                            | (Audience::LeaseOwner, Lease::Held) => {
-                                if let Err(error) = outbound.enqueue_event(&event) {
-                                    break 'connected error.into();
-                                }
-                            }
-                            (Audience::LeaseOwner, Lease::NotHeld) => {}
-                        },
-                        Err(broadcast::error::RecvError::Lagged(count)) => {
-                            debug!(lagged_events = count, "control event receiver lagged");
-                            if let Err(error) = enqueue_snapshot(
-                                &outbound,
-                                state.events.snapshot(),
-                                state.sessions.quality(),
-                                lease,
-                            ) {
-                                break 'connected error.into();
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break 'connected
-                            SocketEnd::failed(anyhow!("control event broadcaster closed")),
+                    if let Err(error) = dispatch_control_event(
+                        &outbound,
+                        state,
+                        lease,
+                        event_result,
+                    ) {
+                        break 'connected error;
                     }
                 }
             }
@@ -643,6 +627,36 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
         &mut writer,
     )
     .await
+}
+
+fn dispatch_control_event(
+    outbound: &Outbound,
+    state: &AppState,
+    lease: Lease,
+    result: Result<ClientEvent, broadcast::error::RecvError>,
+) -> Result<(), SocketEnd> {
+    match result {
+        Ok(event) => match (event.audience(), lease) {
+            (Audience::Everyone, Lease::Held | Lease::NotHeld)
+            | (Audience::LeaseOwner, Lease::Held) => {
+                outbound.enqueue_event(&event).map_err(SocketEnd::from)
+            }
+            (Audience::LeaseOwner, Lease::NotHeld) => Ok(()),
+        },
+        Err(broadcast::error::RecvError::Lagged(count)) => {
+            debug!(lagged_events = count, "control event receiver lagged");
+            enqueue_snapshot(
+                outbound,
+                state.events.snapshot(),
+                state.sessions.quality(),
+                lease,
+            )
+            .map_err(SocketEnd::from)
+        }
+        Err(broadcast::error::RecvError::Closed) => Err(SocketEnd::failed(anyhow!(
+            "control event broadcaster closed"
+        ))),
+    }
 }
 
 fn enqueue_snapshot(
@@ -961,7 +975,297 @@ fn response(status: StatusCode, mime: &'static str, body: Vec<u8>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use sprite_desktop_protocol::browser::TextAction;
+    use sprite_desktop_protocol::pipe::ClipboardText;
+    use sprite_desktop_protocol::pipe::Fps;
+    use sprite_desktop_protocol::pipe::FrameSize;
+    use sprite_desktop_protocol::pipe::Generation;
+    use sprite_desktop_protocol::pipe::InputSequence;
+    use sprite_desktop_protocol::pipe::InputText;
+    use sprite_desktop_protocol::pipe::Kbps;
+    use sprite_desktop_protocol::pipe::RequestId;
+    use sprite_desktop_protocol::pipe::ResizeApplied;
+    use sprite_desktop_protocol::pipe::ScaleV120;
+    use tokio::time::timeout;
+
     use super::*;
+    use crate::daemon::TestCommandReceiver;
+    use crate::daemon::test_command_sink;
+
+    fn test_state() -> (AppState, TestCommandReceiver) {
+        let (commands, receiver) = test_command_sink();
+        let sessions = Sessions::new(
+            commands,
+            Kbps::new(8_000).expect("test bitrate should be valid"),
+            Fps::new(60).expect("test frame rate should be valid"),
+        );
+        (
+            AppState {
+                readiness: Readiness::new(),
+                events: AppEvents::new(),
+                sessions,
+                hub: VideoHub::new(Fps::new(60).expect("test frame rate should be valid")),
+                origin: Origin::parse("https://x.test").expect("test origin should parse"),
+                connections: SocketConnections::new(),
+                next_socket_id: Arc::new(AtomicU64::new(1)),
+            },
+            receiver,
+        )
+    }
+
+    fn outbound() -> (Outbound, mpsc::Receiver<OutboundItem>) {
+        let (tx, rx) = mpsc::channel(16);
+        (
+            Outbound {
+                tx,
+                bytes: Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)),
+            },
+            rx,
+        )
+    }
+
+    async fn next_text(receiver: &mut mpsc::Receiver<OutboundItem>) -> String {
+        let item = receiver
+            .recv()
+            .await
+            .expect("client event should be enqueued");
+        match item.message {
+            Message::Text(text) => text.to_string(),
+            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {
+                panic!("client event should be text")
+            }
+        }
+    }
+
+    async fn acquire(state: &AppState, commands: &mut TestCommandReceiver, socket: SocketId) {
+        assert_eq!(
+            state
+                .sessions
+                .acquire(socket)
+                .await
+                .expect("lease should acquire"),
+            LeaseState::Active
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acquire_message_enqueues_active_state_and_reset_command() {
+        let (state, mut commands) = test_state();
+        let (outbound, mut events) = outbound();
+        let mut lease = Lease::NotHeld;
+
+        handle_text(
+            &outbound,
+            &state,
+            SocketId::new(1),
+            &mut lease,
+            r#"{"type":"acquire"}"#,
+        )
+        .await
+        .expect("acquire message should succeed");
+
+        assert_eq!(lease, Lease::Held);
+        assert_eq!(
+            next_text(&mut events).await,
+            serde_json::to_string(&ClientEvent::ControlState {
+                state: ControlState::Active,
+            })
+            .expect("expected event should serialize")
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_message_enqueues_ready_state_and_reset_command() {
+        let (state, mut commands) = test_state();
+        let socket = SocketId::new(1);
+        acquire(&state, &mut commands, socket).await;
+        let (outbound, mut events) = outbound();
+        let mut lease = Lease::Held;
+
+        handle_text(
+            &outbound,
+            &state,
+            socket,
+            &mut lease,
+            r#"{"type":"release"}"#,
+        )
+        .await
+        .expect("release message should succeed");
+
+        assert_eq!(lease, Lease::NotHeld);
+        assert_eq!(
+            next_text(&mut events).await,
+            serde_json::to_string(&ClientEvent::ControlState {
+                state: ControlState::Ready,
+            })
+            .expect("expected event should serialize")
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ping_message_enqueues_pong_without_a_command() {
+        let (state, mut commands) = test_state();
+        let (outbound, mut events) = outbound();
+        let mut lease = Lease::NotHeld;
+
+        handle_text(
+            &outbound,
+            &state,
+            SocketId::new(1),
+            &mut lease,
+            r#"{"type":"ping","id":7}"#,
+        )
+        .await
+        .expect("ping message should succeed");
+
+        assert!(next_text(&mut events).await.contains(r#""type":"pong""#));
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_message_enqueues_quality_and_changed_quality_command() {
+        let (state, mut commands) = test_state();
+        let socket = SocketId::new(1);
+        acquire(&state, &mut commands, socket).await;
+        let (outbound, mut events) = outbound();
+        let mut lease = Lease::Held;
+        let message = r#"{"type":"feedback","received":50,"presented":50,"queuePeak":5,"queueBusyMs":200.0,"sampleMs":1000.0,"dropped":0,"rtt":20.0}"#;
+
+        handle_text(&outbound, &state, socket, &mut lease, message)
+            .await
+            .expect("first feedback should succeed");
+        let _ = next_text(&mut events).await;
+        handle_text(&outbound, &state, socket, &mut lease, message)
+            .await
+            .expect("second feedback should succeed");
+
+        assert!(next_text(&mut events).await.contains(r#""type":"quality""#));
+        assert!(matches!(commands.recv().await, Some(Command::Quality(_))));
+    }
+
+    #[tokio::test]
+    async fn text_message_sends_text_command_without_an_event() {
+        let (state, mut commands) = test_state();
+        let socket = SocketId::new(1);
+        acquire(&state, &mut commands, socket).await;
+        let (outbound, mut events) = outbound();
+        let mut lease = Lease::Held;
+
+        handle_text(
+            &outbound,
+            &state,
+            socket,
+            &mut lease,
+            r#"{"type":"text","action":"commit","text":"hi","sequence":3}"#,
+        )
+        .await
+        .expect("text message should succeed");
+
+        assert_eq!(
+            commands.recv().await,
+            Some(Command::Text(TextCommand {
+                action: TextAction::Commit,
+                text: InputText::new("hi".to_owned()).expect("test text should be valid"),
+                sequence: InputSequence::new(3).expect("test sequence should be valid"),
+            }))
+        );
+        assert!(
+            timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_message_sends_clipboard_command_without_an_event() {
+        let (state, mut commands) = test_state();
+        let socket = SocketId::new(1);
+        acquire(&state, &mut commands, socket).await;
+        let (outbound, mut events) = outbound();
+        let mut lease = Lease::Held;
+
+        handle_text(
+            &outbound,
+            &state,
+            socket,
+            &mut lease,
+            r#"{"type":"clipboard-write","text":"copy"}"#,
+        )
+        .await
+        .expect("clipboard message should succeed");
+
+        assert_eq!(
+            commands.recv().await,
+            Some(Command::Clipboard(
+                ClipboardText::new("copy".to_owned()).expect("test clipboard should be valid")
+            ))
+        );
+        assert!(
+            timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_events_enqueue_a_snapshot_and_deliver_the_retained_event() {
+        let (state, _commands) = test_state();
+        let (outbound, mut events) = outbound();
+        let (_snapshot, mut receiver) = state.events.subscribe();
+        let retained = ClientEvent::ResizeApplied(ResizeApplied {
+            request_id: RequestId::new(7).expect("test request ID should be valid"),
+            size: FrameSize::new(1280, 720).expect("test frame size should be valid"),
+            scale_v120: ScaleV120::new(120).expect("test scale should be valid"),
+            generation: Generation::new(2).expect("test generation should be valid"),
+        });
+
+        state.events.publish_for_test(ClientEvent::ControlState {
+            state: ControlState::Busy,
+        });
+        state.events.publish_for_test(retained.clone());
+        for id in 0..63 {
+            state.events.publish_for_test(ClientEvent::Pong {
+                id,
+                server_nanos: "0".to_owned(),
+            });
+        }
+
+        let lagged = receiver.recv().await;
+        assert!(matches!(
+            lagged,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        dispatch_control_event(&outbound, &state, Lease::NotHeld, lagged)
+            .expect("lagged event should resynchronise");
+        assert!(next_text(&mut events).await.contains(r#""type":"cursor""#));
+        assert!(next_text(&mut events).await.contains(r#""type":"quality""#));
+
+        let next = receiver.recv().await;
+        assert_eq!(next, Ok(retained));
+        dispatch_control_event(&outbound, &state, Lease::NotHeld, next)
+            .expect("event loop should accept the retained event");
+        assert!(
+            next_text(&mut events)
+                .await
+                .contains(r#""type":"resize-applied""#)
+        );
+    }
 
     #[test]
     fn outbound_queue_enforces_count_and_byte_bounds_independently() {

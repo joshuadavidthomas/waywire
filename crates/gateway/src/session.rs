@@ -215,7 +215,7 @@ impl Sessions {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaseState {
     Active,
     Busy,
@@ -364,8 +364,37 @@ impl Quality {
 #[cfg(test)]
 mod tests {
     use sprite_desktop_protocol::InvalidValue;
+    use tokio::time::timeout;
 
     use super::*;
+    use crate::daemon::TestCommandReceiver;
+    use crate::daemon::test_command_sink;
+
+    fn test_sessions() -> (Sessions, TestCommandReceiver) {
+        let (commands, receiver) = test_command_sink();
+        (
+            Sessions::new(commands, value(Kbps::new(8_000)), value(Fps::new(60))),
+            receiver,
+        )
+    }
+
+    async fn acquire_and_drain(
+        sessions: &Sessions,
+        commands: &mut TestCommandReceiver,
+        socket: SocketId,
+    ) {
+        assert_eq!(
+            sessions
+                .acquire(socket)
+                .await
+                .expect("lease should acquire"),
+            LeaseState::Active
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
 
     fn value<T>(result: Result<T, InvalidValue>) -> T {
         result.expect("test quality value should be valid")
@@ -409,6 +438,96 @@ mod tests {
             assert_eq!(quality.update(&good_feedback(), now), None);
         }
         quality.update(&good_feedback(), now)
+    }
+
+    #[tokio::test]
+    async fn second_acquire_is_busy_and_keeps_the_owner() {
+        let (sessions, mut commands) = test_sessions();
+        let owner = SocketId::new(1);
+        let contender = SocketId::new(2);
+        acquire_and_drain(&sessions, &mut commands, owner).await;
+
+        assert_eq!(
+            sessions
+                .acquire(contender)
+                .await
+                .expect("busy check should succeed"),
+            LeaseState::Busy
+        );
+        assert_eq!(
+            sessions
+                .input(owner, Command::ReleaseAll(ReleaseAll))
+                .await
+                .expect("owner input should succeed"),
+            InputOutcome::Sent
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonowner_release_does_not_change_the_owner() {
+        let (sessions, mut commands) = test_sessions();
+        let owner = SocketId::new(1);
+        acquire_and_drain(&sessions, &mut commands, owner).await;
+
+        sessions
+            .release(SocketId::new(2))
+            .await
+            .expect("nonowner release should be a no-op");
+        assert_eq!(
+            sessions
+                .input(owner, Command::ReleaseAll(ReleaseAll))
+                .await
+                .expect("owner input should succeed"),
+            InputOutcome::Sent
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonowner_input_returns_not_owner_without_a_command() {
+        let (sessions, mut commands) = test_sessions();
+        acquire_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
+
+        assert_eq!(
+            sessions
+                .input(SocketId::new(2), Command::ReleaseAll(ReleaseAll))
+                .await
+                .expect("nonowner input check should succeed"),
+            InputOutcome::NotLeaseOwner
+        );
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonowner_feedback_keeps_quality_and_sends_no_command() {
+        let (sessions, mut commands) = test_sessions();
+        acquire_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
+        let before = sessions.quality();
+
+        assert_eq!(
+            sessions
+                .feedback(SocketId::new(2), bad_feedback())
+                .await
+                .expect("nonowner feedback check should succeed"),
+            FeedbackOutcome::NotLeaseOwner
+        );
+        assert_eq!(sessions.quality(), before);
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
