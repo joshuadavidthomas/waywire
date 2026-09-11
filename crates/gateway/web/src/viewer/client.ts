@@ -32,6 +32,8 @@ function viewerElements(): ViewerElements {
     controlStatus: requireElement("#control-status", html),
     codec: requireElement("#codec", html),
     metrics: requireElement("#metrics", html),
+    readout: requireElement("#readout", html),
+    readoutToggle: requireElement("#readout-toggle", button),
     latency: requireElement(
       "#latency",
       (element): element is HTMLSelectElement =>

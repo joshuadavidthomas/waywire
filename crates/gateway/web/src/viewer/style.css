@@ -1,95 +1,59 @@
-/* Styling belongs to the example frontend, never the framework-free SDK. */
+/* The viewer is a window onto a machine: the screen fills the page and one
+   bezel strip carries the legend, the keys, and the readout. */
 :root {
   color-scheme: dark;
-  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
-  background: #090b10;
-  color: #f2f4f8;
+  --bezel: #0f0f0f;
+  --chassis: #181818;
+  --chassis-raised: #202020;
+  --seam: #2b2b2b;
+  --silkscreen: #dcd7ca;
+  --silkscreen-dim: #928e84;
+  --lamp-live: #6bd47a;
+  --lamp-wait: #e2a53c;
+  --lamp-fault: #e35d4d;
+  --lamp-off: #3c3c3c;
+  --screen: #000;
+  --ui: system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --numerals: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --legend-height: 30px;
+  --key-height: 40px;
+  --lamp-ease: 150ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  font: 12px/1.3 var(--ui);
+  color: var(--silkscreen);
+  background: var(--bezel);
+  accent-color: var(--silkscreen);
 }
 
 * {
   box-sizing: border-box;
 }
 
+::selection {
+  background: var(--silkscreen);
+  color: var(--bezel);
+}
+
 body {
-  min-width: 320px;
-  min-height: 100vh;
   margin: 0;
-  display: grid;
-  place-items: center;
-  background:
-    radial-gradient(
-      circle at 50% -20%,
-      rgba(86, 101, 255, 0.22),
-      transparent 44%
-    ),
-    #090b10;
-}
-
-main {
-  width: 100%;
+  min-width: 320px;
   height: 100dvh;
-  padding: 16px;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-}
-
-header,
-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-header {
-  margin-bottom: 16px;
-}
-
-h1 {
-  margin: 3px 0 0;
-  font-size: 20px;
-  font-weight: 560;
-  letter-spacing: -0.01em;
-}
-
-.eyebrow {
-  color: #9da7ff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.status {
-  border: 1px solid #303644;
-  border-radius: 999px;
-  padding: 7px 11px;
-  color: #aab1c0;
-  font-size: 12px;
-}
-
-.status-group {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.status.connected {
-  border-color: rgba(69, 207, 144, 0.35);
-  background: rgba(69, 207, 144, 0.08);
-  color: #72e6ac;
-}
-
-.display-shell {
-  position: relative;
-  min-width: 0;
-  min-height: 0;
   overflow: hidden;
+}
+
+.console {
+  position: relative;
+  height: 100%;
   display: grid;
-  place-items: center;
-  border: 1px solid #252a35;
-  border-radius: 10px;
-  background: #050609;
-  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.45);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+/* Screen */
+
+.screen {
+  position: relative;
+  min-height: 0;
+  background: var(--screen);
 }
 
 canvas {
@@ -107,62 +71,268 @@ canvas {
 }
 
 canvas:focus-visible {
-  box-shadow: inset 0 0 0 2px rgba(157, 167, 255, 0.8);
+  outline: 1px solid var(--silkscreen-dim);
+  outline-offset: -1px;
 }
 
-.empty {
+.notice {
   position: absolute;
-  color: #777f90;
-  font-size: 13px;
+  inset: 0;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: var(--silkscreen-dim);
+  text-align: center;
+  pointer-events: none;
 }
 
-.empty.hidden {
+.notice.hidden {
   display: none;
 }
 
-footer {
-  padding: 12px 2px 0;
-  color: #7f8797;
-  font-size: 12px;
+/* Bezel */
+
+.bezel {
+  position: relative;
+  min-width: 0;
+  padding: 0 14px;
+  border-top: 1px solid var(--seam);
+  background: var(--chassis);
+  white-space: nowrap;
 }
 
-.clipboard-controls {
+.legend-row,
+.key-row,
+.keys,
+.meter {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  min-width: 0;
 }
 
-button,
-select {
-  border: 1px solid #303644;
-  border-radius: 6px;
-  padding: 5px 8px;
-  background: #151923;
-  color: #c9cfdb;
+.legend-row {
+  gap: 14px;
+  min-height: var(--legend-height);
+  padding-top: 2px;
+  overflow: hidden;
+}
+
+.key-row {
+  gap: 14px;
+  min-height: var(--key-height);
+  padding-bottom: 2px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--seam) transparent;
+}
+
+.keys,
+.meter {
+  gap: 10px;
+}
+
+.keys + .keys {
+  padding-left: 14px;
+  border-left: 1px solid var(--seam);
+}
+
+.mark {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--silkscreen-dim);
+}
+
+.lamp {
+  position: relative;
+  display: inline-block;
+  max-width: 30ch;
+  padding-left: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+.lamp::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -3.5px;
+  border-radius: 50%;
+  background: var(--lamp-off);
+  transition:
+    background-color var(--lamp-ease),
+    box-shadow var(--lamp-ease);
+}
+
+.lamp[data-state="connected"]::before,
+.lamp[data-state="active"]::before {
+  background: var(--lamp-live);
+  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--lamp-live) 60%, transparent);
+}
+
+.lamp[data-state="ready"]::before {
+  background: color-mix(in srgb, var(--lamp-live) 55%, var(--lamp-off));
+}
+
+.lamp[data-state="connecting"]::before,
+.lamp[data-state="reconnecting"]::before,
+.lamp[data-state="requesting"]::before,
+.lamp[data-state="busy"]::before {
+  background: var(--lamp-wait);
+}
+
+.lamp[data-state="error"]::before {
+  background: var(--lamp-fault);
+}
+
+/* Keys */
+
+.key {
+  min-height: 26px;
+  padding: 4px 9px;
+  border: 1px solid var(--seam);
+  border-radius: 4px;
+  background: var(--chassis-raised);
+  color: var(--silkscreen);
   font: inherit;
+  line-height: 1;
   cursor: pointer;
+  transition:
+    border-color var(--lamp-ease),
+    background-color var(--lamp-ease);
 }
 
-button:hover:not(:disabled),
-button:focus-visible,
-select:hover,
-select:focus-visible {
-  border-color: #6572e8;
-  color: #fff;
-  outline: none;
+.key:hover:not(:disabled) {
+  border-color: var(--silkscreen-dim);
 }
 
-button:disabled {
-  opacity: 0.45;
+.key:active:not(:disabled) {
+  background: var(--chassis);
+}
+
+.key:focus-visible {
+  outline: 2px solid var(--silkscreen);
+  outline-offset: 1px;
+}
+
+.key:disabled {
+  color: var(--silkscreen-dim);
+  background: var(--chassis);
   cursor: default;
 }
 
-.latency-control {
-  display: flex;
+.key[aria-pressed="true"] {
+  border-color: var(--silkscreen-dim);
+  background: var(--chassis);
+  box-shadow: inset 0 -2px 0 var(--lamp-live);
+}
+
+select.key {
+  appearance: none;
+  padding-right: 22px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23928e84' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+.latency {
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 7px;
+  color: var(--silkscreen-dim);
+}
+
+.clipboard-status {
+  max-width: 26ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--silkscreen-dim);
+}
+
+/* Readout */
+
+.meter {
+  margin-left: auto;
+  font-family: var(--numerals);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--silkscreen);
+}
+
+.slot {
+  flex: none;
+  display: inline-block;
+  text-align: right;
+  transition: color var(--lamp-ease);
+}
+
+.slot[data-slot="size"] {
+  min-width: 8.5ch;
+}
+
+.slot[data-slot="fps"] {
+  min-width: 6ch;
+}
+
+.slot[data-slot="bitrate"] {
+  min-width: 15ch;
+}
+
+.slot[data-slot="rtt"] {
+  min-width: 10ch;
+}
+
+.slot[data-resize="requested"],
+.slot[data-resize="applied"] {
+  color: var(--lamp-wait);
+}
+
+.readout {
+  position: absolute;
+  right: 14px;
+  bottom: calc(100% + 8px);
+  z-index: 1;
+  max-height: calc(100dvh - 140px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--seam) transparent;
+  margin: 0;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 18px;
+  row-gap: 5px;
+  border: 1px solid var(--seam);
+  border-radius: 6px;
+  background: var(--chassis);
+  font-family: var(--numerals);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+}
+
+.readout[hidden] {
+  display: none;
+}
+
+.readout dt {
+  color: var(--silkscreen-dim);
+  font-family: var(--ui);
+}
+
+#readout-toggle[aria-expanded="true"] {
+  border-color: var(--silkscreen-dim);
+  background: var(--chassis);
+}
+
+.readout dd {
+  margin: 0;
+  text-align: right;
 }
 
 .ime-proxy {
@@ -173,25 +343,55 @@ button:disabled {
   pointer-events: none;
 }
 
-@media (max-width: 640px) {
-  main {
-    padding: 14px;
-  }
+/* Narrow bezel: the readout takes its own line and the key row scrolls
+   sideways instead of stacking. */
 
-  footer {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .clipboard-controls {
+@media (max-width: 900px) {
+  .legend-row {
     flex-wrap: wrap;
-    justify-content: flex-start;
+    gap: 4px 12px;
+    padding-top: 6px;
   }
 
-  .status-group {
-    align-items: flex-end;
-    flex-direction: column-reverse;
-    gap: 4px;
+  .meter {
+    flex-basis: 100%;
+    margin-left: 0;
+    min-height: 30px;
+  }
+
+  .slot {
+    text-align: left;
+  }
+
+  .keys {
+    flex: none;
+  }
+
+  .key {
+    min-height: 40px;
+  }
+
+  .key-row {
+    min-height: 52px;
+    scrollbar-color: var(--silkscreen-dim) transparent;
+  }
+
+  /* The scrolled key row fades at the chassis edge so the hidden keys
+     announce themselves. */
+  .bezel::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 32px;
+    height: 52px;
+    background: linear-gradient(to right, transparent, var(--chassis) 70%);
+    pointer-events: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .slot[data-slot="bitrate"] {
+    display: none;
   }
 }

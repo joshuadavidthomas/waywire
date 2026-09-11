@@ -3,54 +3,111 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
     <title>Waywire</title>
     <link rel="stylesheet" href="/src/viewer/style.css" />
   </head>
   <body>
-    <main>
-      <header>
-        <div>
-          <span class="eyebrow">WAYWIRE</span>
-          <h1>Remote workspace</h1>
-        </div>
-        <div class="status-group">
-          <div id="control-status" class="status disconnected">
-            Click stream to control
-          </div>
-          <div id="status" class="status disconnected">Video connecting</div>
-        </div>
-      </header>
-      <section class="display-shell" aria-label="Streamed Wayland desktop">
+    <main class="console">
+      <section class="screen" aria-label="Streamed Wayland desktop">
         <canvas
           id="display"
           tabindex="0"
           aria-label="Interactive streamed Wayland desktop"
         ></canvas>
-        <div id="empty" class="empty">Waiting for the first keyframe…</div>
+        <p id="empty" class="notice">Waiting for the first keyframe…</p>
       </section>
-      <footer>
-        <span id="codec">H.264 · WebCodecs</span>
-        <div class="clipboard-controls">
-          <label class="latency-control">
-            Latency
-            <select id="latency" aria-label="Stream latency">
-              <option value="60" selected>Low · 60 ms</option>
-              <option value="100">Balanced · 100 ms</option>
-              <option value="180">Smooth · 180 ms</option>
-            </select>
-          </label>
-          <button id="reset-video" type="button">Reset video</button>
-          <button id="pointer-lock" type="button">Lock pointer</button>
-          <button id="text-input" type="button">Text input</button>
-          <button id="send-clipboard" type="button">
-            Send local clipboard
-          </button>
-          <button id="copy-clipboard" type="button" disabled>
-            Copy remote clipboard
-          </button>
-          <span id="clipboard-status">Clipboard connecting</span>
+      <footer class="bezel">
+        <dl id="readout" class="readout" hidden>
+          <dt>Codec</dt>
+          <dd id="codec" data-field="codec">—</dd>
+          <dt>Bitrate</dt>
+          <dd data-field="bitrate">—</dd>
+          <dt>Clock</dt>
+          <dd data-field="clock">—</dd>
+          <dt>Latency target</dt>
+          <dd data-field="target">—</dd>
+          <dt>Late</dt>
+          <dd data-field="late">—</dd>
+          <dt>Input queue</dt>
+          <dd data-field="input">—</dd>
+          <dt>Decode queue</dt>
+          <dd data-field="decode">—</dd>
+          <dt>Dropped</dt>
+          <dd data-field="dropped">—</dd>
+          <dt>Generation</dt>
+          <dd data-field="generation">—</dd>
+          <dt>Resize</dt>
+          <dd data-field="resize">idle</dd>
+        </dl>
+        <div class="legend-row">
+          <span class="mark">Waywire</span>
+          <span id="status" class="lamp" data-state="idle"
+            >Video connecting</span
+          >
+          <span id="control-status" class="lamp" data-state="idle">
+            Click stream to control
+          </span>
+          <div id="metrics" class="meter" aria-label="Stream readout">
+            <span class="slot" data-slot="size" data-resize="idle">—</span>
+            <span class="slot" data-slot="fps">— fps</span>
+            <span class="slot" data-slot="bitrate">— kbps</span>
+            <span class="slot" data-slot="rtt">— ms rtt</span>
+            <button
+              id="readout-toggle"
+              class="key"
+              type="button"
+              aria-expanded="false"
+              aria-controls="readout"
+            >
+              Readout
+            </button>
+          </div>
         </div>
-        <span id="metrics">No frames yet</span>
+        <div class="key-row">
+          <div class="keys" role="group" aria-label="Video">
+            <label class="latency">
+              <span>Latency</span>
+              <select id="latency" class="key" aria-label="Stream latency">
+                <option value="60" selected>Low · 60 ms</option>
+                <option value="100">Balanced · 100 ms</option>
+                <option value="180">Smooth · 180 ms</option>
+              </select>
+            </label>
+            <button id="reset-video" class="key" type="button">
+              Reset video
+            </button>
+          </div>
+          <div class="keys" role="group" aria-label="Input">
+            <button
+              id="pointer-lock"
+              class="key"
+              type="button"
+              aria-pressed="false"
+            >
+              Lock pointer
+            </button>
+            <button
+              id="text-input"
+              class="key"
+              type="button"
+              aria-pressed="false"
+            >
+              Text input
+            </button>
+          </div>
+          <div class="keys" role="group" aria-label="Clipboard">
+            <button id="send-clipboard" class="key" type="button">
+              Send local clipboard
+            </button>
+            <button id="copy-clipboard" class="key" type="button" disabled>
+              Copy remote clipboard
+            </button>
+            <span id="clipboard-status" class="clipboard-status">
+              Clipboard connecting
+            </span>
+          </div>
+        </div>
         <input
           id="ime-proxy"
           class="ime-proxy"
