@@ -11,6 +11,8 @@ export type ViewerElements = {
   readonly signal: HTMLElement;
   readonly signalHeadline: HTMLElement;
   readonly signalMessage: HTMLElement;
+  readonly leaseNotice: HTMLElement;
+  readonly hud: HTMLElement;
   readonly menuKey: HTMLButtonElement;
   readonly panel: HTMLElement;
   readonly status: HTMLElement;
@@ -20,10 +22,10 @@ export type ViewerElements = {
   readonly keyboardButton: HTMLButtonElement;
   readonly sendClipboardButton: HTMLButtonElement;
   readonly copyClipboardButton: HTMLButtonElement;
+  readonly hudToggle: HTMLButtonElement;
   readonly resetVideoButton: HTMLButtonElement;
   readonly clipboardStatus: HTMLElement;
   readonly latency: HTMLFieldSetElement;
-  readonly readout: HTMLElement;
   readonly imeProxy: HTMLInputElement;
 };
 
@@ -53,8 +55,20 @@ const FIELDS: readonly Field[] = [
 ];
 
 const POINTER_STILL_AFTER_MS = 2500;
-const READOUT_INTERVAL_MS = 250;
+const HUD_INTERVAL_MS = 250;
 const ESCAPE_CHORD_MS = 400;
+const HUD_STORAGE_KEY = "waywire.hud";
+export const LATENCY_STORAGE_KEY = "waywire.latency";
+
+type Wheel = "auto" | "handsOff";
+
+function hudField(hud: HTMLElement, name: Field): HTMLElement {
+  const element = hud.querySelector(`[data-field="${name}"]`);
+  if (!(element instanceof HTMLElement)) {
+    throw new Error(`Expected [data-field="${name}"] in the stats readout`);
+  }
+  return element;
+}
 
 function signalHeadline(state: WaywireSessionState): string {
   switch (state.video.state) {
@@ -72,19 +86,11 @@ function signalHeadline(state: WaywireSessionState): string {
   }
 }
 
-function readoutField(readout: HTMLElement, name: Field): HTMLElement {
-  const element = readout.querySelector(`[data-field="${name}"]`);
-  if (!(element instanceof HTMLElement)) {
-    throw new Error(`Expected [data-field="${name}"] in the readout`);
-  }
-  return element;
-}
-
 function titleFor(state: WaywireSessionState): string {
   if (state.video.state === "error") return "Waywire · fault";
   if (state.video.state === "reconnecting") return "Waywire · reconnecting";
   if (state.video.state !== "connected") return "Waywire · offline";
-  if (state.input.state === "active") return "Waywire · driving";
+  if (state.input.state === "busy") return "Waywire · another viewer driving";
   return "Waywire · live";
 }
 
@@ -93,7 +99,7 @@ function inputLabel(state: WaywireSessionState): string {
     case "active":
       return "Driving";
     case "ready":
-      return "Ready to drive";
+      return "Ready";
     case "requesting":
     case "connecting":
       return "Requesting control";
@@ -105,32 +111,81 @@ function inputLabel(state: WaywireSessionState): string {
   }
 }
 
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStored(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // A preference that cannot be stored still applies for this page.
+  }
+}
+
 export function installViewerListeners(
   elements: ViewerElements,
   session: WaywireSession,
   surface: SurfaceHandle,
 ): () => void {
   const fields = Object.fromEntries(
-    FIELDS.map((name) => [name, readoutField(elements.readout, name)]),
+    FIELDS.map((name) => [name, hudField(elements.hud, name)]),
   ) as Record<Field, HTMLElement>;
   const cleanup: Array<() => void> = [];
   const listen = <K extends keyof HTMLElementEventMap>(
     target: HTMLElement,
     type: K,
     listener: (event: HTMLElementEventMap[K]) => void,
+    options?: AddEventListenerOptions,
   ): void => {
-    target.addEventListener(type, listener);
-    cleanup.push(() => target.removeEventListener(type, listener));
+    target.addEventListener(type, listener, options);
+    cleanup.push(() => target.removeEventListener(type, listener, options));
   };
   const panelOpen = (): boolean => elements.panel.matches(":popover-open");
   const closePanel = (): void => {
     if (panelOpen()) elements.panel.hidePopover();
   };
 
-  // The screen speaks for itself until the first frame is drawn, and again
-  // whenever the feed drops.
-  let framesSinceConnect = 0;
+  // Driving is seamless. The SDK ties the lease to canvas focus, so the
+  // screen takes focus whenever the pointer is over it or the window comes
+  // back, unless the viewer chose to let someone else drive.
+  let wheel: Wheel = "auto";
+  const focusScreen = (): void => {
+    if (wheel === "handsOff" || panelOpen()) return;
+    const active = document.activeElement;
+    if (active === elements.display || active === elements.imeProxy) return;
+    if (active instanceof HTMLElement && elements.panel.contains(active))
+      return;
+    elements.display.focus({ preventScroll: true });
+  };
+  listen(elements.display, "pointerenter", focusScreen);
+  listen(elements.display, "pointermove", focusScreen);
+  listen(elements.display, "pointerdown", focusScreen);
+  const onWindowFocus = (): void => focusScreen();
+  window.addEventListener("focus", onWindowFocus);
+  cleanup.push(() => window.removeEventListener("focus", onWindowFocus));
+  const controlLabel = (): string =>
+    wheel === "handsOff" ? "Start driving" : "Stop driving";
+  // The one mode a person forgets they are in gets the page's one pill.
+  const renderLeaseNotice = (state: WaywireSessionState): void => {
+    if (wheel === "handsOff") {
+      elements.leaseNotice.textContent =
+        "You stopped driving · Esc twice for controls";
+      elements.leaseNotice.hidden = false;
+    } else if (state.input.state === "busy") {
+      elements.leaseNotice.textContent = "Another viewer is driving";
+      elements.leaseNotice.hidden = false;
+    } else {
+      elements.leaseNotice.hidden = true;
+    }
+  };
+
   let lastState: WaywireSessionState | null = null;
+  let framesSinceConnect = 0;
   cleanup.push(
     session.on("state", (state) => {
       lastState = state;
@@ -142,15 +197,14 @@ export function installViewerListeners(
       elements.signalHeadline.textContent = headline;
       elements.signalMessage.textContent =
         state.video.message === headline ? "" : state.video.message;
+      renderLeaseNotice(state);
       elements.status.textContent = state.video.message;
       elements.status.title = state.video.message;
       elements.status.dataset["state"] = state.video.state;
       elements.controlStatus.textContent = inputLabel(state);
       elements.controlStatus.title = state.input.message;
       elements.controlStatus.dataset["state"] = state.input.state;
-      elements.stage.dataset["lease"] = state.input.state;
-      elements.controlToggle.textContent =
-        state.input.state === "active" ? "Release control" : "Take control";
+      elements.controlToggle.textContent = controlLabel();
       elements.pointerLockButton.textContent = state.input.pointerLocked
         ? "Unlock pointer"
         : "Lock pointer";
@@ -163,15 +217,24 @@ export function installViewerListeners(
     }),
   );
 
+  // Stats live in their own overlay and only cost work while it shows.
+  const hudVisible = (): boolean => !elements.hud.hidden;
+  const setHud = (visible: boolean): void => {
+    elements.hud.hidden = !visible;
+    elements.hudToggle.setAttribute("aria-pressed", String(visible));
+    elements.hudToggle.textContent = visible ? "Hide stats" : "Show stats";
+    writeStored(HUD_STORAGE_KEY, visible ? "on" : "off");
+  };
+  setHud(readStored(HUD_STORAGE_KEY) === "on");
   let pendingStats: WaywireStats | null = null;
-  let readoutTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastReadout = Number.NEGATIVE_INFINITY;
-  const renderReadout = (): void => {
-    readoutTimer = null;
+  let hudTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastHud = Number.NEGATIVE_INFINITY;
+  const renderHud = (): void => {
+    hudTimer = null;
     const stats = pendingStats;
     if (!stats) return;
     pendingStats = null;
-    lastReadout = performance.now();
+    lastHud = performance.now();
     fields.size.textContent = `${stats.width}×${stats.height}`;
     fields.fps.textContent = `${stats.renderedFps.toFixed(0)} fps`;
     fields.bitrate.textContent = `${stats.bitrateKbps} kbps at ${stats.scalePercent}%`;
@@ -190,14 +253,14 @@ export function installViewerListeners(
         elements.signal.hidden = true;
         if (lastState) document.title = titleFor(lastState);
       }
-      if (!panelOpen()) return;
+      if (!hudVisible()) return;
       pendingStats = stats;
-      const remaining = READOUT_INTERVAL_MS - (performance.now() - lastReadout);
+      const remaining = HUD_INTERVAL_MS - (performance.now() - lastHud);
       if (remaining <= 0) {
-        if (readoutTimer !== null) clearTimeout(readoutTimer);
-        renderReadout();
-      } else if (readoutTimer === null) {
-        readoutTimer = setTimeout(renderReadout, remaining);
+        if (hudTimer !== null) clearTimeout(hudTimer);
+        renderHud();
+      } else if (hudTimer === null) {
+        hudTimer = setTimeout(renderHud, remaining);
       }
     }),
   );
@@ -223,9 +286,8 @@ export function installViewerListeners(
     session.on("error", (error) => console.warn("Waywire stream error", error)),
   );
 
-  // The SDK ties the lease to canvas focus, so the key and the panel's
-  // controls never take focus: pressing them leaves the screen focused and
-  // the lease where it was.
+  // The key and the panel's controls never take focus, so pressing them
+  // leaves the screen focused and the lease where it was.
   const keepScreenFocus = (event: PointerEvent): void => event.preventDefault();
   listen(elements.menuKey, "pointerdown", keepScreenFocus);
   for (const control of elements.panel.querySelectorAll("button, label")) {
@@ -235,28 +297,43 @@ export function installViewerListeners(
   }
 
   listen(elements.controlToggle, "click", () => {
-    if (elements.stage.dataset["lease"] === "active") {
-      session.input.release();
-    } else {
+    if (wheel === "handsOff") {
+      wheel = "auto";
       session.input.acquire();
       surface.focus();
+    } else {
+      wheel = "handsOff";
+      session.input.release();
+      elements.display.blur();
     }
+    elements.controlToggle.textContent = controlLabel();
+    if (lastState) renderLeaseNotice(lastState);
     closePanel();
   });
   listen(elements.keyboardButton, "click", () => {
+    wheel = "auto";
+    elements.controlToggle.textContent = controlLabel();
+    if (lastState) renderLeaseNotice(lastState);
     session.input.acquire();
     closePanel();
     surface.focusTextInput();
   });
+  listen(elements.hudToggle, "click", () => setHud(!hudVisible()));
   listen(elements.resetVideoButton, "click", () => {
     session.video.reset();
     closePanel();
   });
+  listen(elements.latency, "change", (event) => {
+    const input = event.target;
+    if (input instanceof HTMLInputElement && input.checked) {
+      session.video.setLatencyTarget(Number(input.value));
+      writeStored(LATENCY_STORAGE_KEY, input.value);
+    }
+  });
 
-  // Escape twice from the screen opens the panel and lets go of the
-  // desktop; a single Escape still reaches the remote. With the panel open,
+  // Escape twice from the screen opens the panel; a single Escape still
+  // reaches the remote. With the panel open no key reaches the remote and
   // one Escape closes it. This runs before the SDK's own key handling.
-  // While the panel is open no key reaches the remote desktop.
   let lastEscapeAt = Number.NEGATIVE_INFINITY;
   const escapeChord = (event: KeyboardEvent): void => {
     if (panelOpen()) {
@@ -271,25 +348,13 @@ export function installViewerListeners(
       lastEscapeAt = Number.NEGATIVE_INFINITY;
       event.preventDefault();
       event.stopImmediatePropagation();
-      session.input.release();
       elements.panel.showPopover();
       elements.controlToggle.focus();
       return;
     }
     lastEscapeAt = now;
   };
-  elements.display.addEventListener("keydown", escapeChord, { capture: true });
-  cleanup.push(() =>
-    elements.display.removeEventListener("keydown", escapeChord, {
-      capture: true,
-    }),
-  );
-  listen(elements.latency, "change", (event) => {
-    const input = event.target;
-    if (input instanceof HTMLInputElement && input.checked) {
-      session.video.setLatencyTarget(Number(input.value));
-    }
-  });
+  listen(elements.display, "keydown", escapeChord, { capture: true });
 
   // The key dims while the pointer rests so it stops reading as chrome.
   let stillTimer: ReturnType<typeof setTimeout> | null = null;
@@ -306,9 +371,9 @@ export function installViewerListeners(
   pointerMoved();
 
   return () => {
-    if (readoutTimer !== null) clearTimeout(readoutTimer);
+    if (hudTimer !== null) clearTimeout(hudTimer);
     if (stillTimer !== null) clearTimeout(stillTimer);
-    readoutTimer = null;
+    hudTimer = null;
     stillTimer = null;
     pendingStats = null;
     for (const remove of cleanup.splice(0).reverse()) remove();

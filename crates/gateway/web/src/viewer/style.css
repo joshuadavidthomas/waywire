@@ -68,25 +68,79 @@ canvas {
   z-index: 1;
 }
 
-/* Driving: a thin lamp-green edge on the screen while the input lease is
-   held. It is the only chrome the resting page ever shows. */
-.stage::after {
+/* Driving is seamless: the screen takes focus when the pointer is over it,
+   so nothing marks the lease. Only someone else holding it is worth a line. */
+.lease-notice {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 6px 12px 6px 26px;
+  border: 1px solid var(--seam);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--chassis) 92%, transparent);
+  color: var(--silkscreen);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.lease-notice[hidden] {
+  display: none;
+}
+
+.lease-notice::before {
   content: "";
   position: absolute;
-  inset: 0;
+  left: 11px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--lamp-wait);
+}
+
+/* Stats: a persistent readout in the top-right, the one corner neither the
+   remote desktop nor the key claims, on when you ask for it. */
+.hud {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 1;
+  margin: 0;
+  padding: 8px 10px;
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 12px;
+  row-gap: 2px;
+  border: 1px solid var(--seam);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--chassis) 95%, transparent);
+  font-family: var(--numerals);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
   pointer-events: none;
-  box-shadow: inset 0 0 0 2px var(--lamp-live);
-  opacity: 0;
-  transition: opacity var(--ease);
 }
 
-.stage[data-lease="active"]::after {
-  opacity: 1;
+.hud[hidden] {
+  display: none;
 }
 
-canvas:focus-visible {
-  outline: 1px solid var(--silkscreen-dim);
-  outline-offset: -1px;
+.hud dt {
+  color: var(--silkscreen-dim);
+  font-family: var(--ui);
+}
+
+.hud dd {
+  margin: 0;
+  text-align: right;
+  transition: color var(--ease);
+}
+
+.hud dd[data-resize="requested"],
+.hud dd[data-resize="applied"] {
+  color: var(--lamp-wait);
 }
 
 /* Not live: the screen says so, over whatever frame it last held. */
@@ -382,36 +436,6 @@ canvas:focus-visible {
   margin: 0;
 }
 
-/* Readout */
-
-.readout {
-  margin: 0;
-  padding: 10px 4px 4px;
-  border-top: 1px solid var(--seam);
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 14px;
-  row-gap: 4px;
-  font-size: 12px;
-}
-
-.readout dt {
-  color: var(--silkscreen-dim);
-}
-
-.readout dd {
-  margin: 0;
-  text-align: right;
-  font-family: var(--numerals);
-  font-variant-numeric: tabular-nums;
-  transition: color var(--ease);
-}
-
-.readout dd[data-resize="requested"],
-.readout dd[data-resize="applied"] {
-  color: var(--lamp-wait);
-}
-
 .hint {
   margin: 8px 4px 0;
   color: var(--silkscreen-dim);
@@ -447,5 +471,15 @@ canvas:focus-visible {
     height: 40px;
     right: 14px;
     bottom: max(14px, env(safe-area-inset-bottom));
+  }
+
+  /* Phones get the four rows that matter. */
+  .hud {
+    top: max(8px, env(safe-area-inset-top));
+    right: 8px;
+  }
+
+  .hud > :nth-child(n + 9) {
+    display: none;
   }
 }

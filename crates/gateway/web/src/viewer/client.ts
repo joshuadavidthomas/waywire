@@ -2,6 +2,7 @@ import { ProtocolVersionMismatchError } from "../sdk/messages.ts";
 import { WaywireSession, type SurfaceHandle } from "../sdk/waywire.ts";
 import {
   installViewerListeners,
+  LATENCY_STORAGE_KEY,
   type ViewerElements,
 } from "./viewer-listeners.ts";
 
@@ -31,6 +32,8 @@ function viewerElements(): ViewerElements {
     signal: requireElement("#signal", html),
     signalHeadline: requireElement("#signal-headline", html),
     signalMessage: requireElement("#signal-message", html),
+    leaseNotice: requireElement("#lease-notice", html),
+    hud: requireElement("#hud", html),
     menuKey: requireElement("#menu-key", button),
     panel: requireElement("#panel", html),
     status: requireElement("#status", html),
@@ -40,6 +43,7 @@ function viewerElements(): ViewerElements {
     keyboardButton: requireElement("#keyboard", button),
     sendClipboardButton: requireElement("#send-clipboard", button),
     copyClipboardButton: requireElement("#copy-clipboard", button),
+    hudToggle: requireElement("#hud-toggle", button),
     resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
     latency: requireElement(
@@ -47,7 +51,6 @@ function viewerElements(): ViewerElements {
       (element): element is HTMLFieldSetElement =>
         element instanceof HTMLFieldSetElement,
     ),
-    readout: requireElement("#readout", html),
     imeProxy: requireElement(
       "#ime-proxy",
       (element): element is HTMLInputElement =>
@@ -56,7 +59,17 @@ function viewerElements(): ViewerElements {
   };
 }
 
+// The latency choice sticks between visits when storage allows it.
 function checkedLatency(latency: HTMLFieldSetElement): number {
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(LATENCY_STORAGE_KEY);
+  } catch {
+    stored = null;
+  }
+  for (const input of latency.querySelectorAll("input")) {
+    if (input.value === stored) input.checked = true;
+  }
   const checked = latency.querySelector("input:checked");
   return checked instanceof HTMLInputElement ? Number(checked.value) : 60;
 }
