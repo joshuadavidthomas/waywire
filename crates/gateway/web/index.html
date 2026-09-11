@@ -76,16 +76,12 @@
         </svg>
       </button>
       <div id="panel" class="panel" popover>
-        <p id="panel-status" class="status" role="status">
-          <span id="status" class="dot" data-state="idle"></span>
-          <span id="status-video">Connecting</span>
-        </p>
         <ul class="menu" role="list" aria-label="Input">
           <li>
             <label
               class="item"
               for="control-toggle"
-              title="Your mouse and keyboard reach the desktop while this is on. Turn it off to watch without touching anything."
+              title="Your mouse, keyboard, and scrolling reach the desktop while this is on. Turn it off to watch without touching anything."
             >
               <svg
                 class="glyph"
@@ -97,7 +93,7 @@
                   d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z"
                 />
               </svg>
-              <span class="label">Mouse and keyboard</span>
+              <span class="label">Input</span>
               <span class="toggle">
                 <span class="toggle-knob" aria-hidden="true"></span>
                 <input
@@ -162,7 +158,7 @@
               id="send-clipboard"
               class="item"
               type="button"
-              title="Copy what is on this computer's clipboard onto the desktop's clipboard."
+              title="Put what is on this computer's clipboard onto the desktop's clipboard, ready to paste over there."
             >
               <svg
                 class="glyph"
@@ -178,7 +174,7 @@
                 />
                 <rect x="8" y="2" width="8" height="4" rx="1" />
               </svg>
-              <span class="label">Clipboard to desktop</span>
+              <span class="label">Copy clipboard to the desktop</span>
             </button>
           </li>
           <li>
@@ -203,7 +199,7 @@
                 <path d="M21 14H11" />
                 <path d="m15 10-4 4 4 4" />
               </svg>
-              <span class="label">Clipboard from desktop</span>
+              <span class="label">Copy clipboard to this computer</span>
             </button>
           </li>
           <li id="clipboard-status" class="note" aria-live="polite"></li>
@@ -294,12 +290,17 @@
           </li>
         </ul>
         <div class="panel-foot">
+          <p id="panel-status" class="status" role="status">
+            <span id="status" class="dot" data-state="idle"></span>
+            <span id="status-video">Connecting</span>
+          </p>
           <div class="tools">
             <button
               id="fullscreen"
               class="tool"
               type="button"
               aria-label="Full screen"
+              title="Fill the screen with the desktop."
               aria-pressed="false"
             >
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -314,6 +315,7 @@
               class="tool"
               type="button"
               aria-label="Keep the menu open"
+              title="Keep this menu open while you use the desktop."
               aria-pressed="false"
             >
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -328,6 +330,7 @@
               class="tool"
               type="button"
               aria-label="Close"
+              title="Close this menu."
             >
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M18 6 6 18" />

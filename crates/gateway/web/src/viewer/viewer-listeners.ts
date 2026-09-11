@@ -228,7 +228,7 @@ export function installViewerListeners(
   // The one mode a person forgets they are in gets the page's one pill.
   const renderLeaseNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent = "Your mouse and keyboard are off";
+      elements.leaseNotice.textContent = "Input is off";
       elements.leaseNotice.hidden = false;
     } else if (state.input.state === "busy") {
       elements.leaseNotice.textContent = "Another viewer has control";
