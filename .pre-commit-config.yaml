@@ -12,7 +12,7 @@ repos:
       - id: mixed-line-ending
       - id: trailing-whitespace
   - repo: https://github.com/joshuadavidthomas/ast-grep-rules
-    rev: v0.5.0
+    rev: v0.7.0
     hooks:
       - id: rust
   - repo: local
