@@ -1248,7 +1248,7 @@ fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
 fn ffmpeg_converts_and_tags_desktop_srgb_consistently() {
     let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
     for pair in [
-        ["-profile:v", "high444"],
+        ["-profile:v", H264_PROFILE.ffmpeg_profile()],
         ["-pix_fmt", "yuv444p"],
         ["-vf", "scale=2:2:out_color_matrix=bt709:out_range=pc"],
         ["-colorspace", "bt709"],
@@ -1336,7 +1336,7 @@ fn every_same_generation_config_change_requests_a_new_generation() {
 
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
-fn ffmpeg_actual_sps_matches_gateway_avc1_f40034() {
+fn ffmpeg_actual_sps_matches_protocol_profile() {
     let socket =
         UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
@@ -1368,7 +1368,7 @@ fn ffmpeg_actual_sps_matches_gateway_avc1_f40034() {
     assert_eq!(&sps[1..4], &[0xf4, 0x00, 0x34]);
     assert_eq!(
         format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]),
-        "avc1.F40034"
+        H264_PROFILE.codec()
     );
     assert_eq!(
         parse_test_sps(sps),

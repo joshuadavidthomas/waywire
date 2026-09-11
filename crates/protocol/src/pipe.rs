@@ -66,8 +66,10 @@ macro_rules! ranged_newtype {
         pub struct $name($inner);
 
         impl $name {
-            pub fn new(value: $inner) -> Result<Self, InvalidValue> {
-                if ($minimum..=$maximum).contains(&value) {
+            pub const fn new(value: $inner) -> Result<Self, InvalidValue> {
+                let minimum: $inner = $minimum;
+                let maximum: $inner = $maximum;
+                if minimum <= value && value <= maximum {
                     Ok(Self(value))
                 } else {
                     Err(InvalidValue($label))
@@ -92,6 +94,24 @@ macro_rules! ranged_newtype {
     };
 }
 
+macro_rules! ordered_ranged_newtype {
+    ($name:ident, $inner:ty, $minimum:expr, $maximum:expr, $label:literal) => {
+        ranged_newtype!($name, $inner, $minimum, $maximum, $label);
+
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.cmp(&other.0)
+            }
+        }
+    };
+}
+
 nonzero_newtype!(Generation, u32, NonZeroU32, "generation must be nonzero");
 nonzero_newtype!(RequestId, u16, NonZeroU16, "request ID must be nonzero");
 nonzero_newtype!(
@@ -107,21 +127,21 @@ ranged_newtype!(
     480,
     "scale must be between 120 and 480"
 );
-ranged_newtype!(
+ordered_ranged_newtype!(
     Kbps,
     u32,
     300,
     50_000,
     "bitrate must be between 300 and 50000 Kbps"
 );
-ranged_newtype!(
+ordered_ranged_newtype!(
     Fps,
     u32,
     10,
     120,
     "frame rate must be between 10 and 120 FPS"
 );
-ranged_newtype!(
+ordered_ranged_newtype!(
     ScalePercent,
     u32,
     50,
@@ -143,6 +163,113 @@ ranged_newtype!(
     u16::MAX,
     "frame dimension must be nonzero"
 );
+
+impl Kbps {
+    pub const MINIMUM: Self = Self(300);
+    pub const MAXIMUM: Self = Self(50_000);
+
+    #[must_use]
+    pub fn scaled(self, percent: u8) -> Self {
+        let value = self
+            .get()
+            .saturating_mul(u32::from(percent))
+            .saturating_div(100)
+            .clamp(Self::MINIMUM.get(), Self::MAXIMUM.get());
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn at_least(self, minimum: Self) -> Self {
+        Self(self.get().max(minimum.get()))
+    }
+
+    #[must_use]
+    pub fn at_most(self, maximum: Self) -> Self {
+        Self(self.get().min(maximum.get()))
+    }
+
+    #[must_use]
+    pub fn divided_by(self, divisor: NonZeroU32) -> Self {
+        Self(self.get() / divisor.get())
+    }
+}
+
+impl Fps {
+    pub const MINIMUM: Self = Self(10);
+    pub const MAXIMUM: Self = Self(120);
+
+    #[must_use]
+    pub fn lowered_by(self, step: u32, floor: Self) -> Self {
+        Self(self.get().saturating_sub(step).max(floor.get()))
+    }
+
+    #[must_use]
+    pub fn raised_by(self, step: u32, ceiling: Self) -> Self {
+        Self(
+            self.get()
+                .saturating_add(step)
+                .min(ceiling.get())
+                .min(Self::MAXIMUM.get()),
+        )
+    }
+}
+
+impl ScalePercent {
+    pub const MINIMUM: Self = Self(50);
+    pub const MAXIMUM: Self = Self(100);
+
+    #[must_use]
+    pub fn lowered_by(self, step: u32, floor: Self) -> Self {
+        Self(self.get().saturating_sub(step).max(floor.get()))
+    }
+
+    #[must_use]
+    pub fn raised_by(self, step: u32, ceiling: Self) -> Self {
+        Self(
+            self.get()
+                .saturating_add(step)
+                .min(ceiling.get())
+                .min(Self::MAXIMUM.get()),
+        )
+    }
+}
+
+/// The stored `FFmpeg` profile name must encode `profile_idc`; the streamd test
+/// `ffmpeg_actual_sps_matches_protocol_profile` checks both against the emitted SPS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct H264Profile {
+    profile_idc: u8,
+    constraints: u8,
+    level_idc: u8,
+    ffmpeg_profile: &'static str,
+}
+
+pub const H264_PROFILE: H264Profile = H264Profile {
+    profile_idc: 0xf4,
+    constraints: 0,
+    level_idc: 0x34,
+    ffmpeg_profile: "high444",
+};
+
+impl H264Profile {
+    #[must_use]
+    pub const fn ffmpeg_profile(self) -> &'static str {
+        self.ffmpeg_profile
+    }
+
+    #[must_use]
+    pub fn ffmpeg_level(self) -> String {
+        format!("{}.{}", self.level_idc / 10, self.level_idc % 10)
+    }
+
+    #[must_use]
+    pub fn codec(self) -> String {
+        format!(
+            "avc1.{:02X}{:02X}{:02X}",
+            self.profile_idc, self.constraints, self.level_idc
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct FrameSize {

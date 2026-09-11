@@ -40,7 +40,6 @@ pub enum ClientEvent {
     VideoConfig {
         version: u8,
         codec: String,
-        frame_rate: Fps,
     },
     Cursor(CursorState),
     Clipboard {
@@ -60,11 +59,10 @@ pub enum ClientEvent {
 
 impl ClientEvent {
     #[must_use]
-    pub fn video_config(codec: String, frame_rate: Fps) -> Self {
+    pub fn video_config(codec: String) -> Self {
         Self::VideoConfig {
             version: PROTOCOL_VERSION,
             codec,
-            frame_rate,
         }
     }
 }
@@ -115,6 +113,8 @@ pub struct QualityLevels {
 
 #[derive(Debug, PartialEq)]
 pub enum ClientMessage {
+    AcquireControl,
+    ReleaseControl,
     Ping {
         id: u64,
     },
@@ -133,6 +133,8 @@ impl ClientMessage {
     pub fn parse_json(bytes: &[u8]) -> Result<Self, BrowserError> {
         let input: JsonInput = serde_json::from_slice(bytes).map_err(BrowserError::InvalidJson)?;
         match input {
+            JsonInput::Acquire => Ok(Self::AcquireControl),
+            JsonInput::Release => Ok(Self::ReleaseControl),
             JsonInput::Ping { id } => Ok(Self::Ping { id }),
             JsonInput::Feedback(values) => Feedback::new(values).map(Self::Feedback),
             JsonInput::Text {
@@ -154,6 +156,8 @@ impl ClientMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum JsonInput {
+    Acquire,
+    Release,
     Ping {
         id: u64,
     },
@@ -411,10 +415,13 @@ mod tests {
 
     #[test]
     fn video_config_json_is_exact() {
-        let event = ClientEvent::video_config("avc1.F40034".into(), value(Fps::new(60)));
+        let event = ClientEvent::video_config(pipe::H264_PROFILE.codec());
         assert_eq!(
             json(&event),
-            r#"{"type":"video-config","version":4,"codec":"avc1.F40034","frameRate":60}"#
+            format!(
+                r#"{{"type":"video-config","version":4,"codec":"{}"}}"#,
+                pipe::H264_PROFILE.codec()
+            )
         );
     }
 
@@ -596,6 +603,18 @@ mod tests {
         let invalid = br#"{"type":"feedback","received":1,"presented":1,"queuePeak":2,"queueBusyMs":0,"sampleMs":0,"dropped":0,"rtt":20}"#;
         let error = ClientMessage::parse_json(invalid).map_err(|error| error.to_string());
         assert_eq!(error, Err("invalid feedback: sampleMs out of range".into()));
+    }
+
+    #[test]
+    fn parses_control_lease_json() {
+        assert_eq!(
+            ClientMessage::parse_json(br#"{"type":"acquire"}"#).expect("acquire should parse"),
+            ClientMessage::AcquireControl
+        );
+        assert_eq!(
+            ClientMessage::parse_json(br#"{"type":"release"}"#).expect("release should parse"),
+            ClientMessage::ReleaseControl
+        );
     }
 
     #[test]

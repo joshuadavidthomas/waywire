@@ -1,9 +1,12 @@
 use std::future::pending;
+use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -47,6 +50,7 @@ use tokio::time::timeout;
 use tracing::info;
 use tracing::warn;
 
+use crate::XkbLayout;
 use crate::protocol::EventReader;
 use crate::session::LeaseEpoch;
 use crate::video::VideoHub;
@@ -110,57 +114,85 @@ impl CursorPositionGate {
     }
 }
 
+/// Nothing is published behind this flag: the frames that justify `Ready` reach viewers through
+/// `VideoHub`'s mutex and `Notify`, and both readers look only at the tag. `Relaxed` would therefore
+/// be sound; Acquire/Release costs nothing at one update per frame and keeps the edge in place for
+/// a future reader that does hang data off it.
 #[derive(Clone)]
 pub(crate) struct Readiness {
-    state: Arc<Mutex<ReadinessState>>,
+    state: Arc<AtomicU8>,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadinessState {
-    WaitingForFirstFrame,
-    Ready,
-    WaitingForKeyframe,
-    Failed,
-}
-
-pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>, purpose: &'static str) -> MutexGuard<'a, T> {
-    match mutex.lock() {
-        Ok(value) => value,
-        Err(error) => panic!("{purpose} mutex poisoned: {error}"),
-    }
+pub(crate) enum ReadinessState {
+    WaitingForFirstFrame = 0,
+    Ready = 1,
+    WaitingForKeyframe = 2,
+    Stopped = 3,
 }
 
 impl Readiness {
     pub(crate) fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(ReadinessState::WaitingForFirstFrame)),
+            state: Arc::new(AtomicU8::new(ReadinessState::WaitingForFirstFrame as u8)),
+        }
+    }
+
+    fn decode(tag: u8) -> ReadinessState {
+        match tag {
+            0 => ReadinessState::WaitingForFirstFrame,
+            1 => ReadinessState::Ready,
+            2 => ReadinessState::WaitingForKeyframe,
+            3 => ReadinessState::Stopped,
+            _ => panic!("defect: invalid ReadinessState tag {tag}"),
         }
     }
 
     pub(crate) fn mark_video_ready(&self) {
-        let mut state = lock(&self.state, "daemon readiness");
-        if *state != ReadinessState::Failed {
-            *state = ReadinessState::Ready;
-        }
+        let _ =
+            self.state.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |tag| match Self::decode(tag) {
+                    ReadinessState::WaitingForFirstFrame
+                    | ReadinessState::Ready
+                    | ReadinessState::WaitingForKeyframe => Some(ReadinessState::Ready as u8),
+                    ReadinessState::Stopped => None,
+                },
+            );
     }
 
     pub(crate) fn await_keyframe(&self) {
-        let mut state = lock(&self.state, "daemon readiness");
-        if *state == ReadinessState::Ready {
-            *state = ReadinessState::WaitingForKeyframe;
-        }
+        let _ =
+            self.state.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |tag| match Self::decode(tag) {
+                    ReadinessState::Ready => Some(ReadinessState::WaitingForKeyframe as u8),
+                    ReadinessState::WaitingForFirstFrame
+                    | ReadinessState::WaitingForKeyframe
+                    | ReadinessState::Stopped => None,
+                },
+            );
     }
 
-    pub(crate) fn failed(&self) {
-        *lock(&self.state, "daemon readiness") = ReadinessState::Failed;
+    pub(crate) fn stop(&self) {
+        self.state
+            .store(ReadinessState::Stopped as u8, Ordering::Release);
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        *lock(&self.state, "daemon readiness") == ReadinessState::Ready
+        Self::decode(self.state.load(Ordering::Acquire)) == ReadinessState::Ready
     }
 
     pub(crate) fn needs_startup_frame(&self) -> bool {
-        *lock(&self.state, "daemon readiness") == ReadinessState::WaitingForFirstFrame
+        Self::decode(self.state.load(Ordering::Acquire)) == ReadinessState::WaitingForFirstFrame
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> ReadinessState {
+        Self::decode(self.state.load(Ordering::Acquire))
     }
 }
 
@@ -181,17 +213,34 @@ impl AppEvents {
         }
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ClientEvent> {
-        self.tx.subscribe()
-    }
-
-    pub(crate) fn initial(&self) -> Vec<ClientEvent> {
-        let cursor = lock(&self.latest_cursor, "daemon cursor state").clone();
+    pub(crate) fn snapshot(&self) -> Vec<ClientEvent> {
+        let cursor = self
+            .latest_cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let clipboard = self
+            .latest_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let mut values = vec![ClientEvent::Cursor(cursor)];
-        if let Some(text) = lock(&self.latest_clipboard, "daemon clipboard state").clone() {
+        if let Some(text) = clipboard {
             values.push(ClientEvent::Clipboard { text });
         }
         values
+    }
+
+    pub(crate) fn subscribe(&self) -> (Vec<ClientEvent>, broadcast::Receiver<ClientEvent>) {
+        let receiver = self.tx.subscribe();
+        (self.snapshot(), receiver)
+    }
+
+    pub(crate) fn latest_clipboard(&self) -> Option<ClipboardText> {
+        self.latest_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn publish(&self, value: ClientEvent) {
@@ -226,7 +275,11 @@ impl CommandReader {
         while let Some(request) = self.requests.recv().await {
             let authorized = match request.authority {
                 Authority::System => true,
-                Authority::Lease(lease) => self.active_lease.load(Ordering::Acquire) == lease.get(),
+                Authority::Lease(lease) => {
+                    NonZeroU64::new(self.active_lease.load(Ordering::Acquire))
+                        .map(LeaseEpoch::from_nonzero)
+                        == Some(lease)
+                }
             };
             if authorized {
                 return Some(AuthorizedCommand {
@@ -245,11 +298,11 @@ pub(crate) enum CommandSinkError {
     LengthOverflow { length: usize },
     #[error("daemon command byte budget closed")]
     ByteBudgetClosed,
-    #[error("daemon command byte budget stalled for two seconds")]
+    #[error("daemon command byte budget stalled after {deadline:?}", deadline = PIPE_DEADLINE)]
     ByteBudgetStalled,
     #[error("daemon command writer stopped")]
     WriterStopped,
-    #[error("daemon command count budget stalled for two seconds")]
+    #[error("daemon command count budget stalled after {deadline:?}", deadline = PIPE_DEADLINE)]
     CountBudgetStalled,
 }
 
@@ -315,7 +368,7 @@ impl CommandSink {
     }
 
     fn fail<T>(&self, error: CommandSinkError) -> Result<T, CommandSinkError> {
-        self.readiness.failed();
+        self.readiness.stop();
         // The first fatal error shuts down the session. Later failures need
         // neither additional queue space nor a second shutdown transition.
         let _ = self.fatal.try_send(error.clone());
@@ -367,10 +420,10 @@ pub(crate) struct StartedDaemon {
 }
 
 pub(crate) struct Config {
-    pub(crate) path: String,
+    pub(crate) path: PathBuf,
     pub(crate) frame_rate: Fps,
     pub(crate) bitrate: Kbps,
-    pub(crate) xkb_layout: String,
+    pub(crate) xkb_layout: XkbLayout,
 }
 
 impl Daemon {
@@ -441,7 +494,7 @@ fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
             "--rtp-port",
             &rtp_port.to_string(),
             "--xkb-layout",
-            &config.xkb_layout,
+            config.xkb_layout.as_str(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -450,7 +503,7 @@ fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
     command.as_std_mut().process_group(0);
     let mut child = command
         .spawn()
-        .with_context(|| format!("spawn private daemon {}", config.path))?;
+        .with_context(|| format!("spawn private daemon {}", config.path.display()))?;
     let raw_pid = i32::try_from(
         child
             .id()
@@ -460,7 +513,7 @@ fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
     let pid = Pid::from_raw(raw_pid);
     let stdin = child.stdin.take().context("open daemon stdin")?;
     let stdout = child.stdout.take().context("open daemon stdout")?;
-    info!(%pid, path = %config.path, "daemon spawned");
+    info!(%pid, path = %config.path.display(), "daemon spawned");
     Ok(SpawnedDaemon {
         child,
         pid,
@@ -526,7 +579,7 @@ async fn supervise_daemon(
         }
     }
     .await;
-    readiness.failed();
+    readiness.stop();
     let result = match cleanup_group(&mut child, pid).await {
         Ok(()) => result,
         Err(cleanup_error) => match result {
@@ -551,7 +604,7 @@ enum CommandWriterError {
     QueueClosed,
     #[error("write daemon command: {0}")]
     Write(#[source] std::io::Error),
-    #[error("daemon command write timed out after two seconds")]
+    #[error("daemon command write timed out after {deadline:?}", deadline = PIPE_DEADLINE)]
     WriteTimeout,
 }
 
@@ -592,7 +645,10 @@ async fn read_events(
                 match event {
                     Event::Frame(metadata) => pipeline.metadata(metadata).await?,
                     Event::Clipboard(text) => {
-                        *lock(&events.latest_clipboard, "daemon clipboard state") = Some(text.clone());
+                        *events
+                            .latest_clipboard
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(text.clone());
                         events.publish(ClientEvent::Clipboard { text });
                     }
                     Event::ResizeApplied(applied) => {
@@ -630,7 +686,10 @@ where
     F: FnOnce(&mut CursorState),
 {
     let event = {
-        let mut cursor = lock(&events.latest_cursor, "daemon cursor state");
+        let mut cursor = events
+            .latest_cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         update(&mut cursor);
         ClientEvent::Cursor(cursor.clone())
     };
@@ -709,6 +768,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
+    use crate::session::InputOutcome;
     use crate::session::LeaseState;
     use crate::session::Sessions;
     use crate::session::SocketId;
@@ -882,12 +942,14 @@ mod tests {
             .await
             .expect("quality command should queue");
         let decoded = Command::decode(&quality.encoded).expect("quality command should decode");
-        let Command::Quality(payload) = decoded else {
-            return;
-        };
-        assert_eq!(payload.bitrate_kbps.get(), 6_400);
-        assert_eq!(payload.fps.get(), 60);
-        assert_eq!(payload.scale_percent.get(), 100);
+        assert_eq!(
+            decoded,
+            Command::Quality(Quality {
+                bitrate_kbps: Kbps::new(6_400).expect("expected bitrate should be valid"),
+                fps: Fps::new(60).expect("expected frame rate should be valid"),
+                scale_percent: ScalePercent::new(100).expect("expected scale should be valid"),
+            })
+        );
 
         release_task
             .await
@@ -901,7 +963,13 @@ mod tests {
             Command::decode(&final_release.encoded),
             Ok(Command::ReleaseAll(_))
         ));
-        assert!(!sessions.owns(socket).await);
+        assert_eq!(
+            sessions
+                .input(socket, Command::ReleaseAll(ReleaseAll))
+                .await
+                .expect("released socket input check should succeed"),
+            InputOutcome::NotLeaseOwner
+        );
     }
 
     #[tokio::test]
@@ -915,8 +983,7 @@ mod tests {
             .expect_err("closed byte budget should reject a command");
 
         assert_eq!(error, CommandSinkError::ByteBudgetClosed);
-        assert!(!commands.readiness.is_ready());
-        assert!(!commands.readiness.needs_startup_frame());
+        assert_eq!(commands.readiness.state(), ReadinessState::Stopped);
         drop(request_guard);
     }
 
@@ -937,12 +1004,11 @@ mod tests {
     }
 
     #[test]
-    fn video_ready_cannot_revive_a_failed_runtime() {
+    fn video_ready_cannot_revive_a_stopped_runtime() {
         let readiness = Readiness::new();
-        readiness.failed();
+        readiness.stop();
         readiness.mark_video_ready();
-        assert!(!readiness.is_ready());
-        assert!(!readiness.needs_startup_frame());
+        assert_eq!(readiness.state(), ReadinessState::Stopped);
     }
 
     #[test]
@@ -950,15 +1016,13 @@ mod tests {
         let readiness = Readiness::new();
         readiness.mark_video_ready();
         readiness.await_keyframe();
-        assert!(!readiness.is_ready());
-        assert!(!readiness.needs_startup_frame());
+        assert_eq!(readiness.state(), ReadinessState::WaitingForKeyframe);
     }
 
     #[test]
     fn ready_runtime_stays_healthy_while_video_is_idle() {
         let readiness = Readiness::new();
         readiness.mark_video_ready();
-        assert!(readiness.is_ready());
-        assert!(!readiness.needs_startup_frame());
+        assert_eq!(readiness.state(), ReadinessState::Ready);
     }
 }

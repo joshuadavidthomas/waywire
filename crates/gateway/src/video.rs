@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -30,16 +31,18 @@ use tracing::warn;
 
 use crate::daemon::CommandSink;
 use crate::daemon::Readiness;
-use crate::daemon::lock;
 
 const MAX_ACCESS_UNIT: usize = MAX_VIDEO_DATA_BYTES;
-const MAX_PENDING_RECORDS: u64 = 120;
 const PENDING_RECORD_CAPACITY: usize = 120;
+// Timestamp gaps wider than the queue cannot ever be matched.
+const MAX_PENDING_RECORDS: u64 = PENDING_RECORD_CAPACITY as u64;
 const MAX_PENDING_UNIT_BYTES: usize = 32 << 20;
 const MAX_GOP_FRAMES: usize = 241;
 const MAX_GOP_BYTES: usize = 32 << 20;
-const MAX_VIEWER_FRAMES: usize = 8;
-const MAX_VIEWER_BYTES: usize = 32 << 20;
+const VIEWER_BOUNDS: ViewerBounds = ViewerBounds {
+    frames: 8,
+    bytes: 32 << 20,
+};
 const UNMATCHED_DEADLINE: Duration = Duration::from_secs(2);
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -49,16 +52,20 @@ pub(crate) struct VideoHub {
 }
 
 struct Hub {
-    subscribers: HashMap<u64, Subscriber>,
-    next: u64,
+    subscribers: HashMap<SubscriberId, ViewerHandle>,
+    next_subscriber: u64,
     gop: Vec<VideoSample>,
     gop_bytes: usize,
+    generation: Option<Generation>,
 }
 
-struct Subscriber {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SubscriberId(u64);
+
+#[derive(Clone)]
+struct ViewerHandle {
     queue: Arc<Mutex<ViewerQueue>>,
     notify: Arc<Notify>,
-    waiting_for_keyframe: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,32 +74,132 @@ enum GopState {
     Recovering,
 }
 
-#[derive(Default)]
-struct ViewerQueue {
-    frames: VecDeque<VideoSample>,
+#[derive(Clone, Copy)]
+struct ViewerBounds {
+    frames: usize,
     bytes: usize,
 }
 
+struct ViewerQueue {
+    frames: VecDeque<VideoSample>,
+    bytes: usize,
+    keyframe: GopState,
+    generation: Option<Generation>,
+    bounds: ViewerBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pushed {
+    Queued,
+    Dropped,
+}
+
+impl ViewerQueue {
+    fn new(keyframe: GopState, generation: Option<Generation>, bounds: ViewerBounds) -> Self {
+        Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+            keyframe,
+            generation,
+            bounds,
+        }
+    }
+
+    fn push(&mut self, mut sample: VideoSample) -> Pushed {
+        let generation_reset = self
+            .generation
+            .is_some_and(|current| current != sample.metadata.generation);
+        self.generation = Some(sample.metadata.generation);
+        let stream_reset = sample.continuity == Continuity::AfterGap || generation_reset;
+        if stream_reset {
+            self.clear();
+        }
+        let recovering = self.keyframe == GopState::Recovering;
+        if recovering && sample.kind != FrameKind::Key {
+            return Pushed::Dropped;
+        }
+        if sample.kind == FrameKind::Key {
+            self.keyframe = GopState::KeyframeCached;
+        }
+        let overflow = self.frames.len() >= self.bounds.frames
+            || self.bytes.saturating_add(sample.data.len()) > self.bounds.bytes;
+        if overflow {
+            debug!(
+                frames = self.frames.len().saturating_add(1),
+                bytes = self.bytes.saturating_add(sample.data.len()),
+                kind = ?sample.kind,
+                "viewer queue overflow"
+            );
+            self.clear();
+            if sample.kind != FrameKind::Key {
+                return Pushed::Dropped;
+            }
+            self.keyframe = GopState::KeyframeCached;
+        }
+        if stream_reset || recovering || overflow {
+            sample.continuity = Continuity::AfterGap;
+        }
+        self.bytes += sample.data.len();
+        self.frames.push_back(sample);
+        Pushed::Queued
+    }
+
+    fn pop(&mut self) -> Option<VideoSample> {
+        let frame = self.frames.pop_front();
+        if let Some(value) = &frame {
+            self.bytes -= value.data.len();
+        }
+        frame
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+        self.keyframe = GopState::Recovering;
+    }
+}
+
 pub(crate) struct VideoSubscription {
+    hub: VideoHub,
+    id: SubscriberId,
+    bootstrap: VecDeque<VideoSample>,
     queue: Arc<Mutex<ViewerQueue>>,
     notify: Arc<Notify>,
 }
 
 impl VideoSubscription {
-    pub(crate) async fn next(&self) -> VideoSample {
+    pub(crate) async fn next(&mut self) -> VideoSample {
         loop {
-            if let Some(frame) = {
-                let mut queue = lock(&self.queue, "video viewer queue");
-                let frame = queue.frames.pop_front();
-                if let Some(value) = &frame {
-                    queue.bytes -= value.data.len();
+            if let Some(frame) = self.bootstrap.pop_front() {
+                let current_generation = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .generation;
+                if current_generation == Some(frame.metadata.generation) {
+                    return frame;
                 }
-                frame
-            } {
+                continue;
+            }
+            let notified = self.notify.notified();
+            if let Some(frame) = self
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop()
+            {
                 return frame;
             }
-            self.notify.notified().await;
+            // All durable progress lives in the queues. Cancellation can only
+            // discard this waiter, and the next call checks both queues before waiting again.
+            notified.await;
         }
+    }
+}
+
+impl Drop for VideoSubscription {
+    fn drop(&mut self) {
+        self.hub.unsubscribe(self.id);
     }
 }
 
@@ -101,112 +208,131 @@ impl VideoHub {
         Self {
             inner: Arc::new(Mutex::new(Hub {
                 subscribers: HashMap::new(),
-                next: 1,
+                next_subscriber: 1,
                 gop: Vec::new(),
                 gop_bytes: 0,
+                generation: None,
             })),
         }
     }
 
-    pub(crate) fn subscribe(&self) -> (u64, Vec<VideoSample>, VideoSubscription) {
-        let queue = Arc::new(Mutex::new(ViewerQueue::default()));
+    pub(crate) fn subscribe(&self) -> VideoSubscription {
+        let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let id = SubscriberId(hub.next_subscriber);
+        hub.next_subscriber = hub.next_subscriber.wrapping_add(1);
+        let bootstrap = VecDeque::from(hub.gop.clone());
+        let keyframe = if bootstrap.is_empty() {
+            GopState::Recovering
+        } else {
+            GopState::KeyframeCached
+        };
+        let queue = Arc::new(Mutex::new(ViewerQueue::new(
+            keyframe,
+            hub.generation,
+            VIEWER_BOUNDS,
+        )));
         let notify = Arc::new(Notify::new());
-        let mut hub = lock(&self.inner, "video hub");
-        let id = hub.next;
-        hub.next += 1;
-        let bootstrap = hub.gop.clone();
-        hub.subscribers.insert(
+        let _ = hub.subscribers.insert(
             id,
-            Subscriber {
+            ViewerHandle {
                 queue: Arc::clone(&queue),
                 notify: Arc::clone(&notify),
-                waiting_for_keyframe: bootstrap.is_empty(),
             },
         );
-        (id, bootstrap, VideoSubscription { queue, notify })
+        drop(hub);
+        VideoSubscription {
+            hub: self.clone(),
+            id,
+            bootstrap,
+            queue,
+            notify,
+        }
     }
 
-    pub(crate) fn unsubscribe(&self, id: u64) {
-        let _ = lock(&self.inner, "video hub").subscribers.remove(&id);
+    fn unsubscribe(&self, id: SubscriberId) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .subscribers
+            .remove(&id);
     }
 
-    fn broadcast(&self, sample: VideoSample) -> GopState {
+    // VideoWorker::run is the sole production caller. Fan-out happens without the hub lock, so
+    // per-viewer ordering depends on that caller broadcasting each frame in sequence.
+    fn broadcast(&self, sample: &VideoSample) -> GopState {
         let generation = sample.metadata.generation;
-        let mut hub = lock(&self.inner, "video hub");
-        let stream_reset = sample.continuity == Continuity::AfterGap
-            || hub.gop.first().is_some_and(|first_cached| {
-                first_cached.metadata.generation != sample.metadata.generation
-            });
-        if stream_reset {
-            hub.gop.clear();
-            hub.gop_bytes = 0;
-        }
-        for subscriber in hub.subscribers.values_mut() {
-            {
-                let mut queue = lock(&subscriber.queue, "video viewer queue");
-                if stream_reset {
-                    queue.frames.clear();
-                    queue.bytes = 0;
-                    subscriber.waiting_for_keyframe = true;
-                }
-                let recovering = subscriber.waiting_for_keyframe;
-                if recovering {
-                    if sample.kind != FrameKind::Key {
-                        continue;
-                    }
-                    subscriber.waiting_for_keyframe = false;
-                }
-                let overflow = queue.frames.len() == MAX_VIEWER_FRAMES
-                    || queue.bytes + sample.data.len() > MAX_VIEWER_BYTES;
-                if overflow {
-                    queue.frames.clear();
-                    queue.bytes = 0;
-                    if sample.kind != FrameKind::Key {
-                        subscriber.waiting_for_keyframe = true;
-                        continue;
-                    }
-                    subscriber.waiting_for_keyframe = false;
-                }
-                let mut outgoing = sample.clone();
-                if stream_reset || recovering || overflow {
-                    outgoing.continuity = Continuity::AfterGap;
-                }
-                queue.bytes += outgoing.data.len();
-                queue.frames.push_back(outgoing);
-            }
-            subscriber.notify.notify_one();
-        }
-        if sample.kind == FrameKind::Key {
-            hub.gop.clear();
-            hub.gop_bytes = sample.data.len();
-            hub.gop.push(sample);
-        } else if !hub.gop.is_empty() {
-            if hub.gop.len() < MAX_GOP_FRAMES && hub.gop_bytes + sample.data.len() <= MAX_GOP_BYTES
-            {
-                hub.gop_bytes += sample.data.len();
-                hub.gop.push(sample);
-            } else {
+        let (handles, state, stream_reset) = {
+            let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let stream_reset = sample.continuity == Continuity::AfterGap
+                || hub
+                    .generation
+                    .is_some_and(|current| current != sample.metadata.generation);
+            hub.generation = Some(sample.metadata.generation);
+            if stream_reset {
                 hub.gop.clear();
                 hub.gop_bytes = 0;
             }
+            if sample.kind == FrameKind::Key {
+                hub.gop.clear();
+                hub.gop_bytes = sample.data.len();
+                hub.gop.push(sample.clone());
+            } else if !hub.gop.is_empty() {
+                if hub.gop.len() < MAX_GOP_FRAMES
+                    && hub.gop_bytes + sample.data.len() <= MAX_GOP_BYTES
+                {
+                    hub.gop_bytes += sample.data.len();
+                    hub.gop.push(sample.clone());
+                } else {
+                    hub.gop.clear();
+                    hub.gop_bytes = 0;
+                }
+            }
+            let state = if hub.gop.first().is_some_and(|frame| {
+                frame.kind == FrameKind::Key && frame.metadata.generation == generation
+            }) {
+                GopState::KeyframeCached
+            } else {
+                GopState::Recovering
+            };
+            (
+                hub.subscribers.values().cloned().collect::<Vec<_>>(),
+                state,
+                stream_reset,
+            )
+        };
+
+        for handle in handles {
+            let mut outgoing = sample.clone();
+            if stream_reset {
+                outgoing.continuity = Continuity::AfterGap;
+            }
+            let pushed = handle
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(outgoing);
+            match pushed {
+                Pushed::Queued => handle.notify.notify_one(),
+                Pushed::Dropped => {}
+            }
         }
-        if hub.gop.first().is_some_and(|frame| {
-            frame.kind == FrameKind::Key && frame.metadata.generation == generation
-        }) {
-            GopState::KeyframeCached
-        } else {
-            GopState::Recovering
-        }
+        state
     }
 }
 
 #[derive(Debug)]
 struct Packet {
-    marker: bool,
+    end: AccessUnitEnd,
     sequence: u16,
     timestamp: u32,
     generation: Generation,
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessUnitEnd {
+    Final,
+    More,
 }
 
 fn decode_packet(data: &[u8]) -> Result<Packet> {
@@ -243,7 +369,11 @@ fn decode_packet(data: &[u8]) -> Result<Packet> {
     let generation = Generation::new(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
         .map_err(|_invalid_generation| anyhow!("RTP SSRC generation must be positive"))?;
     Ok(Packet {
-        marker: data[1] & 0x80 != 0,
+        end: if data[1] & 0x80 == 0 {
+            AccessUnitEnd::More
+        } else {
+            AccessUnitEnd::Final
+        },
         sequence: u16::from_be_bytes([data[2], data[3]]),
         timestamp: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
         generation,
@@ -259,7 +389,7 @@ struct Assembler {
     next_sequence: Option<u16>,
     generation: Option<Generation>,
     buffered_packets: u64,
-    recovering: bool,
+    keyframe: GopState,
 }
 
 impl Default for Assembler {
@@ -272,7 +402,7 @@ impl Default for Assembler {
             next_sequence: None,
             generation: None,
             buffered_packets: 0,
-            recovering: false,
+            keyframe: GopState::KeyframeCached,
         }
     }
 }
@@ -385,7 +515,7 @@ impl Assembler {
             let discarded = self.clear_access_unit();
             drops.record(discarded, AssemblyDrop::GenerationDiscontinuity);
             self.next_sequence = None;
-            self.recovering = true;
+            self.keyframe = GopState::Recovering;
         }
         self.generation = Some(packet.generation);
         if self
@@ -394,7 +524,7 @@ impl Assembler {
         {
             let discarded = self.clear_access_unit();
             drops.record(discarded, AssemblyDrop::SequenceDiscontinuity);
-            self.recovering = true;
+            self.keyframe = GopState::Recovering;
         }
         self.next_sequence = Some(packet.sequence.wrapping_add(1));
         if self
@@ -404,7 +534,7 @@ impl Assembler {
             let incomplete = self.fu_kind.is_some();
             let discarded = self.clear_access_unit();
             drops.record(discarded, AssemblyDrop::TimestampDiscontinuity);
-            self.recovering = true;
+            self.keyframe = GopState::Recovering;
             if incomplete {
                 return AssemblyResult::rejected(
                     anyhow!("RTP timestamp changed during FU-A"),
@@ -417,17 +547,17 @@ impl Assembler {
         if let Err(error) = self.append_payload(&payload) {
             let discarded = self.clear_access_unit();
             drops.record(discarded, AssemblyDrop::PacketRejection);
-            self.recovering = true;
+            self.keyframe = GopState::Recovering;
             return AssemblyResult::rejected(error, drops);
         }
         self.buffered_packets = self.buffered_packets.saturating_add(1);
-        if !packet.marker {
+        if packet.end == AccessUnitEnd::More {
             return AssemblyResult::accepted(AssemblyOutcome::Incomplete, drops);
         }
         if self.fu_kind.is_some() {
             let buffered = self.clear_access_unit();
             drops.record(buffered.saturating_sub(1), AssemblyDrop::PacketRejection);
-            self.recovering = true;
+            self.keyframe = GopState::Recovering;
             return AssemblyResult::rejected(anyhow!("RTP marker ended an incomplete FU-A"), drops);
         }
         let data = std::mem::take(&mut self.data);
@@ -438,11 +568,12 @@ impl Assembler {
             drops.record(access_unit_packets, AssemblyDrop::EmptyAccessUnit);
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
-        if self.recovering && kind != FrameKind::Key {
+        if self.keyframe == GopState::Recovering && kind != FrameKind::Key {
             drops.record(access_unit_packets, AssemblyDrop::RecoveringWithoutKeyframe);
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
-        let continuity = if std::mem::take(&mut self.recovering) {
+        let continuity = if self.keyframe == GopState::Recovering {
+            self.keyframe = GopState::KeyframeCached;
             Continuity::AfterGap
         } else {
             Continuity::Continuous
@@ -726,7 +857,6 @@ impl Correlator {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)] // `count` is bounded to 120 before the cast.
 fn metadata_gap(delta: u32, fps: Fps) -> Result<usize> {
     if delta == 0 {
         return Ok(1);
@@ -738,7 +868,7 @@ fn metadata_gap(delta: u32, fps: Fps) -> Result<usize> {
     if count > MAX_PENDING_RECORDS {
         return Err(anyhow!("RTP timestamp gap exceeds correlation window"));
     }
-    Ok(count as usize)
+    usize::try_from(count).context("bounded metadata gap exceeds usize")
 }
 
 enum PipelineMessage {
@@ -926,7 +1056,7 @@ impl VideoWorker {
             };
             for frame in frames {
                 let generation = frame.metadata.generation;
-                let transition = match self.hub.broadcast(frame) {
+                let transition = match self.hub.broadcast(&frame) {
                     GopState::KeyframeCached => {
                         self.readiness.mark_video_ready();
                         if ready_generation == Some(generation) {

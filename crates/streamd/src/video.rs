@@ -33,6 +33,7 @@ use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::FrameDimension;
 use sprite_desktop_protocol::pipe::FrameMetadata;
 use sprite_desktop_protocol::pipe::Generation;
+use sprite_desktop_protocol::pipe::H264_PROFILE;
 use sprite_desktop_protocol::pipe::Kbps;
 use sprite_desktop_protocol::pipe::MAX_RAW_PIXELS;
 use sprite_desktop_protocol::pipe::ScalePercent;
@@ -940,9 +941,9 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "-tune".into(),
         "zerolatency".into(),
         "-profile:v".into(),
-        "high444".into(),
+        H264_PROFILE.ffmpeg_profile().into(),
         "-level:v".into(),
-        "5.2".into(),
+        H264_PROFILE.ffmpeg_level(),
         "-pix_fmt".into(),
         "yuv444p".into(),
         "-b:v".into(),

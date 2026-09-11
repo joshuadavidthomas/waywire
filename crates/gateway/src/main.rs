@@ -4,6 +4,7 @@ mod protocol;
 mod session;
 mod video;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -16,9 +17,9 @@ use clap::Parser;
 use socket2::SockRef;
 use sprite_desktop_protocol::pipe::Fps;
 use sprite_desktop_protocol::pipe::Kbps;
+use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -65,27 +66,85 @@ struct Options {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: String,
     #[arg(long)]
-    streamd: String,
-    #[arg(long = "public-url", env = "PUBLIC_URL", value_parser = parse_origin)]
-    origin: String,
+    streamd: PathBuf,
+    #[arg(long = "public-url", env = "PUBLIC_URL", value_parser = Origin::parse)]
+    origin: Origin,
     #[arg(long, default_value = "60", value_parser = parse_fps)]
     frame_rate: Fps,
     #[arg(long, default_value = "16000", value_parser = parse_kbps)]
     bitrate: Kbps,
-    #[arg(long, default_value = "us", value_parser = parse_layout)]
-    xkb_layout: String,
+    #[arg(long, default_value = "us", value_parser = XkbLayout::parse)]
+    xkb_layout: XkbLayout,
 }
 
-fn parse_origin(raw: &str) -> Result<String, String> {
-    let url = Url::parse(raw).map_err(|error| error.to_string())?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err("must be an absolute HTTP(S) URL without credentials".into());
+#[derive(Clone, Debug)]
+pub(crate) struct Origin(Box<str>);
+
+impl Origin {
+    fn parse(raw: &str) -> std::result::Result<Self, OriginError> {
+        let url = Url::parse(raw).map_err(OriginError::Url)?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(OriginError::Scheme);
+        }
+        if url.host_str().is_none() {
+            return Err(OriginError::MissingHost);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(OriginError::Credentials);
+        }
+        Ok(Self(url.origin().ascii_serialization().into()))
     }
-    Ok(url.origin().ascii_serialization())
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Error)]
+enum OriginError {
+    #[error("origin is not a URL")]
+    Url(#[source] url::ParseError),
+    #[error("origin scheme must be HTTP or HTTPS")]
+    Scheme,
+    #[error("origin must include a host")]
+    MissingHost,
+    #[error("origin must not include credentials")]
+    Credentials,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct XkbLayout(String);
+
+impl XkbLayout {
+    fn parse(value: &str) -> std::result::Result<Self, XkbLayoutError> {
+        if value.is_empty() {
+            return Err(XkbLayoutError::Empty);
+        }
+        if value.len() > 32 {
+            return Err(XkbLayoutError::TooLong);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(XkbLayoutError::InvalidCharacter);
+        }
+        Ok(Self(value.into()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+enum XkbLayoutError {
+    #[error("layout must not be empty")]
+    Empty,
+    #[error("layout must be at most 32 bytes")]
+    TooLong,
+    #[error("layout may contain only ASCII letters, digits, '_' or '-'")]
+    InvalidCharacter,
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -100,19 +159,6 @@ fn parse_kbps(value: &str) -> Result<Kbps, String> {
         .parse()
         .map_err(|error| format!("bitrate must be an integer: {error}"))?;
     Kbps::new(value).map_err(|error| error.to_string())
-}
-
-fn parse_layout(value: &str) -> Result<String, String> {
-    if !value.is_empty()
-        && value.len() <= 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        Ok(value.into())
-    } else {
-        Err("layout must be 1-32 ASCII letters, digits, '_' or '-'".into())
-    }
 }
 
 async fn http_listener(
@@ -167,21 +213,15 @@ async fn main() -> Result<()> {
         events: daemon.events.clone(),
         sessions,
         hub,
-        origin: options.origin.into(),
-        frame_rate: options.frame_rate,
+        origin: options.origin,
         connections: connections.clone(),
         next_socket_id: Arc::new(AtomicU64::new(1)),
     });
-    let (tx, rx) = watch::channel(false);
+    let server_shutdown = connections.cancellation();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let mut rx = rx;
-                while !*rx.borrow() {
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
+                server_shutdown.cancelled().await;
             })
             .await
             .map_err(anyhow::Error::from)
@@ -193,15 +233,7 @@ async fn main() -> Result<()> {
     };
 
     info!(reason = stop.reason(), "shutdown beginning");
-    let result = finish_shutdown(
-        stop,
-        connections,
-        tx,
-        &daemon,
-        &mut daemon_task,
-        &mut server,
-    )
-    .await;
+    let result = finish_shutdown(stop, connections, &daemon, &mut daemon_task, &mut server).await;
     if result.is_ok() {
         info!(outcome = "clean", "shutdown ended");
     } else {
@@ -213,46 +245,49 @@ async fn main() -> Result<()> {
 async fn finish_shutdown(
     stop: Stop,
     connections: SocketConnections,
-    shutdown_server: watch::Sender<bool>,
     daemon: &Daemon,
     daemon_task: &mut JoinHandle<Result<()>>,
     server: &mut JoinHandle<Result<()>>,
 ) -> Result<()> {
     connections.begin_shutdown();
-    let _ = shutdown_server.send(true);
     let deadline = Instant::now() + SHUTDOWN_DEADLINE;
     let sockets_result = timeout_at(deadline, connections.wait())
         .await
-        .map_err(|_elapsed| anyhow!("WebSocket shutdown exceeded eight seconds"));
+        .map_err(|_elapsed| anyhow!("WebSocket shutdown exceeded {SHUTDOWN_DEADLINE:?}"));
     daemon.shutdown().await;
 
-    let (trigger_result, daemon_result, server_result) = match stop {
+    let results = match stop {
         Stop::Signal(signal_result) => {
-            let trigger_result = signal_result;
             let daemon_result = join_task(deadline, "daemon supervisor", daemon_task).await;
             let server_result = join_task(deadline, "HTTP server", server).await;
-            (trigger_result, daemon_result, server_result)
+            [
+                ("shutdown trigger", signal_result),
+                ("WebSocket connections", sockets_result),
+                ("daemon supervisor", daemon_result),
+                ("HTTP server", server_result),
+            ]
         }
         Stop::Daemon(task_result) => {
-            let trigger_result = Err(anyhow!("daemon supervisor stopped"));
             let daemon_result = completed_task("daemon supervisor", task_result);
             let server_result = join_task(deadline, "HTTP server", server).await;
-            (trigger_result, daemon_result, server_result)
+            [
+                ("daemon supervisor", daemon_result),
+                ("WebSocket connections", sockets_result),
+                ("HTTP server", server_result),
+                ("shutdown trigger", Ok(())),
+            ]
         }
         Stop::Server(task_result) => {
-            let trigger_result = Err(anyhow!("HTTP server stopped"));
             let daemon_result = join_task(deadline, "daemon supervisor", daemon_task).await;
             let server_result = completed_task("HTTP server", task_result);
-            (trigger_result, daemon_result, server_result)
+            [
+                ("HTTP server", server_result),
+                ("WebSocket connections", sockets_result),
+                ("daemon supervisor", daemon_result),
+                ("shutdown trigger", Ok(())),
+            ]
         }
     };
-
-    let results = [
-        ("WebSocket connections", sockets_result),
-        ("daemon supervisor", daemon_result),
-        ("HTTP server", server_result),
-        ("shutdown trigger", trigger_result),
-    ];
     let mut first_failure = None;
     for (component, result) in results {
         if let Err(error) = result {
@@ -299,11 +334,13 @@ mod tests {
     #[test]
     fn canonical_origin_strips_path_and_rejects_foreign_shapes() {
         assert_eq!(
-            parse_origin("https://example.test/a").expect("absolute HTTPS test URL should parse"),
+            Origin::parse("https://example.test/a")
+                .expect("absolute HTTPS test URL should parse")
+                .as_str(),
             "https://example.test"
         );
-        assert!(parse_origin("example.test").is_err());
-        assert!(parse_origin("https://u@example.test").is_err());
+        assert!(Origin::parse("example.test").is_err());
+        assert!(Origin::parse("https://u@example.test").is_err());
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@ use sprite_desktop_protocol::browser::QualityLevels;
 use sprite_desktop_protocol::browser::VideoSample;
 use sprite_desktop_protocol::browser::parse_browser_record;
 use sprite_desktop_protocol::pipe::Command;
-use sprite_desktop_protocol::pipe::Fps;
+use sprite_desktop_protocol::pipe::H264_PROFILE;
 use sprite_desktop_protocol::pipe::MAX_CLIPBOARD_BYTES;
 use sprite_desktop_protocol::pipe::Text as TextCommand;
 use thiserror::Error;
@@ -48,31 +48,84 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::Origin;
 use crate::daemon::AppEvents;
 use crate::daemon::Readiness;
+use crate::session::FeedbackOutcome;
+use crate::session::InputOutcome;
 use crate::session::LeaseState;
 use crate::session::Sessions;
 use crate::session::SocketId;
 use crate::video::VideoHub;
 
 const WRITE_LIMIT: Duration = Duration::from_secs(5);
-const MAX_CONTROL_MESSAGE_BYTES: usize = 6 * MAX_CLIPBOARD_BYTES + 4096;
+// A byte can expand to a six-byte `\\uXXXX` JSON escape.
+const JSON_ESCAPE_WORST_CASE: usize = 6;
+const MAX_CONTROL_MESSAGE_BYTES: usize = JSON_ESCAPE_WORST_CASE * MAX_CLIPBOARD_BYTES + 4096;
 const OUTBOUND_MESSAGE_LIMIT: usize = 32;
 const OUTBOUND_BYTE_LIMIT: usize = 2 * MAX_CONTROL_MESSAGE_BYTES;
+// 32 control sockets permit about 384 MiB of outbound buffers per process.
 const MAX_UPGRADED_CONNECTIONS: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Audience {
+    Everyone,
+    LeaseOwner,
+}
+
+trait ClientEventAudience {
+    fn audience(&self) -> Audience;
+}
+
+impl ClientEventAudience for ClientEvent {
+    fn audience(&self) -> Audience {
+        match self {
+            ClientEvent::Clipboard { .. } => Audience::LeaseOwner,
+            ClientEvent::Cursor(_)
+            | ClientEvent::ResizeApplied(_)
+            | ClientEvent::VideoConfig { .. }
+            | ClientEvent::ControlState { .. }
+            | ClientEvent::Pong { .. }
+            | ClientEvent::Quality(_) => Audience::Everyone,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{primary:#}")]
+struct SocketFailure {
+    #[source]
+    primary: anyhow::Error,
+    cleanup: Option<anyhow::Error>,
+}
+
+impl SocketFailure {
+    fn new(primary: impl Into<anyhow::Error>) -> Self {
+        Self {
+            primary: primary.into(),
+            cleanup: None,
+        }
+    }
+}
 
 #[derive(Debug)]
 enum SocketEnd {
     Shutdown,
     ClientClosed(Option<CloseFrame>),
     Disconnected,
-    Failed(anyhow::Error),
+    Failed(SocketFailure),
 }
 
 impl SocketEnd {
+    fn failed(error: impl Into<anyhow::Error>) -> Self {
+        Self::Failed(SocketFailure::new(error))
+    }
+
+    #[cfg(test)]
     fn is_failure(&self) -> bool {
         matches!(self, Self::Failed(_))
     }
@@ -91,7 +144,7 @@ impl fmt::Display for SocketEnd {
                 formatter.write_str("client sent a WebSocket close frame without a status")
             }
             Self::Disconnected => formatter.write_str("client disconnected without a close frame"),
-            Self::Failed(error) => write!(formatter, "{error:#}"),
+            Self::Failed(error) => formatter.write_str(error.to_string().as_str()),
         }
     }
 }
@@ -141,6 +194,10 @@ impl SocketConnections {
     pub(crate) async fn wait(&self) {
         self.tasks.wait().await;
     }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -149,8 +206,7 @@ pub(crate) struct AppState {
     pub(crate) events: AppEvents,
     pub(crate) sessions: Sessions,
     pub(crate) hub: VideoHub,
-    pub(crate) origin: Arc<str>,
-    pub(crate) frame_rate: Fps,
+    pub(crate) origin: Origin,
     pub(crate) connections: SocketConnections,
     pub(crate) next_socket_id: Arc<AtomicU64>,
 }
@@ -164,8 +220,26 @@ impl AppState {
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/stream", get(stream))
-        .route("/control", get(control))
+        .route(
+            "/stream",
+            get(
+                |State(state): State<AppState>,
+                 headers: HeaderMap,
+                 upgrade: WebSocketUpgrade| async move {
+                    upgrade_socket(state, &headers, upgrade, SocketKind::Stream)
+                },
+            ),
+        )
+        .route(
+            "/control",
+            get(
+                |State(state): State<AppState>,
+                 headers: HeaderMap,
+                 upgrade: WebSocketUpgrade| async move {
+                    upgrade_socket(state, &headers, upgrade, SocketKind::Control)
+                },
+            ),
+        )
         .fallback(get(asset))
         .with_state(state)
 }
@@ -186,23 +260,37 @@ async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn stream(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+#[derive(Clone, Copy)]
+enum SocketKind {
+    Stream,
+    Control,
+}
+
+fn upgrade_socket(
+    state: AppState,
+    headers: &HeaderMap,
     upgrade: WebSocketUpgrade,
+    kind: SocketKind,
 ) -> Response {
-    if !valid_origin(&headers, &state.origin) {
+    if !valid_origin(headers, &state.origin) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(admission) = state.connections.admit() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let socket_id = state.allocate_socket_id();
-    upgrade
-        .max_message_size(4096)
-        .max_frame_size(4096)
-        .on_upgrade(move |socket| stream_socket(socket, state, socket_id, admission))
-        .into_response()
+    match kind {
+        SocketKind::Stream => upgrade
+            .max_message_size(4096)
+            .max_frame_size(4096)
+            .on_upgrade(move |socket| stream_socket(socket, state, socket_id, admission))
+            .into_response(),
+        SocketKind::Control => upgrade
+            .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
+            .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
+            .on_upgrade(move |socket| control_socket(socket, state, socket_id, admission))
+            .into_response(),
+    }
 }
 
 async fn stream_socket(
@@ -217,7 +305,7 @@ async fn stream_socket(
 }
 
 async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEnd {
-    let configuration = ClientEvent::video_config("avc1.F40034".into(), state.frame_rate);
+    let configuration = ClientEvent::video_config(H264_PROFILE.codec());
     let configuration = match client_event_message(&configuration) {
         Ok(message) => message,
         Err(error) => return error.into(),
@@ -226,61 +314,37 @@ async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEn
         return error;
     }
 
-    let (subscriber_id, bootstrap, subscription) = state.hub.subscribe();
-    let result = async {
-        for frame in bootstrap {
-            send_video(socket, &frame, &state.connections.cancellation).await?;
-        }
-
-        loop {
-            tokio::select! {
-                () = state.connections.cancellation.cancelled() => {
-                    return Ok(SocketEnd::Shutdown);
-                }
-                incoming = socket.recv() => {
-                    match incoming {
-                        Some(Ok(Message::Close(frame))) => {
-                            return Ok(SocketEnd::ClientClosed(frame));
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
-                            return Ok(SocketEnd::Failed(
-                                anyhow::Error::new(error).context("WebSocket read failed"),
-                            ));
-                        }
-                        None => return Ok(SocketEnd::Disconnected),
+    let mut subscription = state.hub.subscribe();
+    loop {
+        tokio::select! {
+            () = state.connections.cancellation.cancelled() => {
+                return SocketEnd::Shutdown;
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(frame))) => {
+                        return SocketEnd::ClientClosed(frame);
                     }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        return SocketEnd::failed(
+                            anyhow::Error::new(error).context("WebSocket read failed"),
+                        );
+                    }
+                    None => return SocketEnd::Disconnected,
                 }
-                frame = subscription.next() => {
-                    send_video(socket, &frame, &state.connections.cancellation).await?;
+            }
+            frame = subscription.next() => {
+                if let Err(reason) = send_video(
+                    socket,
+                    &frame,
+                    &state.connections.cancellation,
+                ).await {
+                    return reason;
                 }
             }
         }
     }
-    .await;
-    state.hub.unsubscribe(subscriber_id);
-    match result {
-        Ok(reason) | Err(reason) => reason,
-    }
-}
-
-async fn control(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    if !valid_origin(&headers, &state.origin) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let Some(admission) = state.connections.admit() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let socket_id = state.allocate_socket_id();
-    upgrade
-        .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
-        .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| control_socket(socket, state, socket_id, admission))
-        .into_response()
 }
 
 struct OutboundItem {
@@ -304,7 +368,7 @@ enum OutboundError {
 
 impl From<OutboundError> for SocketEnd {
     fn from(error: OutboundError) -> Self {
-        Self::Failed(error.into())
+        Self::failed(error)
     }
 }
 
@@ -358,11 +422,19 @@ impl Drop for CancelOnDrop {
     }
 }
 
+#[derive(Debug, Error)]
+enum WriterFailure {
+    #[error("WebSocket write failed")]
+    Write(#[source] axum::Error),
+    #[error("WebSocket write timed out after {limit:?}", limit = WRITE_LIMIT)]
+    Timeout,
+}
+
 async fn control_writer(
     mut sink: SplitSink<WebSocket, Message>,
     mut receiver: mpsc::Receiver<OutboundItem>,
     cancellation: CancellationToken,
-) -> Result<(), SocketEnd> {
+) -> Result<(), WriterFailure> {
     let cancel_when_writer_stops = CancelOnDrop(cancellation.clone());
     let result = 'writer: loop {
         tokio::select! {
@@ -370,9 +442,7 @@ async fn control_writer(
             () = cancellation.cancelled() => break 'writer Ok(()),
             item = receiver.recv() => {
                 let Some(OutboundItem { message, bytes }) = item else {
-                    break 'writer Err(SocketEnd::Failed(anyhow!(
-                        "control writer stopped without a socket termination"
-                    )));
+                    break 'writer Ok(());
                 };
                 tokio::select! {
                     biased;
@@ -384,12 +454,8 @@ async fn control_writer(
                         drop(bytes);
                         match write_result {
                             Ok(Ok(())) => {}
-                            Ok(Err(error)) => break 'writer Err(SocketEnd::Failed(
-                                anyhow::Error::new(error).context("WebSocket write failed"),
-                            )),
-                            Err(_elapsed) => break 'writer Err(SocketEnd::Failed(anyhow!(
-                                "WebSocket write timed out after five seconds"
-                            ))),
+                            Ok(Err(error)) => break 'writer Err(WriterFailure::Write(error)),
+                            Err(_elapsed) => break 'writer Err(WriterFailure::Timeout),
                         }
                     }
                 }
@@ -412,16 +478,50 @@ async fn control_socket(
 }
 
 fn log_socket_close(kind: &'static str, socket_id: SocketId, reason: &SocketEnd) {
-    if reason.is_failure() {
-        warn!(socket = kind, socket_id = socket_id.get(), reason = %reason, "socket closed");
-    } else {
-        info!(socket = kind, socket_id = socket_id.get(), reason = %reason, "socket closed");
+    match reason {
+        SocketEnd::Failed(SocketFailure {
+            primary,
+            cleanup: Some(cleanup),
+        }) => warn!(
+            socket = kind,
+            socket_id = socket_id.get(),
+            reason = %format_args!("{primary:#}"),
+            cleanup = %format_args!("{cleanup:#}"),
+            "socket closed"
+        ),
+        SocketEnd::Failed(SocketFailure {
+            primary,
+            cleanup: None,
+        }) => warn!(
+            socket = kind,
+            socket_id = socket_id.get(),
+            reason = %format_args!("{primary:#}"),
+            "socket closed"
+        ),
+        SocketEnd::Shutdown | SocketEnd::ClientClosed(_) | SocketEnd::Disconnected => {
+            info!(socket = kind, socket_id = socket_id.get(), reason = %reason, "socket closed");
+        }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lease {
+    Held,
+    NotHeld,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterStatus {
+    Running,
+    Finished,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive socket select keeps event ordering and cancellation in one loop"
+)]
 async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: SocketId) -> SocketEnd {
-    // Subscribe before reading the snapshot so an update cannot fall between them.
-    let mut events = state.events.subscribe();
+    let (snapshot, mut events) = state.events.subscribe();
     let cancellation = state.connections.cancellation.child_token();
     let (sink, mut incoming) = socket.split();
     let (sender, receiver) = mpsc::channel(OUTBOUND_MESSAGE_LIMIT);
@@ -430,12 +530,16 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
         bytes: Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)),
     };
     let mut writer = tokio::spawn(control_writer(sink, receiver, cancellation.clone()));
-    let mut writer_finished = false;
+    let mut writer_status = WriterStatus::Running;
+    let mut lease = Lease::NotHeld;
 
     let reason = 'connected: {
-        if let Err(error) =
-            enqueue_initial_events(&outbound, state.events.initial(), state.sessions.quality())
-        {
+        if let Err(error) = enqueue_snapshot(
+            &outbound,
+            snapshot,
+            state.sessions.quality(),
+            Lease::NotHeld,
+        ) {
             break 'connected error.into();
         }
 
@@ -444,41 +548,52 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                 biased;
                 () = state.connections.cancellation.cancelled() => break 'connected SocketEnd::Shutdown,
                 writer_result = &mut writer => {
-                    writer_finished = true;
+                    writer_status = WriterStatus::Finished;
                     break 'connected match writer_result {
-                        Ok(Ok(())) => SocketEnd::Failed(anyhow!(
-                            "control writer stopped without a socket termination"
-                        )),
-                        Ok(Err(error)) => error,
-                        Err(error) => SocketEnd::Failed(anyhow!(
-                            "control writer task failed: {error}"
-                        )),
+                        Ok(Ok(())) => SocketEnd::Shutdown,
+                        Ok(Err(error)) => SocketEnd::failed(error),
+                        Err(error) => SocketEnd::failed(
+                            anyhow::Error::new(error).context("control writer task failed"),
+                        ),
                     };
                 }
                 incoming_result = incoming.next() => {
                     let message = match incoming_result {
                         Some(Ok(message)) => message,
-                        Some(Err(error)) => break 'connected SocketEnd::Failed(anyhow!(
-                            "WebSocket read failed: {error}"
-                        )),
+                        Some(Err(error)) => break 'connected SocketEnd::failed(
+                            anyhow::Error::new(error).context("WebSocket read failed"),
+                        ),
                         None => break 'connected SocketEnd::Disconnected,
                     };
                     let result = match message {
                         Message::Text(text) => {
-                            handle_text(&outbound, state, socket_id, text.as_str()).await
+                            handle_text(&outbound, state, socket_id, &mut lease, text.as_str()).await
                         }
                         Message::Binary(bytes) => {
                             let command = parse_browser_record(&bytes).map_err(|error| {
-                                SocketEnd::Failed(anyhow!("browser control parse failed: {error}"))
+                                SocketEnd::failed(
+                                    anyhow::Error::new(error)
+                                        .context("browser control parse failed"),
+                                )
                             });
                             match command {
-                                Ok(command) => state
-                                    .sessions
-                                    .input(socket_id, command)
-                                    .await
-                                    .map_err(|error| {
-                                        SocketEnd::Failed(error.context("send binary input"))
-                                    }),
+                                Ok(command) => match lease {
+                                    Lease::NotHeld => Ok(()),
+                                    Lease::Held => match state.sessions.input(socket_id, command).await {
+                                        Ok(InputOutcome::Sent) => Ok(()),
+                                        Ok(InputOutcome::NotLeaseOwner) => {
+                                            lease = Lease::NotHeld;
+                                            warn!(
+                                                socket_id = socket_id.get(),
+                                                "control socket input lease disagreed with session owner"
+                                            );
+                                            Ok(())
+                                        }
+                                        Err(error) => Err(SocketEnd::failed(
+                                            error.context("send binary input"),
+                                        )),
+                                    },
+                                },
                                 Err(error) => Err(error),
                             }
                         }
@@ -491,19 +606,28 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                 }
                 event_result = events.recv() => {
                     match event_result {
-                        Ok(event) => {
-                            if state.sessions.owns(socket_id).await
-                                && let Err(error) = outbound.enqueue_event(&event)
-                            {
+                        Ok(event) => match (event.audience(), lease) {
+                            (Audience::Everyone, Lease::Held | Lease::NotHeld)
+                            | (Audience::LeaseOwner, Lease::Held) => {
+                                if let Err(error) = outbound.enqueue_event(&event) {
+                                    break 'connected error.into();
+                                }
+                            }
+                            (Audience::LeaseOwner, Lease::NotHeld) => {}
+                        },
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            debug!(lagged_events = count, "control event receiver lagged");
+                            if let Err(error) = enqueue_snapshot(
+                                &outbound,
+                                state.events.snapshot(),
+                                state.sessions.quality(),
+                                lease,
+                            ) {
                                 break 'connected error.into();
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(count)) => break 'connected
-                            SocketEnd::Failed(anyhow!(
-                                "control event subscription lagged by {count} events"
-                            )),
                         Err(broadcast::error::RecvError::Closed) => break 'connected
-                            SocketEnd::Failed(anyhow!("control event broadcaster closed")),
+                            SocketEnd::failed(anyhow!("control event broadcaster closed")),
                     }
                 }
             }
@@ -515,160 +639,226 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
         state,
         socket_id,
         cancellation,
-        writer_finished,
+        writer_status,
         &mut writer,
     )
     .await
 }
 
-fn enqueue_initial_events(
+fn enqueue_snapshot(
     outbound: &Outbound,
-    initial_events: Vec<ClientEvent>,
+    snapshot: Vec<ClientEvent>,
     quality: QualityLevels,
+    lease: Lease,
 ) -> Result<(), OutboundError> {
-    for event in initial_events
-        .into_iter()
-        .chain([ClientEvent::Quality(quality)])
-    {
-        outbound.enqueue_event(&event)?;
+    for event in snapshot {
+        match (event.audience(), lease) {
+            (Audience::Everyone, Lease::Held | Lease::NotHeld)
+            | (Audience::LeaseOwner, Lease::Held) => outbound.enqueue_event(&event)?,
+            (Audience::LeaseOwner, Lease::NotHeld) => {}
+        }
     }
-    Ok(())
+    outbound.enqueue_event(&ClientEvent::Quality(quality))
+}
+
+#[derive(Debug, Error)]
+enum CleanupFailure {
+    #[error("release input lease")]
+    Release(#[source] anyhow::Error),
+    #[error("control writer cleanup")]
+    Writer(#[source] anyhow::Error),
+    #[error("release input lease; control writer cleanup also failed: {writer:#}")]
+    Both {
+        #[source]
+        release: anyhow::Error,
+        writer: anyhow::Error,
+    },
 }
 
 async fn finish_control_socket(
-    reason: SocketEnd,
+    mut reason: SocketEnd,
     state: &AppState,
     socket_id: SocketId,
     cancellation: CancellationToken,
-    writer_finished: bool,
-    writer: &mut JoinHandle<Result<(), SocketEnd>>,
+    writer_status: WriterStatus,
+    writer: &mut JoinHandle<Result<(), WriterFailure>>,
 ) -> SocketEnd {
     cancellation.cancel();
-    let mut cleanup_error = state
-        .sessions
-        .release(socket_id)
-        .await
-        .err()
-        .map(|error| error.context("release input lease"));
+    let release_error = state.sessions.release(socket_id).await.err();
 
-    if !writer_finished {
-        let writer_error = match timeout(WRITE_LIMIT, &mut *writer).await {
+    let writer_error = match writer_status {
+        WriterStatus::Finished => None,
+        WriterStatus::Running => match timeout(WRITE_LIMIT, &mut *writer).await {
             Ok(Ok(Ok(()))) => None,
-            Ok(Ok(Err(SocketEnd::Failed(error)))) => Some(error),
-            Ok(Ok(Err(clean_end))) => Some(anyhow!(clean_end.to_string())),
+            Ok(Ok(Err(error))) => Some(anyhow::Error::new(error)),
             Ok(Err(error)) => Some(anyhow::Error::new(error).context("control writer task failed")),
             Err(_elapsed) => {
                 writer.abort();
                 let _ = writer.await;
-                Some(anyhow!("control writer did not stop within five seconds"))
+                Some(anyhow!(
+                    "control writer did not stop within {WRITE_LIMIT:?}"
+                ))
             }
-        };
-        if let Some(writer_error) = writer_error {
-            cleanup_error = Some(match cleanup_error {
-                Some(error) => error.context(format!("cleanup also failed: {writer_error:#}")),
-                None => writer_error,
-            });
+        },
+    };
+    let cleanup_error = match (release_error, writer_error) {
+        (Some(release), Some(writer)) => {
+            Some(anyhow::Error::new(CleanupFailure::Both { release, writer }))
         }
-    }
+        (Some(error), None) => Some(anyhow::Error::new(CleanupFailure::Release(error))),
+        (None, Some(error)) => Some(anyhow::Error::new(CleanupFailure::Writer(error))),
+        (None, None) => None,
+    };
 
     let Some(cleanup_error) = cleanup_error else {
         return reason;
     };
-    if let SocketEnd::Failed(error) = reason {
-        return SocketEnd::Failed(error.context(format!("cleanup also failed: {cleanup_error:#}")));
+    match &mut reason {
+        SocketEnd::Failed(failure) => failure.cleanup = Some(cleanup_error),
+        SocketEnd::Shutdown | SocketEnd::ClientClosed(_) | SocketEnd::Disconnected => warn!(
+            socket_id = socket_id.get(),
+            reason = %format_args!("{cleanup_error:#}"),
+            "socket cleanup failed"
+        ),
     }
-    warn!(
-        socket_id = socket_id.get(),
-        reason = %format_args!("{cleanup_error:#}"),
-        "socket cleanup failed"
-    );
     reason
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive match keeps the complete browser message protocol visible"
+)]
 async fn handle_text(
     outbound: &Outbound,
     state: &AppState,
     socket_id: SocketId,
+    lease: &mut Lease,
     text: &str,
 ) -> Result<(), SocketEnd> {
-    match text {
-        "acquire" => {
+    let message = ClientMessage::parse_json(text.as_bytes()).map_err(|error| {
+        SocketEnd::failed(anyhow::Error::new(error).context("browser control parse failed"))
+    })?;
+    match message {
+        ClientMessage::AcquireControl => {
             let control_state = match state
                 .sessions
                 .acquire(socket_id)
                 .await
-                .map_err(|error| SocketEnd::Failed(error.context("acquire input lease")))?
+                .map_err(|error| SocketEnd::failed(error.context("acquire input lease")))?
             {
-                LeaseState::Active => ControlState::Active,
-                LeaseState::Busy => ControlState::Busy,
+                LeaseState::Active => {
+                    *lease = Lease::Held;
+                    ControlState::Active
+                }
+                LeaseState::Busy => {
+                    *lease = Lease::NotHeld;
+                    ControlState::Busy
+                }
             };
             outbound
                 .enqueue_event(&ClientEvent::ControlState {
                     state: control_state,
                 })
-                .map_err(SocketEnd::from)
+                .map_err(SocketEnd::from)?;
+            if control_state == ControlState::Active
+                && let Some(text) = state.events.latest_clipboard()
+            {
+                outbound
+                    .enqueue_event(&ClientEvent::Clipboard { text })
+                    .map_err(SocketEnd::from)?;
+            }
+            Ok(())
         }
-        "release" => {
+        ClientMessage::ReleaseControl => {
             state
                 .sessions
                 .release(socket_id)
                 .await
-                .map_err(|error| SocketEnd::Failed(error.context("release input lease")))?;
+                .map_err(|error| SocketEnd::failed(error.context("release input lease")))?;
+            *lease = Lease::NotHeld;
             outbound
                 .enqueue_event(&ClientEvent::ControlState {
                     state: ControlState::Ready,
                 })
                 .map_err(SocketEnd::from)
         }
-        _ => match ClientMessage::parse_json(text.as_bytes()).map_err(|error| {
-            SocketEnd::Failed(anyhow::Error::new(error).context("browser control parse failed"))
-        })? {
-            ClientMessage::Ping { id: request_id } => {
-                let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(|error| {
-                    SocketEnd::Failed(anyhow::Error::new(error).context("read monotonic clock"))
-                })?;
-                let nanos = i128::from(time.tv_sec()) * 1_000_000_000 + i128::from(time.tv_nsec());
-                outbound
-                    .enqueue_event(&ClientEvent::Pong {
-                        id: request_id,
-                        server_nanos: nanos.to_string(),
-                    })
-                    .map_err(SocketEnd::from)
+        ClientMessage::Ping { id: request_id } => {
+            let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(|error| {
+                SocketEnd::failed(anyhow::Error::new(error).context("read monotonic clock"))
+            })?;
+            let nanos = i128::from(time.tv_sec()) * 1_000_000_000 + i128::from(time.tv_nsec());
+            outbound
+                .enqueue_event(&ClientEvent::Pong {
+                    id: request_id,
+                    server_nanos: nanos.to_string(),
+                })
+                .map_err(SocketEnd::from)
+        }
+        ClientMessage::Feedback(feedback) => {
+            let outcome = state
+                .sessions
+                .feedback(socket_id, feedback)
+                .await
+                .map_err(|error| SocketEnd::failed(error.context("apply quality feedback")))?;
+            match outcome {
+                FeedbackOutcome::Applied(levels) => outbound
+                    .enqueue_event(&ClientEvent::Quality(levels))
+                    .map_err(SocketEnd::from),
+                FeedbackOutcome::NotLeaseOwner => Ok(()),
             }
-            ClientMessage::Feedback(feedback) => {
-                let levels = state
+        }
+        ClientMessage::Text {
+            action,
+            text,
+            sequence,
+        } => match *lease {
+            Lease::NotHeld => Ok(()),
+            Lease::Held => {
+                let outcome = state
                     .sessions
-                    .feedback(socket_id, feedback)
+                    .input(
+                        socket_id,
+                        Command::Text(TextCommand {
+                            action,
+                            sequence,
+                            text,
+                        }),
+                    )
                     .await
-                    .map_err(|error| SocketEnd::Failed(error.context("apply quality feedback")))?;
-                if let Some(levels) = levels {
-                    outbound
-                        .enqueue_event(&ClientEvent::Quality(levels))
-                        .map_err(SocketEnd::from)?;
+                    .map_err(|error| SocketEnd::failed(error.context("send text input")))?;
+                match outcome {
+                    InputOutcome::Sent => Ok(()),
+                    InputOutcome::NotLeaseOwner => {
+                        *lease = Lease::NotHeld;
+                        warn!(
+                            socket_id = socket_id.get(),
+                            "control socket input lease disagreed with session owner"
+                        );
+                        Ok(())
+                    }
                 }
-                Ok(())
             }
-            ClientMessage::Text {
-                action,
-                text,
-                sequence,
-            } => state
-                .sessions
-                .input(
-                    socket_id,
-                    Command::Text(TextCommand {
-                        action,
-                        sequence,
-                        text,
-                    }),
-                )
-                .await
-                .map_err(|error| SocketEnd::Failed(error.context("send text input"))),
-            ClientMessage::ClipboardWrite { text } => state
-                .sessions
-                .input(socket_id, Command::Clipboard(text))
-                .await
-                .map_err(|error| SocketEnd::Failed(error.context("send clipboard input"))),
+        },
+        ClientMessage::ClipboardWrite { text } => match *lease {
+            Lease::NotHeld => Ok(()),
+            Lease::Held => {
+                let outcome = state
+                    .sessions
+                    .input(socket_id, Command::Clipboard(text))
+                    .await
+                    .map_err(|error| SocketEnd::failed(error.context("send clipboard input")))?;
+                match outcome {
+                    InputOutcome::Sent => Ok(()),
+                    InputOutcome::NotLeaseOwner => {
+                        *lease = Lease::NotHeld;
+                        warn!(
+                            socket_id = socket_id.get(),
+                            "control socket input lease disagreed with session owner"
+                        );
+                        Ok(())
+                    }
+                }
+            }
         },
     }
 }
@@ -692,18 +882,18 @@ async fn send(
         result = timeout(WRITE_LIMIT, socket.send(message)) => {
             match result {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(SocketEnd::Failed(
+                Ok(Err(error)) => Err(SocketEnd::failed(
                     anyhow::Error::new(error).context("WebSocket write failed"),
                 )),
-                Err(_elapsed) => Err(SocketEnd::Failed(anyhow!(
-                    "WebSocket write timed out after five seconds"
+                Err(_elapsed) => Err(SocketEnd::failed(anyhow!(
+                    "WebSocket write timed out after {WRITE_LIMIT:?}"
                 ))),
             }
         }
     }
 }
 
-fn valid_origin(headers: &HeaderMap, expected: &str) -> bool {
+fn valid_origin(headers: &HeaderMap, expected: &Origin) -> bool {
     let mut origins = headers.get_all(header::ORIGIN).iter();
     let Some(origin) = origins.next() else {
         return false;
@@ -711,7 +901,7 @@ fn valid_origin(headers: &HeaderMap, expected: &str) -> bool {
     origins.next().is_none()
         && origin
             .to_str()
-            .is_ok_and(|value| value == expected && value != "null")
+            .is_ok_and(|value| value == expected.as_str() && value != "null")
 }
 
 async fn asset(axum::extract::OriginalUri(uri): axum::extract::OriginalUri) -> Response {
@@ -855,8 +1045,20 @@ mod tests {
             "client sent WebSocket close frame 1008: policy"
         );
         assert!(!peer_close.is_failure());
-        assert!(SocketEnd::Failed(anyhow!("write timeout")).is_failure());
+        assert!(SocketEnd::failed(anyhow!("write timeout")).is_failure());
         assert!(!SocketEnd::Shutdown.is_failure());
+    }
+
+    #[test]
+    fn combined_cleanup_error_renders_release_and_writer_failures() {
+        let error = anyhow::Error::new(CleanupFailure::Both {
+            release: anyhow!("release failed"),
+            writer: anyhow!("writer failed"),
+        });
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("release failed"));
+        assert!(rendered.contains("writer failed"));
     }
 
     #[test]
@@ -877,14 +1079,15 @@ mod tests {
 
     #[test]
     fn origin_requires_one_exact_value() {
+        let expected = Origin::parse("https://x.test").expect("test origin should parse");
         let mut headers = HeaderMap::new();
-        assert!(!valid_origin(&headers, "https://x.test"));
+        assert!(!valid_origin(&headers, &expected));
         headers.append(header::ORIGIN, HeaderValue::from_static("null"));
-        assert!(!valid_origin(&headers, "https://x.test"));
+        assert!(!valid_origin(&headers, &expected));
         headers.clear();
         headers.append(header::ORIGIN, HeaderValue::from_static("https://x.test"));
-        assert!(valid_origin(&headers, "https://x.test"));
+        assert!(valid_origin(&headers, &expected));
         headers.append(header::ORIGIN, HeaderValue::from_static("https://x.test"));
-        assert!(!valid_origin(&headers, "https://x.test"));
+        assert!(!valid_origin(&headers, &expected));
     }
 }

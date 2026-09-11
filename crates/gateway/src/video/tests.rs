@@ -1,8 +1,14 @@
 use super::*;
 
-fn packet(sequence: u16, timestamp: u32, generation: u32, marker: bool, payload: &[u8]) -> Packet {
+fn packet(
+    sequence: u16,
+    timestamp: u32,
+    generation: u32,
+    end: AccessUnitEnd,
+    payload: &[u8],
+) -> Packet {
     Packet {
-        marker,
+        end,
         sequence,
         timestamp,
         generation: sprite_desktop_protocol::pipe::Generation::new(generation)
@@ -73,9 +79,18 @@ fn rtp_decoder_parses_ssrc_as_a_generation() {
 #[test]
 fn emits_final_access_unit_at_marker() {
     let mut assembler = Assembler::default();
-    assert!(consume(&mut assembler, packet(1, 90, 7, false, &[0x7c, 0x85, 1])).is_none());
-    let value = consume(&mut assembler, packet(2, 90, 7, true, &[0x7c, 0x45, 2]))
-        .expect("marker packet should complete the fragmented test access unit");
+    assert!(
+        consume(
+            &mut assembler,
+            packet(1, 90, 7, AccessUnitEnd::More, &[0x7c, 0x85, 1])
+        )
+        .is_none()
+    );
+    let value = consume(
+        &mut assembler,
+        packet(2, 90, 7, AccessUnitEnd::Final, &[0x7c, 0x45, 2]),
+    )
+    .expect("marker packet should complete the fragmented test access unit");
     assert_eq!(value.kind, FrameKind::Key);
     assert_eq!(&*value.data, [0, 0, 0, 1, 0x65, 1, 2]);
 }
@@ -83,10 +98,22 @@ fn emits_final_access_unit_at_marker() {
 #[test]
 fn generation_restart_stays_sticky_across_fragments() {
     let mut assembler = Assembler::default();
-    let _ = consume(&mut assembler, packet(1, 1, 1, true, &[5, 1]));
-    assert!(consume(&mut assembler, packet(2, 2, 2, false, &[0x7c, 0x85, 2])).is_none());
-    let value = consume(&mut assembler, packet(3, 2, 2, true, &[0x7c, 0x45, 3]))
-        .expect("final fragment should complete the replacement generation");
+    let _ = consume(
+        &mut assembler,
+        packet(1, 1, 1, AccessUnitEnd::Final, &[5, 1]),
+    );
+    assert!(
+        consume(
+            &mut assembler,
+            packet(2, 2, 2, AccessUnitEnd::More, &[0x7c, 0x85, 2])
+        )
+        .is_none()
+    );
+    let value = consume(
+        &mut assembler,
+        packet(3, 2, 2, AccessUnitEnd::Final, &[0x7c, 0x45, 3]),
+    )
+    .expect("final fragment should complete the replacement generation");
     assert_eq!(value.continuity, Continuity::AfterGap);
 }
 
@@ -95,14 +122,20 @@ fn rejects_invalid_fu_boundaries() {
     let mut assembler = Assembler::default();
     assert!(
         assembler
-            .consume(packet(1, 1, 1, true, &[0x7c, 0xc5, 1]))
+            .consume(packet(1, 1, 1, AccessUnitEnd::Final, &[0x7c, 0xc5, 1]))
             .outcome
             .is_err()
     );
-    assert!(consume(&mut assembler, packet(2, 2, 1, false, &[0x7c, 0x85, 1])).is_none());
+    assert!(
+        consume(
+            &mut assembler,
+            packet(2, 2, 1, AccessUnitEnd::More, &[0x7c, 0x85, 1])
+        )
+        .is_none()
+    );
     assert!(
         assembler
-            .consume(packet(3, 2, 1, true, &[0x7c, 0x41, 2]))
+            .consume(packet(3, 2, 1, AccessUnitEnd::Final, &[0x7c, 0x41, 2]))
             .outcome
             .is_err()
     );
@@ -111,19 +144,19 @@ fn rejects_invalid_fu_boundaries() {
 #[test]
 fn assembler_distinguishes_incomplete_recovery_and_stale_packets() {
     let mut assembler = Assembler::default();
-    let incomplete = assembler.consume(packet(1, 1, 2, false, &[1, 1]));
+    let incomplete = assembler.consume(packet(1, 1, 2, AccessUnitEnd::More, &[1, 1]));
     assert!(matches!(
         incomplete.outcome,
         Ok(AssemblyOutcome::Incomplete)
     ));
 
-    let complete = assembler.consume(packet(2, 1, 2, true, &[5, 2]));
+    let complete = assembler.consume(packet(2, 1, 2, AccessUnitEnd::Final, &[5, 2]));
     assert!(matches!(complete.outcome, Ok(AssemblyOutcome::Complete(_))));
-    let stale = assembler.consume(packet(3, 2, 1, true, &[5, 3]));
+    let stale = assembler.consume(packet(3, 2, 1, AccessUnitEnd::Final, &[5, 3]));
     assert!(matches!(stale.outcome, Ok(AssemblyOutcome::Dropped)));
     assert_eq!(stale.drops.packets, 1);
 
-    let recovering = assembler.consume(packet(4, 2, 2, true, &[1, 4]));
+    let recovering = assembler.consume(packet(4, 2, 2, AccessUnitEnd::Final, &[1, 4]));
     assert!(matches!(recovering.outcome, Ok(AssemblyOutcome::Dropped)));
     assert_eq!(recovering.drops.packets, 1);
 }
@@ -143,16 +176,22 @@ fn packet_drop_summary_keeps_packet_counts_and_the_last_reason() {
 #[test]
 fn fragmented_recovery_drop_counts_every_packet_in_the_access_unit() {
     let mut assembler = Assembler::default();
-    assert!(consume(&mut assembler, packet(1, 1, 1, true, &[5, 1])).is_some());
+    assert!(
+        consume(
+            &mut assembler,
+            packet(1, 1, 1, AccessUnitEnd::Final, &[5, 1])
+        )
+        .is_some()
+    );
 
-    let first_fragment = assembler.consume(packet(3, 2, 1, false, &[0x7c, 0x81, 2]));
+    let first_fragment = assembler.consume(packet(3, 2, 1, AccessUnitEnd::More, &[0x7c, 0x81, 2]));
     assert!(matches!(
         first_fragment.outcome,
         Ok(AssemblyOutcome::Incomplete)
     ));
     assert_eq!(first_fragment.drops.packets, 0);
 
-    let final_fragment = assembler.consume(packet(4, 2, 1, true, &[0x7c, 0x41, 3]));
+    let final_fragment = assembler.consume(packet(4, 2, 1, AccessUnitEnd::Final, &[0x7c, 0x41, 3]));
     assert!(matches!(
         final_fragment.outcome,
         Ok(AssemblyOutcome::Dropped)
@@ -167,10 +206,10 @@ fn fragmented_recovery_drop_counts_every_packet_in_the_access_unit() {
 #[test]
 fn discontinuities_count_packets_cleared_from_the_access_unit() {
     let mut assembler = Assembler::default();
-    let buffered = assembler.consume(packet(1, 1, 1, false, &[1, 1]));
+    let buffered = assembler.consume(packet(1, 1, 1, AccessUnitEnd::More, &[1, 1]));
     assert!(matches!(buffered.outcome, Ok(AssemblyOutcome::Incomplete)));
 
-    let sequence_change = assembler.consume(packet(3, 1, 1, true, &[5, 2]));
+    let sequence_change = assembler.consume(packet(3, 1, 1, AccessUnitEnd::Final, &[5, 2]));
     assert!(matches!(
         sequence_change.outcome,
         Ok(AssemblyOutcome::Complete(_))
@@ -181,10 +220,10 @@ fn discontinuities_count_packets_cleared_from_the_access_unit() {
         Some(AssemblyDrop::SequenceDiscontinuity)
     );
 
-    let buffered = assembler.consume(packet(4, 2, 1, false, &[1, 3]));
+    let buffered = assembler.consume(packet(4, 2, 1, AccessUnitEnd::More, &[1, 3]));
     assert!(matches!(buffered.outcome, Ok(AssemblyOutcome::Incomplete)));
 
-    let timestamp_change = assembler.consume(packet(5, 3, 1, true, &[5, 4]));
+    let timestamp_change = assembler.consume(packet(5, 3, 1, AccessUnitEnd::Final, &[5, 4]));
     assert!(matches!(
         timestamp_change.outcome,
         Ok(AssemblyOutcome::Complete(_))
@@ -199,13 +238,34 @@ fn discontinuities_count_packets_cleared_from_the_access_unit() {
 #[test]
 fn loss_and_sequence_wrap_recover_at_keyframe() {
     let mut assembler = Assembler::default();
-    assert!(consume(&mut assembler, packet(u16::MAX, 1, 1, true, &[1, 1]),).is_some());
-    assert!(consume(&mut assembler, packet(0, 2, 1, true, &[1, 2])).is_some());
-    assert!(consume(&mut assembler, packet(2, 3, 1, true, &[1, 3])).is_none());
+    assert!(
+        consume(
+            &mut assembler,
+            packet(u16::MAX, 1, 1, AccessUnitEnd::Final, &[1, 1]),
+        )
+        .is_some()
+    );
+    assert!(
+        consume(
+            &mut assembler,
+            packet(0, 2, 1, AccessUnitEnd::Final, &[1, 2])
+        )
+        .is_some()
+    );
+    assert!(
+        consume(
+            &mut assembler,
+            packet(2, 3, 1, AccessUnitEnd::Final, &[1, 3])
+        )
+        .is_none()
+    );
     assert_eq!(
-        consume(&mut assembler, packet(3, 4, 1, true, &[5, 4]))
-            .expect("keyframe should complete sequence-loss recovery")
-            .continuity,
+        consume(
+            &mut assembler,
+            packet(3, 4, 1, AccessUnitEnd::Final, &[5, 4])
+        )
+        .expect("keyframe should complete sequence-loss recovery")
+        .continuity,
         Continuity::AfterGap
     );
 }
@@ -260,19 +320,34 @@ fn stale_generation_packet_cannot_poison_current_assembler_state() {
     let mut correlator = Correlator::new();
 
     push_metadata(&mut correlator, metadata(1, 1));
-    let first = consume(&mut assembler, packet(1, 3_000, 1, true, &[5, 1]))
-        .expect("first generation packet should complete an access unit");
+    let first = consume(
+        &mut assembler,
+        packet(1, 3_000, 1, AccessUnitEnd::Final, &[5, 1]),
+    )
+    .expect("first generation packet should complete an access unit");
     let _ = push_unit(&mut correlator, pending(first, &budget));
 
     push_metadata(&mut correlator, metadata(2, 2));
-    let replacement = consume(&mut assembler, packet(1, 3_000, 2, true, &[5, 2]))
-        .expect("replacement generation packet should complete an access unit");
+    let replacement = consume(
+        &mut assembler,
+        packet(1, 3_000, 2, AccessUnitEnd::Final, &[5, 2]),
+    )
+    .expect("replacement generation packet should complete an access unit");
     let _ = push_unit(&mut correlator, pending(replacement, &budget));
     push_metadata(&mut correlator, metadata(3, 2));
 
-    assert!(consume(&mut assembler, packet(2, 6_000, 1, true, &[5, 3])).is_none());
-    let current = consume(&mut assembler, packet(2, 6_000, 2, true, &[5, 4]))
-        .expect("current generation packet should complete an access unit");
+    assert!(
+        consume(
+            &mut assembler,
+            packet(2, 6_000, 1, AccessUnitEnd::Final, &[5, 3])
+        )
+        .is_none()
+    );
+    let current = consume(
+        &mut assembler,
+        packet(2, 6_000, 2, AccessUnitEnd::Final, &[5, 4]),
+    )
+    .expect("current generation packet should complete an access unit");
     assert_eq!(current.continuity, Continuity::Continuous);
     let samples = push_unit(&mut correlator, pending(current, &budget));
     assert_eq!(samples.len(), 1);
@@ -316,85 +391,125 @@ fn sample(sequence: u64, bytes: usize, kind: FrameKind) -> VideoSample {
     }
 }
 
-#[test]
-fn viewer_queue_keeps_exact_frame_and_byte_bounds() {
+#[tokio::test]
+async fn viewer_queue_delivers_every_frame_up_to_the_bound() {
     let hub = VideoHub::new();
-    assert_eq!(
-        hub.broadcast(sample(0, 1, FrameKind::Key)),
-        GopState::KeyframeCached
-    );
-    let (_, _, frames) = hub.subscribe();
+    let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
+    let mut frames = hub.subscribe();
     for sequence in 1..=8 {
         let kind = if sequence == 8 {
             FrameKind::Key
         } else {
             FrameKind::Delta
         };
-        let _ = hub.broadcast(sample(sequence, 1, kind));
+        let _ = hub.broadcast(&sample(sequence, 1, kind));
     }
-    assert_eq!(
-        lock(&frames.queue, "test video viewer queue").frames.len(),
-        MAX_VIEWER_FRAMES
-    );
-
-    let hub = VideoHub::new();
-    let _ = hub.broadcast(sample(0, 1, FrameKind::Key));
-    let (_, _, bytes) = hub.subscribe();
-    let _ = hub.broadcast(sample(1, MAX_VIEWER_BYTES, FrameKind::Key));
-    assert_eq!(
-        lock(&bytes.queue, "test video viewer queue").bytes,
-        MAX_VIEWER_BYTES
-    );
+    for expected in 0..=8 {
+        let frame = frames.next().await;
+        assert_eq!(frame.metadata.sequence, expected);
+    }
 }
 
-#[test]
-fn overflow_keeps_arriving_keyframe_and_discards_delta() {
+#[tokio::test]
+async fn viewer_queue_recovers_after_byte_overflow_without_large_allocations() {
     let hub = VideoHub::new();
-    let _ = hub.broadcast(sample(0, 1, FrameKind::Key));
-    let (_, _, slow) = hub.subscribe();
-    let (_, _, independent) = hub.subscribe();
+    let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
+    let mut subscription = hub.subscribe();
+    assert_eq!(subscription.next().await.metadata.sequence, 0);
+    subscription
+        .queue
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .bounds = ViewerBounds {
+        frames: 8,
+        bytes: 4,
+    };
+
+    let _ = hub.broadcast(&sample(1, 4, FrameKind::Delta));
+    let _ = hub.broadcast(&sample(2, 1, FrameKind::Delta));
+    let _ = hub.broadcast(&sample(3, 1, FrameKind::Delta));
+    let _ = hub.broadcast(&sample(4, 1, FrameKind::Key));
+
+    let recovered = subscription.next().await;
+    assert_eq!(recovered.metadata.sequence, 4);
+    assert_eq!(recovered.kind, FrameKind::Key);
+    assert_eq!(recovered.continuity, Continuity::AfterGap);
+}
+
+#[tokio::test]
+async fn overflow_keeps_arriving_keyframe_and_discards_delta() {
+    let hub = VideoHub::new();
+    let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
+    let mut slow = hub.subscribe();
+    let mut independent = hub.subscribe();
+    let _ = slow.next().await;
+    let _ = independent.next().await;
     for sequence in 1..=8 {
-        let _ = hub.broadcast(sample(sequence, 1, FrameKind::Delta));
-    }
-    {
-        let mut independent_queue = lock(&independent.queue, "test video viewer queue");
-        independent_queue.frames.clear();
-        independent_queue.bytes = 0;
+        let _ = hub.broadcast(&sample(sequence, 1, FrameKind::Delta));
+        let _ = independent.next().await;
     }
 
-    let _ = hub.broadcast(sample(20, 1, FrameKind::Delta));
+    let _ = hub.broadcast(&sample(20, 1, FrameKind::Delta));
+    assert_eq!(independent.next().await.metadata.sequence, 20);
+    let _ = hub.broadcast(&sample(21, 1, FrameKind::Key));
+    let recovered = slow.next().await;
+    assert_eq!(recovered.kind, FrameKind::Key);
+    assert_eq!(recovered.continuity, Continuity::AfterGap);
+}
+
+#[tokio::test]
+async fn cancelled_waiter_rechecks_durable_queue_state() {
+    let hub = VideoHub::new();
+    let mut subscription = hub.subscribe();
     assert!(
-        lock(&slow.queue, "test video viewer queue")
-            .frames
-            .is_empty()
+        tokio::time::timeout(Duration::from_millis(1), subscription.next())
+            .await
+            .is_err()
     );
-    assert_eq!(
-        lock(&independent.queue, "test video viewer queue")
-            .frames
-            .len(),
-        1
-    );
-    let _ = hub.broadcast(sample(21, 1, FrameKind::Key));
-    let slow_queue = lock(&slow.queue, "test video viewer queue");
-    assert_eq!(slow_queue.frames.len(), 1);
-    assert_eq!(slow_queue.frames[0].kind, FrameKind::Key);
-    assert_eq!(slow_queue.frames[0].continuity, Continuity::AfterGap);
+
+    let _ = hub.broadcast(&sample(1, 1, FrameKind::Key));
+    let frame = tokio::time::timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .expect("replacement wait should be notified");
+    assert_eq!(frame.metadata.sequence, 1);
+}
+
+#[tokio::test]
+async fn generation_reset_discards_queued_deltas_until_a_new_keyframe() {
+    let hub = VideoHub::new();
+    let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
+    let mut subscription = hub.subscribe();
+    let _ = subscription.next().await;
+
+    let _ = hub.broadcast(&sample(1, 1, FrameKind::Delta));
+    let mut replacement_delta = sample(2, 1, FrameKind::Delta);
+    replacement_delta.metadata.generation =
+        Generation::new(2).expect("replacement generation should be valid");
+    let _ = hub.broadcast(&replacement_delta);
+    let mut replacement_key = sample(3, 1, FrameKind::Key);
+    replacement_key.metadata.generation =
+        Generation::new(2).expect("replacement generation should be valid");
+    let _ = hub.broadcast(&replacement_key);
+
+    let frame = subscription.next().await;
+    assert_eq!(frame.metadata.sequence, 3);
+    assert_eq!(frame.metadata.generation.get(), 2);
+    assert_eq!(frame.continuity, Continuity::AfterGap);
 }
 
 #[tokio::test]
 async fn viewer_starts_and_recovers_only_at_keyframe() {
     let hub = VideoHub::new();
-    let (_, bootstrap, subscription) = hub.subscribe();
-    assert!(bootstrap.is_empty());
+    let mut subscription = hub.subscribe();
     for sequence in 0..10 {
-        let _ = hub.broadcast(VideoSample {
+        let _ = hub.broadcast(&VideoSample {
             data: vec![1].into(),
             kind: FrameKind::Delta,
             continuity: Continuity::Continuous,
             metadata: metadata(sequence, 1),
         });
     }
-    let _ = hub.broadcast(VideoSample {
+    let _ = hub.broadcast(&VideoSample {
         data: vec![1].into(),
         kind: FrameKind::Key,
         continuity: Continuity::Continuous,

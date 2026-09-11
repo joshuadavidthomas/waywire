@@ -1,5 +1,8 @@
+use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -18,25 +21,42 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
 use crate::daemon::CommandSink;
-use crate::daemon::lock;
 
 const QUALITY_CHANGE_COOLDOWN: Duration = Duration::from_secs(5);
 const BAD_STREAK_THRESHOLD: u8 = 2;
 const GOOD_STREAK_THRESHOLD: u8 = 8;
+const BITRATE_FLOOR: Kbps = Kbps::MINIMUM;
+// Evaluated at compile time: a floor outside the `Fps` range is a build error, not a fallback.
+const FPS_FLOOR: Fps = match Fps::new(20) {
+    Ok(value) => value,
+    Err(_) => panic!("FPS_FLOOR is outside the Fps range"),
+};
+const SCALE_FLOOR: ScalePercent = ScalePercent::MINIMUM;
+const FULL_SCALE: ScalePercent = ScalePercent::MAXIMUM;
+const DOWN_STEP_PERCENT: u8 = 80;
+const UP_STEP_PERCENT: u8 = 110;
+const FPS_STEP: u32 = 10;
+const SCALE_STEP: u32 = 25;
+const BITRATE_FLOOR_DIVISOR: NonZeroU32 =
+    NonZeroU32::new(2).expect("bitrate floor divisor must be nonzero");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LeaseEpoch(u64);
+pub(crate) struct LeaseEpoch(NonZeroU64);
 
 impl LeaseEpoch {
-    pub(crate) const FIRST: Self = Self(1);
+    pub(crate) const FIRST: Self = Self(NonZeroU64::MIN);
 
     #[must_use]
     pub(crate) const fn get(self) -> u64 {
-        self.0
+        self.0.get()
+    }
+
+    pub(crate) const fn from_nonzero(value: NonZeroU64) -> Self {
+        Self(value)
     }
 
     pub(crate) fn next(self) -> Self {
-        Self(self.0.wrapping_add(1).max(Self::FIRST.0))
+        NonZeroU64::new(self.get().wrapping_add(1)).map_or(Self::FIRST, Self)
     }
 }
 
@@ -96,7 +116,8 @@ impl Sessions {
         }
 
         // ReleaseAll enters the FIFO before the new epoch becomes valid, so
-        // no command from the new owner can overtake the reset.
+        // no command from the new owner can overtake the reset. The lease can
+        // be held for at worst two PIPE_DEADLINEs while that write enters the FIFO.
         self.commands
             .system(Command::ReleaseAll(ReleaseAll))
             .await?;
@@ -119,6 +140,7 @@ impl Sessions {
 
         // The reset follows every command already queued by this epoch. Once
         // the authority is cleared, the writer drops any late stale command.
+        // The lease can be held for at worst two PIPE_DEADLINEs during the send.
         self.commands
             .system(Command::ReleaseAll(ReleaseAll))
             .await?;
@@ -137,36 +159,36 @@ impl Sessions {
             .map(|owner| owner.epoch)
     }
 
-    pub(crate) async fn owns(&self, socket: SocketId) -> bool {
-        self.epoch(socket).await.is_some()
-    }
-
-    pub(crate) async fn input(&self, socket: SocketId, command: Command) -> Result<()> {
-        if let Some(epoch) = self.epoch(socket).await {
-            self.commands.input(epoch, command).await?;
-        }
-        Ok(())
+    pub(crate) async fn input(&self, socket: SocketId, command: Command) -> Result<InputOutcome> {
+        let Some(epoch) = self.epoch(socket).await else {
+            return Ok(InputOutcome::NotLeaseOwner);
+        };
+        self.commands.input(epoch, command).await?;
+        Ok(InputOutcome::Sent)
     }
 
     pub(crate) fn quality(&self) -> QualityLevels {
-        lock(&self.quality, "session quality").levels()
+        self.quality
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .levels()
     }
 
     pub(crate) async fn feedback(
         &self,
         socket: SocketId,
         feedback: Feedback,
-    ) -> Result<Option<QualityLevels>> {
+    ) -> Result<FeedbackOutcome> {
         let book = self.lease.lock().await;
         let Some(owner) = book.owner else {
-            return Ok(None);
+            return Ok(FeedbackOutcome::NotLeaseOwner);
         };
         if owner.socket != socket {
-            return Ok(None);
+            return Ok(FeedbackOutcome::NotLeaseOwner);
         }
 
         let (change, levels) = {
-            let mut quality = lock(&self.quality, "session quality");
+            let mut quality = self.quality.lock().unwrap_or_else(PoisonError::into_inner);
             let change = quality.update(&feedback, Instant::now());
             (change, quality.levels())
         };
@@ -179,6 +201,7 @@ impl Sessions {
             );
             // Quality is daemon state, not user input. Holding the lease lock
             // puts this command before a release and any later acquisition.
+            // The lease can be held for at worst two PIPE_DEADLINEs during the send.
             self.commands
                 .system(Command::Quality(QualityCommand {
                     bitrate_kbps: change.new.bitrate,
@@ -188,7 +211,7 @@ impl Sessions {
                 .await?;
         }
 
-        Ok(Some(levels))
+        Ok(FeedbackOutcome::Applied(levels))
     }
 }
 
@@ -196,6 +219,18 @@ impl Sessions {
 pub(crate) enum LeaseState {
     Active,
     Busy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputOutcome {
+    Sent,
+    NotLeaseOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FeedbackOutcome {
+    Applied(QualityLevels),
+    NotLeaseOwner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,15 +246,8 @@ struct QualityChange {
     new: QualityLevels,
 }
 
-/// Bad samples have at least 10% queue pressure, a queue peak of 24, or RTT
-/// above 250 ms. Two bad samples in a row cut bitrate by 20% to half its
-/// configured maximum (never below 300 Kbps), then cut FPS by 10 to 20, then
-/// scale by 25 points to 50%. Good samples have under 5% queue pressure, a
-/// queue peak under 24, no drops, RTT under 120 ms, and present at least 90% of
-/// received frames. Eight good samples in a row raise bitrate by 10% to its
-/// configured maximum, then scale by 25 points, then FPS by 10. Each change
-/// moves one ladder level. Changes are at least five seconds apart; the first
-/// change may happen immediately.
+/// Bad samples move down one ladder level; good samples move up one. Changes
+/// are rate-limited, and the first change may happen immediately.
 struct Quality {
     levels: QualityLevels,
     max_bitrate: Kbps,
@@ -234,7 +262,7 @@ impl Quality {
             levels: QualityLevels {
                 bitrate,
                 fps,
-                scale: scale_percent(100),
+                scale: FULL_SCALE,
             },
             max_bitrate: bitrate,
             max_fps: fps,
@@ -301,53 +329,47 @@ impl Quality {
     }
 
     fn lower_one_level(&mut self) {
-        let minimum_bitrate = self.max_bitrate.get().saturating_div(2).max(300);
-        if self.levels.bitrate.get() > minimum_bitrate {
-            let bitrate = (self.levels.bitrate.get() * 80 / 100).max(minimum_bitrate);
-            self.levels.bitrate = kbps(bitrate);
-        } else if self.levels.fps.get() > 20 {
-            self.levels.fps = fps(self.levels.fps.get().saturating_sub(10).max(20));
-        } else if self.levels.scale.get() > 50 {
-            self.levels.scale = scale_percent(self.levels.scale.get().saturating_sub(25).max(50));
+        let minimum_bitrate = self
+            .max_bitrate
+            .divided_by(BITRATE_FLOOR_DIVISOR)
+            .at_least(BITRATE_FLOOR);
+        if self.levels.bitrate > minimum_bitrate {
+            self.levels.bitrate = self
+                .levels
+                .bitrate
+                .scaled(DOWN_STEP_PERCENT)
+                .at_least(minimum_bitrate);
+        } else if self.levels.fps > FPS_FLOOR {
+            self.levels.fps = self.levels.fps.lowered_by(FPS_STEP, FPS_FLOOR);
+        } else if self.levels.scale > SCALE_FLOOR {
+            self.levels.scale = self.levels.scale.lowered_by(SCALE_STEP, SCALE_FLOOR);
         }
     }
 
     fn raise_one_level(&mut self) {
-        if self.levels.bitrate.get() < self.max_bitrate.get() {
-            let bitrate = (self.levels.bitrate.get() * 110 / 100).min(self.max_bitrate.get());
-            self.levels.bitrate = kbps(bitrate);
-        } else if self.levels.scale.get() < 100 {
-            self.levels.scale = scale_percent((self.levels.scale.get() + 25).min(100));
-        } else if self.levels.fps.get() < self.max_fps.get() {
-            self.levels.fps = fps((self.levels.fps.get() + 10).min(self.max_fps.get()));
+        if self.levels.bitrate < self.max_bitrate {
+            self.levels.bitrate = self
+                .levels
+                .bitrate
+                .scaled(UP_STEP_PERCENT)
+                .at_most(self.max_bitrate);
+        } else if self.levels.scale < FULL_SCALE {
+            self.levels.scale = self.levels.scale.raised_by(SCALE_STEP, FULL_SCALE);
+        } else if self.levels.fps < self.max_fps {
+            self.levels.fps = self.levels.fps.raised_by(FPS_STEP, self.max_fps);
         }
-    }
-}
-
-fn kbps(value: u32) -> Kbps {
-    match Kbps::new(value) {
-        Ok(bitrate) => bitrate,
-        Err(error) => panic!("quality produced invalid bitrate: {error}"),
-    }
-}
-
-fn fps(value: u32) -> Fps {
-    match Fps::new(value) {
-        Ok(frame_rate) => frame_rate,
-        Err(error) => panic!("quality produced invalid frame rate: {error}"),
-    }
-}
-
-fn scale_percent(value: u32) -> ScalePercent {
-    match ScalePercent::new(value) {
-        Ok(scale) => scale,
-        Err(error) => panic!("quality produced invalid scale: {error}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use sprite_desktop_protocol::InvalidValue;
+
     use super::*;
+
+    fn value<T>(result: Result<T, InvalidValue>) -> T {
+        result.expect("test quality value should be valid")
+    }
 
     fn feedback(
         received: u32,
@@ -391,7 +413,7 @@ mod tests {
 
     #[test]
     fn first_change_is_allowed_immediately() {
-        let mut quality = Quality::new(kbps(8_000), fps(60));
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
         let now = Instant::now();
 
         let change = trigger_bad(&mut quality, now)
@@ -401,14 +423,14 @@ mod tests {
             change,
             QualityChange {
                 old: QualityLevels {
-                    bitrate: kbps(8_000),
-                    fps: fps(60),
-                    scale: scale_percent(100),
+                    bitrate: value(Kbps::new(8_000)),
+                    fps: value(Fps::new(60)),
+                    scale: value(ScalePercent::new(100)),
                 },
                 new: QualityLevels {
-                    bitrate: kbps(6_400),
-                    fps: fps(60),
-                    scale: scale_percent(100),
+                    bitrate: value(Kbps::new(6_400)),
+                    fps: value(Fps::new(60)),
+                    scale: value(ScalePercent::new(100)),
                 },
             }
         );
@@ -416,7 +438,7 @@ mod tests {
 
     #[test]
     fn bad_ladder_changes_one_level_at_a_time_and_stops_at_every_floor() {
-        let mut quality = Quality::new(kbps(1_000), fps(30));
+        let mut quality = Quality::new(value(Kbps::new(1_000)), value(Fps::new(30)));
         let mut now = Instant::now();
         let expected = [
             (800, 30, 100),
@@ -434,9 +456,9 @@ mod tests {
             assert_eq!(
                 change.new,
                 QualityLevels {
-                    bitrate: kbps(bitrate),
-                    fps: fps(frame_rate),
-                    scale: scale_percent(scale),
+                    bitrate: value(Kbps::new(bitrate)),
+                    fps: value(Fps::new(frame_rate)),
+                    scale: value(ScalePercent::new(scale)),
                 }
             );
             now += QUALITY_CHANGE_COOLDOWN;
@@ -446,38 +468,38 @@ mod tests {
         assert_eq!(
             quality.levels(),
             QualityLevels {
-                bitrate: kbps(500),
-                fps: fps(20),
-                scale: scale_percent(50),
+                bitrate: value(Kbps::new(500)),
+                fps: value(Fps::new(20)),
+                scale: value(ScalePercent::new(50)),
             }
         );
     }
 
     #[test]
     fn bitrate_floor_is_three_hundred_when_half_the_maximum_is_lower() {
-        let mut quality = Quality::new(kbps(500), fps(20));
+        let mut quality = Quality::new(value(Kbps::new(500)), value(Fps::new(20)));
         let mut now = Instant::now();
 
         for expected in [400, 320, 300] {
             let change = trigger_bad(&mut quality, now)
                 .expect("bad streak should lower bitrate to its floor");
-            assert_eq!(change.new.bitrate, kbps(expected));
+            assert_eq!(change.new.bitrate, value(Kbps::new(expected)));
             now += QUALITY_CHANGE_COOLDOWN;
         }
 
         let change =
             trigger_bad(&mut quality, now).expect("bitrate floor should expose the scale ladder");
-        assert_eq!(change.new.bitrate, kbps(300));
-        assert_eq!(change.new.scale, scale_percent(75));
+        assert_eq!(change.new.bitrate, value(Kbps::new(300)));
+        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
     }
 
     #[test]
     fn good_ladder_restores_bitrate_then_scale_then_fps() {
-        let mut quality = Quality::new(kbps(1_000), fps(40));
+        let mut quality = Quality::new(value(Kbps::new(1_000)), value(Fps::new(40)));
         quality.levels = QualityLevels {
-            bitrate: kbps(500),
-            fps: fps(20),
-            scale: scale_percent(50),
+            bitrate: value(Kbps::new(500)),
+            fps: value(Fps::new(20)),
+            scale: value(ScalePercent::new(50)),
         };
         let mut now = Instant::now();
         let expected = [
@@ -501,9 +523,9 @@ mod tests {
             assert_eq!(
                 change.new,
                 QualityLevels {
-                    bitrate: kbps(bitrate),
-                    fps: fps(frame_rate),
-                    scale: scale_percent(scale),
+                    bitrate: value(Kbps::new(bitrate)),
+                    fps: value(Fps::new(frame_rate)),
+                    scale: value(ScalePercent::new(scale)),
                 }
             );
             now += QUALITY_CHANGE_COOLDOWN;
@@ -514,7 +536,7 @@ mod tests {
 
     #[test]
     fn cooldown_spaces_changes_by_five_seconds() {
-        let mut quality = Quality::new(kbps(8_000), fps(60));
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
         let now = Instant::now();
         assert!(trigger_bad(&mut quality, now).is_some());
 
@@ -527,12 +549,12 @@ mod tests {
                 .update(&bad_feedback(), now + QUALITY_CHANGE_COOLDOWN)
                 .is_some()
         );
-        assert_eq!(quality.levels().bitrate, kbps(5_120));
+        assert_eq!(quality.levels().bitrate, value(Kbps::new(5_120)));
     }
 
     #[test]
     fn idle_and_mixed_samples_clear_the_streak() {
-        let mut quality = Quality::new(kbps(8_000), fps(60));
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
         let now = Instant::now();
         assert_eq!(quality.update(&bad_feedback(), now), None);
         assert_eq!(
@@ -545,12 +567,12 @@ mod tests {
             None
         );
         assert_eq!(quality.update(&bad_feedback(), now), None);
-        assert_eq!(quality.levels().bitrate, kbps(8_000));
+        assert_eq!(quality.levels().bitrate, value(Kbps::new(8_000)));
     }
 
     #[test]
     fn high_rtt_counts_as_bad() {
-        let mut quality = Quality::new(kbps(8_000), fps(60));
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
         let now = Instant::now();
         let high_rtt = feedback(50, 50, 0, 0.0, 0, 251.0);
 

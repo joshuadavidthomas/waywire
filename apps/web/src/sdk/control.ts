@@ -733,7 +733,7 @@ export class ControlRuntime {
       this.controlSocket &&
       this.controlSocket.readyState === WebSocket.OPEN
     ) {
-      this.controlSocket.send("acquire");
+      this.controlSocket.send(JSON.stringify({ type: "acquire" }));
       this.setControlStatus("Input requesting");
     }
   }
@@ -753,7 +753,7 @@ export class ControlRuntime {
       this.controlSocket &&
       this.controlSocket.readyState === WebSocket.OPEN
     ) {
-      this.controlSocket.send("release");
+      this.controlSocket.send(JSON.stringify({ type: "release" }));
       if (this.sessionConnected)
         this.setControlStatus("Input ready · click stream", true);
     } else if (this.sessionConnected) {
@@ -769,7 +769,7 @@ export class ControlRuntime {
     ) {
       return;
     }
-    this.controlSocket.send("acquire");
+    this.controlSocket.send(JSON.stringify({ type: "acquire" }));
     this.controlAcquireDelay = Math.min(this.controlAcquireDelay * 2, 2000);
     this.controlAcquireTimer = setTimeout(
       () => this.retryControlAcquire(),
@@ -840,7 +840,7 @@ export class ControlRuntime {
       }
       this.video.resetFeedbackInterval();
       if (this.controlWanted) {
-        socket.send("acquire");
+        socket.send(JSON.stringify({ type: "acquire" }));
       }
       for (const record of this.pendingControlRecords) {
         this.sendControl(record);
@@ -930,7 +930,7 @@ export class ControlRuntime {
         }
         if (!this.controlWanted) {
           this.controlActive = false;
-          socket.send("release");
+          socket.send(JSON.stringify({ type: "release" }));
         } else if (!wasControlActive) {
           this.lastResizeRequest = null;
           this.sendResize();
