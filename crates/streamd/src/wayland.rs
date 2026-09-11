@@ -437,8 +437,18 @@ impl State {
                     || (disables_overlay && self.capture.cursor_overlay)
                 {
                     self.capture.cursor_overlay = overlay;
-                    self.capture.cancel();
                     self.capture.can_wait_for_damage = false;
+                    // Switching the overlay on wants a frame at once, and the
+                    // plain capture in flight is worth dropping for it.
+                    // Switching it off must let the overlay capture finish:
+                    // asking for the pointer makes the compositor render it
+                    // into the output itself for as long as that capture
+                    // lives, and tearing the capture down mid-flight leaves
+                    // it rendering the pointer into every later frame, which
+                    // no flag of ours can then take back out.
+                    if overlay {
+                        self.capture.cancel();
+                    }
                     self.start_queued_resize_or_capture()?;
                 }
                 self.input.apply(command)?;

@@ -350,8 +350,8 @@ export function installViewerListeners(
       const empty = event.text === null || event.text.length === 0;
       elements.copyClipboardButton.disabled = empty;
       elements.copyClipboardButton.title = empty
-        ? "The desktop's clipboard is empty."
-        : "Put what the desktop copied onto your clipboard here.";
+        ? "The desktop clipboard is empty"
+        : "Bring the desktop clipboard here";
       if (event.text !== null) elements.clipboardStatus.textContent = "";
     }),
   );
