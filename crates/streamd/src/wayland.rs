@@ -338,6 +338,30 @@ impl State {
         self.running = false;
     }
 
+    // Once a capture has asked the compositor for its pointer, the compositor
+    // keeps drawing that pointer into the output. Asking later captures to
+    // leave it out changes nothing, and neither does letting the asking
+    // capture finish or tearing it down: the picture keeps both the drawn
+    // pointer and the one the page draws from the shape it is sent. Building
+    // the output again is the only thing that takes it back out, so leaving
+    // the overlay costs what a video reset costs, once, on the way out.
+    fn stop_cursor_overlay(&mut self) -> Result<()> {
+        match self.outputs.begin_reset() {
+            ResetStart::Start => {
+                self.capture.cancel();
+                self.start_queued_resize_or_capture()
+            }
+            ResetStart::AlreadyRunning => Ok(()),
+            ResetStart::Refused(reason) => {
+                warn!(
+                    ?reason,
+                    "cursor overlay could not be cleared; the desktop pointer stays in the picture"
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn request_capture(&mut self) -> Result<()> {
         let output = self.output.as_ref().context("output disappeared")?;
         self.capture.request(output, &self.qh)?;
@@ -433,23 +457,15 @@ impl State {
                     command,
                     Command::PointerAbsolute(_) | Command::ReleaseAll(_)
                 );
-                if (overlay && !self.capture.cursor_overlay)
-                    || (disables_overlay && self.capture.cursor_overlay)
-                {
-                    self.capture.cursor_overlay = overlay;
+                if overlay && !self.capture.cursor_overlay {
+                    self.capture.cursor_overlay = true;
                     self.capture.can_wait_for_damage = false;
-                    // Switching the overlay on wants a frame at once, and the
-                    // plain capture in flight is worth dropping for it.
-                    // Switching it off must let the overlay capture finish:
-                    // asking for the pointer makes the compositor render it
-                    // into the output itself for as long as that capture
-                    // lives, and tearing the capture down mid-flight leaves
-                    // it rendering the pointer into every later frame, which
-                    // no flag of ours can then take back out.
-                    if overlay {
-                        self.capture.cancel();
-                    }
+                    self.capture.cancel();
                     self.start_queued_resize_or_capture()?;
+                } else if disables_overlay && self.capture.cursor_overlay {
+                    self.capture.cursor_overlay = false;
+                    self.capture.can_wait_for_damage = false;
+                    self.stop_cursor_overlay()?;
                 }
                 self.input.apply(command)?;
                 if let Some(sequence) = command.input_sequence() {
