@@ -314,8 +314,10 @@ export class ControlRuntime {
         );
       }
     },
-    updatePointerLocked: (pointerLocked) =>
-      this.owner.updateState("input", { pointerLocked }),
+    updatePointerLocked: (pointerLocked) => {
+      if (!pointerLocked) this.localCursor?.forget();
+      this.owner.updateState("input", { pointerLocked });
+    },
     visibilityChanged: () => this.handleVisibilityChange(),
     emitError: (error) => this.emit("error", error),
   });

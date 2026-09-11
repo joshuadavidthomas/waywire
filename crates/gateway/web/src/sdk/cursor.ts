@@ -33,6 +33,17 @@ export class LocalCursor {
     this.restore();
   }
 
+  // Forget the remembered shape without giving up the desktop. A pointer
+  // grab can end with the compositor's last word being "hidden", and the
+  // page would then have no pointer at all until the desktop changed shape
+  // again. Falling back to the element's own cursor keeps one on screen,
+  // and the next cursor message replaces it.
+  forget(): void {
+    if (this.disposed) return;
+    this.state = null;
+    this.restore();
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.active = false;

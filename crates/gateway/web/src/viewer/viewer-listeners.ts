@@ -17,8 +17,7 @@ export type ViewerElements = {
   readonly panel: HTMLElement;
   readonly status: HTMLElement;
   readonly statusVideo: HTMLElement;
-  readonly controlStatus: HTMLElement;
-  readonly controlToggle: HTMLButtonElement;
+  readonly controlToggle: HTMLInputElement;
   readonly pointerLockButton: HTMLButtonElement;
   readonly keyboardButton: HTMLButtonElement;
   readonly sendClipboardButton: HTMLButtonElement;
@@ -135,23 +134,6 @@ function titleFor(state: WaywireSessionState): string {
   return "Waywire";
 }
 
-// The right of the status line says what your mouse and keyboard can do.
-function inputLabel(state: WaywireSessionState): string {
-  switch (state.input.state) {
-    case "active":
-      return "Control";
-    case "requesting":
-    case "connecting":
-      return "Requesting control";
-    case "busy":
-      return "Another viewer has control";
-    case "ready":
-    case "idle":
-    case "disconnected":
-      return "View only";
-  }
-}
-
 function readStored(key: string): string | null {
   try {
     return localStorage.getItem(key);
@@ -176,7 +158,6 @@ export function installViewerListeners(
   const fields = Object.fromEntries(
     FIELDS.map((name) => [name, hudField(elements.hud, name)]),
   ) as Record<Field, HTMLElement>;
-  const controlLabel = itemLabel(elements.controlToggle);
   const pointerLockLabel = itemLabel(elements.pointerLockButton);
   const cleanup: Array<() => void> = [];
   const listen = <K extends keyof HTMLElementEventMap>(
@@ -242,13 +223,12 @@ export function installViewerListeners(
   window.addEventListener("focus", onWindowFocus);
   cleanup.push(() => window.removeEventListener("focus", onWindowFocus));
   const renderWheel = (): void => {
-    controlLabel.textContent =
-      wheel === "handsOff" ? "Take control" : "Release control";
+    elements.controlToggle.checked = wheel === "auto";
   };
   // The one mode a person forgets they are in gets the page's one pill.
   const renderLeaseNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent = "View only";
+      elements.leaseNotice.textContent = "Your mouse and keyboard are off";
       elements.leaseNotice.hidden = false;
     } else if (state.input.state === "busy") {
       elements.leaseNotice.textContent = "Another viewer has control";
@@ -276,9 +256,6 @@ export function installViewerListeners(
       elements.status.dataset["state"] = state.video.state;
       elements.status.title = state.video.message;
       elements.statusVideo.textContent = videoLabel(state);
-      elements.controlStatus.textContent = inputLabel(state);
-      elements.controlStatus.title = state.input.message;
-      elements.controlStatus.dataset["state"] = state.input.state;
       pointerLockLabel.textContent = state.input.pointerLocked
         ? "Unlock pointer"
         : "Lock pointer";
@@ -363,19 +340,20 @@ export function installViewerListeners(
   );
   cleanup.push(
     session.on("clipboard", (event) => {
-      elements.copyClipboardButton.disabled =
-        event.text === null || event.text.length === 0;
+      const empty = event.text === null || event.text.length === 0;
+      elements.copyClipboardButton.disabled = empty;
+      elements.copyClipboardButton.title = empty
+        ? "The desktop's clipboard is empty."
+        : "Copy what is on the desktop's clipboard onto this computer's clipboard.";
       if (event.text !== null) elements.clipboardStatus.textContent = "";
     }),
   );
   cleanup.push(
     session.on("resize", (event) => {
-      const latency =
-        event.latencyMs === undefined
-          ? ""
-          : ` in ${event.latencyMs.toFixed(0)} ms`;
       fields.resolution.dataset["resize"] = event.state;
-      fields.resize.textContent = `${event.state}${latency}`;
+      if (event.latencyMs !== undefined) {
+        fields.resize.textContent = `${event.latencyMs.toFixed(0)} ms`;
+      }
     }),
   );
   cleanup.push(
@@ -392,8 +370,8 @@ export function installViewerListeners(
     }
   }
 
-  listen(elements.controlToggle, "click", () => {
-    if (wheel === "handsOff") {
+  listen(elements.controlToggle, "change", () => {
+    if (elements.controlToggle.checked) {
       wheel = "auto";
       session.input.acquire();
       surface.focus();

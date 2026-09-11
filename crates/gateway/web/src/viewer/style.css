@@ -190,7 +190,7 @@ canvas {
   margin: 0;
   padding: 10px 12px;
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: max-content minmax(0, 1fr);
   column-gap: 14px;
   row-gap: 3px;
   border-radius: 8px;
@@ -211,7 +211,9 @@ canvas {
 
 .hud dd {
   margin: 0;
+  overflow: hidden;
   text-align: right;
+  text-overflow: ellipsis;
   color: var(--ink-dim);
   font-family: var(--numerals);
   font-variant-numeric: tabular-nums;
@@ -403,11 +405,11 @@ canvas {
   cursor: pointer;
 }
 
-:is(button, label).item:hover {
+:is(button, label).item:hover:not(:disabled) {
   background: var(--panel-hi);
 }
 
-:is(button, label).item:hover .glyph {
+:is(button, label).item:hover:not(:disabled) .glyph {
   color: var(--ink);
 }
 
@@ -424,10 +426,6 @@ canvas {
 
 .item:disabled .glyph {
   color: var(--ink-faint);
-}
-
-.item:disabled:hover {
-  background: transparent;
 }
 
 /* The soft keyboard only exists where there is one to summon. */

@@ -22,6 +22,8 @@ function viewerElements(): ViewerElements {
     element instanceof HTMLElement;
   const button = (element: Element): element is HTMLButtonElement =>
     element instanceof HTMLButtonElement;
+  const input = (element: Element): element is HTMLInputElement =>
+    element instanceof HTMLInputElement;
   return {
     stage: requireElement("#stage", html),
     display: requireElement(
@@ -38,28 +40,19 @@ function viewerElements(): ViewerElements {
     panel: requireElement("#panel", html),
     status: requireElement("#status", html),
     statusVideo: requireElement("#status-video", html),
-    controlStatus: requireElement("#control-status", html),
-    controlToggle: requireElement("#control-toggle", button),
+    controlToggle: requireElement("#control-toggle", input),
     pointerLockButton: requireElement("#pointer-lock", button),
     keyboardButton: requireElement("#keyboard", button),
     sendClipboardButton: requireElement("#send-clipboard", button),
     copyClipboardButton: requireElement("#copy-clipboard", button),
-    hudToggle: requireElement(
-      "#hud-toggle",
-      (element): element is HTMLInputElement =>
-        element instanceof HTMLInputElement,
-    ),
+    hudToggle: requireElement("#hud-toggle", input),
     resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
     latency: requireElement("#latency", html),
     fullscreenButton: requireElement("#fullscreen", button),
     pinButton: requireElement("#pin-panel", button),
     closeButton: requireElement("#close-panel", button),
-    imeProxy: requireElement(
-      "#ime-proxy",
-      (element): element is HTMLInputElement =>
-        element instanceof HTMLInputElement,
-    ),
+    imeProxy: requireElement("#ime-proxy", input),
   };
 }
 

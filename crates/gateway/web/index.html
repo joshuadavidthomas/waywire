@@ -49,7 +49,7 @@
         <dt>Frames received</dt>
         <dd data-field="received">-</dd>
         <dt>Last resize</dt>
-        <dd data-field="resize">idle</dd>
+        <dd data-field="resize">-</dd>
         <dt>Codec</dt>
         <dd data-field="codec">-</dd>
       </dl>
@@ -79,11 +79,14 @@
         <p id="panel-status" class="status" role="status">
           <span id="status" class="dot" data-state="idle"></span>
           <span id="status-video">Connecting</span>
-          <span id="control-status" data-state="idle">View only</span>
         </p>
         <ul class="menu" role="list" aria-label="Input">
           <li>
-            <button id="control-toggle" class="item" type="button">
+            <label
+              class="item"
+              for="control-toggle"
+              title="Your mouse and keyboard reach the desktop while this is on. Turn it off to watch without touching anything."
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
@@ -94,11 +97,26 @@
                   d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z"
                 />
               </svg>
-              <span class="label">Release control</span>
-            </button>
+              <span class="label">Mouse and keyboard</span>
+              <span class="toggle">
+                <span class="toggle-knob" aria-hidden="true"></span>
+                <input
+                  id="control-toggle"
+                  name="input"
+                  type="checkbox"
+                  role="switch"
+                  checked
+                />
+              </span>
+            </label>
           </li>
           <li>
-            <button id="pointer-lock" class="item" type="button">
+            <button
+              id="pointer-lock"
+              class="item"
+              type="button"
+              title="Hand the pointer to the desktop so it can move past the edge of the window and apps can read raw movement. Press Escape to end it."
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
@@ -112,7 +130,12 @@
             </button>
           </li>
           <li class="on-touch">
-            <button id="keyboard" class="item" type="button">
+            <button
+              id="keyboard"
+              class="item"
+              type="button"
+              title="Open this device's keyboard and type into the desktop."
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
@@ -135,7 +158,12 @@
         </ul>
         <ul class="menu" role="list" aria-label="Clipboard">
           <li>
-            <button id="send-clipboard" class="item" type="button">
+            <button
+              id="send-clipboard"
+              class="item"
+              type="button"
+              title="Copy what is on this computer's clipboard onto the desktop's clipboard."
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
@@ -150,11 +178,17 @@
                 />
                 <rect x="8" y="2" width="8" height="4" rx="1" />
               </svg>
-              <span class="label">Send clipboard</span>
+              <span class="label">Clipboard to desktop</span>
             </button>
           </li>
           <li>
-            <button id="copy-clipboard" class="item" type="button" disabled>
+            <button
+              id="copy-clipboard"
+              class="item"
+              type="button"
+              title="The desktop's clipboard is empty."
+              disabled
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
@@ -169,14 +203,18 @@
                 <path d="M21 14H11" />
                 <path d="m15 10-4 4 4 4" />
               </svg>
-              <span class="label">Receive clipboard</span>
+              <span class="label">Clipboard from desktop</span>
             </button>
           </li>
           <li id="clipboard-status" class="note" aria-live="polite"></li>
         </ul>
         <ul class="menu" role="list" aria-label="Picture">
           <li>
-            <label class="item" for="hud-toggle">
+            <label
+              class="item"
+              for="hud-toggle"
+              title="Show what the stream is doing in the corner of the screen."
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
@@ -205,6 +243,7 @@
               class="item latency"
               role="radiogroup"
               aria-labelledby="latency-label"
+              title="How much of the stream to hold back before drawing it. A shorter target reacts sooner, a longer one rides out a bumpy connection."
             >
               <svg
                 class="glyph"
@@ -233,7 +272,12 @@
             </div>
           </li>
           <li>
-            <button id="reset-video" class="item" type="button">
+            <button
+              id="reset-video"
+              class="item"
+              type="button"
+              title="Throw away the decoder and start the picture again. Use it if the video tears, freezes, or goes wrong."
+            >
               <svg
                 class="glyph"
                 viewBox="0 0 24 24"
