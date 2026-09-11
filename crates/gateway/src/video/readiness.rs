@@ -1,86 +1,68 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
-/// Nothing is published behind this flag: the frames that justify `Ready` reach viewers through
-/// `VideoHub`'s mutex and `Notify`, and both readers look only at the tag. `Relaxed` would therefore
-/// be sound; Acquire/Release costs nothing at one update per frame and keeps the edge in place for
-/// a future reader that does hang data off it.
+/// Shared video readiness state.
+///
+/// Each critical section only reads the state or replaces the `Copy` value in one assignment, so
+/// recovering a poisoned mutex cannot expose a partly-applied transition.
 #[derive(Clone)]
 pub(crate) struct Readiness {
-    state: Arc<AtomicU8>,
+    state: Arc<Mutex<ReadinessState>>,
 }
 
-#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadinessState {
-    WaitingForFirstFrame = 0,
-    Ready = 1,
-    WaitingForKeyframe = 2,
-    Stopped = 3,
+    WaitingForFirstFrame,
+    Ready,
+    WaitingForKeyframe,
+    Stopped,
 }
 
 impl Readiness {
     pub(crate) fn new() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(ReadinessState::WaitingForFirstFrame as u8)),
-        }
-    }
-
-    fn decode(tag: u8) -> ReadinessState {
-        match tag {
-            0 => ReadinessState::WaitingForFirstFrame,
-            1 => ReadinessState::Ready,
-            2 => ReadinessState::WaitingForKeyframe,
-            3 => ReadinessState::Stopped,
-            _ => panic!("defect: invalid ReadinessState tag {tag}"),
+            state: Arc::new(Mutex::new(ReadinessState::WaitingForFirstFrame)),
         }
     }
 
     pub(crate) fn mark_video_ready(&self) {
-        let _ =
-            self.state.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |tag| match Self::decode(tag) {
-                    ReadinessState::WaitingForFirstFrame
-                    | ReadinessState::Ready
-                    | ReadinessState::WaitingForKeyframe => Some(ReadinessState::Ready as u8),
-                    ReadinessState::Stopped => None,
-                },
-            );
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = match *state {
+            ReadinessState::WaitingForFirstFrame
+            | ReadinessState::Ready
+            | ReadinessState::WaitingForKeyframe => ReadinessState::Ready,
+            ReadinessState::Stopped => ReadinessState::Stopped,
+        };
     }
 
     pub(crate) fn await_keyframe(&self) {
-        let _ =
-            self.state.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |tag| match Self::decode(tag) {
-                    ReadinessState::Ready => Some(ReadinessState::WaitingForKeyframe as u8),
-                    ReadinessState::WaitingForFirstFrame
-                    | ReadinessState::WaitingForKeyframe
-                    | ReadinessState::Stopped => None,
-                },
-            );
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = match *state {
+            ReadinessState::WaitingForFirstFrame => ReadinessState::WaitingForFirstFrame,
+            ReadinessState::Ready | ReadinessState::WaitingForKeyframe => {
+                ReadinessState::WaitingForKeyframe
+            }
+            ReadinessState::Stopped => ReadinessState::Stopped,
+        };
     }
 
     pub(crate) fn stop(&self) {
-        self.state
-            .store(ReadinessState::Stopped as u8, Ordering::Release);
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = ReadinessState::Stopped;
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        Self::decode(self.state.load(Ordering::Acquire)) == ReadinessState::Ready
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) == ReadinessState::Ready
     }
 
     pub(crate) fn needs_startup_frame(&self) -> bool {
-        Self::decode(self.state.load(Ordering::Acquire)) == ReadinessState::WaitingForFirstFrame
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
+            == ReadinessState::WaitingForFirstFrame
     }
 
     #[cfg(test)]
     pub(crate) fn state(&self) -> ReadinessState {
-        Self::decode(self.state.load(Ordering::Acquire))
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

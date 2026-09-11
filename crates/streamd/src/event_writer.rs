@@ -4,7 +4,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -65,20 +65,6 @@ struct Shared {
     ready: Condvar,
 }
 
-fn lock_queue(queue: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
-    match queue.lock() {
-        Ok(queue) => queue,
-        Err(error) => panic!("event writer queue mutex poisoned: {error}"),
-    }
-}
-
-fn wait_for_queue<'a>(ready: &Condvar, queue: MutexGuard<'a, Queue>) -> MutexGuard<'a, Queue> {
-    match ready.wait(queue) {
-        Ok(queue) => queue,
-        Err(error) => panic!("event writer queue mutex poisoned while waiting: {error}"),
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct EventSink {
     shared: Arc<Shared>,
@@ -114,7 +100,10 @@ impl EventWriter {
     }
 
     pub(crate) fn failure(&self) -> Option<EventWriterError> {
-        lock_queue(&self.shared.queue)
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .failure
             .clone()
             .map(EventWriterError::Write)
@@ -126,7 +115,11 @@ impl EventWriter {
 
     fn stop_inner(&mut self) {
         {
-            let mut queue = lock_queue(&self.shared.queue);
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             queue.stopping = true;
             self.shared.ready.notify_one();
         }
@@ -146,7 +139,11 @@ impl EventSink {
     pub(crate) fn send(&self, event: &Event) -> Result<(), EventWriterError> {
         let replacement = Replacement::for_event(event);
         let bytes = event.encode();
-        let mut queue = lock_queue(&self.shared.queue);
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(failure) = &queue.failure {
             return Err(EventWriterError::Write(failure.clone()));
         }
@@ -193,19 +190,30 @@ fn writer_main(shared: &Shared) {
     if let Ok(raw_flags) = fcntl(&stdout, FcntlArg::F_GETFL) {
         let flags = OFlag::from_bits_truncate(raw_flags);
         if let Err(error) = fcntl(&stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-            lock_queue(&shared.queue).failure = Some(error.to_string());
+            shared
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .failure = Some(error.to_string());
             return;
         }
     } else {
-        lock_queue(&shared.queue).failure = Some("could not read stdout flags".into());
+        shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .failure = Some("could not read stdout flags".into());
         return;
     }
     let mut output = stdout.lock();
     loop {
         let record = {
-            let mut queue = lock_queue(&shared.queue);
+            let mut queue = shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
             while queue.records.is_empty() && !queue.stopping {
-                queue = wait_for_queue(&shared.ready, queue);
+                queue = shared
+                    .ready
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
             match queue.records.pop_front() {
                 Some(record) => {
@@ -216,7 +224,7 @@ fn writer_main(shared: &Shared) {
             }
         };
         if let Err(error) = write_with_deadline(&mut output, &record) {
-            let mut queue = lock_queue(&shared.queue);
+            let mut queue = shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
             queue.failure = Some(error.to_string());
             queue.records.clear();
             queue.bytes = 0;

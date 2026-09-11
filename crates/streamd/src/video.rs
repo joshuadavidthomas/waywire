@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -176,33 +176,6 @@ struct Shared {
     work: Condvar,
 }
 
-fn lock_pool(shared: &Shared) -> MutexGuard<'_, Pool> {
-    match shared.pool.lock() {
-        Ok(pool) => pool,
-        Err(error) => panic!("video frame pool mutex poisoned: {error}"),
-    }
-}
-
-fn wait_for_pool<'a>(work: &Condvar, pool: MutexGuard<'a, Pool>) -> MutexGuard<'a, Pool> {
-    match work.wait(pool) {
-        Ok(pool) => pool,
-        Err(error) => panic!("video frame pool mutex poisoned while waiting for work: {error}"),
-    }
-}
-
-fn wait_for_pool_timeout<'a>(
-    work: &Condvar,
-    pool: MutexGuard<'a, Pool>,
-    timeout: Duration,
-) -> MutexGuard<'a, Pool> {
-    match work.wait_timeout(pool, timeout) {
-        Ok((pool, _timeout)) => pool,
-        Err(error) => {
-            panic!("video frame pool mutex poisoned while waiting for timed work: {error}")
-        }
-    }
-}
-
 pub(crate) struct VideoEncoder {
     shared: Arc<Shared>,
     notifications: mpsc::Receiver<Notification>,
@@ -279,7 +252,11 @@ impl VideoEncoder {
 
     pub(crate) fn submit(&self, frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
         frame.validate()?;
-        let mut pool = lock_pool(&self.shared);
+        let mut pool = self
+            .shared
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if pool.stopping {
             return Err(VideoError::Stopped);
         }
@@ -312,7 +289,11 @@ impl VideoEncoder {
     }
 
     pub(crate) fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
-        let mut pool = lock_pool(&self.shared);
+        let mut pool = self
+            .shared
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if pool.stopping {
             return Err(VideoError::Stopped);
         }
@@ -349,12 +330,14 @@ impl VideoEncoder {
     pub(crate) fn try_notification(&self) -> Option<Notification> {
         match self.notifications.try_recv() {
             Ok(notification) => Some(notification),
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
-                lock_pool(&self.shared)
-                    .notification_failure
-                    .take()
-                    .map(Notification::Fatal)
-            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => self
+                .shared
+                .pool
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .notification_failure
+                .take()
+                .map(Notification::Fatal),
         }
     }
 
@@ -364,7 +347,11 @@ impl VideoEncoder {
 
     fn stop_inner(&mut self) {
         {
-            let mut pool = lock_pool(&self.shared);
+            let mut pool = self
+                .shared
+                .pool
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             pool.stopping = true;
             self.shared.work.notify_all();
         }
@@ -375,7 +362,11 @@ impl VideoEncoder {
 
     #[cfg(test)]
     fn child_pid(&self) -> Option<u32> {
-        lock_pool(&self.shared).child_pid
+        self.shared
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .child_pid
     }
 }
 
@@ -657,7 +648,11 @@ impl Worker<'_> {
                     frame.metadata.generation,
                 ) {
                     Ok(started) => {
-                        lock_pool(self.shared).child_pid = Some(started.child.id());
+                        self.shared
+                            .pool
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .child_pid = Some(started.child.id());
                         self.process = Some(started);
                         self.consecutive_spawn_failures = 0;
                     }
@@ -705,9 +700,13 @@ impl Worker<'_> {
 }
 
 fn take_pending_frame(shared: &Shared) -> Option<(usize, RawFrame)> {
-    let mut pool = lock_pool(shared);
+    let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
     if pool.pending.is_none() && !pool.stopping {
-        pool = wait_for_pool_timeout(&shared.work, pool, CHILD_POLL_INTERVAL);
+        pool = shared
+            .work
+            .wait_timeout(pool, CHILD_POLL_INTERVAL)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
     if pool.stopping {
         return None;
@@ -735,9 +734,12 @@ fn request_new_generation(
     ) {
         return false;
     }
-    let mut pool = lock_pool(shared);
+    let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
     while pool.generation == generation && !pool.stopping {
-        pool = wait_for_pool(&shared.work, pool);
+        pool = shared
+            .work
+            .wait(pool)
+            .unwrap_or_else(PoisonError::into_inner);
     }
     !pool.stopping
 }
@@ -777,7 +779,7 @@ fn send_notification_until(
                 // event loop drained an earlier, coalesced ping.
                 notification_wake.ping();
                 notification = returned;
-                let mut pool = lock_pool(shared);
+                let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
                 if pool.stopping {
                     return false;
                 }
@@ -799,13 +801,16 @@ fn send_notification_until(
 
 fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> bool {
     while Instant::now() < deadline {
-        let pool = lock_pool(shared);
+        let pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.stopping {
             return false;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let pool =
-            wait_for_pool_timeout(&shared.work, pool, remaining.min(Duration::from_millis(20)));
+        let pool = shared
+            .work
+            .wait_timeout(pool, remaining.min(Duration::from_millis(20)))
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
         if pool.stopping {
             return false;
         }
@@ -814,15 +819,23 @@ fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> bool {
 }
 
 fn is_stopping(shared: &Shared) -> bool {
-    lock_pool(shared).stopping
+    shared
+        .pool
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .stopping
 }
 
 fn current_generation(shared: &Shared) -> Generation {
-    lock_pool(shared).generation
+    shared
+        .pool
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .generation
 }
 
 fn release_slot(shared: &Shared, slot: usize, frame: RawFrame) {
-    let mut pool = lock_pool(shared);
+    let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(pool.encoding, Some(slot));
     assert!(matches!(pool.slots[slot], FrameSlot::Encoding));
     pool.encoding = None;
@@ -831,7 +844,7 @@ fn release_slot(shared: &Shared, slot: usize, frame: RawFrame) {
 }
 
 fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
-    let mut pool = lock_pool(shared);
+    let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(pool.encoding, Some(slot));
     assert!(matches!(pool.slots[slot], FrameSlot::Encoding));
     pool.encoding = None;
@@ -848,7 +861,11 @@ fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
 }
 
 fn stop_process(shared: &Shared, process: Option<EncoderProcess>) {
-    lock_pool(shared).child_pid = None;
+    shared
+        .pool
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .child_pid = None;
     if let Some(process) = process {
         process.stop();
     }
@@ -1000,7 +1017,7 @@ fn write_frame(
     let started = Instant::now();
     let mut written = 0;
     while written < bytes.len() {
-        let pool = lock_pool(shared);
+        let pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.stopping {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
