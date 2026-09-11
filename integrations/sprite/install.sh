@@ -139,10 +139,13 @@ fi
 # The API's service PID may not exist in this process namespace after restart.
 # Use actual cgroup members to distinguish replacement processes.
 previous_service_pids=$(sudo cat /sys/fs/cgroup/svc.waywire/cgroup.procs 2>/dev/null | tr '\n' ' ' || true)
-if [ -n "$current_service" ]; then
-  if [ -z "$record" ] || ! jq -e --argjson current "$current_service" --argjson target "$target_service" '.services == [$current] or (.state == "pending" and $current == $target)' <<<"$record" >/dev/null; then
-    fail 'service name is foreign: waywire'
-  fi
+# The live service is ours when the record names it, or when a pending update
+# already replaced it with this installer's definition.
+service_is_owned() {
+  [ -n "$record" ] && jq -e --argjson current "$current_service" --argjson target "$target_service" '.services == [$current] or (.state == "pending" and $current == $target)' <<<"$record" >/dev/null
+}
+if [ -n "$current_service" ] && ! service_is_owned; then
+  fail 'service name is foreign: waywire'
 fi
 while IFS= read -r definition; do
   name=$(jq -r .name <<<"$definition")
@@ -152,7 +155,7 @@ while IFS= read -r definition; do
 done < <(jq -c '.[]' <<<"$live_services")
 listeners=$(ss -H -ltne 'sport = :8080')
 if [ -n "$listeners" ]; then
-  if [ -z "$current_service" ] || [ -z "$record" ] || ! jq -e --argjson current "$current_service" '.services == [$current]' <<<"$record" >/dev/null; then
+  if [ -z "$current_service" ] || ! service_is_owned; then
     fail 'port 8080 is occupied by an unmanaged process'
   fi
   jq -e 'any(.[]; .name == "waywire" and .state.status == "running")' <<<"$services_raw" >/dev/null || fail 'port 8080 has no running owner service'
@@ -214,6 +217,11 @@ sudo mv -Tf /opt/waywire/current.new "$CURRENT_LINK"
 request=$(jq -c 'del(.name)' <<<"$target_service")
 service_replacement_requested=false
 if [ "$current_service" != "$target_service" ]; then
+  # PUT on an existing name keeps the old definition and the old process
+  # (seen on rc.13, 2026-09-11); the service has to be removed and recreated.
+  if [ -n "$current_service" ]; then
+    curl --unix-socket "$API_SOCKET" -fsS -X DELETE 'http://sprite/v1/services/waywire' -o /dev/null || fail 'could not remove the outdated waywire service'
+  fi
   curl --unix-socket "$API_SOCKET" -fsS -X PUT -H 'Content-Type: application/json' -d "$request" 'http://sprite/v1/services/waywire' -o /dev/null || fail 'could not create waywire service'
   service_replacement_requested=true
 elif $recovery || $release_changed || [ "$(curl -fsS --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)" != ok ]; then
