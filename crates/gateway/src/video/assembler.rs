@@ -9,33 +9,45 @@ use sprite_desktop_protocol::pipe::Generation;
 use super::GopState;
 use super::MAX_ACCESS_UNIT;
 use super::rtp::AccessUnitEnd;
+use super::rtp::NalType;
 use super::rtp::Packet;
 use super::rtp::PacketReject;
 use super::rtp::RtpSequence;
 use super::rtp::RtpTimestamp;
 
 pub(super) struct Assembler {
-    data: Vec<u8>,
-    kind: FrameKind,
-    fu_kind: Option<u8>,
-    timestamp: Option<RtpTimestamp>,
-    next_sequence: Option<RtpSequence>,
-    generation: Option<Generation>,
-    buffered_packets: u64,
+    cursor: StreamCursor,
     keyframe: GopState,
+    unit: AccessUnit,
+}
+
+enum StreamCursor {
+    Fresh,
+    Streaming {
+        generation: Generation,
+        next_sequence: RtpSequence,
+    },
+}
+
+enum AccessUnit {
+    Idle,
+    Collecting(PartialUnit),
+}
+
+struct PartialUnit {
+    timestamp: RtpTimestamp,
+    kind: FrameKind,
+    data: Vec<u8>,
+    packets: NonZeroU64,
+    fragment: Option<NalType>,
 }
 
 impl Default for Assembler {
     fn default() -> Self {
         Self {
-            data: Vec::new(),
-            kind: FrameKind::Delta,
-            fu_kind: None,
-            timestamp: None,
-            next_sequence: None,
-            generation: None,
-            buffered_packets: 0,
+            cursor: StreamCursor::Fresh,
             keyframe: GopState::KeyframeCached,
+            unit: AccessUnit::Idle,
         }
     }
 }
@@ -144,173 +156,285 @@ impl AssemblyResult {
 }
 
 impl Assembler {
+    fn drop_unit(&mut self, drops: &mut Option<DroppedPackets>, reason: AssemblyDrop) {
+        if let Some(packets) = self.unit.discard() {
+            DroppedPackets::record(drops, packets, reason);
+        }
+        self.keyframe = GopState::Recovering;
+    }
+
     pub(super) fn consume(&mut self, packet: Packet) -> AssemblyResult {
         let mut drops = None;
-        if self
-            .generation
-            .is_some_and(|generation| packet.generation.get() < generation.get())
-        {
-            // SSRC is the monotonic frame generation. A packet from an older
-            // encoder must not alter access-unit or restart state.
-            DroppedPackets::record(&mut drops, NonZeroU64::MIN, AssemblyDrop::StaleGeneration);
-            return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
-        }
-        if self
-            .generation
-            .is_some_and(|generation| packet.generation.get() > generation.get())
-        {
-            if let Some(packets) = self.clear_access_unit() {
-                DroppedPackets::record(&mut drops, packets, AssemblyDrop::GenerationDiscontinuity);
+        match self.cursor.advance(packet.generation, packet.sequence) {
+            CursorAdvance::Stale => {
+                // SSRC is the monotonic frame generation. A packet from an older
+                // encoder must not alter access-unit or restart state.
+                DroppedPackets::record(&mut drops, NonZeroU64::MIN, AssemblyDrop::StaleGeneration);
+                return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
             }
-            self.next_sequence = None;
-            self.keyframe = GopState::Recovering;
-        }
-        self.generation = Some(packet.generation);
-        if self
-            .next_sequence
-            .is_some_and(|next| next != packet.sequence)
-        {
-            if let Some(packets) = self.clear_access_unit() {
-                DroppedPackets::record(&mut drops, packets, AssemblyDrop::SequenceDiscontinuity);
+            CursorAdvance::GenerationChanged => {
+                self.drop_unit(&mut drops, AssemblyDrop::GenerationDiscontinuity);
             }
-            self.keyframe = GopState::Recovering;
-        }
-        self.next_sequence = Some(packet.sequence.next());
-        if self
-            .timestamp
-            .is_some_and(|timestamp| timestamp != packet.timestamp)
-        {
-            let incomplete = self.fu_kind.is_some();
-            if let Some(packets) = self.clear_access_unit() {
-                DroppedPackets::record(&mut drops, packets, AssemblyDrop::TimestampDiscontinuity);
+            CursorAdvance::SequenceChanged => {
+                self.drop_unit(&mut drops, AssemblyDrop::SequenceDiscontinuity);
             }
-            self.keyframe = GopState::Recovering;
-            if incomplete {
+            CursorAdvance::Started | CursorAdvance::Continuous => {}
+        }
+        if let AccessUnit::Collecting(unit) = &self.unit
+            && unit.timestamp != packet.timestamp
+        {
+            let fragment = unit.fragment;
+            self.drop_unit(&mut drops, AssemblyDrop::TimestampDiscontinuity);
+            if fragment.is_some() {
                 return AssemblyResult::rejected(PacketReject::TimestampChangedDuringFu, drops);
             }
         }
-        self.timestamp = Some(packet.timestamp);
         let payload = packet.payload;
-        if let Err(error) = self.append_payload(&payload) {
-            if let Some(packets) = self.clear_access_unit() {
-                DroppedPackets::record(&mut drops, packets, AssemblyDrop::PacketRejection);
+        let unit = match self.unit.append(packet.timestamp, &payload, packet.end) {
+            Ok(UnitAppend::Incomplete) => {
+                return AssemblyResult::accepted(AssemblyOutcome::Incomplete, drops);
             }
-            self.keyframe = GopState::Recovering;
-            return AssemblyResult::rejected(error, drops);
-        }
-        self.buffered_packets = self.buffered_packets.saturating_add(1);
-        if packet.end == AccessUnitEnd::More {
-            return AssemblyResult::accepted(AssemblyOutcome::Incomplete, drops);
-        }
-        if self.fu_kind.is_some() {
-            if let Some(buffered) = self.clear_access_unit()
-                && let Some(packets) = NonZeroU64::new(buffered.get().saturating_sub(1))
-            {
-                DroppedPackets::record(&mut drops, packets, AssemblyDrop::PacketRejection);
+            Ok(UnitAppend::Complete(unit)) => unit,
+            Err(rejection) => {
+                if let Some(packets) = rejection.buffered {
+                    DroppedPackets::record(&mut drops, packets, AssemblyDrop::PacketRejection);
+                }
+                self.keyframe = GopState::Recovering;
+                return AssemblyResult::rejected(rejection.reason, drops);
             }
-            self.keyframe = GopState::Recovering;
-            return AssemblyResult::rejected(PacketReject::MarkerEndedIncompleteFu, drops);
-        }
-        let data = std::mem::take(&mut self.data);
-        let kind = std::mem::replace(&mut self.kind, FrameKind::Delta);
-        let access_unit_packets = std::mem::take(&mut self.buffered_packets);
-        self.timestamp = None;
-        if data.is_empty() {
-            if let Some(packets) = NonZeroU64::new(access_unit_packets) {
-                DroppedPackets::record(&mut drops, packets, AssemblyDrop::EmptyAccessUnit);
-            }
+        };
+        if unit.data.is_empty() {
+            DroppedPackets::record(&mut drops, unit.packets, AssemblyDrop::EmptyAccessUnit);
             return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
         }
-        if self.keyframe == GopState::Recovering && kind != FrameKind::Key {
-            if let Some(packets) = NonZeroU64::new(access_unit_packets) {
+        let continuity = match (self.keyframe, unit.kind) {
+            (GopState::Recovering, FrameKind::Delta) => {
                 DroppedPackets::record(
                     &mut drops,
-                    packets,
+                    unit.packets,
                     AssemblyDrop::RecoveringWithoutKeyframe,
                 );
+                return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
             }
-            return AssemblyResult::accepted(AssemblyOutcome::Dropped, drops);
-        }
-        let continuity = if self.keyframe == GopState::Recovering {
-            self.keyframe = GopState::KeyframeCached;
-            Continuity::AfterGap
-        } else {
-            Continuity::Continuous
+            (GopState::Recovering, FrameKind::Key) => {
+                self.keyframe = GopState::KeyframeCached;
+                Continuity::AfterGap
+            }
+            (GopState::KeyframeCached, FrameKind::Delta | FrameKind::Key) => Continuity::Continuous,
         };
         AssemblyResult::accepted(
             AssemblyOutcome::Complete(Unit {
-                data: data.into(),
-                kind,
+                data: unit.data.into(),
+                kind: unit.kind,
                 continuity,
-                timestamp: packet.timestamp,
+                timestamp: unit.timestamp,
                 generation: packet.generation,
             }),
             drops,
         )
     }
+}
+
+enum CursorAdvance {
+    Started,
+    Continuous,
+    GenerationChanged,
+    SequenceChanged,
+    Stale,
+}
+
+impl StreamCursor {
+    fn advance(&mut self, generation: Generation, sequence: RtpSequence) -> CursorAdvance {
+        match *self {
+            Self::Fresh => {
+                *self = Self::Streaming {
+                    generation,
+                    next_sequence: sequence.next(),
+                };
+                CursorAdvance::Started
+            }
+            Self::Streaming {
+                generation: current,
+                ..
+            } if generation.get() < current.get() => CursorAdvance::Stale,
+            Self::Streaming {
+                generation: current,
+                ..
+            } if generation.get() > current.get() => {
+                *self = Self::Streaming {
+                    generation,
+                    next_sequence: sequence.next(),
+                };
+                CursorAdvance::GenerationChanged
+            }
+            Self::Streaming { next_sequence, .. } => {
+                *self = Self::Streaming {
+                    generation,
+                    next_sequence: sequence.next(),
+                };
+                if sequence == next_sequence {
+                    CursorAdvance::Continuous
+                } else {
+                    CursorAdvance::SequenceChanged
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FuPosition {
+    Start,
+    Middle,
+    End,
+}
+
+struct RejectedPacket {
+    reason: PacketReject,
+    buffered: Option<NonZeroU64>,
+}
+
+enum UnitAppend {
+    Incomplete,
+    Complete(PartialUnit),
+}
+
+impl AccessUnit {
+    fn discard(&mut self) -> Option<NonZeroU64> {
+        let packets = match self {
+            Self::Idle => None,
+            Self::Collecting(unit) => Some(unit.packets),
+        };
+        *self = Self::Idle;
+        packets
+    }
+
+    fn append(
+        &mut self,
+        timestamp: RtpTimestamp,
+        payload: &[u8],
+        end: AccessUnitEnd,
+    ) -> Result<UnitAppend, RejectedPacket> {
+        let current = std::mem::replace(self, Self::Idle);
+        let unit = match current {
+            Self::Idle => {
+                PartialUnit::start(timestamp, payload).map_err(|reason| RejectedPacket {
+                    reason,
+                    buffered: None,
+                })?
+            }
+            Self::Collecting(mut unit) => {
+                let buffered = Some(unit.packets);
+                unit.append_payload(payload)
+                    .map_err(|reason| RejectedPacket { reason, buffered })?;
+                unit.packets = unit.packets.saturating_add(1);
+                unit
+            }
+        };
+        match (end, unit.fragment) {
+            (AccessUnitEnd::More, None | Some(_)) => {
+                *self = Self::Collecting(unit);
+                Ok(UnitAppend::Incomplete)
+            }
+            (AccessUnitEnd::Final, None) => Ok(UnitAppend::Complete(unit)),
+            (AccessUnitEnd::Final, Some(_)) => Err(RejectedPacket {
+                reason: PacketReject::MarkerEndedIncompleteFu,
+                buffered: NonZeroU64::new(unit.packets.get().saturating_sub(1)),
+            }),
+        }
+    }
+}
+
+impl PartialUnit {
+    fn start(timestamp: RtpTimestamp, payload: &[u8]) -> Result<Self, PacketReject> {
+        let mut unit = Self {
+            timestamp,
+            kind: FrameKind::Delta,
+            data: Vec::new(),
+            packets: NonZeroU64::MIN,
+            fragment: None,
+        };
+        unit.append_payload(payload)?;
+        Ok(unit)
+    }
 
     fn append_payload(&mut self, payload: &[u8]) -> Result<(), PacketReject> {
-        if payload.is_empty() {
+        let Some(header) = payload.first() else {
             return Err(PacketReject::EmptyPayload);
-        }
-        let packet_type = payload[0] & 31;
-        if self.fu_kind.is_some() && packet_type != 28 {
+        };
+        let packet_type = header & 31;
+        if self.fragment.is_some() && packet_type != 28 {
             return Err(PacketReject::NalInterleavedWithFu);
         }
         match packet_type {
             1..=23 => self.append_nal(payload),
-            24 => {
-                let mut rest = &payload[1..];
-                while !rest.is_empty() {
-                    if rest.len() < 2 {
-                        return Err(PacketReject::TruncatedStapLength);
-                    }
-                    let len = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
-                    rest = &rest[2..];
-                    if len == 0 || len > rest.len() {
-                        return Err(PacketReject::InvalidStapNalLength);
-                    }
-                    self.append_nal(&rest[..len])?;
-                    rest = &rest[len..];
-                }
-                Ok(())
-            }
+            24 => self.append_stap(&payload[1..]),
             28 => self.append_fu(payload),
             kind => Err(PacketReject::UnsupportedPacketization { kind }),
         }
+    }
+
+    fn append_stap(&mut self, mut payload: &[u8]) -> Result<(), PacketReject> {
+        while !payload.is_empty() {
+            if payload.len() < 2 {
+                return Err(PacketReject::TruncatedStapLength);
+            }
+            let length = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+            payload = &payload[2..];
+            if length == 0 || length > payload.len() {
+                return Err(PacketReject::InvalidStapNalLength);
+            }
+            self.append_nal(&payload[..length])?;
+            payload = &payload[length..];
+        }
+        Ok(())
     }
 
     fn append_fu(&mut self, payload: &[u8]) -> Result<(), PacketReject> {
         if payload.len() < 3 {
             return Err(PacketReject::TruncatedFuPayload);
         }
-        let start = payload[1] & 0x80 != 0;
-        let end = payload[1] & 0x40 != 0;
-        let reserved = payload[1] & 0x20 != 0;
-        let kind = payload[1] & 31;
-        if reserved || kind == 0 || kind > 23 || start && end {
+        if payload[1] & 0x20 != 0 {
             return Err(PacketReject::InvalidFuHeader);
         }
-        match (start, self.fu_kind) {
-            (true, None) => {
-                self.push(&[0, 0, 0, 1, payload[0] & 0xe0 | kind])?;
-                self.fu_kind = Some(kind);
+        let Some(kind) = NalType::new(payload[1] & 31) else {
+            return Err(PacketReject::InvalidFuHeader);
+        };
+        let position = match (payload[1] & 0x80 != 0, payload[1] & 0x40 != 0) {
+            (true, true) => return Err(PacketReject::InvalidFuHeader),
+            (true, false) => FuPosition::Start,
+            (false, true) => FuPosition::End,
+            (false, false) => FuPosition::Middle,
+        };
+        match (position, self.fragment) {
+            (FuPosition::Start, None) => {
+                self.push(&[0, 0, 0, 1, payload[0] & 0xe0 | kind.value()])?;
+                self.fragment = Some(kind);
             }
-            (false, Some(active)) if active == kind => {}
-            _ => return Err(PacketReject::InvalidFuSequence),
+            (FuPosition::Start, Some(_)) | (FuPosition::Middle | FuPosition::End, None) => {
+                return Err(PacketReject::InvalidFuSequence);
+            }
+            (FuPosition::Middle | FuPosition::End, Some(active)) => {
+                if active != kind {
+                    return Err(PacketReject::InvalidFuSequence);
+                }
+            }
         }
         self.push(&payload[2..])?;
-        if kind == 5 {
+        if kind.is_keyframe() {
             self.kind = FrameKind::Key;
         }
-        if end {
-            self.fu_kind = None;
+        match position {
+            FuPosition::Start | FuPosition::Middle => {}
+            FuPosition::End => self.fragment = None,
         }
         Ok(())
     }
 
     fn append_nal(&mut self, nal: &[u8]) -> Result<(), PacketReject> {
-        if nal[0] & 31 == 5 {
+        // STAP-A lengths delimit opaque member bytes, so a member type outside
+        // `NalType` is appended, not rejected; only known types are classified.
+        if NalType::new(nal[0] & 31).is_some_and(NalType::is_keyframe) {
             self.kind = FrameKind::Key;
         }
         self.push(&[0, 0, 0, 1])?;
@@ -323,14 +447,6 @@ impl Assembler {
         }
         self.data.extend_from_slice(value);
         Ok(())
-    }
-
-    fn clear_access_unit(&mut self) -> Option<NonZeroU64> {
-        self.data.clear();
-        self.kind = FrameKind::Delta;
-        self.fu_kind = None;
-        self.timestamp = None;
-        NonZeroU64::new(std::mem::take(&mut self.buffered_packets))
     }
 }
 
@@ -380,6 +496,46 @@ mod tests {
         )
         .expect("final fragment should complete the replacement generation");
         assert_eq!(value.continuity, Continuity::AfterGap);
+    }
+
+    #[test]
+    fn generation_change_drops_open_fragment_before_rejecting_continuation() {
+        let mut assembler = Assembler::default();
+        let started = assembler.consume(packet(1, 1, 1, AccessUnitEnd::More, &[0x7c, 0x81, 1]));
+        assert!(matches!(started.outcome, Ok(AssemblyOutcome::Incomplete)));
+
+        let changed = assembler.consume(packet(2, 1, 2, AccessUnitEnd::Final, &[0x7c, 0x41, 2]));
+        assert!(matches!(
+            changed.outcome,
+            Err(PacketReject::InvalidFuSequence)
+        ));
+        assert_eq!(
+            changed.drops,
+            Some(DroppedPackets {
+                packets: NonZeroU64::MIN,
+                reason: AssemblyDrop::GenerationDiscontinuity,
+            })
+        );
+    }
+
+    #[test]
+    fn sequence_gap_drops_open_fragment_before_rejecting_continuation() {
+        let mut assembler = Assembler::default();
+        let started = assembler.consume(packet(1, 1, 1, AccessUnitEnd::More, &[0x7c, 0x81, 1]));
+        assert!(matches!(started.outcome, Ok(AssemblyOutcome::Incomplete)));
+
+        let changed = assembler.consume(packet(3, 1, 1, AccessUnitEnd::Final, &[0x7c, 0x41, 2]));
+        assert!(matches!(
+            changed.outcome,
+            Err(PacketReject::InvalidFuSequence)
+        ));
+        assert_eq!(
+            changed.drops,
+            Some(DroppedPackets {
+                packets: NonZeroU64::MIN,
+                reason: AssemblyDrop::SequenceDiscontinuity,
+            })
+        );
     }
 
     #[test]

@@ -27,6 +27,26 @@ impl RtpSequence {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NalType(u8);
+
+impl NalType {
+    pub(super) fn new(value: u8) -> Option<Self> {
+        match value {
+            1..=23 => Some(Self(value)),
+            0 | 24..=u8::MAX => None,
+        }
+    }
+
+    pub(super) fn value(self) -> u8 {
+        self.0
+    }
+
+    pub(super) fn is_keyframe(self) -> bool {
+        self.0 == 5
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Packet {
     pub(super) end: AccessUnitEnd,
