@@ -51,11 +51,7 @@ function viewerElements(): ViewerElements {
     ),
     resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
-    latency: requireElement(
-      "#latency",
-      (element): element is HTMLFieldSetElement =>
-        element instanceof HTMLFieldSetElement,
-    ),
+    latency: requireElement("#latency", html),
     fullscreenButton: requireElement("#fullscreen", button),
     pinButton: requireElement("#pin-panel", button),
     closeButton: requireElement("#close-panel", button),
@@ -68,7 +64,7 @@ function viewerElements(): ViewerElements {
 }
 
 // The latency choice sticks between visits when storage allows it.
-function checkedLatency(latency: HTMLFieldSetElement): number {
+function checkedLatency(latency: HTMLElement): number {
   let stored: string | null = null;
   try {
     stored = localStorage.getItem(LATENCY_STORAGE_KEY);
@@ -185,7 +181,7 @@ function startViewer(): void {
         if (disposed) return;
         console.warn("local clipboard read failed", error);
         elements.clipboardStatus.textContent =
-          "The browser refused to read the local clipboard";
+          "The browser would not hand over your clipboard";
       }
     });
     onPermissionClick(elements.copyClipboardButton, async () => {
@@ -193,8 +189,7 @@ function startViewer(): void {
       if (text === null) return;
       try {
         await navigator.clipboard.writeText(text);
-        if (!disposed)
-          elements.clipboardStatus.textContent = "Desktop clipboard copied";
+        if (!disposed) elements.clipboardStatus.textContent = "";
       } catch (error) {
         if (disposed) return;
         let copied = false;
@@ -210,8 +205,8 @@ function startViewer(): void {
           document.removeEventListener("copy", handleCopy);
         }
         elements.clipboardStatus.textContent = copied
-          ? "Desktop clipboard copied"
-          : "The browser refused to write the local clipboard";
+          ? ""
+          : "The browser would not take the desktop's clipboard";
         if (!copied) console.warn("remote clipboard write failed", error);
       }
     });

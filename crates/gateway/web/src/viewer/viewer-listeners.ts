@@ -26,7 +26,7 @@ export type ViewerElements = {
   readonly resetVideoButton: HTMLButtonElement;
   readonly clipboardStatus: HTMLElement;
   readonly hudToggle: HTMLInputElement;
-  readonly latency: HTMLFieldSetElement;
+  readonly latency: HTMLElement;
   readonly fullscreenButton: HTMLButtonElement;
   readonly pinButton: HTMLButtonElement;
   readonly closeButton: HTMLButtonElement;
@@ -93,44 +93,46 @@ function signalHeadline(state: WaywireSessionState): string {
   }
 }
 
+// Say what is true of the stream, not how exciting it is.
 function videoLabel(state: WaywireSessionState): string {
   switch (state.video.state) {
     case "idle":
     case "connecting":
       return "Connecting";
     case "connected":
-      return "Live";
+      return "Connected";
     case "reconnecting":
       return "Reconnecting";
     case "disconnected":
-      return "Disconnected";
+      return "Not connected";
     case "error":
       return "Video stopped";
   }
 }
 
 function titleFor(state: WaywireSessionState): string {
-  if (state.video.state === "error") return "Waywire · fault";
+  if (state.video.state === "error") return "Waywire · video stopped";
   if (state.video.state === "reconnecting") return "Waywire · reconnecting";
-  if (state.video.state !== "connected") return "Waywire · offline";
-  if (state.input.state === "busy") return "Waywire · another viewer driving";
-  return "Waywire · live";
+  if (state.video.state !== "connected") return "Waywire · not connected";
+  if (state.input.state === "busy") return "Waywire · someone else has it";
+  return "Waywire · connected";
 }
 
+// The second half of the status line answers the other question a person
+// has: do my mouse and keyboard reach that desktop?
 function inputLabel(state: WaywireSessionState): string {
   switch (state.input.state) {
     case "active":
-      return "Driving";
-    case "ready":
-      return "Ready";
+      return "yours to use";
     case "requesting":
     case "connecting":
-      return "Requesting control";
+      return "claiming it";
     case "busy":
-      return "Another viewer is driving";
+      return "someone else has it";
+    case "ready":
     case "idle":
     case "disconnected":
-      return "Watching";
+      return "watching only";
   }
 }
 
@@ -176,7 +178,7 @@ export function installViewerListeners(
     cleanup.push(() => document.removeEventListener(type, listener));
   };
 
-  // Panel: floating (light dismiss, scrim, keys held) or pinned (a palette
+  // Menu: floating (light dismiss, scrim, keys held) or pinned (a palette
   // that stays and lets the desktop through).
   let panel: Panel =
     readStored(PANEL_STORAGE_KEY) === "pinned" ? "pinned" : "floating";
@@ -202,9 +204,9 @@ export function installViewerListeners(
   applyPanelMode();
   if (panel === "pinned") elements.panel.showPopover();
 
-  // Driving is seamless. The SDK ties the lease to canvas focus, so the
-  // screen takes focus whenever the pointer is over it or the window comes
-  // back, unless the viewer chose to stop driving.
+  // Reaching the desktop is seamless. The SDK ties the lease to canvas
+  // focus, so the screen takes focus whenever the pointer is over it or the
+  // window comes back, unless the viewer switched their input off.
   let wheel: Wheel = "auto";
   const focusScreen = (): void => {
     if (wheel === "handsOff") return;
@@ -221,21 +223,25 @@ export function installViewerListeners(
   const onWindowFocus = (): void => focusScreen();
   window.addEventListener("focus", onWindowFocus);
   cleanup.push(() => window.removeEventListener("focus", onWindowFocus));
-  const controlLabel = (): string =>
-    wheel === "handsOff" ? "Start driving" : "Stop driving";
+  const renderWheel = (): void => {
+    elements.controlToggle.setAttribute(
+      "aria-pressed",
+      String(wheel === "auto"),
+    );
+  };
   // The one mode a person forgets they are in gets the page's one pill.
   const renderLeaseNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent =
-        "You stopped driving · Esc twice for controls";
+      elements.leaseNotice.textContent = "Your mouse and keyboard are off";
       elements.leaseNotice.hidden = false;
     } else if (state.input.state === "busy") {
-      elements.leaseNotice.textContent = "Another viewer is driving";
+      elements.leaseNotice.textContent = "Someone else has this desktop";
       elements.leaseNotice.hidden = false;
     } else {
       elements.leaseNotice.hidden = true;
     }
   };
+  renderWheel();
 
   let lastState: WaywireSessionState | null = null;
   let framesSinceConnect = 0;
@@ -257,10 +263,6 @@ export function installViewerListeners(
       elements.controlStatus.textContent = inputLabel(state);
       elements.controlStatus.title = state.input.message;
       elements.controlStatus.dataset["state"] = state.input.state;
-      elements.controlToggle.textContent = controlLabel();
-      elements.pointerLockButton.textContent = state.input.pointerLocked
-        ? "Unlock pointer"
-        : "Lock pointer";
       elements.pointerLockButton.setAttribute(
         "aria-pressed",
         String(state.input.pointerLocked),
@@ -342,8 +344,9 @@ export function installViewerListeners(
   );
   cleanup.push(
     session.on("clipboard", (event) => {
-      elements.clipboardStatus.textContent = event.status;
-      elements.copyClipboardButton.disabled = event.text === null;
+      elements.copyClipboardButton.disabled =
+        event.text === null || event.text.length === 0;
+      if (event.text !== null) elements.clipboardStatus.textContent = "";
     }),
   );
   cleanup.push(
@@ -362,7 +365,7 @@ export function installViewerListeners(
     session.on("error", (error) => console.warn("Waywire stream error", error)),
   );
 
-  // The key and the panel's controls never take focus, so pressing them
+  // The key and the menu's controls never take focus, so pressing them
   // leaves the screen focused and the lease where it was.
   const keepScreenFocus = (event: PointerEvent): void => event.preventDefault();
   listen(elements.menuKey, "pointerdown", keepScreenFocus);
@@ -382,13 +385,13 @@ export function installViewerListeners(
       session.input.release();
       elements.display.blur();
     }
-    elements.controlToggle.textContent = controlLabel();
+    renderWheel();
     if (lastState) renderLeaseNotice(lastState);
     settle();
   });
   listen(elements.keyboardButton, "click", () => {
     wheel = "auto";
-    elements.controlToggle.textContent = controlLabel();
+    renderWheel();
     if (lastState) renderLeaseNotice(lastState);
     session.input.acquire();
     settle();
@@ -428,9 +431,10 @@ export function installViewerListeners(
     );
   });
 
-  // Escape twice from the screen opens the panel; a single Escape still
-  // reaches the remote. With a floating panel open no key reaches the
-  // remote and one Escape closes it; a pinned panel lets keys through.
+  // Escape twice from the screen opens the menu without the pointer; a
+  // single Escape still reaches the remote. With a floating menu open no key
+  // reaches the remote and one Escape closes it; a pinned menu lets keys
+  // through.
   let lastEscapeAt = Number.NEGATIVE_INFINITY;
   const escapeChord = (event: KeyboardEvent): void => {
     if (panel === "floating" && panelOpen()) {
@@ -453,7 +457,7 @@ export function installViewerListeners(
   };
   listen(elements.display, "keydown", escapeChord, { capture: true });
 
-  // The key dims while the pointer rests so it stops reading as chrome.
+  // The key fades while the pointer rests so it stops reading as chrome.
   let stillTimer: ReturnType<typeof setTimeout> | null = null;
   const pointerMoved = (): void => {
     elements.stage.dataset["pointer"] = "moving";

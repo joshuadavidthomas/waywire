@@ -1,18 +1,22 @@
 /* The page is the desktop. The canvas fills the viewport, the screen itself
-   says whether the feed is live, and one corner key opens the only panel.
-   Panel rules follow ui.sh: whitespace before dividers, ghost items instead
-   of cards, a recessed well for preferences, no shadows in the dark. */
+   says whether the feed is live, and one corner key opens the only menu.
+
+   The menu follows ui.sh: rows rather than cards, a hairline only between
+   groups, no shadows in the dark, opacity-based lines, 16px icons that are
+   never rescaled. Icons come from one set (Lucide) so a pushpin, a keyboard,
+   and a clipboard read as siblings. */
 :root {
   color-scheme: dark;
   --screen: #000;
   --panel: #171717;
-  --well: #111111;
-  --ring: rgba(255, 255, 255, 0.06);
-  --hover: rgba(255, 255, 255, 0.06);
-  --pressed: rgba(255, 255, 255, 0.09);
-  --ink: #e5e5e5;
+  --panel-hi: #232323;
+  --panel-on: #2b2b2b;
+  --sunk: rgba(255, 255, 255, 0.05);
+  --ring: rgba(255, 255, 255, 0.08);
+  --line: rgba(255, 255, 255, 0.07);
+  --ink: #ededed;
   --ink-dim: #a1a1a1;
-  --ink-faint: #737373;
+  --ink-faint: #6f6f6f;
   --lamp-live: #4ade80;
   --lamp-wait: #fbbf24;
   --lamp-fault: #f87171;
@@ -42,6 +46,17 @@ body {
   overflow: hidden;
 }
 
+/* One icon size, one stroke, everywhere. */
+svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  stroke-width: 2.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 /* Stage */
 
 .stage {
@@ -65,9 +80,9 @@ canvas {
   cursor: default;
 }
 
-/* While the floating panel is open a scrim above the canvas takes the
-   dismissing click, so closing the panel never presses a button on the remote
-   desktop. A pinned panel is a palette and lets the desktop through. */
+/* While the floating menu is open a scrim above the canvas takes the
+   dismissing click, so closing the menu never presses a button on the remote
+   desktop. A pinned menu is a palette and lets the desktop through. */
 .stage[data-panel="floating"]:has(.panel:popover-open)::before {
   content: "";
   position: absolute;
@@ -75,7 +90,7 @@ canvas {
   z-index: 1;
 }
 
-/* Only someone else holding the desktop, or your own hands-off, gets a line. */
+/* Only someone else holding the desktop, or your own hands off, gets a line. */
 .lease-notice {
   position: absolute;
   top: 12px;
@@ -106,7 +121,7 @@ canvas {
   background: var(--lamp-wait);
 }
 
-/* Not live: the screen says so, over whatever frame it last held. */
+/* No picture: the screen says so, over whatever frame it last held. */
 
 .signal {
   position: absolute;
@@ -164,7 +179,7 @@ canvas {
   background: var(--lamp-fault);
 }
 
-/* Stats: a persistent readout in the top-right, on when you ask for it. */
+/* Stats: a readout in the top right, on when you ask for it. */
 
 .hud {
   position: absolute;
@@ -207,12 +222,13 @@ canvas {
   color: var(--lamp-wait);
 }
 
-/* The key */
+/* The key. Its centre is the centre of the menu's close button, so opening
+   and closing never moves the target under the pointer. */
 
 .menu-key {
   position: absolute;
-  right: 12px;
-  bottom: 12px;
+  right: 18px;
+  bottom: 18px;
   z-index: 2;
   width: 36px;
   height: 36px;
@@ -223,22 +239,17 @@ canvas {
   border-radius: 50%;
   background: var(--panel);
   box-shadow: inset 0 0 0 1px var(--ring);
-  color: var(--ink);
+  color: var(--ink-dim);
   cursor: pointer;
   opacity: 0.92;
   transition: opacity 400ms ease-out;
 }
 
-.menu-key svg {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-}
-
 .menu-key:hover,
 .menu-key:focus-visible {
   opacity: 1;
-  background: var(--pressed);
+  background: var(--panel-hi);
+  color: var(--ink);
 }
 
 .menu-key:focus-visible {
@@ -247,25 +258,25 @@ canvas {
 }
 
 .stage[data-pointer="still"] .menu-key:not(:hover):not(:focus-visible) {
-  opacity: 0.22;
+  opacity: 0.28;
 }
 
 .stage:has(.panel:popover-open) .menu-key {
   visibility: hidden;
 }
 
-/* The panel */
+/* The menu */
 
 .panel {
   position: fixed;
   inset: auto 12px 12px auto;
-  width: min(344px, calc(100vw - 24px));
+  width: min(360px, calc(100vw - 24px));
   max-height: calc(100dvh - 24px);
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--ring) transparent;
   margin: 0;
-  padding: 14px 12px 10px;
+  padding: 6px;
   border: 0;
   border-radius: 12px;
   background: var(--panel);
@@ -290,13 +301,13 @@ canvas {
 
 /* One status line, not stacked lamps. */
 .status {
-  margin: 0 0 8px;
-  padding: 0 8px;
+  margin: 0;
+  padding: 6px 8px 8px;
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  color: var(--ink);
+  color: var(--ink-dim);
 }
 
 .status > span {
@@ -331,7 +342,7 @@ canvas {
   background: var(--lamp-fault);
 }
 
-/* Menu groups: whitespace between groups, ghost items inside. */
+/* Groups of rows, one hairline between them. */
 
 .menu {
   margin: 0;
@@ -339,57 +350,93 @@ canvas {
   list-style: none;
 }
 
-.menu + .menu {
-  margin-top: 10px;
+.menu,
+.panel-foot {
+  border-top: 1px solid var(--line);
+  margin-inline: -6px;
+  padding-inline: 6px;
+  padding-top: 6px;
+}
+
+.menu + .menu,
+.panel-foot {
+  margin-top: 6px;
 }
 
 .item {
-  position: relative;
-  display: block;
+  display: grid;
+  grid-template-columns: 16px 1fr auto;
+  align-items: center;
+  gap: 10px;
   width: 100%;
-  min-height: 32px;
-  padding: 6px 8px;
+  min-height: 34px;
+  margin: 0;
+  padding: 4px 8px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
   color: var(--ink);
   font: inherit;
   text-align: left;
+}
+
+.item .glyph {
+  color: var(--ink-dim);
+}
+
+.item .check {
+  color: var(--lamp-live);
+}
+
+.item[aria-pressed="false"] .check {
+  visibility: hidden;
+}
+
+:is(button, label).item {
   cursor: pointer;
 }
 
-.item:hover:not(:disabled) {
-  background: var(--hover);
+:is(button, label).item:hover {
+  background: var(--panel-hi);
 }
 
-.item:focus-visible {
+:is(button, label).item:hover .glyph {
+  color: var(--ink);
+}
+
+.item:focus-visible,
+.item:has(input:focus-visible):not(.latency) {
   outline: 2px solid var(--lamp-live);
   outline-offset: -2px;
 }
 
 .item:disabled {
-  color: var(--ink-faint);
   cursor: default;
+  color: var(--ink-faint);
 }
 
-.item[aria-pressed="true"] {
-  background: var(--pressed);
+.item:disabled .glyph {
+  color: var(--ink-faint);
 }
 
-.item[aria-pressed="true"]::after {
-  content: "";
-  position: absolute;
-  right: 10px;
-  top: 50%;
-  width: 8px;
-  height: 8px;
-  margin-top: -4px;
-  border-radius: 50%;
-  background: var(--lamp-live);
+.item:disabled:hover {
+  background: transparent;
 }
 
+/* The soft keyboard only exists where there is one to summon. */
+.on-touch {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .on-touch {
+    display: block;
+  }
+}
+
+/* A short line under an action, only when something went wrong. */
 .note {
-  padding: 4px 8px 0;
+  padding: 2px 8px 4px 34px;
   color: var(--ink-dim);
 }
 
@@ -397,99 +444,7 @@ canvas {
   display: none;
 }
 
-/* Preferences: a recessed well. */
-
-.prefs {
-  margin-top: 12px;
-  padding: 4px 8px;
-  border-radius: 8px;
-  background: var(--well);
-  box-shadow: inset 0 0 0 1px var(--ring);
-}
-
-.pref {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 36px;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  color: var(--ink);
-}
-
-.pref + .pref {
-  box-shadow: 0 -1px 0 var(--ring);
-}
-
-.latency legend {
-  float: left;
-  padding: 0;
-}
-
-.latency {
-  flex-wrap: wrap;
-  justify-content: flex-start;
-  column-gap: 14px;
-  row-gap: 4px;
-}
-
-.latency legend {
-  margin-right: auto;
-}
-
-.radio {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-
-.radio-mark {
-  display: inline-grid;
-  width: 16px;
-  height: 16px;
-  grid-template-columns: 1fr;
-}
-
-.radio-mark input {
-  grid-area: 1 / 1;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  appearance: none;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.05);
-  cursor: pointer;
-}
-
-.radio-mark input:checked {
-  border-color: var(--lamp-live);
-  background: var(--lamp-live);
-}
-
-.radio-mark input:focus-visible {
-  outline: 2px solid var(--lamp-live);
-  outline-offset: 2px;
-}
-
-.radio-mark::after {
-  content: "";
-  grid-area: 1 / 1;
-  width: 40%;
-  height: 40%;
-  place-self: center;
-  border-radius: 50%;
-  background: var(--screen);
-  opacity: 0;
-  pointer-events: none;
-}
-
-.radio-mark:has(input:checked)::after {
-  opacity: 1;
-}
+/* Two-state and three-state controls sit in their rows, no card around them. */
 
 .toggle {
   position: relative;
@@ -498,8 +453,8 @@ canvas {
   width: 36px;
   padding: 2px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  background: var(--sunk);
+  box-shadow: inset 0 0 0 1px var(--ring);
   transition: background-color var(--move);
 }
 
@@ -530,56 +485,76 @@ canvas {
   outline: none;
 }
 
-.toggle:has(input:focus-visible) {
-  outline: 2px solid var(--lamp-live);
-  outline-offset: 2px;
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--sunk);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  font-size: 13px;
 }
 
-/* Foot: the hint and the three tools, sitting where the key was. */
+.segment {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 6px;
+  color: var(--ink-dim);
+  cursor: pointer;
+}
+
+.segment:has(input:checked) {
+  background: var(--panel-on);
+  color: var(--ink);
+}
+
+.segment input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  appearance: none;
+  cursor: pointer;
+  outline: none;
+}
+
+.segment:has(input:focus-visible) {
+  outline: 2px solid var(--lamp-live);
+  outline-offset: -2px;
+}
+
+/* Foot: three tools, the close button standing where the key was. */
 
 .panel-foot {
-  margin-top: 10px;
   display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.hint {
-  margin: 0;
-  padding: 0 8px 4px;
-  min-width: 0;
-  color: var(--ink-faint);
+  justify-content: flex-end;
 }
 
 .tools {
   display: flex;
   gap: 2px;
-  flex-shrink: 0;
 }
 
 .tool {
   position: relative;
-  width: 32px;
-  height: 32px;
+  width: 36px;
+  height: 36px;
   padding: 0;
   display: grid;
   place-items: center;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
   color: var(--ink-dim);
   cursor: pointer;
 }
 
-.tool svg {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-}
-
 .tool:hover {
-  background: var(--hover);
+  background: var(--panel-hi);
   color: var(--ink);
 }
 
@@ -589,7 +564,7 @@ canvas {
 }
 
 .tool[aria-pressed="true"] {
-  background: var(--pressed);
+  background: var(--panel-on);
   color: var(--lamp-live);
 }
 
@@ -615,8 +590,8 @@ canvas {
   pointer-events: none;
 }
 
-/* Phones: larger text and controls, the panel is a sheet, the readout keeps
-   the four rows that matter. */
+/* Phones: larger text and controls, the menu is a sheet, the readout keeps
+   the four rows that matter. The key still stands where close will. */
 
 @media (max-width: 480px) {
   :root {
@@ -633,12 +608,10 @@ canvas {
 
   .item {
     min-height: 44px;
-    padding: 10px 8px;
   }
 
-  .radio-mark {
-    width: 20px;
-    height: 20px;
+  .segment {
+    height: 32px;
   }
 
   .toggle {
@@ -646,15 +619,15 @@ canvas {
   }
 
   .tool {
-    width: 40px;
-    height: 40px;
+    width: 44px;
+    height: 44px;
   }
 
   .menu-key {
     width: 44px;
     height: 44px;
-    right: 14px;
-    bottom: max(14px, env(safe-area-inset-bottom));
+    right: 6px;
+    bottom: max(10px, env(safe-area-inset-bottom));
   }
 
   .hud {
