@@ -1,8 +1,8 @@
 import { ProtocolVersionMismatchError } from "../sdk/messages.ts";
+import { initialPlayoutTargetMs } from "../sdk/playout.ts";
 import { WaywireSession, type SurfaceHandle } from "../sdk/waywire.ts";
 import {
   installViewerListeners,
-  LATENCY_STORAGE_KEY,
   type ViewerControls,
   type ViewerElements,
 } from "./viewer-listeners.ts";
@@ -25,6 +25,10 @@ function viewerElements(): ViewerElements {
     element instanceof HTMLButtonElement;
   const input = (element: Element): element is HTMLInputElement =>
     element instanceof HTMLInputElement;
+  const select = (element: Element): element is HTMLSelectElement =>
+    element instanceof HTMLSelectElement;
+  const label = (element: Element): element is HTMLLabelElement =>
+    element instanceof HTMLLabelElement;
   return {
     stage: requireElement("#stage", html),
     display: requireElement(
@@ -35,7 +39,7 @@ function viewerElements(): ViewerElements {
     signal: requireElement("#signal", html),
     signalHeadline: requireElement("#signal-headline", html),
     signalMessage: requireElement("#signal-message", html),
-    leaseNotice: requireElement("#lease-notice", html),
+    notice: requireElement("#notice", html),
     hud: requireElement("#hud", html),
     menuKey: requireElement("#menu-key", button),
     panel: requireElement("#panel", html),
@@ -46,10 +50,11 @@ function viewerElements(): ViewerElements {
     keyboardButton: requireElement("#keyboard", button),
     sendClipboardButton: requireElement("#send-clipboard", button),
     copyClipboardButton: requireElement("#copy-clipboard", button),
+    resolutionSelect: requireElement("#resolution", select),
+    resolutionLabel: requireElement("#resolution-label", label),
     hudToggle: requireElement("#hud-toggle", input),
     resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
-    latency: requireElement("#latency", html),
     fullscreenButton: requireElement("#fullscreen", button),
     pinButton: requireElement("#pin-panel", button),
     closeButton: requireElement("#close-panel", button),
@@ -57,26 +62,12 @@ function viewerElements(): ViewerElements {
   };
 }
 
-// The latency choice sticks between visits when storage allows it.
-function checkedLatency(latency: HTMLElement): number {
-  let stored: string | null = null;
-  try {
-    stored = localStorage.getItem(LATENCY_STORAGE_KEY);
-  } catch {
-    stored = null;
-  }
-  for (const input of latency.querySelectorAll("input")) {
-    if (input.value === stored) input.checked = true;
-  }
-  const checked = latency.querySelector("input:checked");
-  return checked instanceof HTMLInputElement ? Number(checked.value) : 60;
-}
-
 function startViewer(): void {
   const elements = viewerElements();
   const session = new WaywireSession({
-    latency: checkedLatency(elements.latency),
-    statsIntervalMs: 250,
+    latency: initialPlayoutTargetMs,
+    // Sample every drawn frame for playout control; the HUD throttles its own updates.
+    statsIntervalMs: 0,
     remoteDisplay: {
       mode: "observe",
       element: elements.display,

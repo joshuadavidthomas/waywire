@@ -21,6 +21,7 @@ export class FakeTarget {
   VideoDecoder: unknown = true;
   hidden = false;
   pointerLockElement: unknown = null;
+  activeElement: unknown = null;
   width = 1280;
   height = 720;
   rect = { width: 1280, height: 720, left: 0, top: 0 };
@@ -28,6 +29,7 @@ export class FakeTarget {
   getContext: (...values: unknown[]) => unknown = () => ({});
   requestPointerLock: () => Promise<void> = () => Promise.resolve();
   focus: (...values: unknown[]) => void = () => undefined;
+  hasFocus: () => boolean = () => true;
   getBoundingClientRect = () => ({ ...this.rect });
   hasPointerCapture = (_pointerId: number): boolean => false;
   setPointerCapture(_pointerId: number): void {}

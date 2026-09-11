@@ -16,7 +16,7 @@
           <span id="signal-message" class="signal-detail"></span>
         </p>
       </div>
-      <p id="lease-notice" class="lease-notice" role="status" hidden></p>
+      <p id="notice" class="notice" role="status" hidden></p>
       <!-- One measurement per row, each labelled with what it measures. The
            readout holds a fixed width so the numbers stay put as they change. -->
       <dl id="hud" class="hud" hidden>
@@ -24,28 +24,28 @@
         <dd data-field="resolution" data-resize="idle">-</dd>
         <dt>Frame rate</dt>
         <dd data-field="rate">-</dd>
-        <dt>Bitrate</dt>
-        <dd data-field="bitrate">-</dd>
+        <dt>Target bitrate</dt>
+        <dd data-field="target-bitrate">-</dd>
         <dt>Encode scale</dt>
         <dd data-field="scale">-</dd>
-        <dt>Round trip</dt>
+        <dt>RTT</dt>
         <dd data-field="rtt">-</dd>
         <dt>Frame lateness</dt>
         <dd data-field="late">-</dd>
-        <dt>Latency target</dt>
-        <dd data-field="target">-</dd>
-        <dt>Clock error</dt>
-        <dd data-field="clock">-</dd>
-        <dt>Input queue</dt>
-        <dd data-field="input-queue">-</dd>
+        <dt>Video latency target</dt>
+        <dd data-field="video-latency-target">-</dd>
+        <dt>Clock uncertainty</dt>
+        <dd data-field="clock-uncertainty">-</dd>
+        <dt>Unacknowledged input</dt>
+        <dd data-field="unacknowledged-input">-</dd>
         <dt>Decode queue</dt>
         <dd data-field="decode-queue">-</dd>
         <dt>Frames dropped</dt>
         <dd data-field="dropped">-</dd>
         <dt>Frames received</dt>
         <dd data-field="received">-</dd>
-        <dt>Last resize</dt>
-        <dd data-field="resize">-</dd>
+        <dt>Resize time</dt>
+        <dd data-field="resize-time">-</dd>
         <dt>Codec</dt>
         <dd data-field="codec">-</dd>
       </dl>
@@ -202,6 +202,48 @@
         </ul>
         <ul class="menu" role="list" aria-label="Picture">
           <li>
+            <div class="item" title="Choose the remote screen size">
+              <svg
+                class="glyph"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect width="20" height="14" x="2" y="3" rx="2" />
+                <path d="M8 21h8" />
+                <path d="M12 17v4" />
+              </svg>
+              <label id="resolution-label" class="label" for="resolution">
+                Resolution
+              </label>
+              <span class="resolution-control">
+                <select
+                  id="resolution"
+                  class="resolution-select"
+                  name="resolution"
+                >
+                  <option value="fit">Fit to window</option>
+                  <option value="2560x1440">2560 × 1440</option>
+                  <option value="1920x1080">1920 × 1080</option>
+                  <option value="1600x900">1600 × 900</option>
+                  <option value="1366x768">1366 × 768</option>
+                  <option value="1280x720">1280 × 720</option>
+                  <option value="1024x768">1024 × 768</option>
+                </select>
+                <svg
+                  class="resolution-chevron"
+                  viewBox="0 0 8 5"
+                  width="8"
+                  height="5"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path d="M.5.5 4 4 7.5.5" />
+                </svg>
+              </span>
+            </div>
+          </li>
+          <li>
             <label class="item" for="hud-toggle" title="Show stream numbers">
               <svg
                 class="glyph"
@@ -224,40 +266,6 @@
                 />
               </span>
             </label>
-          </li>
-          <li>
-            <div
-              id="latency"
-              class="item latency"
-              role="radiogroup"
-              aria-labelledby="latency-label"
-              title="Shorter reacts sooner, longer rides out a bumpy connection"
-            >
-              <svg
-                class="glyph"
-                viewBox="0 0 24 24"
-                fill="none"
-                aria-hidden="true"
-              >
-                <path d="m12 14 4-4" />
-                <path d="M3.34 19a10 10 0 1 1 17.32 0" />
-              </svg>
-              <span id="latency-label" class="label">Latency target</span>
-              <span class="segmented">
-                <label class="segment">
-                  <input name="latency" type="radio" value="60" checked />
-                  <span>60 ms</span>
-                </label>
-                <label class="segment">
-                  <input name="latency" type="radio" value="100" />
-                  <span>100 ms</span>
-                </label>
-                <label class="segment">
-                  <input name="latency" type="radio" value="180" />
-                  <span>180 ms</span>
-                </label>
-              </span>
-            </div>
           </li>
           <li>
             <button

@@ -16,7 +16,7 @@ use waywire_protocol::pipe::ScaleV120;
 
 use super::State;
 
-const RESET_DIMENSION_DELTA: u32 = 2;
+const DISPLAY_RESET_DIMENSION_DELTA: u32 = 2;
 const MAX_RESIZE_STEP_FAILURES: u8 = 3;
 const OUTPUT_CONFIGURATION_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -39,14 +39,14 @@ impl OutputSize {
         }
     }
 
-    fn reset_bounce(self) -> Result<Self, ResetRefusal> {
-        let Some(width) = self.width.checked_sub(RESET_DIMENSION_DELTA) else {
-            return Err(ResetRefusal::OutputTooSmall);
+    fn display_reset_bounce(self) -> Result<Self, DisplayResetRefusal> {
+        let Some(width) = self.width.checked_sub(DISPLAY_RESET_DIMENSION_DELTA) else {
+            return Err(DisplayResetRefusal::OutputTooSmall);
         };
-        let Some(height) = self.height.checked_sub(RESET_DIMENSION_DELTA) else {
-            return Err(ResetRefusal::OutputTooSmall);
+        let Some(height) = self.height.checked_sub(DISPLAY_RESET_DIMENSION_DELTA) else {
+            return Err(DisplayResetRefusal::OutputTooSmall);
         };
-        Self::new(width, height).ok_or(ResetRefusal::OutputTooSmall)
+        Self::new(width, height).ok_or(DisplayResetRefusal::OutputTooSmall)
     }
 
     pub(crate) fn external_size(self) -> Result<FrameSize> {
@@ -79,11 +79,11 @@ enum RequestPurpose {
         scale_v120: ScaleV120,
         failures: u8,
     },
-    ResetBounce {
+    DisplayResetBounce {
         original: OutputSize,
         failures: u8,
     },
-    ResetRestore {
+    DisplayResetRestore {
         failures: u8,
     },
 }
@@ -98,9 +98,8 @@ impl ResizeRequest {
     pub(crate) const fn operation(self) -> ResizeOperation {
         match self.purpose {
             RequestPurpose::External { .. } => ResizeOperation::External,
-            RequestPurpose::ResetBounce { .. } | RequestPurpose::ResetRestore { .. } => {
-                ResizeOperation::Reset
-            }
+            RequestPurpose::DisplayResetBounce { .. }
+            | RequestPurpose::DisplayResetRestore { .. } => ResizeOperation::DisplayReset,
         }
     }
 }
@@ -167,7 +166,7 @@ struct QueuedResize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResetSequence {
+enum DisplayResetSequence {
     Idle,
     AwaitingBounce {
         original: OutputSize,
@@ -181,14 +180,14 @@ enum ResetSequence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResetStart {
+pub(crate) enum DisplayResetStart {
     Start,
     AlreadyRunning,
-    Refused(ResetRefusal),
+    Refused(DisplayResetRefusal),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResetRefusal {
+pub(crate) enum DisplayResetRefusal {
     CurrentModeUnknown,
     OutputTooSmall,
     CompositorRejected,
@@ -197,14 +196,14 @@ pub(crate) enum ResetRefusal {
     OutputUnavailable,
 }
 
-impl ResetRefusal {
+impl DisplayResetRefusal {
     pub(crate) const fn reason(self) -> &'static str {
         match self {
             Self::CurrentModeUnknown => "current output dimensions are not known yet",
             Self::OutputTooSmall => "current output dimensions are too small to bounce",
-            Self::CompositorRejected => "compositor rejected the reset output mode",
-            Self::CompositorCancelled => "compositor cancelled the reset output mode",
-            Self::CompositorTimedOut => "compositor did not finish the reset output mode",
+            Self::CompositorRejected => "compositor rejected the display reset output mode",
+            Self::CompositorCancelled => "compositor cancelled the display reset output mode",
+            Self::CompositorTimedOut => "compositor did not finish the display reset output mode",
             Self::OutputUnavailable => "output configuration is unavailable",
         }
     }
@@ -224,13 +223,13 @@ pub(crate) enum AppliedResize {
         request_id: RequestId,
         dimension_change: DimensionChange,
     },
-    ResetStep,
+    DisplayResetStep,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResizeOperation {
     External,
-    Reset,
+    DisplayReset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +265,7 @@ pub(crate) struct OutputManager {
     pub(crate) pending: Option<PendingResize>,
     queued: Option<QueuedResize>,
     retry: Option<QueuedResize>,
-    reset: ResetSequence,
+    display_reset: DisplayResetSequence,
     current: CurrentMode,
 }
 
@@ -279,7 +278,7 @@ impl OutputManager {
             pending: None,
             queued: None,
             retry: None,
-            reset: ResetSequence::Idle,
+            display_reset: DisplayResetSequence::Idle,
             current: CurrentMode::Unknown,
         }
     }
@@ -302,7 +301,7 @@ impl OutputManager {
         let request = ResizeRequest::external(size, scale_v120, request_id);
         if self.pending.is_some()
             || self.retry.is_some()
-            || !matches!(self.reset, ResetSequence::Idle)
+            || !matches!(self.display_reset, DisplayResetSequence::Idle)
             || self.queued.is_some()
         {
             self.queue_external(request);
@@ -311,27 +310,28 @@ impl OutputManager {
         self.configure_now(output_name, request, fps, qh)
     }
 
-    pub(crate) fn begin_reset(&mut self) -> ResetStart {
-        if !matches!(self.reset, ResetSequence::Idle) {
-            return ResetStart::AlreadyRunning;
+    pub(crate) fn begin_display_reset(&mut self) -> DisplayResetStart {
+        if !matches!(self.display_reset, DisplayResetSequence::Idle) {
+            return DisplayResetStart::AlreadyRunning;
         }
         let CurrentMode::Known(original) = self.current else {
-            return ResetStart::Refused(ResetRefusal::CurrentModeUnknown);
+            return DisplayResetStart::Refused(DisplayResetRefusal::CurrentModeUnknown);
         };
-        let bounce = match original.reset_bounce() {
+        let bounce = match original.display_reset_bounce() {
             Ok(bounce) => bounce,
-            Err(reason) => return ResetStart::Refused(reason),
+            Err(reason) => return DisplayResetStart::Refused(reason),
         };
-        self.reset = ResetSequence::AwaitingBounce { original, bounce };
-        ResetStart::Start
+        self.display_reset = DisplayResetSequence::AwaitingBounce { original, bounce };
+        DisplayResetStart::Start
     }
 
-    pub(crate) fn abort_reset(&mut self) {
-        self.reset = ResetSequence::Idle;
+    pub(crate) fn abort_display_reset(&mut self) {
+        self.display_reset = DisplayResetSequence::Idle;
         if self.retry.is_some_and(|retry| {
             matches!(
                 retry.request.purpose,
-                RequestPurpose::ResetBounce { .. } | RequestPurpose::ResetRestore { .. }
+                RequestPurpose::DisplayResetBounce { .. }
+                    | RequestPurpose::DisplayResetRestore { .. }
             )
         }) {
             self.retry = None;
@@ -420,7 +420,8 @@ impl OutputManager {
                     retry.request = request;
                     return;
                 }
-                RequestPurpose::ResetBounce { .. } | RequestPurpose::ResetRestore { .. } => {}
+                RequestPurpose::DisplayResetBounce { .. }
+                | RequestPurpose::DisplayResetRestore { .. } => {}
             }
         }
         self.queued = Some(QueuedResize {
@@ -447,20 +448,20 @@ impl OutputManager {
                 scale_v120,
                 ..
             } => {
-                if let ResetSequence::AwaitingBounce { .. } = self.reset {
-                    self.reset = match request.mode.size.reset_bounce() {
-                        Ok(bounce) => ResetSequence::AwaitingBounce {
+                if let DisplayResetSequence::AwaitingBounce { .. } = self.display_reset {
+                    self.display_reset = match request.mode.size.display_reset_bounce() {
+                        Ok(bounce) => DisplayResetSequence::AwaitingBounce {
                             original: request.mode.size,
                             bounce,
                         },
                         Err(
-                            ResetRefusal::CurrentModeUnknown
-                            | ResetRefusal::OutputTooSmall
-                            | ResetRefusal::CompositorRejected
-                            | ResetRefusal::CompositorCancelled
-                            | ResetRefusal::CompositorTimedOut
-                            | ResetRefusal::OutputUnavailable,
-                        ) => ResetSequence::Idle,
+                            DisplayResetRefusal::CurrentModeUnknown
+                            | DisplayResetRefusal::OutputTooSmall
+                            | DisplayResetRefusal::CompositorRejected
+                            | DisplayResetRefusal::CompositorCancelled
+                            | DisplayResetRefusal::CompositorTimedOut
+                            | DisplayResetRefusal::OutputUnavailable,
+                        ) => DisplayResetSequence::Idle,
                     };
                 }
                 AppliedResize::External {
@@ -470,13 +471,13 @@ impl OutputManager {
                     dimension_change,
                 }
             }
-            RequestPurpose::ResetBounce { original, .. } => {
-                self.reset = ResetSequence::AwaitingRestore { original };
-                AppliedResize::ResetStep
+            RequestPurpose::DisplayResetBounce { original, .. } => {
+                self.display_reset = DisplayResetSequence::AwaitingRestore { original };
+                AppliedResize::DisplayResetStep
             }
-            RequestPurpose::ResetRestore { .. } => {
-                self.reset = ResetSequence::Idle;
-                AppliedResize::ResetStep
+            RequestPurpose::DisplayResetRestore { .. } => {
+                self.display_reset = DisplayResetSequence::Idle;
+                AppliedResize::DisplayResetStep
             }
         }
     }
@@ -508,26 +509,26 @@ impl OutputManager {
                 };
                 (retry, ResizeOperation::External, failures)
             }
-            RequestPurpose::ResetBounce { original, failures } => {
+            RequestPurpose::DisplayResetBounce { original, failures } => {
                 let failures = failures.saturating_add(1);
                 let retry = ResizeRequest {
-                    purpose: RequestPurpose::ResetBounce { original, failures },
+                    purpose: RequestPurpose::DisplayResetBounce { original, failures },
                     ..request
                 };
-                (retry, ResizeOperation::Reset, failures)
+                (retry, ResizeOperation::DisplayReset, failures)
             }
-            RequestPurpose::ResetRestore { failures } => {
+            RequestPurpose::DisplayResetRestore { failures } => {
                 let failures = failures.saturating_add(1);
                 let retry = ResizeRequest {
-                    purpose: RequestPurpose::ResetRestore { failures },
+                    purpose: RequestPurpose::DisplayResetRestore { failures },
                     ..request
                 };
-                (retry, ResizeOperation::Reset, failures)
+                (retry, ResizeOperation::DisplayReset, failures)
             }
         };
         if failures >= MAX_RESIZE_STEP_FAILURES {
-            if matches!(operation, ResizeOperation::Reset) {
-                self.reset = ResetSequence::Idle;
+            if matches!(operation, ResizeOperation::DisplayReset) {
+                self.display_reset = DisplayResetSequence::Idle;
             }
             return RejectOutcome::Exhausted {
                 operation,
@@ -562,9 +563,10 @@ impl OutputManager {
                 });
                 Some(ResizeOperation::External)
             }
-            RequestPurpose::ResetBounce { .. } | RequestPurpose::ResetRestore { .. } => {
-                self.reset = ResetSequence::Idle;
-                Some(ResizeOperation::Reset)
+            RequestPurpose::DisplayResetBounce { .. }
+            | RequestPurpose::DisplayResetRestore { .. } => {
+                self.display_reset = DisplayResetSequence::Idle;
+                Some(ResizeOperation::DisplayReset)
             }
         }
     }
@@ -598,32 +600,32 @@ impl OutputManager {
                 RetryReadiness::AwaitingFreshSerial { .. } => return None,
             }
         }
-        match self.reset {
-            ResetSequence::AwaitingBounce { original, bounce } => {
-                self.reset = ResetSequence::BounceInFlight;
+        match self.display_reset {
+            DisplayResetSequence::AwaitingBounce { original, bounce } => {
+                self.display_reset = DisplayResetSequence::BounceInFlight;
                 Some(ResizeRequest {
                     mode: OutputMode {
                         size: bounce,
                         scale: ScaleChange::Keep,
                     },
-                    purpose: RequestPurpose::ResetBounce {
+                    purpose: RequestPurpose::DisplayResetBounce {
                         original,
                         failures: 0,
                     },
                 })
             }
-            ResetSequence::AwaitingRestore { original } => {
-                self.reset = ResetSequence::RestoreInFlight;
+            DisplayResetSequence::AwaitingRestore { original } => {
+                self.display_reset = DisplayResetSequence::RestoreInFlight;
                 Some(ResizeRequest {
                     mode: OutputMode {
                         size: original,
                         scale: ScaleChange::Keep,
                     },
-                    purpose: RequestPurpose::ResetRestore { failures: 0 },
+                    purpose: RequestPurpose::DisplayResetRestore { failures: 0 },
                 })
             }
-            ResetSequence::Idle => self.queued.take().map(|queued| queued.request),
-            ResetSequence::BounceInFlight | ResetSequence::RestoreInFlight => None,
+            DisplayResetSequence::Idle => self.queued.take().map(|queued| queued.request),
+            DisplayResetSequence::BounceInFlight | DisplayResetSequence::RestoreInFlight => None,
         }
     }
 
@@ -631,7 +633,7 @@ impl OutputManager {
         self.pending.is_some()
             || self.retry.is_some()
             || self.queued.is_some()
-            || !matches!(self.reset, ResetSequence::Idle)
+            || !matches!(self.display_reset, DisplayResetSequence::Idle)
     }
 
     pub(crate) const fn configuration_deadline() -> Duration {
@@ -662,9 +664,10 @@ impl OutputManager {
             pending.configuration.destroy();
             let operation = match pending.request.purpose {
                 RequestPurpose::External { .. } => ResizeOperation::External,
-                RequestPurpose::ResetBounce { .. } | RequestPurpose::ResetRestore { .. } => {
-                    self.reset = ResetSequence::Idle;
-                    ResizeOperation::Reset
+                RequestPurpose::DisplayResetBounce { .. }
+                | RequestPurpose::DisplayResetRestore { .. } => {
+                    self.display_reset = DisplayResetSequence::Idle;
+                    ResizeOperation::DisplayReset
                 }
             };
             return Some(OutputTimeout::Configuration { operation });
@@ -705,11 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn capture_dimensions_seed_reset_without_head_mode_state() {
+    fn capture_dimensions_seed_display_reset_without_head_mode_state() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1366, 768));
 
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         let bounce = outputs.take_ready_queued().expect("bounce should start");
         assert_eq!(bounce.mode.size, size(1364, 766));
         assert_eq!(bounce.mode.scale, ScaleChange::Keep);
@@ -726,12 +729,12 @@ mod tests {
     fn output_work_blocks_stale_capture_dimension_seeds() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1280, 720));
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
 
         outputs.record_capture_size(size(1600, 900));
-        outputs.abort_reset();
+        outputs.abort_display_reset();
 
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         assert_eq!(
             outputs.take_ready_queued().map(|request| request.mode.size),
             Some(size(1278, 718))
@@ -739,32 +742,32 @@ mod tests {
     }
 
     #[test]
-    fn reset_with_unknown_dimensions_is_refused_without_parking() {
+    fn display_reset_with_unknown_dimensions_is_refused_without_parking() {
         let mut outputs = OutputManager::new();
         assert_eq!(
-            outputs.begin_reset(),
-            ResetStart::Refused(ResetRefusal::CurrentModeUnknown)
+            outputs.begin_display_reset(),
+            DisplayResetStart::Refused(DisplayResetRefusal::CurrentModeUnknown)
         );
         outputs.queue_external(request(1, 1280, 720));
         assert_eq!(outputs.take_ready_queued(), Some(request(1, 1280, 720)));
     }
 
     #[test]
-    fn too_small_reset_is_refused_without_parking() {
+    fn too_small_display_reset_is_refused_without_parking() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(2, 2));
         assert_eq!(
-            outputs.begin_reset(),
-            ResetStart::Refused(ResetRefusal::OutputTooSmall)
+            outputs.begin_display_reset(),
+            DisplayResetStart::Refused(DisplayResetRefusal::OutputTooSmall)
         );
         assert!(!outputs.capture_blocked());
     }
 
     #[test]
-    fn external_success_during_reset_updates_the_definite_restore_size() {
+    fn external_success_during_display_reset_updates_the_definite_restore_size() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1280, 720));
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         accept(&mut outputs, request(7, 1600, 900));
 
         let bounce = outputs.take_ready_queued().expect("bounce should start");
@@ -777,10 +780,10 @@ mod tests {
     }
 
     #[test]
-    fn reset_finishes_before_a_queued_external_resize() {
+    fn display_reset_finishes_before_a_queued_external_resize() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1280, 720));
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         outputs.queue_external(request(9, 1920, 1080));
 
         let bounce = outputs.take_ready_queued().expect("bounce should start");
@@ -792,33 +795,33 @@ mod tests {
     }
 
     #[test]
-    fn aborting_a_reset_keeps_queued_external_work_reachable() {
+    fn aborting_a_display_reset_keeps_queued_external_work_reachable() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1280, 720));
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         outputs.queue_external(request(9, 1920, 1080));
 
         assert_eq!(
             outputs.take_ready_queued().map(ResizeRequest::operation),
-            Some(ResizeOperation::Reset)
+            Some(ResizeOperation::DisplayReset)
         );
-        outputs.abort_reset();
+        outputs.abort_display_reset();
         assert!(outputs.capture_blocked());
         assert_eq!(outputs.take_ready_queued(), Some(request(9, 1920, 1080)));
         assert!(!outputs.capture_blocked());
     }
 
     #[test]
-    fn aborting_a_reset_keeps_an_external_retry_reachable() {
+    fn aborting_a_display_reset_keeps_an_external_retry_reachable() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1280, 720));
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         outputs.retry = Some(QueuedResize {
             request: request(9, 1920, 1080),
             readiness: RetryReadiness::Ready,
         });
 
-        outputs.abort_reset();
+        outputs.abort_display_reset();
 
         assert_eq!(outputs.take_ready_queued(), Some(request(9, 1920, 1080)));
         assert!(!outputs.capture_blocked());
@@ -854,16 +857,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_reset_clears_at_the_nonfatal_bound() {
+    fn failed_display_reset_clears_at_the_nonfatal_bound() {
         let mut outputs = OutputManager::new();
         outputs.record_capture_size(size(1280, 720));
-        assert_eq!(outputs.begin_reset(), ResetStart::Start);
+        assert_eq!(outputs.begin_display_reset(), DisplayResetStart::Start);
         let mut request = outputs.take_ready_queued().expect("bounce should start");
         for failures in 1..MAX_RESIZE_STEP_FAILURES {
             assert_eq!(
                 outputs.retry_failed_request(request),
                 RejectOutcome::Retrying {
-                    operation: ResizeOperation::Reset,
+                    operation: ResizeOperation::DisplayReset,
                     failures,
                 }
             );
@@ -872,7 +875,7 @@ mod tests {
         assert_eq!(
             outputs.retry_failed_request(request),
             RejectOutcome::Exhausted {
-                operation: ResizeOperation::Reset,
+                operation: ResizeOperation::DisplayReset,
                 failures: MAX_RESIZE_STEP_FAILURES,
             }
         );

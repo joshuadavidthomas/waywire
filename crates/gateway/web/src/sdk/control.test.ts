@@ -156,7 +156,7 @@ test("resize observer burst sends its final viewport", async () => {
 
 test("reset restore presents an external resize on its later matching generation", async () => {
   installBrowser();
-  installQueueVideoDecoder();
+  const installed = installQueueVideoDecoder();
   const sockets = new Map<string, FakeWebSocket>();
   const resizeEvents: ResizeEvent[] = [];
   const canvas = new FakeTarget();
@@ -216,6 +216,12 @@ test("reset restore presents an external resize on its later matching generation
     });
     await flush();
 
+    assert.deepEqual(
+      resizeEvents.map((event) => event.state),
+      ["requested", "applied"],
+    );
+    installed.decoder()?.outputAll();
+    await flush();
     assert.deepEqual(
       resizeEvents.map((event) => event.state),
       ["requested", "applied", "presented"],
@@ -287,6 +293,12 @@ test("75 and 50 percent video settle applied output resizes as presented", async
       }),
     });
     await flush();
+    assert.equal(resizeEvents.at(-1)?.state, "applied");
+    installed.decoder()?.outputAll();
+    await flush();
+    assert.equal(resizeEvents.at(-1)?.state, "presented");
+    assert.equal(resizeEvents.at(-1)?.width, 1200);
+    assert.equal(resizeEvents.at(-1)?.height, 674);
 
     session.remoteDisplay.fixed({ width: 1280, height: 720, scale: 1 });
     const second = resizeRecords(control)[1];
@@ -310,6 +322,11 @@ test("75 and 50 percent video settle applied output resizes as presented", async
       }),
     });
     await flush();
+    assert.equal(resizeEvents.at(-1)?.state, "applied");
+    installed.decoder()?.outputAll();
+    await flush();
+    assert.equal(resizeEvents.at(-1)?.width, 640);
+    assert.equal(resizeEvents.at(-1)?.height, 360);
 
     assert.deepEqual(
       resizeEvents.map((event) => event.state),
@@ -322,15 +339,13 @@ test("75 and 50 percent video settle applied output resizes as presented", async
         "presented",
       ],
     );
-    installed.decoder()?.outputAll();
-    await flush();
     assert.equal(session.stats.resizeState, "presented");
   } finally {
     await session.dispose();
   }
 });
 
-test("video reset sends the leased control command", async () => {
+test("video reset sends the input-owner control command", async () => {
   installBrowser();
   const sockets = new Map<string, FakeWebSocket>();
   const session = new WaywireSession({
@@ -372,7 +387,7 @@ test("video reset sends the leased control command", async () => {
   }
 });
 
-test("reconnect sends one unchanged resize across observer and lease callbacks", async () => {
+test("reconnect sends one unchanged resize across observer and ownership callbacks", async () => {
   installBrowser();
   const observers = installResizeObserver();
   const controls: FakeWebSocket[] = [];
@@ -418,6 +433,52 @@ test("reconnect sends one unchanged resize across observer and lease callbacks",
     });
     await new Promise<void>((resolve) => setTimeout(resolve, 15));
     assert.equal(resizeRecords(second).length, 1);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("a native resolution selection reacquires ownership and sends scale 120 without moving focus", async () => {
+  const { document } = installBrowser();
+  const control = new FakeWebSocket();
+  const canvas = new FakeTarget();
+  const select = new FakeTarget();
+  const session = new WaywireSession({
+    endpoint: "https://remote.example.com",
+    createWebSocket: (path) =>
+      socket(path === "/control" ? control : new FakeWebSocket()),
+  });
+  session.attachSurface({ ...surfaceOptions(canvas), controlOnFocus: true });
+  try {
+    session.connect();
+    await flush();
+    control.readyState = FakeWebSocket.OPEN;
+    control.dispatch("open", {});
+    session.input.acquire();
+    control.dispatch("message", {
+      data: JSON.stringify({ type: "control-state", state: "active" }),
+    });
+    document.activeElement = select;
+    canvas.dispatch("blur", { relatedTarget: select });
+    const before = resizeRecords(control).length;
+    // These are the viewer's selection-change actions, in their actual order.
+    session.remoteDisplay.setPolicy({
+      mode: "fixed",
+      width: 1366,
+      height: 768,
+      scale: 1,
+    });
+    session.input.acquire();
+    assert.equal(resizeRecords(control).length, before);
+    control.dispatch("message", {
+      data: JSON.stringify({ type: "control-state", state: "active" }),
+    });
+    const resized = resizeRecords(control).at(-1);
+    assert.ok(resized);
+    assert.equal(resizeRecords(control).length, before + 1);
+    assert.deepEqual(resizeSize(resized), [1366, 768]);
+    assert.equal(new DataView(resized).getUint16(16, true), 120);
+    assert.equal(document.activeElement, select);
   } finally {
     await session.dispose();
   }

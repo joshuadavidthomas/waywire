@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_control_lease_json() {
+    fn parses_control_ownership_json() {
         assert_eq!(
             ClientMessage::parse_json(br#"{"type":"acquire"}"#).expect("acquire should parse"),
             ClientMessage::AcquireControl

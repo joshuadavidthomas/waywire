@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use waywire_protocol::Record;
 use waywire_protocol::pipe::Command;
 
-use crate::session::LeaseEpoch;
+use crate::session::OwnershipEpoch;
 use crate::video::Readiness;
 
 pub(super) const COMMAND_COUNT: usize = 128;
@@ -24,7 +24,7 @@ const PIPE_DEADLINE: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authority {
     System,
-    Lease(LeaseEpoch),
+    InputOwnership(OwnershipEpoch),
 }
 
 struct Request {
@@ -40,7 +40,7 @@ struct AuthorizedCommand {
 
 pub(super) struct CommandReader {
     requests: mpsc::Receiver<Request>,
-    active_lease: Arc<AtomicU64>,
+    active_ownership: Arc<AtomicU64>,
 }
 
 impl CommandReader {
@@ -48,10 +48,10 @@ impl CommandReader {
         while let Some(request) = self.requests.recv().await {
             let authorized = match request.authority {
                 Authority::System => true,
-                Authority::Lease(lease) => {
-                    NonZeroU64::new(self.active_lease.load(Ordering::Acquire))
-                        .map(LeaseEpoch::from_nonzero)
-                        == Some(lease)
+                Authority::InputOwnership(ownership) => {
+                    NonZeroU64::new(self.active_ownership.load(Ordering::Acquire))
+                        .map(OwnershipEpoch::from_nonzero)
+                        == Some(ownership)
                 }
             };
             if authorized {
@@ -103,7 +103,7 @@ pub(crate) struct CommandSink {
     budget: Arc<Semaphore>,
     fatal: mpsc::Sender<CommandSinkError>,
     readiness: Readiness,
-    active_lease: Arc<AtomicU64>,
+    active_ownership: Arc<AtomicU64>,
 }
 
 impl CommandSink {
@@ -114,18 +114,18 @@ impl CommandSink {
         readiness: Readiness,
     ) -> (Self, CommandReader) {
         let (tx, requests) = mpsc::channel(capacity);
-        let active_lease = Arc::new(AtomicU64::new(0));
+        let active_ownership = Arc::new(AtomicU64::new(0));
         (
             Self {
                 tx,
                 budget: Arc::new(Semaphore::new(budget_bytes)),
                 fatal,
                 readiness,
-                active_lease: Arc::clone(&active_lease),
+                active_ownership: Arc::clone(&active_ownership),
             },
             CommandReader {
                 requests,
-                active_lease,
+                active_ownership,
             },
         )
     }
@@ -175,26 +175,30 @@ impl CommandSink {
 
     pub(crate) async fn input(
         &self,
-        lease: LeaseEpoch,
+        ownership: OwnershipEpoch,
         command: Command,
     ) -> Result<(), CommandSinkError> {
-        match self.send(Authority::Lease(lease), command).await {
+        match self
+            .send(Authority::InputOwnership(ownership), command)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) => self.fail(error),
         }
     }
 
-    pub(crate) fn set_active_lease(&self, lease: LeaseEpoch) {
+    pub(crate) fn set_active_ownership(&self, ownership: OwnershipEpoch) {
         // Release publishes the epoch before its commands enter the FIFO. The
         // reader's Acquire either sees this epoch or rejects the command.
-        self.active_lease.store(lease.get(), Ordering::Release);
+        self.active_ownership
+            .store(ownership.get(), Ordering::Release);
     }
 
-    pub(crate) fn clear_active_lease(&self) {
-        // Release invalidates the epoch after ReleaseAll enters the FIFO. A
-        // reader that observes the clear can only drop late leased commands;
-        // system commands remain ordered by the channel.
-        self.active_lease.store(0, Ordering::Release);
+    pub(crate) fn clear_active_ownership(&self) {
+        // Release invalidates the epoch after ReleaseAll enters the FIFO. A reader that
+        // observes the clear can only drop late input-owner commands; system commands
+        // remain ordered by the channel.
+        self.active_ownership.store(0, Ordering::Release);
     }
 }
 
@@ -248,7 +252,7 @@ mod tests {
 
     use super::*;
     use crate::session::InputOutcome;
-    use crate::session::LeaseState;
+    use crate::session::OwnershipState;
     use crate::session::Sessions;
     use crate::session::SocketId;
     use crate::video::Readiness;
@@ -260,14 +264,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_transitions_keep_fifo_order_and_reject_stale_input() {
+    async fn ownership_transitions_keep_fifo_order_and_reject_stale_input() {
         let (commands, command_reader) = command_sink(8);
         let (mut output, daemon_input) = tokio::io::duplex(1024);
         let writer = tokio::spawn(write_commands(daemon_input, command_reader));
-        let first = LeaseEpoch::FIRST;
+        let first = OwnershipEpoch::FIRST;
         let second = first.next();
 
-        commands.set_active_lease(first);
+        commands.set_active_ownership(first);
         let first_input = Command::KeyframeReadiness(KeyframeReadiness {
             generation: Generation::new(1).expect("test generation should be valid"),
             state: KeyframeState::Cached,
@@ -276,19 +280,19 @@ mod tests {
         commands
             .input(first, first_input)
             .await
-            .expect("first lease input should queue");
+            .expect("first input-owner command should queue");
         let mut written = vec![0; first_bytes.len()];
         output
             .read_exact(&mut written)
             .await
-            .expect("active lease input should be written");
+            .expect("active input-owner command should be written");
         assert_eq!(written, first_bytes);
 
-        commands.set_active_lease(second);
+        commands.set_active_ownership(second);
         commands
             .system(Command::ReleaseAll(ReleaseAll))
             .await
-            .expect("lease transition reset should queue");
+            .expect("ownership transition reset should queue");
         commands
             .input(
                 first,
@@ -298,7 +302,7 @@ mod tests {
                 }),
             )
             .await
-            .expect("stale lease input should enter the queue before filtering");
+            .expect("stale input-owner command should enter the queue before filtering");
         let second_input = Command::Quality(Quality {
             bitrate_kbps: Kbps::new(8_000).expect("test bitrate should be valid"),
             fps: Fps::new(60).expect("test frame rate should be valid"),
@@ -309,7 +313,7 @@ mod tests {
         commands
             .input(second, second_input)
             .await
-            .expect("second lease input should queue");
+            .expect("second input-owner command should queue");
         drop(commands);
 
         written.clear();
@@ -338,7 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quality_change_is_queued_as_system_work_before_lease_release() {
+    async fn quality_change_is_queued_as_system_work_before_ownership_release() {
         let (commands, mut command_reader) = command_sink(1);
         let sessions = Sessions::new(
             commands.clone(),
@@ -358,8 +362,8 @@ mod tests {
         .expect("test feedback should be valid");
 
         assert!(matches!(
-            sessions.acquire(socket).await.expect("acquire lease"),
-            LeaseState::Active
+            sessions.acquire(socket).await.expect("acquire ownership"),
+            OwnershipState::Active
         ));
         let initial_release = command_reader
             .recv()
@@ -434,7 +438,7 @@ mod tests {
                 .input(socket, Command::ReleaseAll(ReleaseAll))
                 .await
                 .expect("released socket input check should succeed"),
-            InputOutcome::NotLeaseOwner
+            InputOutcome::NotInputOwner
         );
     }
 }

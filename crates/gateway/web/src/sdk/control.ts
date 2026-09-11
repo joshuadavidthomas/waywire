@@ -217,10 +217,10 @@ export class ControlRuntime {
   private controlReconnectTimer: Timer | null = null;
   private controlStableTimer: Timer | null = null;
   private controlConnectAttempt: ConnectionAttempt | null = null;
-  private controlAcquireDelay = 250;
-  private controlAcquireTimer: Timer | null = null;
+  private controlAcquisition: "automatic" | "requesting" | "waiting" =
+    "automatic";
   private controlActive = false;
-  private controlWanted = false;
+  private controlIntent: "automatic" | "wanted" | "disabled" = "automatic";
   private pendingControlRecords: ArrayBuffer[] = [];
   private resizeTimer: Timer | null = null;
   private resizePending = false;
@@ -287,8 +287,16 @@ export class ControlRuntime {
     contentPosition: (event) => this.contentPosition(event),
     sendRecord: (record) => this.sendControl(record),
     nextSequence: () => this.nextInputSequence(),
-    requestControl: () => this.requestControl(),
-    releaseControl: () => this.releaseControl(),
+    requestControlOnFocus: () => this.requestControlOnFocus(),
+    requestControlOnInteraction: () => {
+      if (
+        this.controlAcquisition !== "requesting" &&
+        this.controlIntent !== "disabled" &&
+        (this.controlIntent === "wanted" || this.owner.controlOnFocus())
+      )
+        this.requestControl();
+    },
+    releaseControl: () => this.releaseControl("automatic"),
     controlActive: () => this.controlActive,
     controlOnFocus: () => this.owner.controlOnFocus(),
     sendLocalClipboard: () => this.sendLocalClipboard(),
@@ -551,7 +559,12 @@ export class ControlRuntime {
     }
     if (this.controlActive) {
       this.setControlStatus("Input active", true);
-    } else if (this.controlWanted) {
+    } else if (
+      this.controlIntent === "wanted" &&
+      this.controlAcquisition === "waiting"
+    ) {
+      this.setControlStatus("Input in use");
+    } else if (this.controlIntent === "wanted") {
       this.setControlStatus("Input requesting");
     } else {
       this.setControlStatus("Input ready · click stream", true);
@@ -594,7 +607,7 @@ export class ControlRuntime {
     generation: number,
     width: number,
     height: number,
-  ): WaywireStats["resizeState"] {
+  ): void {
     let settledState = this.resizeState;
     for (const [id, request] of this.resizeRequests) {
       if (request.state === "requested") continue;
@@ -616,7 +629,6 @@ export class ControlRuntime {
     }
     const pending = [...this.resizeRequests.values()].at(-1);
     this.resizeState = pending?.state ?? settledState;
-    return this.resizeState;
   }
 
   private sendResize(): void {
@@ -744,12 +756,20 @@ export class ControlRuntime {
     this.inputRuntime.release();
   }
 
+  private requestControlOnFocus(): void {
+    // A busy response blocks automatic acquisition until readiness returns.
+    if (
+      this.controlAcquisition === "waiting" ||
+      this.controlIntent === "disabled"
+    )
+      return;
+    this.requestControl();
+  }
+
   public requestControl(): void {
-    this.controlWanted = true;
-    if (this.controlAcquireTimer !== null) {
-      clearTimeout(this.controlAcquireTimer);
-      this.controlAcquireTimer = null;
-    }
+    this.controlIntent = "wanted";
+    if (this.controlActive || this.controlAcquisition === "requesting") return;
+    this.controlAcquisition = "requesting";
     if (this.sessionConnected) void this.connectControl();
     if (
       this.controlSocket &&
@@ -760,15 +780,15 @@ export class ControlRuntime {
     }
   }
 
-  public releaseControl(): void {
+  public releaseControl(intent: "automatic" | "disabled"): void {
     this.localCursor?.clear();
-    this.controlWanted = false;
+    // Losing focus releases ownership; turning input off also blocks acquisition.
+    // Later blur events must not undo the viewer's explicit choice.
+    if (this.controlIntent !== "disabled") this.controlIntent = intent;
     this.controlActive = false;
     this.lastResizeRequest = null;
-    if (this.controlAcquireTimer !== null) {
-      clearTimeout(this.controlAcquireTimer);
-      this.controlAcquireTimer = null;
-    }
+    if (this.controlAcquisition === "requesting")
+      this.controlAcquisition = "automatic";
     this.releaseInput();
     this.pendingControlRecords = [];
     if (
@@ -781,22 +801,6 @@ export class ControlRuntime {
     } else if (this.sessionConnected) {
       this.setControlStatus("Input connecting");
     }
-  }
-
-  private retryControlAcquire(): void {
-    if (
-      !this.controlWanted ||
-      !this.controlSocket ||
-      this.controlSocket.readyState !== WebSocket.OPEN
-    ) {
-      return;
-    }
-    this.controlSocket.send(JSON.stringify({ type: "acquire" }));
-    this.controlAcquireDelay = Math.min(this.controlAcquireDelay * 2, 2000);
-    this.controlAcquireTimer = setTimeout(
-      () => this.retryControlAcquire(),
-      this.controlAcquireDelay,
-    );
   }
 
   private async connectControl(): Promise<void> {
@@ -861,7 +865,11 @@ export class ControlRuntime {
         return;
       }
       this.video.resetFeedbackInterval();
-      if (this.controlWanted) {
+      if (
+        this.controlIntent === "wanted" &&
+        this.controlAcquisition !== "waiting"
+      ) {
+        this.controlAcquisition = "requesting";
         socket.send(JSON.stringify({ type: "acquire" }));
       }
       for (const record of this.pendingControlRecords) {
@@ -903,20 +911,23 @@ export class ControlRuntime {
         if (message.type === "resize-applied") {
           const request = this.resizeRequests.get(message.request);
           if (request) {
-            for (const id of this.resizeRequests.keys()) {
+            for (const [id, earlier] of this.resizeRequests) {
               if (id === message.request) break;
-              this.resizeRequests.delete(id);
+              // An unacknowledged request was superseded by the compositor.
+              // Applied requests still belong to frames awaiting presentation.
+              if (earlier.state === "requested") this.resizeRequests.delete(id);
             }
             this.resizeRequests.set(message.request, {
               state: "applied",
               requested: request.requested,
               generation: message.generation,
             });
-            this.resizeState = "applied";
+            this.resizeState =
+              [...this.resizeRequests.values()].at(-1)?.state ?? "applied";
             this.emit(
               "resize",
               Object.freeze({
-                state: this.resizeState,
+                state: "applied",
                 latencyMs: performance.now() - request.requested,
                 width: message.width,
                 height: message.height,
@@ -957,34 +968,40 @@ export class ControlRuntime {
       }
       const wasControlActive = this.controlActive;
       this.controlActive = message.state === "active";
-      this.localCursor?.setActive(this.controlActive && this.controlWanted);
+      this.localCursor?.setActive(
+        this.controlActive && this.controlIntent === "wanted",
+      );
       if (this.controlActive) {
-        this.controlAcquireDelay = 250;
-        if (this.controlAcquireTimer !== null) {
-          clearTimeout(this.controlAcquireTimer);
-          this.controlAcquireTimer = null;
-        }
-        if (!this.controlWanted) {
+        this.controlAcquisition = "automatic";
+        if (this.controlIntent !== "wanted") {
           this.controlActive = false;
           socket.send(JSON.stringify({ type: "release" }));
         } else if (!wasControlActive) {
           this.sendResize();
         }
-      } else if (message.state === "busy" && this.controlWanted) {
+      } else if (message.state === "busy") {
+        // The reply can arrive after blur released ownership. Remember the
+        // denial anyway so refocusing cannot create a new automatic claim.
         this.lastResizeRequest = null;
         this.inputRuntime.resetPressed();
+        this.controlAcquisition = "waiting";
         this.setControlStatus("Input in use");
-        if (this.controlAcquireTimer === null) {
-          this.controlAcquireTimer = setTimeout(
-            () => this.retryControlAcquire(),
-            this.controlAcquireDelay,
-          );
-        }
         return;
-      } else if (message.state === "ready" && this.controlWanted) {
+      } else if (message.state === "ready") {
         this.lastResizeRequest = null;
-        this.requestControl();
-        return;
+        if (this.controlAcquisition === "waiting")
+          this.controlAcquisition = "automatic";
+        // Readiness is an opportunity for a present viewer, not a queued claim.
+        if (
+          this.controlIntent !== "disabled" &&
+          this.owner.controlOnFocus() &&
+          !document.hidden &&
+          document.hasFocus() &&
+          document.activeElement === this.inputElement
+        ) {
+          this.requestControl();
+          return;
+        }
       }
       this.updateControlStatus();
     });
@@ -998,10 +1015,8 @@ export class ControlRuntime {
       this.lastResizeRequest = null;
       this.pendingControlRecords = [];
       this.inputRuntime.resetPressed();
-      if (this.controlAcquireTimer !== null) {
-        clearTimeout(this.controlAcquireTimer);
-        this.controlAcquireTimer = null;
-      }
+      if (this.controlAcquisition === "requesting")
+        this.controlAcquisition = "automatic";
       if (this.sessionConnected && !document.hidden) {
         this.setControlStatus(`Input reconnecting · ${event.code}`);
         this.controlReconnectTimer = setTimeout(() => {
@@ -1042,7 +1057,7 @@ export class ControlRuntime {
 
   private handleVisibilityChange(): void {
     if (document.hidden) {
-      this.releaseControl();
+      this.releaseControl("automatic");
       this.controlConnectAttempt = null;
       this.video.closeForHiddenPage();
     } else if (this.sessionConnected) {
@@ -1052,7 +1067,7 @@ export class ControlRuntime {
         this.owner.controlOnFocus() &&
         document.activeElement === this.inputElement
       ) {
-        this.requestControl();
+        this.requestControlOnFocus();
       }
     }
   }
@@ -1181,7 +1196,7 @@ export class ControlRuntime {
     const disposeSurface = () => {
       if (surfaceDisposed) return;
       surfaceDisposed = true;
-      this.releaseControl();
+      this.releaseControl("automatic");
       this.localCursor?.dispose();
       this.localCursor = null;
       if (document.pointerLockElement === attachedCanvas)
@@ -1260,7 +1275,7 @@ export class ControlRuntime {
     this.connectionGeneration += 1;
     this.controlConnectAttempt = null;
     this.video.invalidateConnectionAttempt();
-    this.releaseControl();
+    this.releaseControl("automatic");
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     window.removeEventListener("resize", this.scheduleResizeBound);

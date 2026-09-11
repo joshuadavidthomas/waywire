@@ -89,13 +89,13 @@ use self::cursor::ShapeTable;
 use self::input::Input;
 use self::output::AppliedResize;
 use self::output::DimensionChange;
+use self::output::DisplayResetRefusal;
+use self::output::DisplayResetStart;
 use self::output::Head;
 use self::output::ManagerSerial;
 use self::output::OutputManager;
 use self::output::OutputTimeout;
 use self::output::RejectOutcome;
-use self::output::ResetRefusal;
-use self::output::ResetStart;
 use self::output::ResizeOperation;
 use self::output::SerialPublication;
 use crate::Options;
@@ -344,15 +344,15 @@ impl State {
     // capture finish or tearing it down: the picture keeps both the drawn
     // pointer and the one the page draws from the shape it is sent. Building
     // the output again is the only thing that takes it back out, so leaving
-    // the overlay costs what a video reset costs, once, on the way out.
+    // the overlay costs what a display reset costs, once, on the way out.
     fn stop_cursor_overlay(&mut self) -> Result<()> {
-        match self.outputs.begin_reset() {
-            ResetStart::Start => {
+        match self.outputs.begin_display_reset() {
+            DisplayResetStart::Start => {
                 self.capture.cancel();
                 self.start_queued_resize_or_capture()
             }
-            ResetStart::AlreadyRunning => Ok(()),
-            ResetStart::Refused(reason) => {
+            DisplayResetStart::AlreadyRunning => Ok(()),
+            DisplayResetStart::Refused(reason) => {
                 warn!(
                     ?reason,
                     "cursor overlay could not be cleared; the desktop pointer stays in the picture"
@@ -403,18 +403,20 @@ impl State {
                     self.start_queued_resize_or_capture()?;
                 }
             }
-            Command::ResetVideo(_) => match self.outputs.begin_reset() {
-                ResetStart::Start => {
+            Command::ResetVideo(_) => match self.outputs.begin_display_reset() {
+                DisplayResetStart::Start => {
                     self.capture.cancel();
                     self.start_queued_resize_or_capture()?;
                 }
-                ResetStart::AlreadyRunning => {
+                DisplayResetStart::AlreadyRunning => {
                     warn!(
-                        reason = "video reset is already running",
-                        "video reset ignored"
+                        reason = "display reset is already running",
+                        "display reset ignored"
                     );
                 }
-                ResetStart::Refused(reason) => self.report_reset_refusal(reason)?,
+                DisplayResetStart::Refused(reason) => {
+                    self.report_display_reset_refusal(reason)?;
+                }
             },
             Command::Clipboard(text) => {
                 self.clipboard.set_text(text, &self.qh)?;
@@ -528,15 +530,15 @@ impl State {
         }
     }
 
-    fn report_reset_refusal(&self, refusal: ResetRefusal) -> Result<()> {
-        warn!(reason = refusal.reason(), "video reset refused");
+    fn report_display_reset_refusal(&self, refusal: DisplayResetRefusal) -> Result<()> {
+        warn!(reason = refusal.reason(), "display reset refused");
         let reason = match refusal {
-            ResetRefusal::CurrentModeUnknown => ResetVideoRefusal::CurrentModeUnknown,
-            ResetRefusal::OutputTooSmall => ResetVideoRefusal::OutputTooSmall,
-            ResetRefusal::CompositorRejected => ResetVideoRefusal::CompositorRejected,
-            ResetRefusal::CompositorCancelled => ResetVideoRefusal::CompositorCancelled,
-            ResetRefusal::CompositorTimedOut => ResetVideoRefusal::CompositorTimedOut,
-            ResetRefusal::OutputUnavailable => ResetVideoRefusal::OutputUnavailable,
+            DisplayResetRefusal::CurrentModeUnknown => ResetVideoRefusal::CurrentModeUnknown,
+            DisplayResetRefusal::OutputTooSmall => ResetVideoRefusal::OutputTooSmall,
+            DisplayResetRefusal::CompositorRejected => ResetVideoRefusal::CompositorRejected,
+            DisplayResetRefusal::CompositorCancelled => ResetVideoRefusal::CompositorCancelled,
+            DisplayResetRefusal::CompositorTimedOut => ResetVideoRefusal::CompositorTimedOut,
+            DisplayResetRefusal::OutputUnavailable => ResetVideoRefusal::OutputUnavailable,
         };
         self.event_sink.send(&Event::ResetVideoRefused(reason))?;
         Ok(())
@@ -552,8 +554,8 @@ impl State {
                 "external resize timed out; dropping request"
             ),
             OutputTimeout::Configuration {
-                operation: ResizeOperation::Reset,
-            } => self.report_reset_refusal(ResetRefusal::CompositorTimedOut)?,
+                operation: ResizeOperation::DisplayReset,
+            } => self.report_display_reset_refusal(DisplayResetRefusal::CompositorTimedOut)?,
             OutputTimeout::FreshSerial => warn!(
                 deadline = ?OutputManager::configuration_deadline(),
                 reason = "output manager did not publish a fresh serial",
@@ -586,7 +588,7 @@ impl State {
                     generation: self.generation,
                 }))?;
             }
-            AppliedResize::ResetStep => self.replace_media_generation()?,
+            AppliedResize::DisplayResetStep => self.replace_media_generation()?,
         }
         self.capture.can_wait_for_damage = false;
         self.start_queued_resize_or_capture()
@@ -622,10 +624,10 @@ impl State {
                             "queued external resize could not start; dropping request"
                         );
                     }
-                    ResizeOperation::Reset => {
-                        self.outputs.abort_reset();
-                        warn!(%error, "video reset output configuration could not start");
-                        self.report_reset_refusal(ResetRefusal::OutputUnavailable)?;
+                    ResizeOperation::DisplayReset => {
+                        self.outputs.abort_display_reset();
+                        warn!(%error, "display reset output configuration could not start");
+                        self.report_display_reset_refusal(DisplayResetRefusal::OutputUnavailable)?;
                     }
                 },
             }
@@ -982,18 +984,18 @@ impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for S
                             "external resize failure limit reached; dropping request"
                         ),
                         RejectOutcome::Exhausted {
-                            operation: ResizeOperation::Reset,
+                            operation: ResizeOperation::DisplayReset,
                             failures,
                         } => {
                             warn!(
                                 consecutive_failures = failures,
                                 maximum_failures = 3,
                                 reason = "compositor rejected the output configuration",
-                                "video reset failure limit reached"
+                                "display reset failure limit reached"
                             );
-                            if let Err(error) =
-                                state.report_reset_refusal(ResetRefusal::CompositorRejected)
-                            {
+                            if let Err(error) = state.report_display_reset_refusal(
+                                DisplayResetRefusal::CompositorRejected,
+                            ) {
                                 state.fail(error);
                                 return;
                             }
@@ -1007,9 +1009,9 @@ impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for S
             zwlr_output_configuration_v1::Event::Cancelled => {
                 if matches!(
                     state.outputs.retry_cancelled(),
-                    Some(ResizeOperation::Reset)
+                    Some(ResizeOperation::DisplayReset)
                 ) && let Err(error) =
-                    state.report_reset_refusal(ResetRefusal::CompositorCancelled)
+                    state.report_display_reset_refusal(DisplayResetRefusal::CompositorCancelled)
                 {
                     state.fail(error);
                     return;

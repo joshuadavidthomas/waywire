@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 use tracing::info;
 use waywire_protocol::browser::Feedback;
 use waywire_protocol::browser::QualityLevels;
@@ -21,9 +22,9 @@ use self::quality::Quality;
 use crate::daemon::CommandSink;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LeaseEpoch(NonZeroU64);
+pub(crate) struct OwnershipEpoch(NonZeroU64);
 
-impl LeaseEpoch {
+impl OwnershipEpoch {
     pub(crate) const FIRST: Self = Self(NonZeroU64::MIN);
 
     #[must_use]
@@ -58,90 +59,111 @@ impl SocketId {
 #[derive(Clone)]
 pub(crate) struct Sessions {
     commands: CommandSink,
-    lease: Arc<AsyncMutex<LeaseBook>>,
+    ownership: Arc<AsyncMutex<OwnershipBook>>,
+    ownership_changes: watch::Sender<OwnershipAvailability>,
     quality: Arc<Mutex<Quality>>,
 }
 
-struct LeaseBook {
-    owner: Option<Lease>,
-    next_epoch: LeaseEpoch,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnershipAvailability {
+    Available,
+    OwnedBy(SocketId),
+}
+
+struct OwnershipBook {
+    input_owner: Option<InputOwnership>,
+    next_epoch: OwnershipEpoch,
 }
 
 #[derive(Clone, Copy)]
-struct Lease {
+struct InputOwnership {
     socket: SocketId,
-    epoch: LeaseEpoch,
+    epoch: OwnershipEpoch,
 }
 
 impl Sessions {
     pub(crate) fn new(commands: CommandSink, bitrate: Kbps, fps: Fps) -> Self {
+        let (ownership_changes, _) = watch::channel(OwnershipAvailability::Available);
         Self {
             commands,
-            lease: Arc::new(AsyncMutex::new(LeaseBook {
-                owner: None,
-                next_epoch: LeaseEpoch::FIRST,
+            ownership: Arc::new(AsyncMutex::new(OwnershipBook {
+                input_owner: None,
+                next_epoch: OwnershipEpoch::FIRST,
             })),
+            ownership_changes,
             quality: Arc::new(Mutex::new(Quality::new(bitrate, fps))),
         }
     }
 
-    pub(crate) async fn acquire(&self, socket: SocketId) -> Result<LeaseState> {
-        let mut book = self.lease.lock().await;
-        if let Some(owner) = book.owner {
-            return Ok(if owner.socket == socket {
-                LeaseState::Active
+    pub(crate) fn subscribe_ownership(&self) -> watch::Receiver<OwnershipAvailability> {
+        self.ownership_changes.subscribe()
+    }
+
+    pub(crate) async fn acquire(&self, socket: SocketId) -> Result<OwnershipState> {
+        let mut book = self.ownership.lock().await;
+        if let Some(input_owner) = book.input_owner {
+            return Ok(if input_owner.socket == socket {
+                OwnershipState::Active
             } else {
-                LeaseState::Busy
+                OwnershipState::Busy
             });
         }
 
         // ReleaseAll enters the FIFO before the new epoch becomes valid, so
-        // no command from the new owner can overtake the reset. The lease can
-        // be held for at worst two PIPE_DEADLINEs while that write enters the FIFO.
+        // no command from the new input owner can overtake the reset. The input ownership
+        // lock can be held for at worst two PIPE_DEADLINEs while that write enters the FIFO.
         self.commands
             .system(Command::ReleaseAll(ReleaseAll))
             .await?;
         let epoch = book.next_epoch;
         book.next_epoch = epoch.next();
-        book.owner = Some(Lease { socket, epoch });
-        self.commands.set_active_lease(epoch);
-        info!(?socket, ?epoch, "input lease acquired");
-        Ok(LeaseState::Active)
+        book.input_owner = Some(InputOwnership { socket, epoch });
+        self.commands.set_active_ownership(epoch);
+        self.ownership_changes
+            .send_replace(OwnershipAvailability::OwnedBy(socket));
+        info!(?socket, ?epoch, "input ownership acquired");
+        Ok(OwnershipState::Active)
     }
 
-    pub(crate) async fn release(&self, socket: SocketId) -> Result<()> {
-        let mut book = self.lease.lock().await;
-        let Some(owner) = book.owner else {
-            return Ok(());
+    pub(crate) async fn release(&self, socket: SocketId) -> Result<ReleaseOutcome> {
+        let mut book = self.ownership.lock().await;
+        let Some(input_owner) = book.input_owner else {
+            return Ok(ReleaseOutcome::NotInputOwner);
         };
-        if owner.socket != socket {
-            return Ok(());
+        if input_owner.socket != socket {
+            return Ok(ReleaseOutcome::NotInputOwner);
         }
 
         // The reset follows every command already queued by this epoch. Once
         // the authority is cleared, the writer drops any late stale command.
-        // The lease can be held for at worst two PIPE_DEADLINEs during the send.
+        // The input ownership lock can be held for at worst two PIPE_DEADLINEs during the send.
         self.commands
             .system(Command::ReleaseAll(ReleaseAll))
             .await?;
-        self.commands.clear_active_lease();
-        book.owner = None;
-        info!(socket = ?owner.socket, epoch = ?owner.epoch, "input lease released");
-        Ok(())
+        self.commands.clear_active_ownership();
+        book.input_owner = None;
+        self.ownership_changes
+            .send_replace(OwnershipAvailability::Available);
+        info!(
+            socket = ?input_owner.socket,
+            epoch = ?input_owner.epoch,
+            "input ownership released"
+        );
+        Ok(ReleaseOutcome::Released)
     }
 
-    async fn epoch(&self, socket: SocketId) -> Option<LeaseEpoch> {
-        self.lease
+    async fn epoch(&self, socket: SocketId) -> Option<OwnershipEpoch> {
+        self.ownership
             .lock()
             .await
-            .owner
-            .filter(|owner| owner.socket == socket)
-            .map(|owner| owner.epoch)
+            .input_owner
+            .filter(|input_owner| input_owner.socket == socket)
+            .map(|input_owner| input_owner.epoch)
     }
 
     pub(crate) async fn input(&self, socket: SocketId, command: Command) -> Result<InputOutcome> {
         let Some(epoch) = self.epoch(socket).await else {
-            return Ok(InputOutcome::NotLeaseOwner);
+            return Ok(InputOutcome::NotInputOwner);
         };
         self.commands.input(epoch, command).await?;
         Ok(InputOutcome::Sent)
@@ -159,12 +181,12 @@ impl Sessions {
         socket: SocketId,
         feedback: Feedback,
     ) -> Result<FeedbackOutcome> {
-        let book = self.lease.lock().await;
-        let Some(owner) = book.owner else {
-            return Ok(FeedbackOutcome::NotLeaseOwner);
+        let book = self.ownership.lock().await;
+        let Some(input_owner) = book.input_owner else {
+            return Ok(FeedbackOutcome::NotInputOwner);
         };
-        if owner.socket != socket {
-            return Ok(FeedbackOutcome::NotLeaseOwner);
+        if input_owner.socket != socket {
+            return Ok(FeedbackOutcome::NotInputOwner);
         }
 
         let (change, levels) = {
@@ -179,9 +201,9 @@ impl Sessions {
                 new = ?change.new,
                 "quality levels changed"
             );
-            // Quality is daemon state, not user input. Holding the lease lock
-            // puts this command before a release and any later acquisition.
-            // The lease can be held for at worst two PIPE_DEADLINEs during the send.
+            // Quality is daemon state, not user input. Holding the input ownership
+            // lock puts this command before a release and any later acquisition.
+            // The lock can be held for at worst two PIPE_DEADLINEs during the send.
             self.commands
                 .system(Command::Quality(QualityCommand {
                     bitrate_kbps: change.new.bitrate,
@@ -196,21 +218,27 @@ impl Sessions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LeaseState {
+pub(crate) enum OwnershipState {
     Active,
     Busy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    Released,
+    NotInputOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputOutcome {
     Sent,
-    NotLeaseOwner,
+    NotInputOwner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeedbackOutcome {
     Applied(QualityLevels),
-    NotLeaseOwner,
+    NotInputOwner,
 }
 
 #[cfg(test)]
@@ -233,7 +261,7 @@ mod tests {
         )
     }
 
-    async fn acquire_and_drain(
+    async fn acquire_ownership_and_drain(
         sessions: &Sessions,
         commands: &mut TestCommandReceiver,
         socket: SocketId,
@@ -242,8 +270,8 @@ mod tests {
             sessions
                 .acquire(socket)
                 .await
-                .expect("lease should acquire"),
-            LeaseState::Active
+                .expect("ownership should acquire"),
+            OwnershipState::Active
         );
         assert!(matches!(
             commands.recv().await,
@@ -284,24 +312,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_acquire_is_busy_and_keeps_the_owner() {
+    async fn second_acquire_is_busy_and_keeps_the_input_owner() {
         let (sessions, mut commands) = test_sessions();
-        let owner = SocketId::new(1);
+        let input_owner = SocketId::new(1);
         let contender = SocketId::new(2);
-        acquire_and_drain(&sessions, &mut commands, owner).await;
+        acquire_ownership_and_drain(&sessions, &mut commands, input_owner).await;
 
         assert_eq!(
             sessions
                 .acquire(contender)
                 .await
                 .expect("busy check should succeed"),
-            LeaseState::Busy
+            OwnershipState::Busy
         );
         assert_eq!(
             sessions
-                .input(owner, Command::ReleaseAll(ReleaseAll))
+                .input(input_owner, Command::ReleaseAll(ReleaseAll))
                 .await
-                .expect("owner input should succeed"),
+                .expect("input owner command should succeed"),
             InputOutcome::Sent
         );
         assert!(matches!(
@@ -311,20 +339,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonowner_release_does_not_change_the_owner() {
+    async fn non_input_owner_release_does_not_change_or_publish_ownership() {
         let (sessions, mut commands) = test_sessions();
-        let owner = SocketId::new(1);
-        acquire_and_drain(&sessions, &mut commands, owner).await;
-
-        sessions
-            .release(SocketId::new(2))
+        let input_owner = SocketId::new(1);
+        let mut ownership_changes = sessions.subscribe_ownership();
+        acquire_ownership_and_drain(&sessions, &mut commands, input_owner).await;
+        ownership_changes
+            .changed()
             .await
-            .expect("nonowner release should be a no-op");
+            .expect("ownership acquisition should be published");
+        assert_eq!(
+            *ownership_changes.borrow_and_update(),
+            OwnershipAvailability::OwnedBy(input_owner)
+        );
+
         assert_eq!(
             sessions
-                .input(owner, Command::ReleaseAll(ReleaseAll))
+                .release(SocketId::new(2))
                 .await
-                .expect("owner input should succeed"),
+                .expect("non-input-owner release should be a no-op"),
+            ReleaseOutcome::NotInputOwner
+        );
+        assert!(
+            timeout(Duration::from_millis(20), ownership_changes.changed())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sessions
+                .input(input_owner, Command::ReleaseAll(ReleaseAll))
+                .await
+                .expect("input owner command should succeed"),
             InputOutcome::Sent
         );
         assert!(matches!(
@@ -334,16 +379,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonowner_input_returns_not_owner_without_a_command() {
+    async fn input_owner_release_publishes_availability_to_all_subscribers() {
         let (sessions, mut commands) = test_sessions();
-        acquire_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
+        let input_owner = SocketId::new(1);
+        let mut first_waiter = sessions.subscribe_ownership();
+        let mut second_waiter = sessions.subscribe_ownership();
+        acquire_ownership_and_drain(&sessions, &mut commands, input_owner).await;
+        first_waiter
+            .changed()
+            .await
+            .expect("first waiter should observe acquisition");
+        second_waiter
+            .changed()
+            .await
+            .expect("second waiter should observe acquisition");
+
+        assert_eq!(
+            sessions
+                .release(input_owner)
+                .await
+                .expect("input owner release should succeed"),
+            ReleaseOutcome::Released
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+        first_waiter
+            .changed()
+            .await
+            .expect("first waiter should observe release");
+        second_waiter
+            .changed()
+            .await
+            .expect("second waiter should observe release");
+        assert_eq!(
+            *first_waiter.borrow_and_update(),
+            OwnershipAvailability::Available
+        );
+        assert_eq!(
+            *second_waiter.borrow_and_update(),
+            OwnershipAvailability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn non_input_owner_input_returns_not_owner_without_a_command() {
+        let (sessions, mut commands) = test_sessions();
+        acquire_ownership_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
 
         assert_eq!(
             sessions
                 .input(SocketId::new(2), Command::ReleaseAll(ReleaseAll))
                 .await
-                .expect("nonowner input check should succeed"),
-            InputOutcome::NotLeaseOwner
+                .expect("non-input-owner check should succeed"),
+            InputOutcome::NotInputOwner
         );
         assert!(
             timeout(Duration::from_millis(20), commands.recv())
@@ -353,17 +443,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonowner_feedback_keeps_quality_and_sends_no_command() {
+    async fn non_input_owner_feedback_keeps_quality_and_sends_no_command() {
         let (sessions, mut commands) = test_sessions();
-        acquire_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
+        acquire_ownership_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
         let before = sessions.quality();
 
         assert_eq!(
             sessions
                 .feedback(SocketId::new(2), bad_feedback())
                 .await
-                .expect("nonowner feedback check should succeed"),
-            FeedbackOutcome::NotLeaseOwner
+                .expect("non-input-owner feedback check should succeed"),
+            FeedbackOutcome::NotInputOwner
         );
         assert_eq!(sessions.quality(), before);
         assert!(

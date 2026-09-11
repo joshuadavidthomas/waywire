@@ -1,4 +1,6 @@
+import { Playout } from "../sdk/playout.ts";
 import type {
+  RemoteDisplayPolicy,
   SurfaceHandle,
   WaywireSession,
   WaywireSessionState,
@@ -11,7 +13,7 @@ export type ViewerElements = {
   readonly signal: HTMLElement;
   readonly signalHeadline: HTMLElement;
   readonly signalMessage: HTMLElement;
-  readonly leaseNotice: HTMLElement;
+  readonly notice: HTMLElement;
   readonly hud: HTMLElement;
   readonly menuKey: HTMLButtonElement;
   readonly panel: HTMLElement;
@@ -22,10 +24,11 @@ export type ViewerElements = {
   readonly keyboardButton: HTMLButtonElement;
   readonly sendClipboardButton: HTMLButtonElement;
   readonly copyClipboardButton: HTMLButtonElement;
+  readonly resolutionSelect: HTMLSelectElement;
+  readonly resolutionLabel: HTMLLabelElement;
   readonly resetVideoButton: HTMLButtonElement;
   readonly clipboardStatus: HTMLElement;
   readonly hudToggle: HTMLInputElement;
-  readonly latency: HTMLElement;
   readonly fullscreenButton: HTMLButtonElement;
   readonly pinButton: HTMLButtonElement;
   readonly closeButton: HTMLButtonElement;
@@ -35,33 +38,33 @@ export type ViewerElements = {
 type Field =
   | "resolution"
   | "rate"
-  | "bitrate"
+  | "target-bitrate"
   | "scale"
   | "rtt"
   | "late"
-  | "target"
-  | "clock"
-  | "input-queue"
+  | "video-latency-target"
+  | "clock-uncertainty"
+  | "unacknowledged-input"
   | "decode-queue"
   | "dropped"
   | "received"
-  | "resize"
+  | "resize-time"
   | "codec";
 
 const FIELDS: readonly Field[] = [
   "resolution",
   "rate",
-  "bitrate",
+  "target-bitrate",
   "scale",
   "rtt",
   "late",
-  "target",
-  "clock",
-  "input-queue",
+  "video-latency-target",
+  "clock-uncertainty",
+  "unacknowledged-input",
   "decode-queue",
   "dropped",
   "received",
-  "resize",
+  "resize-time",
   "codec",
 ];
 
@@ -71,8 +74,19 @@ const HUD_IDLE_AFTER_MS = 1500;
 const ESCAPE_CHORD_MS = 400;
 const HUD_STORAGE_KEY = "waywire.hud";
 const PANEL_STORAGE_KEY = "waywire.panel";
-export const LATENCY_STORAGE_KEY = "waywire.latency";
+export const RESOLUTION_STORAGE_KEY = "waywire.resolution";
+export const RESOLUTION_VALUES = [
+  "fit",
+  "2560x1440",
+  "1920x1080",
+  "1600x900",
+  "1366x768",
+  "1280x720",
+  "1024x768",
+] as const;
 
+type Resolution = (typeof RESOLUTION_VALUES)[number];
+type FixedResolution = Exclude<Resolution, "fit">;
 type Wheel = "auto" | "handsOff";
 type Panel = "floating" | "pinned";
 
@@ -150,6 +164,40 @@ function writeStored(key: string, value: string): void {
   }
 }
 
+function parseResolution(value: string | null): Resolution | null {
+  for (const allowed of RESOLUTION_VALUES) {
+    if (value === allowed) return allowed;
+  }
+  return null;
+}
+
+const FIXED_RESOLUTIONS: Record<
+  FixedResolution,
+  readonly [width: number, height: number]
+> = {
+  "2560x1440": [2560, 1440],
+  "1920x1080": [1920, 1080],
+  "1600x900": [1600, 900],
+  "1366x768": [1366, 768],
+  "1280x720": [1280, 720],
+  "1024x768": [1024, 768],
+};
+
+function resolutionPolicy(
+  resolution: Resolution,
+  display: HTMLCanvasElement,
+): RemoteDisplayPolicy {
+  if (resolution === "fit") {
+    return {
+      mode: "observe",
+      element: display,
+      devicePixelRatio: 1,
+    };
+  }
+  const [width, height] = FIXED_RESOLUTIONS[resolution];
+  return { mode: "fixed", width, height, scale: 1 };
+}
+
 // What the page keeps hold of: a way to let an action settle the menu the way
 // the viewer asked for it, and a way to tear the whole thing down.
 export type ViewerControls = {
@@ -162,6 +210,16 @@ export function installViewerListeners(
   session: WaywireSession,
   surface: SurfaceHandle,
 ): ViewerControls {
+  const storedResolution = readStored(RESOLUTION_STORAGE_KEY);
+  let resolution = parseResolution(storedResolution) ?? "fit";
+  elements.resolutionSelect.value = resolution;
+  session.remoteDisplay.setPolicy(
+    resolutionPolicy(resolution, elements.display),
+  );
+  if (storedResolution !== null && storedResolution !== resolution) {
+    writeStored(RESOLUTION_STORAGE_KEY, resolution);
+  }
+
   const fields = Object.fromEntries(
     FIELDS.map((name) => [name, hudField(elements.hud, name)]),
   ) as Record<Field, HTMLElement>;
@@ -210,7 +268,7 @@ export function installViewerListeners(
   applyPanelMode();
   if (panel === "pinned") elements.panel.showPopover();
 
-  // Reaching the remote is seamless. The SDK ties the lease to canvas
+  // Reaching the remote is seamless. The SDK ties input ownership to canvas
   // focus, so the screen takes focus whenever the pointer is over it or the
   // window comes back, unless the viewer switched their input off.
   let wheel: Wheel = "auto";
@@ -229,20 +287,26 @@ export function installViewerListeners(
   const onWindowFocus = (): void => focusScreen();
   window.addEventListener("focus", onWindowFocus);
   cleanup.push(() => window.removeEventListener("focus", onWindowFocus));
+  const keyboardTitle = elements.keyboardButton.title;
   const renderWheel = (): void => {
-    elements.controlToggle.checked = wheel === "auto";
+    const inputEnabled = wheel === "auto";
+    elements.controlToggle.checked = inputEnabled;
+    elements.keyboardButton.disabled = !inputEnabled;
+    elements.keyboardButton.title = inputEnabled
+      ? keyboardTitle
+      : "Turn on Remote input first";
   };
   // The page's one notice, for the two states that explain a screen which
   // does not answer. It reports the situation; the switch names the action.
-  const renderLeaseNotice = (state: WaywireSessionState): void => {
+  const renderNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent = "View only";
-      elements.leaseNotice.hidden = false;
+      elements.notice.textContent = "View only";
+      elements.notice.hidden = false;
     } else if (state.input.state === "busy") {
-      elements.leaseNotice.textContent = "Another viewer has control";
-      elements.leaseNotice.hidden = false;
+      elements.notice.textContent = "Another viewer has control";
+      elements.notice.hidden = false;
     } else {
-      elements.leaseNotice.hidden = true;
+      elements.notice.hidden = true;
     }
   };
   renderWheel();
@@ -260,7 +324,7 @@ export function installViewerListeners(
       elements.signalHeadline.textContent = headline;
       elements.signalMessage.textContent =
         state.video.message === headline ? "" : state.video.message;
-      renderLeaseNotice(state);
+      renderNotice(state);
       elements.status.dataset["state"] = state.video.state;
       elements.status.title = state.video.message;
       elements.statusVideo.textContent = videoLabel(state);
@@ -275,6 +339,7 @@ export function installViewerListeners(
   // Stats live in their own overlay. Frames only arrive while the remote
   // changes, so the overlay renders the last snapshot on switch-on and marks
   // the rate idle once frames stop.
+  const playout = new Playout();
   let lastStats: WaywireStats | null = null;
   let lastStatsAt = Number.NEGATIVE_INFINITY;
   let pendingStats: WaywireStats | null = null;
@@ -286,15 +351,17 @@ export function installViewerListeners(
     fields.rate.textContent = idle
       ? "idle"
       : `${stats.renderedFps.toFixed(0)} fps`;
-    fields.bitrate.textContent = `${stats.bitrateKbps} kbps`;
+    fields["target-bitrate"].textContent = `${stats.bitrateKbps} kbps`;
     fields.scale.textContent = `${stats.scalePercent}%`;
     fields.rtt.textContent = `${stats.rttMs.toFixed(1)} ms`;
     fields.late.textContent = `${stats.latenessMs.toFixed(1)} ms`;
-    fields.target.textContent = `${stats.latencyTargetMs} ms`;
-    fields.clock.textContent = stats.clockConfident
+    fields["video-latency-target"].textContent = `${stats.latencyTargetMs} ms`;
+    fields["clock-uncertainty"].textContent = stats.clockConfident
       ? `±${stats.clockUncertaintyMs?.toFixed(1) ?? "?"} ms`
       : "syncing";
-    fields["input-queue"].textContent = String(stats.pendingInputCount);
+    fields["unacknowledged-input"].textContent = String(
+      stats.pendingInputCount,
+    );
     fields["decode-queue"].textContent = String(stats.decoderQueue);
     fields.dropped.textContent = String(stats.droppedFrames);
     fields.received.textContent = String(stats.receivedFrames);
@@ -328,6 +395,14 @@ export function installViewerListeners(
   setHud(readStored(HUD_STORAGE_KEY) === "on");
   cleanup.push(
     session.on("stats", (stats) => {
+      const target = playout.update(
+        stats.clockConfident
+          ? { latenessMs: stats.latenessMs, decodeQueue: stats.decoderQueue }
+          : null,
+        stats.drawCompletedAtMs,
+      );
+      if (target !== stats.latencyTargetMs)
+        session.video.setLatencyTarget(target);
       lastStats = stats;
       lastStatsAt = performance.now();
       if (framesSinceConnect === 0) {
@@ -359,8 +434,8 @@ export function installViewerListeners(
   cleanup.push(
     session.on("resize", (event) => {
       fields.resolution.dataset["resize"] = event.state;
-      if (event.latencyMs !== undefined) {
-        fields.resize.textContent = `${event.latencyMs.toFixed(0)} ms`;
+      if (event.state === "presented" && event.latencyMs !== undefined) {
+        fields["resize-time"].textContent = `${event.latencyMs.toFixed(0)} ms`;
       }
     }),
   );
@@ -368,12 +443,16 @@ export function installViewerListeners(
     session.on("error", (error) => console.warn("Waywire stream error", error)),
   );
 
-  // The key and the menu's controls never take focus, so pressing them
-  // leaves the screen focused and the lease where it was.
+  // Buttons and switches keep input ownership on the screen. The resolution
+  // label stays native so pointer and keyboard users can focus and open its
+  // select without a prevented pointerdown cancelling the browser action.
   const keepScreenFocus = (event: PointerEvent): void => event.preventDefault();
   listen(elements.menuKey, "pointerdown", keepScreenFocus);
   for (const control of elements.panel.querySelectorAll("button, label")) {
-    if (control instanceof HTMLElement) {
+    if (
+      control instanceof HTMLElement &&
+      control !== elements.resolutionLabel
+    ) {
       listen(control, "pointerdown", keepScreenFocus);
     }
   }
@@ -389,16 +468,30 @@ export function installViewerListeners(
       elements.display.blur();
     }
     renderWheel();
-    if (lastState) renderLeaseNotice(lastState);
+    if (lastState) renderNotice(lastState);
     settle();
   });
   listen(elements.keyboardButton, "click", () => {
-    wheel = "auto";
-    renderWheel();
-    if (lastState) renderLeaseNotice(lastState);
+    if (wheel === "handsOff") return;
     session.input.acquire();
     settle();
     surface.focusTextInput();
+  });
+  listen(elements.resolutionSelect, "change", () => {
+    const selected = parseResolution(elements.resolutionSelect.value);
+    if (selected === null) {
+      elements.resolutionSelect.value = resolution;
+      return;
+    }
+    resolution = selected;
+    session.remoteDisplay.setPolicy(
+      resolutionPolicy(resolution, elements.display),
+    );
+    writeStored(RESOLUTION_STORAGE_KEY, resolution);
+    // The native select takes focus and releases canvas ownership. Request it
+    // for this explicit action so the saved policy is sent on the active reply.
+    // Keep focus on the select so keyboard users can continue choosing options.
+    if (wheel === "auto") session.input.acquire();
   });
   listen(elements.hudToggle, "change", () =>
     setHud(elements.hudToggle.checked),
@@ -406,13 +499,6 @@ export function installViewerListeners(
   listen(elements.resetVideoButton, "click", () => {
     session.video.reset();
     settle();
-  });
-  listen(elements.latency, "change", (event) => {
-    const input = event.target;
-    if (input instanceof HTMLInputElement && input.checked) {
-      session.video.setLatencyTarget(Number(input.value));
-      writeStored(LATENCY_STORAGE_KEY, input.value);
-    }
   });
   // Closing by hand ends the request to keep the menu open. Reopening it
   // later should not surprise you with a menu that will not go away.

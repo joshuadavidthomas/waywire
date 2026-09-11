@@ -57,7 +57,7 @@ export interface VideoOwner {
     generation: number,
     width: number,
     height: number,
-  ): WaywireStats["resizeState"];
+  ): void;
   publishStats(stats: WaywireStats): void;
 }
 
@@ -102,12 +102,21 @@ export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
   }
 }
 
+type FrameMetadata = Pick<VideoPacket, "generation" | "width" | "height">;
+type PendingVideoFrame = Readonly<{
+  frame: VideoFrame;
+  metadata: FrameMetadata;
+}>;
+
 export class VideoRuntime {
   private display: HTMLCanvasElement | null = null;
   private context: CanvasRenderingContext2D | null = null;
   private decoder: VideoDecoder | null = null;
   private socket: WebSocket | null = null;
-  private readonly pendingFrames: VideoFrame[] = [];
+  private readonly pendingFrames: PendingVideoFrame[] = [];
+  // WebCodecs returns the chunk timestamp with each decoded frame. Keep packet
+  // metadata until that output arrives, including repeated timestamps.
+  private readonly decodingFrames = new Map<number, FrameMetadata[]>();
   private animationPending = false;
   private animationFrame: number | null = null;
   private presentationTimer: Timer | null = null;
@@ -305,7 +314,8 @@ export class VideoRuntime {
     this.decoderGeneration += 1;
     this.decoder?.close();
     this.decoder = null;
-    for (const frame of this.pendingFrames.splice(0)) frame.close();
+    this.decodingFrames.clear();
+    for (const { frame } of this.pendingFrames.splice(0)) frame.close();
     if (this.presentationTimer !== null) clearTimeout(this.presentationTimer);
     this.presentationTimer = null;
     this.decoderConfiguration = null;
@@ -332,7 +342,8 @@ export class VideoRuntime {
     this.decoder?.close();
     this.decoder = null;
     this.resetFeedbackInterval();
-    for (const frame of this.pendingFrames.splice(0)) frame.close();
+    this.decodingFrames.clear();
+    for (const { frame } of this.pendingFrames.splice(0)) frame.close();
     this.cancelPresentation();
   }
 
@@ -389,6 +400,9 @@ export class VideoRuntime {
     const generation = ++this.decoderGeneration;
     this.decoder?.close();
     this.decoder = null;
+    this.decodingFrames.clear();
+    this.cancelPresentation();
+    for (const { frame } of this.pendingFrames.splice(0)) frame.close();
     this.decoderConfiguration = {
       codec: configuration.codec,
       optimizeForLatency: true,
@@ -420,10 +434,21 @@ export class VideoRuntime {
     }
     const decoder = new VideoDecoder({
       output: (frame) => {
+        if (this.decoder !== decoder) {
+          frame.close();
+          return;
+        }
+        const entries = this.decodingFrames.get(frame.timestamp);
+        const metadata = entries?.shift();
+        if (entries?.length === 0) this.decodingFrames.delete(frame.timestamp);
+        if (!metadata) {
+          frame.close();
+          return;
+        }
         this.decodedFrames += 1;
-        this.pendingFrames.push(frame);
+        this.pendingFrames.push({ frame, metadata });
         if (this.pendingFrames.length > maximumPendingVideoFrames) {
-          this.pendingFrames.shift()?.close();
+          this.pendingFrames.shift()?.frame.close();
           this.droppedFrames += 1;
           this.intervalDroppedFrames += 1;
           this.decodedOverflowDroppedFrames += 1;
@@ -468,11 +493,6 @@ export class VideoRuntime {
     this.owner.setLatestAppliedInput(packet.latestAppliedInput);
     const generationChanged = packet.generation !== this.currentGeneration;
     if (generationChanged) this.currentGeneration = packet.generation;
-    const resizeState = this.owner.presentResizeGeneration(
-      packet.generation,
-      packet.width,
-      packet.height,
-    );
     const queuedBeforeDecode = decoder.decodeQueueSize;
     this.observeDecodeQueue(queuedBeforeDecode);
     if (
@@ -488,6 +508,14 @@ export class VideoRuntime {
     )
       return;
     this.waitingForKeyframe = false;
+    const metadata: FrameMetadata = {
+      generation: packet.generation,
+      width: packet.width,
+      height: packet.height,
+    };
+    const entries = this.decodingFrames.get(packet.timestamp);
+    if (entries) entries.push(metadata);
+    else this.decodingFrames.set(packet.timestamp, [metadata]);
     decoder.decode(
       new EncodedVideoChunk({
         type: packet.keyframe ? "key" : "delta",
@@ -496,7 +524,6 @@ export class VideoRuntime {
       }),
     );
     this.observeDecodeQueue(decoder.decodeQueueSize);
-    void resizeState;
   }
 
   private observeDecodeQueue(size: number, now = performance.now()): void {
@@ -516,7 +543,8 @@ export class VideoRuntime {
     this.decoderResetDroppedFrames += resetFrames;
     this.decoderResets += 1;
     this.cancelPresentation();
-    for (const frame of this.pendingFrames.splice(0)) frame.close();
+    for (const { frame } of this.pendingFrames.splice(0)) frame.close();
+    this.decodingFrames.clear();
     this.waitingForKeyframe = true;
     decoder.reset();
     this.observeDecodeQueue(decoder.decodeQueueSize);
@@ -541,7 +569,7 @@ export class VideoRuntime {
     const next = this.pendingFrames[0];
     if (!next) return;
     const presentation = this.owner.expectedPresentationTime(
-      next.timestamp,
+      next.frame.timestamp,
       this.targetLatencyMilliseconds,
     );
     const delay = presentation === null ? 0 : presentation - performance.now();
@@ -569,16 +597,16 @@ export class VideoRuntime {
     const display = this.display;
     const context = this.context;
     if (!display || !context) {
-      for (const frame of this.pendingFrames.splice(0)) frame.close();
+      for (const { frame } of this.pendingFrames.splice(0)) frame.close();
       return;
     }
     const now = performance.now();
-    let frame: VideoFrame | undefined;
+    let pending: PendingVideoFrame | undefined;
     const synchronized = this.owner.statsContext().clockConfident;
     if (!synchronized) {
-      frame = this.pendingFrames.pop();
-      for (const stale of this.pendingFrames.splice(0)) {
-        stale.close();
+      pending = this.pendingFrames.pop();
+      for (const { frame } of this.pendingFrames.splice(0)) {
+        frame.close();
         this.recordOverdueDrop();
       }
     } else {
@@ -587,7 +615,7 @@ export class VideoRuntime {
         const candidate = this.pendingFrames[due];
         if (!candidate) break;
         const presentation = this.owner.expectedPresentationTime(
-          candidate.timestamp,
+          candidate.frame.timestamp,
           this.targetLatencyMilliseconds,
         );
         if (presentation !== null && presentation > now) break;
@@ -598,13 +626,14 @@ export class VideoRuntime {
         return;
       }
       const ready = this.pendingFrames.splice(0, due);
-      frame = ready.pop();
-      for (const stale of ready) {
-        stale.close();
+      pending = ready.pop();
+      for (const { frame } of ready) {
+        frame.close();
         this.recordOverdueDrop();
       }
     }
-    if (!frame) return;
+    if (!pending) return;
+    const { frame, metadata } = pending;
     const dimensionsChanged =
       display.width !== frame.displayWidth ||
       display.height !== frame.displayHeight;
@@ -614,6 +643,12 @@ export class VideoRuntime {
     }
     context.drawImage(frame, 0, 0, display.width, display.height);
     const drawCompletedAtMs = performance.now();
+    // Presented means rendered to the canvas, not physical display scanout.
+    this.owner.presentResizeGeneration(
+      metadata.generation,
+      metadata.width,
+      metadata.height,
+    );
     this.renderedFrames += 1;
     if (this.renderedFrames === 1) {
       this.owner.updateState({ message: "Streaming video" });
@@ -648,7 +683,7 @@ export class VideoRuntime {
         renderedFps,
         renderedMediaTimestampMicros,
         drawCompletedAtMs,
-        generation: this.currentGeneration,
+        generation: metadata.generation,
         bitrateKbps: contextStats.bitrateKbps,
         scalePercent: contextStats.scalePercent,
         rttMs: contextStats.rttMs,

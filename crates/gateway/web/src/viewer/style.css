@@ -91,7 +91,7 @@ canvas {
 }
 
 /* Only someone else holding the desktop, or your own hands off, gets a line. */
-.lease-notice {
+.notice {
   position: absolute;
   top: 12px;
   left: 50%;
@@ -105,11 +105,11 @@ canvas {
   pointer-events: none;
 }
 
-.lease-notice[hidden] {
+.notice[hidden] {
   display: none;
 }
 
-.lease-notice::before {
+.notice::before {
   content: "";
   position: absolute;
   left: 11px;
@@ -413,7 +413,8 @@ canvas {
 }
 
 .item:focus-visible,
-.item:has(input:focus-visible):not(.latency) {
+.item:has(input:focus-visible),
+.resolution-select:focus-visible {
   outline: 2px solid var(--lamp-live);
   outline-offset: -2px;
 }
@@ -448,7 +449,46 @@ canvas {
   display: none;
 }
 
-/* Two-state and three-state controls sit in their rows, no card around them. */
+/* Controls sit in their rows, with no card around them. */
+
+.resolution-control {
+  display: inline-grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  flex: 0 0 auto;
+  min-width: 154px;
+}
+
+.resolution-select {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  padding: 3px 28px 3px 8px;
+  appearance: none;
+  border: 0;
+  border-radius: 6px;
+  background: var(--sunk);
+  box-shadow: inset 0 0 0 1px var(--ring);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.resolution-chevron {
+  grid-column: 2;
+  grid-row: 1;
+  place-self: center;
+  width: 8px;
+  height: 5px;
+  color: var(--ink-dim);
+  pointer-events: none;
+  stroke-width: 1;
+}
+
+.resolution-control:has(.resolution-select:hover) .resolution-chevron {
+  color: var(--ink);
+}
 
 .toggle {
   position: relative;
@@ -487,49 +527,6 @@ canvas {
   appearance: none;
   cursor: pointer;
   outline: none;
-}
-
-.segmented {
-  display: inline-flex;
-  flex-shrink: 0;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 8px;
-  background: var(--sunk);
-  box-shadow: inset 0 0 0 1px var(--ring);
-  font-size: 13px;
-}
-
-.segment {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 8px;
-  border-radius: 6px;
-  color: var(--ink-dim);
-  cursor: pointer;
-}
-
-.segment:has(input:checked) {
-  background: var(--panel-on);
-  color: var(--ink);
-}
-
-.segment input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  appearance: none;
-  cursor: pointer;
-  outline: none;
-}
-
-.segment:has(input:focus-visible) {
-  outline: 2px solid var(--lamp-live);
-  outline-offset: -2px;
 }
 
 /* Foot: three tools, the close button standing where the key was. */
@@ -617,8 +614,8 @@ canvas {
     min-height: 44px;
   }
 
-  .segment {
-    height: 32px;
+  .resolution-select {
+    height: 36px;
   }
 
   .toggle {

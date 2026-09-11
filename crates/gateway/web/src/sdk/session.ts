@@ -222,7 +222,7 @@ export class WaywireSession {
       },
       release: () => {
         this.#assertActive();
-        this.#runtime.releaseControl();
+        this.#runtime.releaseControl("disabled");
       },
     });
     this.clipboard = Object.freeze({

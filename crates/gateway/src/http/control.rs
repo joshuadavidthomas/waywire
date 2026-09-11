@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -38,13 +39,14 @@ use super::socket::WRITE_LIMIT;
 use super::socket::log_socket_close;
 use crate::session::FeedbackOutcome;
 use crate::session::InputOutcome;
-use crate::session::LeaseState;
+use crate::session::OwnershipAvailability;
+use crate::session::ReleaseOutcome;
 use crate::session::SocketId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Audience {
     Everyone,
-    LeaseOwner,
+    InputOwner,
 }
 
 trait ClientEventAudience {
@@ -55,7 +57,7 @@ impl ClientEventAudience for ClientEvent {
     fn audience(&self) -> Audience {
         match self {
             ClientEvent::Clipboard { .. } | ClientEvent::ResetVideoRefused { .. } => {
-                Audience::LeaseOwner
+                Audience::InputOwner
             }
             ClientEvent::Cursor(_)
             | ClientEvent::ResizeApplied(_)
@@ -79,7 +81,7 @@ pub(super) async fn control_socket(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lease {
+enum InputOwnership {
     Held,
     NotHeld,
 }
@@ -96,6 +98,7 @@ enum WriterStatus {
 )]
 async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: SocketId) -> SocketEnd {
     let (snapshot, mut events) = state.events.subscribe();
+    let mut ownership_changes = state.sessions.subscribe_ownership();
     let cancellation = state.connections.cancellation.child_token();
     let (sink, mut incoming) = socket.split();
     let (sender, receiver) = mpsc::channel(OUTBOUND_MESSAGE_LIMIT);
@@ -105,16 +108,22 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
     };
     let mut writer = tokio::spawn(control_writer(sink, receiver, cancellation.clone()));
     let mut writer_status = WriterStatus::Running;
-    let mut lease = Lease::NotHeld;
+    let mut ownership = InputOwnership::NotHeld;
 
     let reason = 'connected: {
         if let Err(error) = enqueue_snapshot(
             &outbound,
             snapshot,
             state.sessions.quality(),
-            Lease::NotHeld,
+            InputOwnership::NotHeld,
         ) {
             break 'connected error.into();
+        }
+        let availability = *ownership_changes.borrow_and_update();
+        if let Err(error) =
+            dispatch_ownership_availability(&outbound, socket_id, &mut ownership, availability)
+        {
+            break 'connected error;
         }
 
         loop {
@@ -141,7 +150,15 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                     };
                     let result = match message {
                         Message::Text(text) => {
-                            handle_text(&outbound, state, socket_id, &mut lease, text.as_str()).await
+                            handle_text(
+                                &outbound,
+                                state,
+                                socket_id,
+                                &mut ownership,
+                                &mut ownership_changes,
+                                text.as_str(),
+                            )
+                            .await
                         }
                         Message::Binary(bytes) => {
                             let command = parse_browser_record(&bytes).map_err(|error| {
@@ -151,15 +168,19 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                                 )
                             });
                             match command {
-                                Ok(command) => match lease {
-                                    Lease::NotHeld => Ok(()),
-                                    Lease::Held => match state.sessions.input(socket_id, command).await {
+                                Ok(command) => match ownership {
+                                    InputOwnership::NotHeld => Ok(()),
+                                    InputOwnership::Held => match state
+                                        .sessions
+                                        .input(socket_id, command)
+                                        .await
+                                    {
                                         Ok(InputOutcome::Sent) => Ok(()),
-                                        Ok(InputOutcome::NotLeaseOwner) => {
-                                            lease = Lease::NotHeld;
+                                        Ok(InputOutcome::NotInputOwner) => {
+                                            ownership = InputOwnership::NotHeld;
                                             warn!(
                                                 socket_id = socket_id.get(),
-                                                "control socket input lease disagreed with session owner"
+                                                "control socket input ownership disagreed with session input owner"
                                             );
                                             Ok(())
                                         }
@@ -182,8 +203,25 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                     if let Err(error) = dispatch_control_event(
                         &outbound,
                         state,
-                        lease,
+                        ownership,
                         event_result,
+                    ) {
+                        break 'connected error;
+                    }
+                }
+                ownership_result = ownership_changes.changed() => {
+                    if let Err(error) = ownership_result {
+                        break 'connected SocketEnd::failed(
+                            anyhow::Error::new(error)
+                                .context("input ownership watch closed"),
+                        );
+                    }
+                    let availability = *ownership_changes.borrow_and_update();
+                    if let Err(error) = dispatch_ownership_availability(
+                        &outbound,
+                        socket_id,
+                        &mut ownership,
+                        availability,
                     ) {
                         break 'connected error;
                     }
@@ -203,19 +241,51 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
     .await
 }
 
+fn ownership_state_for(
+    socket_id: SocketId,
+    availability: OwnershipAvailability,
+) -> (InputOwnership, ControlState) {
+    match availability {
+        OwnershipAvailability::Available => (InputOwnership::NotHeld, ControlState::Ready),
+        OwnershipAvailability::OwnedBy(owner) => {
+            if owner == socket_id {
+                (InputOwnership::Held, ControlState::Active)
+            } else {
+                (InputOwnership::NotHeld, ControlState::Busy)
+            }
+        }
+    }
+}
+
+fn dispatch_ownership_availability(
+    outbound: &Outbound,
+    socket_id: SocketId,
+    ownership: &mut InputOwnership,
+    availability: OwnershipAvailability,
+) -> Result<ControlState, SocketEnd> {
+    let (next_ownership, control_state) = ownership_state_for(socket_id, availability);
+    *ownership = next_ownership;
+    outbound
+        .enqueue_event(&ClientEvent::ControlState {
+            state: control_state,
+        })
+        .map_err(SocketEnd::from)?;
+    Ok(control_state)
+}
+
 fn dispatch_control_event(
     outbound: &Outbound,
     state: &AppState,
-    lease: Lease,
+    ownership: InputOwnership,
     result: Result<ClientEvent, broadcast::error::RecvError>,
 ) -> Result<(), SocketEnd> {
     match result {
-        Ok(event) => match (event.audience(), lease) {
-            (Audience::Everyone, Lease::Held | Lease::NotHeld)
-            | (Audience::LeaseOwner, Lease::Held) => {
+        Ok(event) => match (event.audience(), ownership) {
+            (Audience::Everyone, InputOwnership::Held | InputOwnership::NotHeld)
+            | (Audience::InputOwner, InputOwnership::Held) => {
                 outbound.enqueue_event(&event).map_err(SocketEnd::from)
             }
-            (Audience::LeaseOwner, Lease::NotHeld) => Ok(()),
+            (Audience::InputOwner, InputOwnership::NotHeld) => Ok(()),
         },
         Err(broadcast::error::RecvError::Lagged(count)) => {
             debug!(lagged_events = count, "control event receiver lagged");
@@ -223,7 +293,7 @@ fn dispatch_control_event(
                 outbound,
                 state.events.snapshot(),
                 state.sessions.quality(),
-                lease,
+                ownership,
             )
             .map_err(SocketEnd::from)
         }
@@ -237,13 +307,13 @@ fn enqueue_snapshot(
     outbound: &Outbound,
     snapshot: Vec<ClientEvent>,
     quality: QualityLevels,
-    lease: Lease,
+    ownership: InputOwnership,
 ) -> Result<(), OutboundError> {
     for event in snapshot {
-        match (event.audience(), lease) {
-            (Audience::Everyone, Lease::Held | Lease::NotHeld)
-            | (Audience::LeaseOwner, Lease::Held) => outbound.enqueue_event(&event)?,
-            (Audience::LeaseOwner, Lease::NotHeld) => {}
+        match (event.audience(), ownership) {
+            (Audience::Everyone, InputOwnership::Held | InputOwnership::NotHeld)
+            | (Audience::InputOwner, InputOwnership::Held) => outbound.enqueue_event(&event)?,
+            (Audience::InputOwner, InputOwnership::NotHeld) => {}
         }
     }
     outbound.enqueue_event(&ClientEvent::Quality(quality))
@@ -251,11 +321,11 @@ fn enqueue_snapshot(
 
 #[derive(Debug, Error)]
 enum CleanupFailure {
-    #[error("release input lease")]
+    #[error("release input ownership")]
     Release(#[source] anyhow::Error),
     #[error("control writer cleanup")]
     Writer(#[source] anyhow::Error),
-    #[error("release input lease; control writer cleanup also failed: {writer:#}")]
+    #[error("release input ownership; control writer cleanup also failed: {writer:#}")]
     Both {
         #[source]
         release: anyhow::Error,
@@ -320,7 +390,8 @@ async fn handle_text(
     outbound: &Outbound,
     state: &AppState,
     socket_id: SocketId,
-    lease: &mut Lease,
+    ownership: &mut InputOwnership,
+    ownership_changes: &mut watch::Receiver<OwnershipAvailability>,
     text: &str,
 ) -> Result<(), SocketEnd> {
     let message = ClientMessage::parse_json(text.as_bytes()).map_err(|error| {
@@ -328,26 +399,14 @@ async fn handle_text(
     })?;
     match message {
         ClientMessage::AcquireControl => {
-            let control_state = match state
+            state
                 .sessions
                 .acquire(socket_id)
                 .await
-                .map_err(|error| SocketEnd::failed(error.context("acquire input lease")))?
-            {
-                LeaseState::Active => {
-                    *lease = Lease::Held;
-                    ControlState::Active
-                }
-                LeaseState::Busy => {
-                    *lease = Lease::NotHeld;
-                    ControlState::Busy
-                }
-            };
-            outbound
-                .enqueue_event(&ClientEvent::ControlState {
-                    state: control_state,
-                })
-                .map_err(SocketEnd::from)?;
+                .map_err(|error| SocketEnd::failed(error.context("acquire input ownership")))?;
+            let availability = *ownership_changes.borrow_and_update();
+            let control_state =
+                dispatch_ownership_availability(outbound, socket_id, ownership, availability)?;
             if control_state == ControlState::Active
                 && let Some(text) = state.events.latest_clipboard()
             {
@@ -358,17 +417,19 @@ async fn handle_text(
             Ok(())
         }
         ClientMessage::ReleaseControl => {
-            state
+            let release = state
                 .sessions
                 .release(socket_id)
                 .await
-                .map_err(|error| SocketEnd::failed(error.context("release input lease")))?;
-            *lease = Lease::NotHeld;
-            outbound
-                .enqueue_event(&ClientEvent::ControlState {
-                    state: ControlState::Ready,
-                })
-                .map_err(SocketEnd::from)
+                .map_err(|error| SocketEnd::failed(error.context("release input ownership")))?;
+            match release {
+                ReleaseOutcome::Released => {
+                    let availability = *ownership_changes.borrow_and_update();
+                    dispatch_ownership_availability(outbound, socket_id, ownership, availability)?;
+                    Ok(())
+                }
+                ReleaseOutcome::NotInputOwner => Ok(()),
+            }
         }
         ClientMessage::Ping { id: request_id } => {
             let time = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(|error| {
@@ -392,16 +453,16 @@ async fn handle_text(
                 FeedbackOutcome::Applied(levels) => outbound
                     .enqueue_event(&ClientEvent::Quality(levels))
                     .map_err(SocketEnd::from),
-                FeedbackOutcome::NotLeaseOwner => Ok(()),
+                FeedbackOutcome::NotInputOwner => Ok(()),
             }
         }
         ClientMessage::Text {
             action,
             text,
             sequence,
-        } => match *lease {
-            Lease::NotHeld => Ok(()),
-            Lease::Held => {
+        } => match *ownership {
+            InputOwnership::NotHeld => Ok(()),
+            InputOwnership::Held => {
                 let outcome = state
                     .sessions
                     .input(
@@ -416,20 +477,20 @@ async fn handle_text(
                     .map_err(|error| SocketEnd::failed(error.context("send text input")))?;
                 match outcome {
                     InputOutcome::Sent => Ok(()),
-                    InputOutcome::NotLeaseOwner => {
-                        *lease = Lease::NotHeld;
+                    InputOutcome::NotInputOwner => {
+                        *ownership = InputOwnership::NotHeld;
                         warn!(
                             socket_id = socket_id.get(),
-                            "control socket input lease disagreed with session owner"
+                            "control socket input ownership disagreed with session input owner"
                         );
                         Ok(())
                     }
                 }
             }
         },
-        ClientMessage::ClipboardWrite { text } => match *lease {
-            Lease::NotHeld => Ok(()),
-            Lease::Held => {
+        ClientMessage::ClipboardWrite { text } => match *ownership {
+            InputOwnership::NotHeld => Ok(()),
+            InputOwnership::Held => {
                 let outcome = state
                     .sessions
                     .input(socket_id, Command::Clipboard(text))
@@ -437,20 +498,20 @@ async fn handle_text(
                     .map_err(|error| SocketEnd::failed(error.context("send clipboard input")))?;
                 match outcome {
                     InputOutcome::Sent => Ok(()),
-                    InputOutcome::NotLeaseOwner => {
-                        *lease = Lease::NotHeld;
+                    InputOutcome::NotInputOwner => {
+                        *ownership = InputOwnership::NotHeld;
                         warn!(
                             socket_id = socket_id.get(),
-                            "control socket input lease disagreed with session owner"
+                            "control socket input ownership disagreed with session input owner"
                         );
                         Ok(())
                     }
                 }
             }
         },
-        ClientMessage::ResetVideo => match *lease {
-            Lease::NotHeld => Ok(()),
-            Lease::Held => {
+        ClientMessage::ResetVideo => match *ownership {
+            InputOwnership::NotHeld => Ok(()),
+            InputOwnership::Held => {
                 let outcome = state
                     .sessions
                     .input(socket_id, Command::ResetVideo(ResetVideo))
@@ -458,11 +519,11 @@ async fn handle_text(
                     .map_err(|error| SocketEnd::failed(error.context("reset video")))?;
                 match outcome {
                     InputOutcome::Sent => Ok(()),
-                    InputOutcome::NotLeaseOwner => {
-                        *lease = Lease::NotHeld;
+                    InputOutcome::NotInputOwner => {
+                        *ownership = InputOwnership::NotHeld;
                         warn!(
                             socket_id = socket_id.get(),
-                            "control socket input lease disagreed with session owner"
+                            "control socket input ownership disagreed with session input owner"
                         );
                         Ok(())
                     }
@@ -499,6 +560,7 @@ mod tests {
     use crate::http::Origin;
     use crate::http::SocketConnections;
     use crate::http::outbound::OutboundItem;
+    use crate::session::OwnershipState;
     use crate::session::Sessions;
     use crate::video::Readiness;
     use crate::video::VideoHub;
@@ -532,6 +594,24 @@ mod tests {
             rx,
         )
     }
+    async fn handle_test_text(
+        outbound: &Outbound,
+        state: &AppState,
+        socket_id: SocketId,
+        ownership: &mut InputOwnership,
+        text: &str,
+    ) -> Result<(), SocketEnd> {
+        let mut ownership_changes = state.sessions.subscribe_ownership();
+        handle_text(
+            outbound,
+            state,
+            socket_id,
+            ownership,
+            &mut ownership_changes,
+            text,
+        )
+        .await
+    }
     async fn next_text(receiver: &mut mpsc::Receiver<OutboundItem>) -> String {
         let item = receiver
             .recv()
@@ -550,8 +630,8 @@ mod tests {
                 .sessions
                 .acquire(socket)
                 .await
-                .expect("lease should acquire"),
-            LeaseState::Active
+                .expect("ownership should acquire"),
+            OwnershipState::Active
         );
         assert!(matches!(
             commands.recv().await,
@@ -562,19 +642,19 @@ mod tests {
     async fn acquire_message_enqueues_active_state_and_reset_command() {
         let (state, mut commands) = test_state();
         let (outbound, mut events) = outbound();
-        let mut lease = Lease::NotHeld;
+        let mut ownership = InputOwnership::NotHeld;
 
-        handle_text(
+        handle_test_text(
             &outbound,
             &state,
             SocketId::new(1),
-            &mut lease,
+            &mut ownership,
             r#"{"type":"acquire"}"#,
         )
         .await
         .expect("acquire message should succeed");
 
-        assert_eq!(lease, Lease::Held);
+        assert_eq!(ownership, InputOwnership::Held);
         assert_eq!(
             next_text(&mut events).await,
             serde_json::to_string(&ClientEvent::ControlState {
@@ -593,19 +673,19 @@ mod tests {
         let socket = SocketId::new(1);
         acquire(&state, &mut commands, socket).await;
         let (outbound, mut events) = outbound();
-        let mut lease = Lease::Held;
+        let mut ownership = InputOwnership::Held;
 
-        handle_text(
+        handle_test_text(
             &outbound,
             &state,
             socket,
-            &mut lease,
+            &mut ownership,
             r#"{"type":"release"}"#,
         )
         .await
         .expect("release message should succeed");
 
-        assert_eq!(lease, Lease::NotHeld);
+        assert_eq!(ownership, InputOwnership::NotHeld);
         assert_eq!(
             next_text(&mut events).await,
             serde_json::to_string(&ClientEvent::ControlState {
@@ -619,16 +699,201 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn ping_message_enqueues_pong_without_a_command() {
+    async fn owner_release_enqueues_ready_for_two_waiting_sockets() {
         let (state, mut commands) = test_state();
+        let input_owner = SocketId::new(1);
+        let first_waiter = SocketId::new(2);
+        let second_waiter = SocketId::new(3);
+        let mut first_changes = state.sessions.subscribe_ownership();
+        let mut second_changes = state.sessions.subscribe_ownership();
+        let (first_outbound, mut first_events) = outbound();
+        let (second_outbound, mut second_events) = outbound();
+        let mut first_ownership = InputOwnership::NotHeld;
+        let mut second_ownership = InputOwnership::NotHeld;
+        acquire(&state, &mut commands, input_owner).await;
+        first_changes
+            .changed()
+            .await
+            .expect("first socket should observe acquisition");
+        second_changes
+            .changed()
+            .await
+            .expect("second socket should observe acquisition");
+        dispatch_ownership_availability(
+            &first_outbound,
+            first_waiter,
+            &mut first_ownership,
+            *first_changes.borrow_and_update(),
+        )
+        .expect("first socket should enqueue busy state");
+        dispatch_ownership_availability(
+            &second_outbound,
+            second_waiter,
+            &mut second_ownership,
+            *second_changes.borrow_and_update(),
+        )
+        .expect("second socket should enqueue busy state");
+        assert!(
+            next_text(&mut first_events)
+                .await
+                .contains(r#""state":"busy""#)
+        );
+        assert!(
+            next_text(&mut second_events)
+                .await
+                .contains(r#""state":"busy""#)
+        );
+
+        assert_eq!(
+            state
+                .sessions
+                .release(input_owner)
+                .await
+                .expect("owner release should succeed"),
+            ReleaseOutcome::Released
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+        first_changes
+            .changed()
+            .await
+            .expect("first socket should observe release");
+        second_changes
+            .changed()
+            .await
+            .expect("second socket should observe release");
+        dispatch_ownership_availability(
+            &first_outbound,
+            first_waiter,
+            &mut first_ownership,
+            *first_changes.borrow_and_update(),
+        )
+        .expect("first socket should enqueue ready state");
+        dispatch_ownership_availability(
+            &second_outbound,
+            second_waiter,
+            &mut second_ownership,
+            *second_changes.borrow_and_update(),
+        )
+        .expect("second socket should enqueue ready state");
+
+        assert_eq!(first_ownership, InputOwnership::NotHeld);
+        assert_eq!(second_ownership, InputOwnership::NotHeld);
+        assert!(
+            next_text(&mut first_events)
+                .await
+                .contains(r#""state":"ready""#)
+        );
+        assert!(
+            next_text(&mut second_events)
+                .await
+                .contains(r#""state":"ready""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn nonowner_release_enqueues_no_state_while_an_owner_exists() {
+        let (state, mut commands) = test_state();
+        let input_owner = SocketId::new(1);
+        let contender = SocketId::new(2);
+        acquire(&state, &mut commands, input_owner).await;
+        let mut ownership_changes = state.sessions.subscribe_ownership();
         let (outbound, mut events) = outbound();
-        let mut lease = Lease::NotHeld;
+        let mut ownership = InputOwnership::NotHeld;
 
         handle_text(
             &outbound,
             &state,
+            contender,
+            &mut ownership,
+            &mut ownership_changes,
+            r#"{"type":"release"}"#,
+        )
+        .await
+        .expect("nonowner release should be ignored");
+
+        assert_eq!(ownership, InputOwnership::NotHeld);
+        assert_eq!(
+            *ownership_changes.borrow(),
+            OwnershipAvailability::OwnedBy(input_owner)
+        );
+        assert!(
+            timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonowner_release_does_not_consume_a_pending_ready_change() {
+        let (state, mut commands) = test_state();
+        let input_owner = SocketId::new(1);
+        let contender = SocketId::new(2);
+        acquire(&state, &mut commands, input_owner).await;
+        let mut ownership_changes = state.sessions.subscribe_ownership();
+        let (outbound, mut events) = outbound();
+        let mut ownership = InputOwnership::NotHeld;
+        assert_eq!(
+            state
+                .sessions
+                .release(input_owner)
+                .await
+                .expect("owner release should succeed"),
+            ReleaseOutcome::Released
+        );
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+
+        handle_text(
+            &outbound,
+            &state,
+            contender,
+            &mut ownership,
+            &mut ownership_changes,
+            r#"{"type":"release"}"#,
+        )
+        .await
+        .expect("nonowner release should be ignored");
+        assert!(
+            timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+
+        ownership_changes
+            .changed()
+            .await
+            .expect("ready change should remain pending");
+        dispatch_ownership_availability(
+            &outbound,
+            contender,
+            &mut ownership,
+            *ownership_changes.borrow_and_update(),
+        )
+        .expect("ready state should enqueue");
+        assert!(next_text(&mut events).await.contains(r#""state":"ready""#));
+    }
+
+    #[tokio::test]
+    async fn ping_message_enqueues_pong_without_a_command() {
+        let (state, mut commands) = test_state();
+        let (outbound, mut events) = outbound();
+        let mut ownership = InputOwnership::NotHeld;
+
+        handle_test_text(
+            &outbound,
+            &state,
             SocketId::new(1),
-            &mut lease,
+            &mut ownership,
             r#"{"type":"ping","id":7}"#,
         )
         .await
@@ -647,14 +912,14 @@ mod tests {
         let socket = SocketId::new(1);
         acquire(&state, &mut commands, socket).await;
         let (outbound, mut events) = outbound();
-        let mut lease = Lease::Held;
+        let mut ownership = InputOwnership::Held;
         let message = r#"{"type":"feedback","received":50,"presented":50,"queuePeak":5,"queueBusyMs":200.0,"sampleMs":1000.0,"dropped":0,"rtt":20.0}"#;
 
-        handle_text(&outbound, &state, socket, &mut lease, message)
+        handle_test_text(&outbound, &state, socket, &mut ownership, message)
             .await
             .expect("first feedback should succeed");
         let _ = next_text(&mut events).await;
-        handle_text(&outbound, &state, socket, &mut lease, message)
+        handle_test_text(&outbound, &state, socket, &mut ownership, message)
             .await
             .expect("second feedback should succeed");
 
@@ -667,13 +932,13 @@ mod tests {
         let socket = SocketId::new(1);
         acquire(&state, &mut commands, socket).await;
         let (outbound, mut events) = outbound();
-        let mut lease = Lease::Held;
+        let mut ownership = InputOwnership::Held;
 
-        handle_text(
+        handle_test_text(
             &outbound,
             &state,
             socket,
-            &mut lease,
+            &mut ownership,
             r#"{"type":"text","action":"commit","text":"hi","sequence":3}"#,
         )
         .await
@@ -699,13 +964,13 @@ mod tests {
         let socket = SocketId::new(1);
         acquire(&state, &mut commands, socket).await;
         let (outbound, mut events) = outbound();
-        let mut lease = Lease::Held;
+        let mut ownership = InputOwnership::Held;
 
-        handle_text(
+        handle_test_text(
             &outbound,
             &state,
             socket,
-            &mut lease,
+            &mut ownership,
             r#"{"type":"clipboard-write","text":"copy"}"#,
         )
         .await
@@ -724,18 +989,18 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn reset_video_message_uses_the_input_lease() {
+    async fn reset_video_message_uses_input_ownership() {
         let (state, mut commands) = test_state();
         let socket = SocketId::new(1);
         acquire(&state, &mut commands, socket).await;
         let (outbound, _events) = outbound();
-        let mut lease = Lease::Held;
+        let mut ownership = InputOwnership::Held;
 
-        handle_text(
+        handle_test_text(
             &outbound,
             &state,
             socket,
-            &mut lease,
+            &mut ownership,
             r#"{"type":"reset-video"}"#,
         )
         .await
@@ -749,13 +1014,13 @@ mod tests {
         let (state, mut commands) = test_state();
         acquire(&state, &mut commands, SocketId::new(1)).await;
         let (outbound, _events) = outbound();
-        let mut lease = Lease::NotHeld;
+        let mut ownership = InputOwnership::NotHeld;
 
-        handle_text(
+        handle_test_text(
             &outbound,
             &state,
             SocketId::new(2),
-            &mut lease,
+            &mut ownership,
             r#"{"type":"reset-video"}"#,
         )
         .await
@@ -796,14 +1061,14 @@ mod tests {
             lagged,
             Err(broadcast::error::RecvError::Lagged(1))
         ));
-        dispatch_control_event(&outbound, &state, Lease::NotHeld, lagged)
+        dispatch_control_event(&outbound, &state, InputOwnership::NotHeld, lagged)
             .expect("lagged event should resynchronise");
         assert!(next_text(&mut events).await.contains(r#""type":"cursor""#));
         assert!(next_text(&mut events).await.contains(r#""type":"quality""#));
 
         let next = receiver.recv().await;
         assert_eq!(next, Ok(retained));
-        dispatch_control_event(&outbound, &state, Lease::NotHeld, next)
+        dispatch_control_event(&outbound, &state, InputOwnership::NotHeld, next)
             .expect("event loop should accept the retained event");
         assert!(
             next_text(&mut events)

@@ -191,7 +191,8 @@ export interface InputOwner {
   contentPosition(event: PointerEvent): PointerPosition | null;
   sendRecord(record: ArrayBuffer): boolean;
   nextSequence(): number;
-  requestControl(): void;
+  requestControlOnFocus(): void;
+  requestControlOnInteraction(): void;
   releaseControl(): void;
   controlActive(): boolean;
   controlOnFocus(): boolean;
@@ -228,6 +229,14 @@ export class InputRuntime {
     this.add(input, "pointermove", this.queuePointerPosition);
     this.add(input, "pointermove", this.handleRelativePointerMove);
     this.add(input, "pointerdown", this.handlePointerDown);
+    this.add(
+      input,
+      "touchstart",
+      () => this.owner.requestControlOnInteraction(),
+      {
+        passive: true,
+      },
+    );
     this.add(input, "pointerup", this.handlePointerUp);
     this.add(input, "pointercancel", this.release);
     this.add(input, "contextmenu", (event) => event.preventDefault());
@@ -235,8 +244,21 @@ export class InputRuntime {
     this.add(input, "keydown", this.handleKeyDown);
     this.add(input, "keyup", this.handleKeyUp);
     this.add(input, "focus", () => {
-      if (this.owner.controlOnFocus()) this.owner.requestControl();
+      if (this.owner.controlOnFocus()) this.owner.requestControlOnFocus();
     });
+    const requestWhilePresent = (): void => {
+      if (
+        this.owner.controlOnFocus() &&
+        !document.hidden &&
+        document.hasFocus() &&
+        document.activeElement === input
+      )
+        this.owner.requestControlOnFocus();
+    };
+    // Window blur can leave the canvas as activeElement, so returning to it
+    // need not emit another element focus event after ownership becomes free.
+    this.add(window, "focus", requestWhilePresent);
+    this.add(input, "pointerenter", requestWhilePresent);
     this.add(input, "blur", (event: FocusEvent) => {
       if (event.relatedTarget !== this.owner.imeProxy())
         this.owner.releaseControl();
@@ -248,7 +270,7 @@ export class InputRuntime {
     this.add(ime, "compositionupdate", this.handleCompositionUpdate);
     this.add(ime, "compositionend", this.handleCompositionEnd);
     this.add(ime, "beforeinput", this.handleBeforeInput);
-    this.add(ime, "focus", () => this.owner.requestControl());
+    this.add(ime, "focus", () => this.owner.requestControlOnFocus());
     this.add(ime, "blur", this.handleTextInputBlur);
     this.add(document, "pointerlockchange", this.handlePointerLockChange);
     this.add(document, "pointerlockerror", () =>
@@ -351,6 +373,7 @@ export class InputRuntime {
   };
 
   private handlePointerDown = (event: PointerEvent): void => {
+    this.owner.requestControlOnInteraction();
     const display = this.owner.display();
     const locked = document.pointerLockElement === display;
     const position = locked ? null : this.owner.contentPosition(event);
@@ -388,6 +411,7 @@ export class InputRuntime {
   };
 
   private handleWheel = (event: WheelEvent): void => {
+    this.owner.requestControlOnInteraction();
     this.owner.inputElement()?.focus({ preventScroll: true });
     const scale =
       event.deltaMode === WheelEvent.DOM_DELTA_LINE
@@ -441,6 +465,7 @@ export class InputRuntime {
   }
 
   private handleKeyDown = (event: KeyboardEvent): void => {
+    if (!event.repeat) this.owner.requestControlOnInteraction();
     if (event.isComposing || event.keyCode === 229) return;
     const key = linuxKeyCodes.get(event.code);
     if (key === undefined) return;
