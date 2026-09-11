@@ -3,6 +3,7 @@ import { WaywireSession, type SurfaceHandle } from "../sdk/waywire.ts";
 import {
   installViewerListeners,
   LATENCY_STORAGE_KEY,
+  type ViewerControls,
   type ViewerElements,
 } from "./viewer-listeners.ts";
 
@@ -84,24 +85,20 @@ function startViewer(): void {
   });
   const listeners = new AbortController();
   let surface: SurfaceHandle | undefined;
-  let removeViewerListeners: (() => void) | undefined;
+  let viewer: ViewerControls | undefined;
   let removeProtocolVersionListener: (() => void) | undefined;
   let disposed = false;
   function dispose(): void {
     if (disposed) return;
     disposed = true;
     listeners.abort();
-    removeViewerListeners?.();
+    viewer?.dispose();
     removeProtocolVersionListener?.();
     surface?.dispose();
     void session
       .dispose()
       .catch((error: unknown) => console.error("Viewer stopped", error));
   }
-  function closePanel(): void {
-    if (elements.panel.matches(":popover-open")) elements.panel.hidePopover();
-  }
-
   // Each permission request keeps its user gesture and ignores repeated clicks
   // until it settles. Page teardown cancels listeners and late continuations.
   function onPermissionClick(
@@ -114,7 +111,7 @@ function startViewer(): void {
       () => {
         if (pending || disposed) return;
         pending = true;
-        closePanel();
+        viewer?.settle();
         void action()
           .catch((error: unknown) => {
             if (!disposed) {
@@ -139,11 +136,7 @@ function startViewer(): void {
       clipboardAutoSync: true,
     });
     surface = attachedSurface;
-    removeViewerListeners = installViewerListeners(
-      elements,
-      session,
-      attachedSurface,
-    );
+    viewer = installViewerListeners(elements, session, attachedSurface);
     removeProtocolVersionListener = session.on("error", (error) => {
       if (!(error instanceof ProtocolVersionMismatchError)) return;
       const storageKey = "waywire.reloaded-for-protocol";

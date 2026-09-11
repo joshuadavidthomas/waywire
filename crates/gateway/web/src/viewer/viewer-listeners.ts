@@ -150,11 +150,18 @@ function writeStored(key: string, value: string): void {
   }
 }
 
+// What the page keeps hold of: a way to let an action settle the menu the way
+// the viewer asked for it, and a way to tear the whole thing down.
+export type ViewerControls = {
+  readonly settle: () => void;
+  readonly dispose: () => void;
+};
+
 export function installViewerListeners(
   elements: ViewerElements,
   session: WaywireSession,
   surface: SurfaceHandle,
-): () => void {
+): ViewerControls {
   const fields = Object.fromEntries(
     FIELDS.map((name) => [name, hudField(elements.hud, name)]),
   ) as Record<Field, HTMLElement>;
@@ -344,7 +351,7 @@ export function installViewerListeners(
       elements.copyClipboardButton.disabled = empty;
       elements.copyClipboardButton.title = empty
         ? "The desktop's clipboard is empty."
-        : "Copy what is on the desktop's clipboard onto this computer's clipboard.";
+        : "Put what the desktop copied onto your clipboard here.";
       if (event.text !== null) elements.clipboardStatus.textContent = "";
     }),
   );
@@ -406,7 +413,16 @@ export function installViewerListeners(
       writeStored(LATENCY_STORAGE_KEY, input.value);
     }
   });
-  listen(elements.closeButton, "click", closePanel);
+  // Closing by hand ends the request to keep the menu open. Reopening it
+  // later should not surprise you with a menu that will not go away.
+  listen(elements.closeButton, "click", () => {
+    closePanel();
+    if (panel === "pinned") {
+      panel = "floating";
+      writeStored(PANEL_STORAGE_KEY, panel);
+      applyPanelMode();
+    }
+  });
   listen(elements.pinButton, "click", () => {
     panel = panel === "pinned" ? "floating" : "pinned";
     writeStored(PANEL_STORAGE_KEY, panel);
@@ -466,12 +482,15 @@ export function installViewerListeners(
   listen(elements.stage, "pointerdown", pointerMoved);
   pointerMoved();
 
-  return () => {
-    if (hudTimer !== null) clearTimeout(hudTimer);
-    if (stillTimer !== null) clearTimeout(stillTimer);
-    hudTimer = null;
-    stillTimer = null;
-    pendingStats = null;
-    for (const remove of cleanup.splice(0).reverse()) remove();
+  return {
+    settle,
+    dispose: () => {
+      if (hudTimer !== null) clearTimeout(hudTimer);
+      if (stillTimer !== null) clearTimeout(stillTimer);
+      hudTimer = null;
+      stillTimer = null;
+      pendingStats = null;
+      for (const remove of cleanup.splice(0).reverse()) remove();
+    },
   };
 }

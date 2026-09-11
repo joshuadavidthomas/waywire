@@ -211,6 +211,7 @@ export class InputRuntime {
   private readonly pressedKeys = new Set<number>();
   private readonly pressedButtons = new Set<number>();
   private pendingPointerPosition: PointerPosition | null = null;
+  private lastPointerPosition: PointerPosition | null = null;
   private pointerAnimationPending = false;
   private pointerAnimationFrame: number | null = null;
   private physicalTextPending = false;
@@ -310,10 +311,12 @@ export class InputRuntime {
       this.pointerAnimationPending = false;
       const position = this.pendingPointerPosition;
       this.pendingPointerPosition = null;
-      if (position)
+      if (position) {
+        this.lastPointerPosition = position;
         this.owner.sendRecord(
           pointerAbsolute(position.x, position.y, this.owner.nextSequence()),
         );
+      }
     });
   };
 
@@ -333,7 +336,18 @@ export class InputRuntime {
   private handlePointerLockChange = (): void => {
     const locked = document.pointerLockElement === this.owner.display();
     this.owner.updatePointerLocked(locked);
-    if (!locked) this.release();
+    if (locked) return;
+    this.release();
+    // Leaving the lock puts the pointer back under the page's own cursor,
+    // which the browser restores where the lock began. Say so in absolute
+    // terms straight away: the desktop stops drawing its own pointer into
+    // the picture, which it does only while it is being driven by deltas,
+    // and the two pointers line up again without waiting for a move.
+    const position = this.lastPointerPosition;
+    if (position)
+      this.owner.sendRecord(
+        pointerAbsolute(position.x, position.y, this.owner.nextSequence()),
+      );
   };
 
   private handlePointerDown = (event: PointerEvent): void => {
