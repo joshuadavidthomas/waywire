@@ -924,6 +924,20 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
 }
 
 #[test]
+fn frame_write_io_error_retains_its_source() {
+    let error = FrameWriteError::Io(io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "injected pipe failure",
+    ));
+    let source = std::error::Error::source(&error)
+        .expect("frame write I/O failure should retain its source");
+    assert_eq!(
+        source.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::BrokenPipe)
+    );
+}
+
+#[test]
 fn partial_pipe_writes_finish_the_same_frame() {
     let (mut reader, mut writer, capacity) = nonblocking_pipe();
     let bytes: Vec<_> = (0..capacity * 3 + 17)
@@ -987,7 +1001,11 @@ fn generation_change_abandons_a_partially_written_pipe_frame() {
         .read_to_end(&mut received)
         .expect("test pipe should drain to EOF");
 
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(matches!(
+        error,
+        FrameWriteError::GenerationChanged { observed, frame }
+            if observed == generation(2) && frame == generation(1)
+    ));
     assert!(!received.is_empty());
     assert!(received.len() < bytes.len());
     assert!(received.iter().all(|byte| *byte == 0x5a));
@@ -1025,7 +1043,7 @@ fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
         .expect("blocked pipe writer thread should finish cleanly")
         .expect_err("stopping should interrupt the blocked frame write");
 
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(matches!(error, FrameWriteError::Stopping));
     assert!(stopped_at.elapsed() < Duration::from_millis(100));
     drop(reader_guard);
 }
@@ -1241,6 +1259,7 @@ fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
                     .any(|pair| pair[0] == flag && pair[1] == value.to_string())
             );
         }
+        assert!(!args.iter().any(|argument| argument == "-re"));
     }
 }
 

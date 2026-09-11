@@ -7,6 +7,7 @@ mod output;
 use std::fs::File;
 use std::io;
 use std::io::Read;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -74,18 +75,29 @@ use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::InputSequence;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::KeyframeState;
+use waywire_protocol::pipe::ResetVideoRefusal;
 use waywire_protocol::pipe::ResizeApplied;
 use waywire_protocol::pipe::ScalePercent;
 
 use self::capture::Capture;
+use self::capture::CaptureFailureOutcome;
+use self::capture::CaptureFailures;
+use self::capture::MAX_CONSECUTIVE_CAPTURE_FAILURES;
 use self::clipboard::Clipboard;
 use self::cursor::Cursor;
 use self::cursor::ShapeTable;
 use self::input::Input;
+use self::output::AppliedResize;
+use self::output::DimensionChange;
 use self::output::Head;
+use self::output::ManagerSerial;
 use self::output::OutputManager;
-use self::output::OutputMode;
-use self::output::ResizeRequest;
+use self::output::OutputTimeout;
+use self::output::RejectOutcome;
+use self::output::ResetRefusal;
+use self::output::ResetStart;
+use self::output::ResizeOperation;
+use self::output::SerialPublication;
 use crate::Options;
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
@@ -107,6 +119,7 @@ pub(crate) struct State {
     output: Option<wl_output::WlOutput>,
     output_name: Option<String>,
     capture: Capture,
+    capture_failures: CaptureFailures,
     input: Input,
     outputs: OutputManager,
     clipboard: Clipboard,
@@ -145,6 +158,7 @@ pub(crate) fn run(options: Options) -> Result<()> {
         output: None,
         output_name: None,
         capture: Capture::new(),
+        capture_failures: CaptureFailures::new(),
         input: Input::new(options.xkb_layout),
         outputs: OutputManager::new(),
         clipboard: Clipboard::new(internal_sender),
@@ -194,10 +208,16 @@ pub(crate) fn run(options: Options) -> Result<()> {
         }
     })?;
 
-    state.request_capture()?;
+    state.start_queued_resize_or_capture()?;
     while state.running {
-        if let Err(error) = event_loop.dispatch(None, &mut state) {
+        let timeout = state.outputs.wait_timeout(Instant::now());
+        if let Err(error) = event_loop.dispatch(timeout, &mut state) {
             state.fail(error.into());
+        }
+        if let Some(timeout) = state.outputs.recover_timeout(Instant::now())
+            && let Err(error) = state.handle_output_timeout(timeout)
+        {
+            state.fail(error);
         }
         if let Some(error) = event_writer.failure() {
             state.fail(error.into());
@@ -336,7 +356,7 @@ impl State {
     fn advance_generation(&mut self) -> Result<()> {
         self.replace_media_generation()?;
         self.capture.cancel();
-        self.request_capture()
+        self.start_queued_resize_or_capture()
     }
 
     fn apply_command(&mut self, command: &Command) -> Result<()> {
@@ -345,18 +365,33 @@ impl State {
                 self.capture.cancel();
                 if let Err(error) = self.outputs.configure(
                     self.output_name.as_deref(),
-                    OutputMode {
-                        size: payload.size,
-                        scale_v120: payload.scale_v120,
-                    },
+                    payload.size,
+                    payload.scale_v120,
                     payload.request_id,
                     self.fps,
                     &self.qh,
                 ) {
-                    self.request_capture()?;
-                    return Err(error);
+                    warn!(
+                        %error,
+                        reason = "output configuration is unavailable",
+                        "external resize could not start; dropping request"
+                    );
+                    self.start_queued_resize_or_capture()?;
                 }
             }
+            Command::ResetVideo(_) => match self.outputs.begin_reset() {
+                ResetStart::Start => {
+                    self.capture.cancel();
+                    self.start_queued_resize_or_capture()?;
+                }
+                ResetStart::AlreadyRunning => {
+                    warn!(
+                        reason = "video reset is already running",
+                        "video reset ignored"
+                    );
+                }
+                ResetStart::Refused(reason) => self.report_reset_refusal(reason)?,
+            },
             Command::Clipboard(text) => {
                 self.clipboard.set_text(text, &self.qh)?;
             }
@@ -380,7 +415,7 @@ impl State {
                             if self.acknowledged_generation == Some(payload.generation) {
                                 self.acknowledged_generation = None;
                                 self.capture.cancel();
-                                self.request_capture()?;
+                                self.start_queued_resize_or_capture()?;
                             }
                         }
                     }
@@ -404,7 +439,7 @@ impl State {
                     self.capture.cursor_overlay = overlay;
                     self.capture.cancel();
                     self.capture.can_wait_for_damage = false;
-                    self.request_capture()?;
+                    self.start_queued_resize_or_capture()?;
                 }
                 self.input.apply(command)?;
                 if let Some(sequence) = command.input_sequence() {
@@ -467,39 +502,108 @@ impl State {
         }
     }
 
+    fn report_reset_refusal(&self, refusal: ResetRefusal) -> Result<()> {
+        warn!(reason = refusal.reason(), "video reset refused");
+        let reason = match refusal {
+            ResetRefusal::CurrentModeUnknown => ResetVideoRefusal::CurrentModeUnknown,
+            ResetRefusal::OutputTooSmall => ResetVideoRefusal::OutputTooSmall,
+            ResetRefusal::CompositorRejected => ResetVideoRefusal::CompositorRejected,
+            ResetRefusal::CompositorCancelled => ResetVideoRefusal::CompositorCancelled,
+            ResetRefusal::CompositorTimedOut => ResetVideoRefusal::CompositorTimedOut,
+            ResetRefusal::OutputUnavailable => ResetVideoRefusal::OutputUnavailable,
+        };
+        self.event_sink.send(&Event::ResetVideoRefused(reason))?;
+        Ok(())
+    }
+
+    fn handle_output_timeout(&mut self, timeout: OutputTimeout) -> Result<()> {
+        match timeout {
+            OutputTimeout::Configuration {
+                operation: ResizeOperation::External,
+            } => warn!(
+                deadline = ?OutputManager::configuration_deadline(),
+                reason = "compositor did not finish the output configuration",
+                "external resize timed out; dropping request"
+            ),
+            OutputTimeout::Configuration {
+                operation: ResizeOperation::Reset,
+            } => self.report_reset_refusal(ResetRefusal::CompositorTimedOut)?,
+            OutputTimeout::FreshSerial => warn!(
+                deadline = ?OutputManager::configuration_deadline(),
+                reason = "output manager did not publish a fresh serial",
+                "cancelled resize retry timed out; dropping request"
+            ),
+        }
+        self.start_queued_resize_or_capture()
+    }
+
     fn resize_succeeded(&mut self) -> Result<()> {
         let applied = self
             .outputs
             .take_succeeded()
             .context("unexpected resize success")?;
-        if applied.dimensions_changed {
-            self.replace_media_generation()?;
+        match applied {
+            AppliedResize::External {
+                size,
+                scale_v120,
+                request_id,
+                dimension_change,
+            } => {
+                match dimension_change {
+                    DimensionChange::Changed => self.replace_media_generation()?,
+                    DimensionChange::Unchanged => {}
+                }
+                self.event_sink.send(&Event::ResizeApplied(ResizeApplied {
+                    request_id,
+                    size: size.external_size()?,
+                    scale_v120,
+                    generation: self.generation,
+                }))?;
+            }
+            AppliedResize::ResetStep => self.replace_media_generation()?,
         }
         self.capture.can_wait_for_damage = false;
-        self.event_sink.send(&Event::ResizeApplied(ResizeApplied {
-            request_id: applied.request_id,
-            size: applied.mode.size,
-            scale_v120: applied.mode.scale_v120,
-            generation: self.generation,
-        }))?;
         self.start_queued_resize_or_capture()
     }
 
     fn start_queued_resize_or_capture(&mut self) -> Result<()> {
-        let Some(ResizeRequest { mode, request_id }) = self.outputs.take_ready_queued() else {
-            return if self.outputs.has_queued() {
-                Ok(())
-            } else {
-                self.request_capture()
+        loop {
+            let Some(request) = self.outputs.take_ready_queued() else {
+                if self.outputs.capture_blocked() {
+                    self.capture.cancel();
+                    return Ok(());
+                }
+                // Every output-work creator cancels capture before arming work, so an
+                // idle manager can only see the capture frame already serving this turn.
+                if self.capture.frame.is_some() {
+                    return Ok(());
+                }
+                return self.request_capture();
             };
-        };
-        self.outputs.configure(
-            self.output_name.as_deref(),
-            mode,
-            request_id,
-            self.fps,
-            &self.qh,
-        )
+            let operation = request.operation();
+            match self.outputs.configure_request(
+                self.output_name.as_deref(),
+                request,
+                self.fps,
+                &self.qh,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => match operation {
+                    ResizeOperation::External => {
+                        warn!(
+                            %error,
+                            reason = "output configuration is unavailable",
+                            "queued external resize could not start; dropping request"
+                        );
+                    }
+                    ResizeOperation::Reset => {
+                        self.outputs.abort_reset();
+                        warn!(%error, "video reset output configuration could not start");
+                        self.report_reset_refusal(ResetRefusal::OutputUnavailable)?;
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -622,7 +726,8 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
             } => match (format, state.shm.clone()) {
                 (WEnum::Value(format), Some(shm)) => state
                     .capture
-                    .set_constraints(&shm, width, height, stride, format, qh),
+                    .set_constraints(&shm, width, height, stride, format, qh)
+                    .map(|size| state.outputs.record_capture_size(size)),
                 _ => Err(anyhow!("unsupported screencopy SHM format")),
             },
             zwlr_screencopy_frame_v1::Event::BufferDone => (|| -> Result<()> {
@@ -653,7 +758,7 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                     sequence
                         .checked_add(1)
                         .context("frame sequence exhausted")?;
-                    state.request_capture()?;
+                    state.start_queued_resize_or_capture()?;
                     capture_flush(connection.flush())?;
                     // capture_output only announces the next frame's constraints.
                     // Its BufferDone cannot dispatch until this callback returns, so
@@ -671,10 +776,37 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                         .as_ref()
                         .context("video encoder missing")?
                         .submit(frame)?;
+                    state.capture_failures.succeeded();
                     Ok(())
                 })
             }
-            zwlr_screencopy_frame_v1::Event::Failed => Err(anyhow!("Wayland screencopy failed")),
+            zwlr_screencopy_frame_v1::Event::Failed => {
+                state.capture.cancel();
+                match state.capture_failures.failed() {
+                    CaptureFailureOutcome::Retry { consecutive } => {
+                        warn!(
+                            consecutive_failures = consecutive,
+                            maximum_failures = MAX_CONSECUTIVE_CAPTURE_FAILURES,
+                            reason = "compositor reported screencopy failure",
+                            "Wayland screencopy failed; requesting another capture"
+                        );
+                        state
+                            .start_queued_resize_or_capture()
+                            .and_then(|()| capture_flush(connection.flush()))
+                    }
+                    CaptureFailureOutcome::Exhausted { consecutive } => {
+                        warn!(
+                            consecutive_failures = consecutive,
+                            maximum_failures = MAX_CONSECUTIVE_CAPTURE_FAILURES,
+                            reason = "compositor reported screencopy failure",
+                            "Wayland screencopy failure limit reached"
+                        );
+                        Err(anyhow!(
+                            "Wayland screencopy failed {consecutive} consecutive times: compositor reported screencopy failure"
+                        ))
+                    }
+                }
+            }
             zwlr_screencopy_frame_v1::Event::Damage { .. }
             | zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. }
             | _ => Ok(()),
@@ -717,14 +849,16 @@ impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for State {
                 finished: false,
             }),
             zwlr_output_manager_v1::Event::Done { serial } => {
-                if state.outputs.publish_serial(serial)
-                    && let Err(error) = state.start_queued_resize_or_capture()
-                {
-                    state.fail(error);
+                match state.outputs.publish_serial(ManagerSerial::new(serial)) {
+                    SerialPublication::Recorded => {}
+                    SerialPublication::RetryReady => {
+                        if let Err(error) = state.start_queued_resize_or_capture() {
+                            state.fail(error);
+                        }
+                    }
                 }
             }
-            zwlr_output_manager_v1::Event::Finished => state.outputs.finished = true,
-            _ => {}
+            zwlr_output_manager_v1::Event::Finished | _ => {}
         }
     }
     event_created_child!(State, zwlr_output_manager_v1::ZwlrOutputManagerV1, [
@@ -796,13 +930,64 @@ impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for S
                 }
             }
             zwlr_output_configuration_v1::Event::Failed => {
-                state.outputs.reject_pending();
+                if let Some(outcome) = state.outputs.reject_pending() {
+                    match outcome {
+                        RejectOutcome::SupersededExternal => warn!(
+                            reason = "a newer external resize is queued",
+                            "compositor rejected an obsolete resize"
+                        ),
+                        RejectOutcome::Retrying {
+                            operation,
+                            failures,
+                        } => warn!(
+                            ?operation,
+                            consecutive_failures = failures,
+                            maximum_failures = 3,
+                            reason = "compositor rejected the output configuration",
+                            "output configuration failed; retrying"
+                        ),
+                        RejectOutcome::Exhausted {
+                            operation: ResizeOperation::External,
+                            failures,
+                        } => warn!(
+                            consecutive_failures = failures,
+                            maximum_failures = 3,
+                            reason = "compositor rejected the output configuration",
+                            "external resize failure limit reached; dropping request"
+                        ),
+                        RejectOutcome::Exhausted {
+                            operation: ResizeOperation::Reset,
+                            failures,
+                        } => {
+                            warn!(
+                                consecutive_failures = failures,
+                                maximum_failures = 3,
+                                reason = "compositor rejected the output configuration",
+                                "video reset failure limit reached"
+                            );
+                            if let Err(error) =
+                                state.report_reset_refusal(ResetRefusal::CompositorRejected)
+                            {
+                                state.fail(error);
+                                return;
+                            }
+                        }
+                    }
+                }
                 if let Err(error) = state.start_queued_resize_or_capture() {
                     state.fail(error);
                 }
             }
             zwlr_output_configuration_v1::Event::Cancelled => {
-                state.outputs.retry_cancelled();
+                if matches!(
+                    state.outputs.retry_cancelled(),
+                    Some(ResizeOperation::Reset)
+                ) && let Err(error) =
+                    state.report_reset_refusal(ResetRefusal::CompositorCancelled)
+                {
+                    state.fail(error);
+                    return;
+                }
                 if let Err(error) = state.start_queued_resize_or_capture() {
                     state.fail(error);
                 }

@@ -128,6 +128,7 @@ export interface SurfaceHandle {
 
 export interface VideoController {
   setLatencyTarget(milliseconds: number): void;
+  reset(): void;
 }
 
 export interface InputController {
@@ -208,6 +209,10 @@ export class WaywireSession {
       setLatencyTarget: (milliseconds: number) => {
         this.#assertActive();
         this.#runtime.setLatencyTarget(milliseconds);
+      },
+      reset: () => {
+        this.#assertActive();
+        this.#runtime.resetVideo();
       },
     });
     this.input = Object.freeze({

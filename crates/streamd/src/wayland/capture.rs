@@ -22,13 +22,48 @@ use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::InputSequence;
 use waywire_protocol::pipe::Kbps;
-use waywire_protocol::pipe::MAX_RAW_PIXELS;
 use waywire_protocol::pipe::ScalePercent;
 
 use super::State;
+use super::output::OutputSize;
 use crate::video::CapturedFrame;
 use crate::video::EncoderConfig;
 use crate::video::encoded_dimensions;
+
+pub(crate) const MAX_CONSECUTIVE_CAPTURE_FAILURES: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureFailureOutcome {
+    Retry { consecutive: u8 },
+    Exhausted { consecutive: u8 },
+}
+
+pub(crate) struct CaptureFailures {
+    consecutive: u8,
+}
+
+impl CaptureFailures {
+    pub(crate) fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    pub(crate) fn failed(&mut self) -> CaptureFailureOutcome {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= MAX_CONSECUTIVE_CAPTURE_FAILURES {
+            CaptureFailureOutcome::Exhausted {
+                consecutive: self.consecutive,
+            }
+        } else {
+            CaptureFailureOutcome::Retry {
+                consecutive: self.consecutive,
+            }
+        }
+    }
+
+    pub(crate) fn succeeded(&mut self) {
+        self.consecutive = 0;
+    }
+}
 
 pub(crate) struct Capture {
     pub(crate) manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
@@ -95,13 +130,11 @@ impl Capture {
         stride: u32,
         format: wl_shm::Format,
         qh: &QueueHandle<State>,
-    ) -> Result<()> {
-        let pixels = u64::from(width) * u64::from(height);
+    ) -> Result<OutputSize> {
+        let size = OutputSize::new(width, height)
+            .context("capture dimensions are zero or exceed the pixel limit")?;
         let expected_stride = width.checked_mul(4).context("capture stride overflow")?;
-        if width == 0
-            || height == 0
-            || pixels > MAX_RAW_PIXELS
-            || stride != expected_stride
+        if stride != expected_stride
             || !matches!(format, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888)
         {
             bail!("unsupported or oversized capture buffer {width}x{height} stride {stride}");
@@ -113,7 +146,7 @@ impl Capture {
             && self.format == Some(format)
         {
             self.constraints = true;
-            return Ok(());
+            return Ok(size);
         }
 
         if let Some(buffer) = self.buffer.take() {
@@ -145,7 +178,7 @@ impl Capture {
         self.stride = stride;
         self.format = Some(format);
         self.constraints = true;
-        Ok(())
+        Ok(size)
     }
 
     pub(crate) fn begin_copy(&self, wait_for_damage: bool) -> Result<()> {
@@ -204,5 +237,36 @@ impl Capture {
                 bitrate_kbps,
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_failures_retry_reset_after_success_and_then_exhaust() {
+        let mut failures = CaptureFailures::new();
+        assert_eq!(
+            failures.failed(),
+            CaptureFailureOutcome::Retry { consecutive: 1 }
+        );
+        assert_eq!(
+            failures.failed(),
+            CaptureFailureOutcome::Retry { consecutive: 2 }
+        );
+        failures.succeeded();
+        assert_eq!(
+            failures.failed(),
+            CaptureFailureOutcome::Retry { consecutive: 1 }
+        );
+        assert_eq!(
+            failures.failed(),
+            CaptureFailureOutcome::Retry { consecutive: 2 }
+        );
+        assert_eq!(
+            failures.failed(),
+            CaptureFailureOutcome::Exhausted { consecutive: 3 }
+        );
     }
 }

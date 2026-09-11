@@ -26,4 +26,25 @@ test("observed resize preserves fitting math and the protocol envelope", () => {
     width: 6000,
     height: 6000,
   });
+  assert.deepEqual(
+    (
+      [
+        [1200, 700],
+        [1840, 900],
+        [1180, 690],
+        [1840, 900],
+      ] as const
+    ).map(([width, height]) => fitObservedResize(width, height)),
+    [
+      { width: 1200, height: 700, downscale: 1 },
+      { width: 1840, height: 900, downscale: 1 },
+      { width: 1180, height: 690, downscale: 1 },
+      { width: 1840, height: 900, downscale: 1 },
+    ],
+  );
+  assert.deepEqual(fitObservedResize(1146, 516), {
+    width: 1146,
+    height: 516,
+    downscale: 1,
+  });
 });

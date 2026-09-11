@@ -8,6 +8,7 @@ export type ViewerElements = {
   readonly codec: HTMLElement;
   readonly metrics: HTMLElement;
   readonly latency: HTMLSelectElement;
+  readonly resetVideoButton: HTMLButtonElement;
   readonly pointerLockButton: HTMLButtonElement;
   readonly textInputButton: HTMLButtonElement;
   readonly sendClipboardButton: HTMLButtonElement;
@@ -123,6 +124,7 @@ export function installViewerListeners(
   listen(elements.latency, "change", () =>
     session.video.setLatencyTarget(Number(elements.latency.value)),
   );
+  listen(elements.resetVideoButton, "click", () => session.video.reset());
   listen(elements.textInputButton, "click", () => {
     session.input.acquire();
     surface.focusTextInput();

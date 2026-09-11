@@ -1,5 +1,5 @@
 // Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 export class ProtocolVersionMismatchError extends Error {
   constructor(
@@ -93,6 +93,16 @@ export type ControlMessage =
       readonly generation: number;
     }
   | CursorState
+  | {
+      readonly type: "reset-video-refused";
+      readonly reason:
+        | "current-mode-unknown"
+        | "output-too-small"
+        | "compositor-rejected"
+        | "compositor-cancelled"
+        | "compositor-timed-out"
+        | "output-unavailable";
+    }
   | { readonly type: "clipboard"; readonly text: string }
   | {
       readonly type: "quality";
@@ -142,6 +152,15 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
             scale: value.scale,
             generation: value.generation,
           }
+        : null;
+    case "reset-video-refused":
+      return value.reason === "current-mode-unknown" ||
+        value.reason === "output-too-small" ||
+        value.reason === "compositor-rejected" ||
+        value.reason === "compositor-cancelled" ||
+        value.reason === "compositor-timed-out" ||
+        value.reason === "output-unavailable"
+        ? { type: value.type, reason: value.reason }
         : null;
     case "cursor": {
       if (typeof value.visible !== "boolean" || !isCursorShape(value.shape))

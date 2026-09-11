@@ -159,6 +159,9 @@ pub(super) async fn read_events(
                     Event::ResizeApplied(applied) => {
                         events.publish(ClientEvent::ResizeApplied(applied));
                     }
+                    Event::ResetVideoRefused(reason) => {
+                        events.publish(ClientEvent::ResetVideoRefused { reason });
+                    }
                     Event::CursorShape(shape) => {
                         publish_cursor(&events, |cursor| cursor.shape = shape);
                     }

@@ -115,6 +115,7 @@ test("keyframes wait for decoder configuration and old sessions are ignored", as
   assert.equal(decoder.counts.constructions, 1);
   assert.equal(decoder.counts.decoded, 1);
   assert.deepEqual(fixture.draws, [1_000]);
+  assert.equal(fixture.session.state.video.message, "Streaming video");
 
   configure(fixture.videoSocket);
   fixture.videoSocket.dispatch("message", {

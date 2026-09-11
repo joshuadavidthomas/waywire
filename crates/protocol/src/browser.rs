@@ -46,6 +46,9 @@ pub enum ClientEvent {
         text: ClipboardText,
     },
     ResizeApplied(pipe::ResizeApplied),
+    ResetVideoRefused {
+        reason: pipe::ResetVideoRefusal,
+    },
     Quality(QualityLevels),
     ControlState {
         state: ControlState,
@@ -127,6 +130,7 @@ pub enum ClientMessage {
     ClipboardWrite {
         text: ClipboardText,
     },
+    ResetVideo,
 }
 
 impl ClientMessage {
@@ -149,6 +153,7 @@ impl ClientMessage {
             JsonInput::ClipboardWrite { text } => Ok(Self::ClipboardWrite {
                 text: ClipboardText::new(text).map_err(BrowserError::InvalidClipboard)?,
             }),
+            JsonInput::ResetVideo => Ok(Self::ResetVideo),
         }
     }
 }
@@ -170,6 +175,7 @@ enum JsonInput {
     ClipboardWrite {
         text: String,
     },
+    ResetVideo,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -403,7 +409,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![4, kind, 0, 0];
+        let mut bytes = vec![5, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -419,7 +425,7 @@ mod tests {
         assert_eq!(
             json(&event),
             format!(
-                r#"{{"type":"video-config","version":4,"codec":"{}"}}"#,
+                r#"{{"type":"video-config","version":5,"codec":"{}"}}"#,
                 pipe::H264_PROFILE.codec()
             )
         );
@@ -467,6 +473,16 @@ mod tests {
         assert_eq!(
             json(&event),
             r#"{"type":"resize-applied","request":9,"width":1280,"height":720,"scale":180,"generation":4}"#
+        );
+    }
+
+    #[test]
+    fn reset_video_refused_json_is_exact() {
+        assert_eq!(
+            json(&ClientEvent::ResetVideoRefused {
+                reason: pipe::ResetVideoRefusal::CurrentModeUnknown,
+            }),
+            r#"{"type":"reset-video-refused","reason":"current-mode-unknown"}"#
         );
     }
 
@@ -537,6 +553,7 @@ mod tests {
                 record(8, &[0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0]),
                 record(8, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             ),
+            ("reset video", record(12, &[]), record(12, &[1])),
         ]
     }
 
@@ -618,6 +635,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_reset_video_json() {
+        assert_eq!(
+            ClientMessage::parse_json(br#"{"type":"reset-video"}"#)
+                .expect("reset video should parse"),
+            ClientMessage::ResetVideo
+        );
+    }
+
+    #[test]
     fn parses_ping_json() {
         assert_eq!(
             ClientMessage::parse_json(br#"{"type":"ping","id":3}"#).expect("ping should parse"),
@@ -678,7 +704,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            4, 1, 0, 0, 36, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            5, 1, 0, 0, 36, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

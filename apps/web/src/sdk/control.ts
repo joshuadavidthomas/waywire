@@ -127,7 +127,16 @@ type ContentBounds = Readonly<{
   left: number;
   top: number;
 }>;
-type ResizeRequest = { requested: number; generation: number };
+type ResizeRequest =
+  | {
+      readonly state: "requested";
+      readonly requested: number;
+    }
+  | {
+      readonly state: "applied";
+      readonly requested: number;
+      readonly generation: number;
+    };
 type PendingClipboardCopy = {
   resolve: (text: string) => void;
   reject: (cause: unknown) => void;
@@ -156,6 +165,11 @@ type RuntimeOwner = {
 };
 function toError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
+}
+
+function generationFollows(candidate: number, earlier: number): boolean {
+  const distance = (candidate - earlier) >>> 0;
+  return distance > 0 && distance < 0x80000000;
 }
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -579,13 +593,17 @@ export class ControlRuntime {
     width: number,
     height: number,
   ): WaywireStats["resizeState"] {
+    let settledState = this.resizeState;
     for (const [id, request] of this.resizeRequests) {
-      if (request.generation !== generation) continue;
-      this.resizeState = "presented";
+      if (request.state === "requested") continue;
+      const exactGeneration = request.generation === generation;
+      const laterGeneration = generationFollows(generation, request.generation);
+      if (!exactGeneration && !laterGeneration) continue;
+      settledState = "presented";
       this.emit(
         "resize",
         Object.freeze({
-          state: this.resizeState,
+          state: settledState,
           latencyMs: performance.now() - request.requested,
           width,
           height,
@@ -594,6 +612,8 @@ export class ControlRuntime {
       );
       this.resizeRequests.delete(id);
     }
+    const pending = [...this.resizeRequests.values()].at(-1);
+    this.resizeState = pending?.state ?? settledState;
     return this.resizeState;
   }
 
@@ -656,8 +676,8 @@ export class ControlRuntime {
     }
     const record = resizeRecord(width, height, scale, this.resizeRequestID);
     this.resizeRequests.set(this.resizeRequestID, {
+      state: "requested",
       requested: performance.now(),
-      generation: 0,
     });
     this.resizeState = "requested";
     this.emit(
@@ -881,7 +901,15 @@ export class ControlRuntime {
         if (message.type === "resize-applied") {
           const request = this.resizeRequests.get(message.request);
           if (request) {
-            request.generation = message.generation;
+            for (const id of this.resizeRequests.keys()) {
+              if (id === message.request) break;
+              this.resizeRequests.delete(id);
+            }
+            this.resizeRequests.set(message.request, {
+              state: "applied",
+              requested: request.requested,
+              generation: message.generation,
+            });
             this.resizeState = "applied";
             this.emit(
               "resize",
@@ -895,6 +923,12 @@ export class ControlRuntime {
               }),
             );
           }
+        }
+        if (message.type === "reset-video-refused") {
+          this.emit(
+            "error",
+            new Error(`Video reset refused: ${message.reason}`),
+          );
         }
         if (message.type === "cursor") {
           try {
@@ -932,7 +966,6 @@ export class ControlRuntime {
           this.controlActive = false;
           socket.send(JSON.stringify({ type: "release" }));
         } else if (!wasControlActive) {
-          this.lastResizeRequest = null;
           this.sendResize();
         }
       } else if (message.state === "busy" && this.controlWanted) {
@@ -1057,11 +1090,12 @@ export class ControlRuntime {
       this.resizeObserver.observe(this.inputElement ?? this.display);
       if (observedDisplay !== this.inputElement)
         this.resizeObserver.observe(observedDisplay);
+    } else {
+      this.scheduleResize();
     }
     if (policy.mode === "observe") {
       window.addEventListener("resize", this.scheduleResizeBound);
     }
-    this.scheduleResize();
   }
 
   public remoteDisplayPolicyChanged(): void {
@@ -1281,5 +1315,14 @@ export class ControlRuntime {
   }
   public setLatencyTarget(milliseconds: number): void {
     this.video.setLatencyTarget(milliseconds);
+  }
+
+  public resetVideo(): void {
+    if (
+      this.controlSocket &&
+      this.controlSocket.readyState === WebSocket.OPEN
+    ) {
+      this.controlSocket.send(JSON.stringify({ type: "reset-video" }));
+    }
   }
 }

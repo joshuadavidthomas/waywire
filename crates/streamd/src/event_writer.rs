@@ -43,7 +43,10 @@ impl Replacement {
             Event::CursorShape(_) => Some(Self::Shape),
             Event::CursorVisibility(_) => Some(Self::Visibility),
             Event::CursorPosition(_) => Some(Self::Position),
-            Event::Clipboard(_) | Event::Frame(_) | Event::ResizeApplied(_) => None,
+            Event::Clipboard(_)
+            | Event::Frame(_)
+            | Event::ResizeApplied(_)
+            | Event::ResetVideoRefused(_) => None,
         }
     }
 }

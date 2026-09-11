@@ -554,18 +554,22 @@ impl Worker<'_> {
 
     fn handle_write_failure(
         &mut self,
-        generation: Generation,
-        frame_generation: Generation,
         slot: usize,
         frame: RawFrame,
-        error: &io::Error,
+        error: &FrameWriteError,
     ) -> ControlFlow<()> {
-        error!(
-            %error,
-            ?generation,
-            ?frame_generation,
-            "ffmpeg frame write failed"
-        );
+        let frame_generation = frame.metadata.generation;
+        match error {
+            FrameWriteError::GenerationChanged { observed, frame } => error!(
+                %error,
+                observed_generation = ?observed,
+                frame_generation = ?frame,
+                "ffmpeg frame write aborted for a generation change"
+            ),
+            FrameWriteError::Stopping | FrameWriteError::Io(_) => {
+                error!(%error, ?frame_generation, "ffmpeg frame write failed");
+            }
+        }
         stop_process(self.shared, self.process.take());
         release_slot(self.shared, slot, frame);
         if is_stopping(self.shared) {
@@ -578,7 +582,7 @@ impl Worker<'_> {
             self.shared,
             self.notifications,
             self.notification_wake,
-            generation,
+            frame_generation,
         ) {
             return ControlFlow::Break(());
         }
@@ -675,8 +679,7 @@ impl Worker<'_> {
                 frame_generation,
             );
             if let Err(error) = write_result {
-                let generation = active.generation;
-                match self.handle_write_failure(generation, frame_generation, slot, frame, &error) {
+                match self.handle_write_failure(slot, frame, &error) {
                     ControlFlow::Break(()) => return,
                     ControlFlow::Continue(()) => continue,
                 }
@@ -947,7 +950,6 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         format!("{}x{}", config.raw_width.get(), config.raw_height.get()),
         "-framerate".into(),
         rate.clone(),
-        "-re".into(),
         "-i".into(),
         "pipe:0".into(),
         "-an".into(),
@@ -1008,52 +1010,62 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
     ]
 }
 
+#[derive(Debug, Error)]
+enum FrameWriteError {
+    #[error("encoder stopped during frame write")]
+    Stopping,
+    #[error("frame generation changed during write from {frame:?} to observed {observed:?}")]
+    GenerationChanged {
+        observed: Generation,
+        frame: Generation,
+    },
+    #[error("ffmpeg pipe write failed")]
+    Io(#[source] io::Error),
+}
+
 fn write_frame(
     shared: &Shared,
     output: &mut (impl Write + AsFd),
     bytes: &[u8],
     generation: Generation,
-) -> io::Result<()> {
+) -> Result<(), FrameWriteError> {
     let started = Instant::now();
     let mut written = 0;
     while written < bytes.len() {
         let pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.stopping {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "encoder stopping",
-            ));
+            return Err(FrameWriteError::Stopping);
         }
         if pool.generation != generation {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "frame generation changed during write",
-            ));
+            return Err(FrameWriteError::GenerationChanged {
+                observed: pool.generation,
+                frame: generation,
+            });
         }
         drop(pool);
         match output.write(&bytes[written..]) {
             Ok(0) => {
-                return Err(io::Error::new(
+                return Err(FrameWriteError::Io(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "ffmpeg pipe closed",
-                ));
+                )));
             }
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if started.elapsed() >= PIPE_WRITE_STALL_LIMIT {
-                    return Err(io::Error::new(
+                    return Err(FrameWriteError::Io(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "ffmpeg pipe stalled",
-                    ));
+                    )));
                 }
                 let mut descriptors = [PollFd::new(output.as_fd(), PollFlags::POLLOUT)];
                 match poll(&mut descriptors, PIPE_WRITE_POLL_INTERVAL_MS) {
                     Ok(_) | Err(Errno::EINTR) => {}
-                    Err(error) => return Err(io::Error::from(error)),
+                    Err(error) => return Err(FrameWriteError::Io(io::Error::from(error))),
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(FrameWriteError::Io(error)),
         }
     }
     Ok(())

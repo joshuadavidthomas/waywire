@@ -22,6 +22,7 @@ use waywire_protocol::browser::ControlState;
 use waywire_protocol::browser::QualityLevels;
 use waywire_protocol::browser::parse_browser_record;
 use waywire_protocol::pipe::Command;
+use waywire_protocol::pipe::ResetVideo;
 use waywire_protocol::pipe::Text as TextCommand;
 
 use super::AppState;
@@ -53,7 +54,9 @@ trait ClientEventAudience {
 impl ClientEventAudience for ClientEvent {
     fn audience(&self) -> Audience {
         match self {
-            ClientEvent::Clipboard { .. } => Audience::LeaseOwner,
+            ClientEvent::Clipboard { .. } | ClientEvent::ResetVideoRefused { .. } => {
+                Audience::LeaseOwner
+            }
             ClientEvent::Cursor(_)
             | ClientEvent::ResizeApplied(_)
             | ClientEvent::VideoConfig { .. }
@@ -445,6 +448,27 @@ async fn handle_text(
                 }
             }
         },
+        ClientMessage::ResetVideo => match *lease {
+            Lease::NotHeld => Ok(()),
+            Lease::Held => {
+                let outcome = state
+                    .sessions
+                    .input(socket_id, Command::ResetVideo(ResetVideo))
+                    .await
+                    .map_err(|error| SocketEnd::failed(error.context("reset video")))?;
+                match outcome {
+                    InputOutcome::Sent => Ok(()),
+                    InputOutcome::NotLeaseOwner => {
+                        *lease = Lease::NotHeld;
+                        warn!(
+                            socket_id = socket_id.get(),
+                            "control socket input lease disagreed with session owner"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -699,6 +723,51 @@ mod tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    async fn reset_video_message_uses_the_input_lease() {
+        let (state, mut commands) = test_state();
+        let socket = SocketId::new(1);
+        acquire(&state, &mut commands, socket).await;
+        let (outbound, _events) = outbound();
+        let mut lease = Lease::Held;
+
+        handle_text(
+            &outbound,
+            &state,
+            socket,
+            &mut lease,
+            r#"{"type":"reset-video"}"#,
+        )
+        .await
+        .expect("reset video message should succeed");
+
+        assert_eq!(commands.recv().await, Some(Command::ResetVideo(ResetVideo)));
+    }
+
+    #[tokio::test]
+    async fn nonowner_reset_video_message_sends_no_command() {
+        let (state, mut commands) = test_state();
+        acquire(&state, &mut commands, SocketId::new(1)).await;
+        let (outbound, _events) = outbound();
+        let mut lease = Lease::NotHeld;
+
+        handle_text(
+            &outbound,
+            &state,
+            SocketId::new(2),
+            &mut lease,
+            r#"{"type":"reset-video"}"#,
+        )
+        .await
+        .expect("nonowner reset video should be ignored");
+
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn lagged_events_enqueue_a_snapshot_and_deliver_the_retained_event() {
         let (state, _commands) = test_state();

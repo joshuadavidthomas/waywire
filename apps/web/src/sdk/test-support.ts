@@ -87,6 +87,55 @@ export function installGlobal(name: string, value: unknown): void {
   });
 }
 
+export type ResizeObserverHarness = {
+  readonly targets: Set<Element>;
+  trigger(): void;
+};
+
+export function installResizeObserver(): ResizeObserverHarness[] {
+  const observers: ResizeObserverHarness[] = [];
+  installGlobal(
+    "ResizeObserver",
+    class {
+      readonly targets = new Set<Element>();
+      private initialCallbackScheduled = false;
+      constructor(private readonly callback: ResizeObserverCallback) {
+        observers.push({
+          targets: this.targets,
+          trigger: () => this.deliver(),
+        });
+      }
+      private deliver(): void {
+        const entries = [...this.targets].flatMap((target) => {
+          const contentRect = target.getBoundingClientRect();
+          return contentRect.width > 0 && contentRect.height > 0
+            ? [{ target, contentRect } as ResizeObserverEntry]
+            : [];
+        });
+        if (entries.length > 0) {
+          this.callback(entries, this as unknown as ResizeObserver);
+        }
+      }
+      observe(target: Element): void {
+        this.targets.add(target);
+        if (this.initialCallbackScheduled) return;
+        this.initialCallbackScheduled = true;
+        queueMicrotask(() => {
+          this.initialCallbackScheduled = false;
+          this.deliver();
+        });
+      }
+      unobserve(target: Element): void {
+        this.targets.delete(target);
+      }
+      disconnect(): void {
+        this.targets.clear();
+      }
+    },
+  );
+  return observers;
+}
+
 export function installBrowser(): {
   window: FakeTarget;
   document: FakeTarget;
@@ -156,6 +205,8 @@ export function videoPacket(
     readonly keyframe?: boolean;
     readonly discontinuity?: boolean;
     readonly generation?: number;
+    readonly width?: number;
+    readonly height?: number;
   } = {},
 ): ArrayBuffer {
   return videoFrame(
@@ -163,8 +214,8 @@ export function videoPacket(
     options.discontinuity ? 1 : 0,
     {
       generation: options.generation ?? 1,
-      width: 1280,
-      height: 720,
+      width: options.width ?? 1280,
+      height: options.height ?? 720,
       captureNanos: BigInt(timestamp) * 1000n,
       sequence: 0n,
       inputSequence: 0,

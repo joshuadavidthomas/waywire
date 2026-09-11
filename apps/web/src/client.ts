@@ -37,6 +37,7 @@ function viewerElements(): ViewerElements {
       (element): element is HTMLSelectElement =>
         element instanceof HTMLSelectElement,
     ),
+    resetVideoButton: requireElement("#reset-video", button),
     pointerLockButton: requireElement("#pointer-lock", button),
     textInputButton: requireElement("#text-input", button),
     sendClipboardButton: requireElement("#send-clipboard", button),

@@ -615,6 +615,9 @@ export class VideoRuntime {
     context.drawImage(frame, 0, 0, display.width, display.height);
     const drawCompletedAtMs = performance.now();
     this.renderedFrames += 1;
+    if (this.renderedFrames === 1) {
+      this.owner.updateState({ message: "Streaming video" });
+    }
     const presentation = this.owner.expectedPresentationTime(
       frame.timestamp,
       this.targetLatencyMilliseconds,

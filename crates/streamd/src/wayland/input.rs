@@ -183,6 +183,7 @@ impl Input {
                 self.send_text(payload.action, payload.text.as_str())?;
             }
             Command::Resize(_)
+            | Command::ResetVideo(_)
             | Command::Clipboard(_)
             | Command::Quality(_)
             | Command::KeyframeReadiness(_) => {
