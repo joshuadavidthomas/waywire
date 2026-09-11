@@ -1,21 +1,208 @@
 use std::collections::VecDeque;
+use std::future::pending;
 use std::io;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
+use anyhow::Result;
 use sprite_desktop_protocol::Decoder;
 use sprite_desktop_protocol::ProtocolError as DecodeError;
+use sprite_desktop_protocol::browser::ClientEvent;
+use sprite_desktop_protocol::browser::CursorState;
+use sprite_desktop_protocol::pipe::ClipboardText;
+use sprite_desktop_protocol::pipe::CursorPosition;
 use sprite_desktop_protocol::pipe::Event;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::sync::broadcast;
 use tokio::time::Instant;
+use tokio::time::sleep_until;
 use tokio::time::timeout_at;
+
+use crate::video::VideoPipeline;
 
 const PARTIAL_EVENT_DEADLINE: Duration = Duration::from_secs(2);
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+const CURSOR_POSITION_PERIOD: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorPositionGate {
+    Open,
+    Quiet {
+        until: Instant,
+        pending: Option<CursorPosition>,
+    },
+}
+
+impl CursorPositionGate {
+    fn push(&mut self, position: CursorPosition, now: Instant) -> Option<CursorPosition> {
+        match self {
+            Self::Open => {
+                *self = Self::Quiet {
+                    until: now + CURSOR_POSITION_PERIOD,
+                    pending: None,
+                };
+                Some(position)
+            }
+            Self::Quiet { pending, .. } => {
+                *pending = Some(position);
+                None
+            }
+        }
+    }
+
+    const fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Open => None,
+            Self::Quiet { until, .. } => Some(*until),
+        }
+    }
+
+    fn flush(&mut self, now: Instant) -> Option<CursorPosition> {
+        match std::mem::replace(self, Self::Open) {
+            Self::Open | Self::Quiet { pending: None, .. } => None,
+            Self::Quiet {
+                pending: Some(position),
+                ..
+            } => {
+                *self = Self::Quiet {
+                    until: now + CURSOR_POSITION_PERIOD,
+                    pending: None,
+                };
+                Some(position)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AppEvents {
+    tx: broadcast::Sender<ClientEvent>,
+    latest_clipboard: Arc<Mutex<Option<ClipboardText>>>,
+    latest_cursor: Arc<Mutex<CursorState>>,
+}
+
+impl AppEvents {
+    pub(crate) fn new() -> Self {
+        let (tx, _) = broadcast::channel(64);
+        Self {
+            tx,
+            latest_clipboard: Arc::new(Mutex::new(None)),
+            latest_cursor: Arc::new(Mutex::new(CursorState::default())),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<ClientEvent> {
+        let cursor = self
+            .latest_cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let clipboard = self
+            .latest_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut values = vec![ClientEvent::Cursor(cursor)];
+        if let Some(text) = clipboard {
+            values.push(ClientEvent::Clipboard { text });
+        }
+        values
+    }
+
+    pub(crate) fn subscribe(&self) -> (Vec<ClientEvent>, broadcast::Receiver<ClientEvent>) {
+        let receiver = self.tx.subscribe();
+        (self.snapshot(), receiver)
+    }
+
+    pub(crate) fn latest_clipboard(&self) -> Option<ClipboardText> {
+        self.latest_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish(&self, value: ClientEvent) {
+        let _ = self.tx.send(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, value: ClientEvent) {
+        self.publish(value);
+    }
+}
+
+pub(super) async fn read_events(
+    stdout: tokio::process::ChildStdout,
+    events: AppEvents,
+    pipeline: VideoPipeline,
+) -> Result<()> {
+    let mut reader = EventReader::new(stdout);
+    let mut position_gate = CursorPositionGate::Open;
+    loop {
+        let position_deadline = position_gate.deadline();
+        tokio::select! {
+            event = reader.next() => {
+                let event = event?;
+                match event {
+                    Event::Frame(metadata) => pipeline.metadata(metadata).await?,
+                    Event::Clipboard(text) => {
+                        *events
+                            .latest_clipboard
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(text.clone());
+                        events.publish(ClientEvent::Clipboard { text });
+                    }
+                    Event::ResizeApplied(applied) => {
+                        events.publish(ClientEvent::ResizeApplied(applied));
+                    }
+                    Event::CursorShape(shape) => {
+                        publish_cursor(&events, |cursor| cursor.shape = shape);
+                    }
+                    Event::CursorVisibility(visibility) => {
+                        publish_cursor(&events, |cursor| cursor.visibility = visibility);
+                    }
+                    Event::CursorPosition(position) => {
+                        if let Some(position) = position_gate.push(position, Instant::now()) {
+                            publish_cursor(&events, |cursor| cursor.position = Some(position));
+                        }
+                    }
+                }
+            }
+            () = async move {
+                match position_deadline {
+                    Some(until) => sleep_until(until).await,
+                    None => pending::<()>().await,
+                }
+            } => {
+                if let Some(position) = position_gate.flush(Instant::now()) {
+                    publish_cursor(&events, |cursor| cursor.position = Some(position));
+                }
+            }
+        }
+    }
+}
+
+fn publish_cursor<F>(events: &AppEvents, update: F)
+where
+    F: FnOnce(&mut CursorState),
+{
+    let event = {
+        let mut cursor = events
+            .latest_cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        update(&mut cursor);
+        ClientEvent::Cursor(cursor.clone())
+    };
+    events.publish(event);
+}
 
 #[derive(Debug, Error)]
-pub(crate) enum EventReadError {
+enum EventReadError {
     #[error("event pipe closed at an event boundary")]
     Closed,
     #[error("peer output ended halfway through an event")]
@@ -28,7 +215,7 @@ pub(crate) enum EventReadError {
     Decode(#[from] DecodeError),
 }
 
-pub(crate) struct EventReader<R> {
+struct EventReader<R> {
     input: R,
     decoder: Decoder<Event>,
     ready: VecDeque<Event>,
@@ -36,7 +223,7 @@ pub(crate) struct EventReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> EventReader<R> {
-    pub(crate) fn new(input: R) -> Self {
+    fn new(input: R) -> Self {
         Self {
             input,
             decoder: Decoder::new(),
@@ -47,7 +234,7 @@ impl<R: AsyncRead + Unpin> EventReader<R> {
 
     /// Cancellation-safe: partial bytes live in the decoder and their deadline lives in
     /// `partial_since`, never in the future returned by this call.
-    pub(crate) async fn next(&mut self) -> Result<Event, EventReadError> {
+    async fn next(&mut self) -> Result<Event, EventReadError> {
         loop {
             if let Some(event) = self.ready.pop_front() {
                 return Ok(event);
@@ -275,5 +462,30 @@ mod tests {
         }
         assert_eq!(start.elapsed(), PARTIAL_EVENT_DEADLINE);
         drop(writer);
+    }
+
+    #[test]
+    fn cursor_position_gate_publishes_first_and_latest_without_idle_deadline() {
+        let now = Instant::now();
+        let first = CursorPosition { x: 1, y: 2 };
+        let replaced = CursorPosition { x: 3, y: 4 };
+        let latest = CursorPosition { x: 5, y: 6 };
+        let mut gate = CursorPositionGate::Open;
+
+        assert_eq!(gate.push(first, now), Some(first));
+        assert_eq!(gate.deadline(), Some(now + CURSOR_POSITION_PERIOD));
+        assert_eq!(gate.push(replaced, now), None);
+        assert_eq!(gate.push(latest, now), None);
+        let first_deadline = gate.deadline().expect("quiet gate should have a deadline");
+        assert_eq!(gate.flush(first_deadline), Some(latest));
+        assert_eq!(
+            gate.deadline(),
+            Some(first_deadline + CURSOR_POSITION_PERIOD)
+        );
+        let final_deadline = gate
+            .deadline()
+            .expect("rearmed gate should have a deadline");
+        assert_eq!(gate.flush(final_deadline), None);
+        assert_eq!(gate.deadline(), None);
     }
 }
