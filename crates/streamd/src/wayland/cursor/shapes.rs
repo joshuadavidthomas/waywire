@@ -93,20 +93,26 @@ impl ShapeTable {
                 // premultiplied ARGB words little-endian, so these bytes are B, G, R, A just
                 // like the compositor's wl_shm ARGB8888 mapping on the Sprite.
                 let key = ImageKey::new(size, &image.pixels_rgba);
-                if let Some(first) = table.get(&key) {
-                    if *first != shape {
-                        debug!(
-                            theme,
-                            shape = name,
-                            first = first.css_name(),
-                            path = %path.display(),
-                            width = image.width,
-                            height = image.height,
-                            "cursor shapes share an image"
-                        );
-                    }
-                } else {
+                let Some(first) = table.get(&key).copied() else {
                     table.insert(key, shape);
+                    continue;
+                };
+                if first == shape {
+                    continue;
+                }
+                let shared = shared_image_shape(first);
+                if shared == shared_image_shape(shape) {
+                    table.insert(key, shared);
+                } else {
+                    debug!(
+                        theme,
+                        shape = name,
+                        first = first.css_name(),
+                        path = %path.display(),
+                        width = image.width,
+                        height = image.height,
+                        "unrelated cursor shapes share an image; keeping the first"
+                    );
                 }
             }
         }
@@ -195,6 +201,50 @@ fn read_inherited_theme(path: &Path) -> Result<Option<String>> {
             .find(|value| !value.is_empty())
             .map(str::to_owned)
     }))
+}
+
+/// Themes such as breeze draw one double-headed arrow for a whole resize axis and link the
+/// single-direction names to it. Those pixels only say which axis the cursor resizes along, so
+/// when two shapes on one axis share an image the bidirectional shape is the honest name for it.
+const fn shared_image_shape(shape: CursorShape) -> CursorShape {
+    match shape {
+        CursorShape::NeResize | CursorShape::SwResize | CursorShape::NeswResize => {
+            CursorShape::NeswResize
+        }
+        CursorShape::NwResize | CursorShape::SeResize | CursorShape::NwseResize => {
+            CursorShape::NwseResize
+        }
+        CursorShape::EResize | CursorShape::WResize | CursorShape::EwResize => {
+            CursorShape::EwResize
+        }
+        CursorShape::NResize | CursorShape::SResize | CursorShape::NsResize => {
+            CursorShape::NsResize
+        }
+        CursorShape::Default
+        | CursorShape::ContextMenu
+        | CursorShape::Help
+        | CursorShape::Pointer
+        | CursorShape::Progress
+        | CursorShape::Wait
+        | CursorShape::Cell
+        | CursorShape::Crosshair
+        | CursorShape::Text
+        | CursorShape::VerticalText
+        | CursorShape::Alias
+        | CursorShape::Copy
+        | CursorShape::Move
+        | CursorShape::NoDrop
+        | CursorShape::NotAllowed
+        | CursorShape::Grab
+        | CursorShape::Grabbing
+        | CursorShape::ColResize
+        | CursorShape::RowResize
+        | CursorShape::AllScroll
+        | CursorShape::ZoomIn
+        | CursorShape::ZoomOut
+        | CursorShape::DndAsk
+        | CursorShape::AllResize => shape,
+    }
 }
 
 const fn alias(shape: CursorShape) -> &'static str {
@@ -328,6 +378,38 @@ mod tests {
 
         assert_eq!(
             table.get(&ImageKey::new(size, &pixels)),
+            Some(CursorShape::Pointer)
+        );
+    }
+
+    #[test]
+    fn one_image_for_a_resize_axis_maps_to_the_bidirectional_shape() {
+        let root = TestDirectory::new();
+        let diagonal = [9, 9, 9, 9];
+        write_cursor(root.path(), "axis", "ne-resize", 1, 1, &diagonal);
+        write_cursor(root.path(), "axis", "sw-resize", 1, 1, &diagonal);
+        let horizontal = [8, 8, 8, 8];
+        write_cursor(root.path(), "axis", "e-resize", 1, 1, &horizontal);
+        write_cursor(root.path(), "axis", "w-resize", 1, 1, &horizontal);
+        write_cursor(root.path(), "axis", "ew-resize", 1, 1, &horizontal);
+        let unrelated = [7, 7, 7, 7];
+        write_cursor(root.path(), "axis", "pointer", 1, 1, &unrelated);
+        write_cursor(root.path(), "axis", "n-resize", 1, 1, &unrelated);
+
+        let table =
+            ShapeTable::load("axis", &[root.path().to_owned()]).expect("axis theme should load");
+        let size = CursorSize::new(1, 1).expect("test cursor size should be valid");
+
+        assert_eq!(
+            table.get(&ImageKey::new(size, &diagonal)),
+            Some(CursorShape::NeswResize)
+        );
+        assert_eq!(
+            table.get(&ImageKey::new(size, &horizontal)),
+            Some(CursorShape::EwResize)
+        );
+        assert_eq!(
+            table.get(&ImageKey::new(size, &unrelated)),
             Some(CursorShape::Pointer)
         );
     }
