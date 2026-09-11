@@ -11,7 +11,7 @@ use crate::http::Origin;
 #[command(
     name = "waywire-gateway",
     version,
-    about = "Private HTTP and WebSocket gateway for waywire-streamd"
+    about = "Unauthenticated HTTP and WebSocket gateway for waywire-streamd; WebSocket upgrades require the configured Origin. Bind to loopback or put an authenticating proxy, such as the Sprite URL policy, in front."
 )]
 pub(super) struct Options {
     #[arg(long, default_value = "127.0.0.1:8080")]

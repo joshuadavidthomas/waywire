@@ -71,8 +71,8 @@ jq -e --arg release "$RELEASE" '
   .os == {id:"ubuntu",codename:"resolute",architecture:"amd64"} and
   .artifacts == ["waywire-gateway","waywire-streamd"] and
   .ports == {http:8080} and
-  .services == [{name:"waywire",cmd:"/opt/waywire/current/bin/desktop.sh",args:[],http_port:8080,needs:[],env:{},dir:"/home/sprite"}]
-' "$staged/manifest.json" >/dev/null || fail 'manifest release, platform, or service definition is invalid'
+  (has("services") | not)
+' "$staged/manifest.json" >/dev/null || fail 'manifest release or platform definition is invalid'
 jq -e '.schema == 1 and (.sources | type == "array") and (.sources | length == 2)' "$staged/sources.lock" >/dev/null || fail 'sources.lock is invalid'
 bash -n "$staged/bin/desktop.sh"
 
@@ -126,6 +126,8 @@ running_artifacts_match() {
 }
 services_raw=$(api) || fail 'could not list Sprite services'
 live_services=$(jq -ce 'if type != "array" then error("expected service array") else [.[] | {name,cmd,args:(.args // []),http_port:(.http_port // null),needs:(.needs // []),env:(.env // {}),dir:(.dir // null)}] end' <<<"$services_raw") || fail 'Sprite services response is invalid'
+target_service=$(jq -cn --arg origin "$origin" '{name:"waywire",cmd:"/opt/waywire/current/bin/desktop.sh",args:[$origin],http_port:8080,needs:[],env:{},dir:"/home/sprite"}')
+current_service=$(jq -c '.[] | select(.name == "waywire")' <<<"$live_services")
 record=
 if sudo test -f "$INSTALL_RECORD"; then
   record=$(sudo cat "$INSTALL_RECORD")
@@ -134,13 +136,11 @@ if sudo test -f "$INSTALL_RECORD"; then
 elif sudo test -e "$CURRENT_LINK" || sudo test -L "$CURRENT_LINK"; then
   fail 'existing runtime pointer has no ownership record'
 fi
-target_service=$(jq -c '.services[0]' "$staged/manifest.json")
-current_service=$(jq -c '.[] | select(.name == "waywire")' <<<"$live_services")
 # The API's service PID may not exist in this process namespace after restart.
 # Use actual cgroup members to distinguish replacement processes.
 previous_service_pids=$(sudo cat /sys/fs/cgroup/svc.waywire/cgroup.procs 2>/dev/null | tr '\n' ' ' || true)
 if [ -n "$current_service" ]; then
-  if [ -z "$record" ] || ! jq -e --argjson current "$current_service" '.services == [$current]' <<<"$record" >/dev/null; then
+  if [ -z "$record" ] || ! jq -e --argjson current "$current_service" --argjson target "$target_service" '.services == [$current] or (.state == "pending" and $current == $target)' <<<"$record" >/dev/null; then
     fail 'service name is foreign: waywire'
   fi
 fi
@@ -188,7 +188,9 @@ sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y -
 packages_json=$(printf '%s\n' "${packages[@]}" | sort -u | xargs dpkg-query -W -f='${binary:Package}\t${Version}\n' | jq -Rn '[inputs | split("\t")] | map({key:.[0],value:.[1]}) | from_entries')
 jq -n --arg release "$RELEASE" --arg source "$(jq -r .source "$staged/manifest.json")" --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson packages "$packages_json" '{release:$release,source:$source,observed_at:$observed_at,packages:$packages}' >"$temporary/version.json"
 
-pending=$(jq -n --arg owner "$OWNER_ID" --arg release "$RELEASE" --arg archive "$ARCHIVE_SHA256" --argjson service "$target_service" '{schema:1,owner:$owner,state:"pending",release:$release,archive_sha256:$archive,services:[$service]}')
+pending_service=$target_service
+[ -z "$current_service" ] || pending_service=$current_service
+pending=$(jq -n --arg owner "$OWNER_ID" --arg release "$RELEASE" --arg archive "$ARCHIVE_SHA256" --argjson service "$pending_service" '{schema:1,owner:$owner,state:"pending",release:$release,archive_sha256:$archive,services:[$service]}')
 sudo install -d -o root -g root -m 0755 /var/lib/waywire /opt/waywire /opt/waywire/releases "$RELEASE_DIR" "$RELEASE_DIR/bin"
 printf '%s\n' "$pending" >"$temporary/install.json"
 sudo install -o root -g root -m 0644 "$temporary/install.json" "$INSTALL_RECORD.tmp"
@@ -237,12 +239,12 @@ for _ in $(seq 1 120); do
 done
 $healthy || fail 'waywire did not run the staged gateway and streamd within 120 seconds'
 final=$(api | jq -ce '[.[] | {name,cmd,args:(.args // []),http_port:(.http_port // null),needs:(.needs // []),env:(.env // {}),dir:(.dir // null)} | select(.name == "waywire")]')
-jq -en --argjson actual "$final" --argjson expected "[$target_service]" '$actual == $expected' >/dev/null || fail 'live waywire service does not match the release manifest'
+jq -en --argjson actual "$final" --argjson expected "[$target_service]" '$actual == $expected' >/dev/null || fail 'live waywire service does not match the installer definition'
 final_listeners=$(ss -H -ltne 'sport = :8080')
 [ "$(awk 'NF {count++} END {print count+0}' <<<"$final_listeners")" = 1 ] || fail 'waywire does not own exactly one HTTP listener'
 awk '{found=0; for (i=1; i<=NF; i++) if ($i == "cgroup:/svc.waywire") found=1; if (!found) exit 1}' <<<"$final_listeners" || fail 'waywire HTTP listener is outside its owned service cgroup'
 failpoint before-commit
-committed=$(jq -c '.state="committed"' <<<"$pending")
+committed=$(jq -c --argjson service "$target_service" '.state="committed" | .services=[$service]' <<<"$pending")
 printf '%s\n' "$committed" >"$temporary/install-committed.json"
 sudo install -o root -g root -m 0644 "$temporary/install-committed.json" "$INSTALL_RECORD.tmp"
 sudo mv "$INSTALL_RECORD.tmp" "$INSTALL_RECORD"

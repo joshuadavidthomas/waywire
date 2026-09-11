@@ -6,11 +6,13 @@ set unstable
 default:
     @just --list
 
-build:
+build-web:
     pnpm --filter @waywire/web build
+
+build: build-web
     cargo build --locked --release --workspace
 
-check:
+check: build-web
     @just typecheck
     cargo check --locked --workspace --all-targets --all-features
 
@@ -43,8 +45,8 @@ lint *ARGS:
 prettier-check:
     pnpm exec prettier --check .
 
-provision SPRITE RELEASE:
-    pnpm --filter @waywire/sprite-provision provision --sprite "{{ SPRITE }}" --release "{{ RELEASE }}"
+sprite-provision SPRITE RELEASE:
+    pnpm --filter @waywire/sprite provision --sprite "{{ SPRITE }}" --release "{{ RELEASE }}"
 
 release VERSION SOURCE:
     pnpm exec tsx scripts/build-release.ts --version "{{ VERSION }}" --source "{{ SOURCE }}"
@@ -52,11 +54,11 @@ release VERSION SOURCE:
 rustfmt-check:
     cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all -- --check
 
-test:
+test: build-web
     pnpm --filter @waywire/web test
     cargo test --locked --workspace
-    python3 -m unittest discover -s installer -p 'test_*.py'
-    shellcheck installer/desktop.sh installer/install.sh
+    python3 -m unittest discover -s desktop -p 'test_*.py'
+    shellcheck desktop/desktop.sh integrations/sprite/install.sh
     pnpm exec tsx --test scripts/build-release.test.ts
 
 test-streamd *ARGS:
@@ -64,4 +66,4 @@ test-streamd *ARGS:
 
 typecheck:
     pnpm --filter @waywire/web check
-    pnpm --filter @waywire/sprite-provision check
+    pnpm --filter @waywire/sprite check

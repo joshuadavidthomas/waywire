@@ -11,7 +11,7 @@ const exec = promisify(execFile);
 const root = resolve(import.meta.dirname, "..");
 
 test(
-  "release archive contains the one Socket runtime and a matching installer",
+  "release archive contains the desktop runtime and a matching Sprite installer",
   { timeout: 180_000 },
   async () => {
     const version = `v0.0.0-test.${randomBytes(8).toString("hex")}`;
@@ -53,36 +53,30 @@ test(
       const manifest = JSON.parse(
         await readFile(join(unpacked, "manifest.json"), "utf8"),
       );
-      assert.deepEqual(manifest.artifacts, [
-        "waywire-gateway",
-        "waywire-streamd",
-      ]);
-      assert.deepEqual(manifest.ports, { http: 8080 });
-      assert.deepEqual(manifest.services, [
-        {
-          name: "waywire",
-          cmd: "/opt/waywire/current/bin/desktop.sh",
-          args: [],
-          http_port: 8080,
-          needs: [],
-          env: {},
-          dir: "/home/sprite",
+      assert.deepEqual(manifest, {
+        schema: 1,
+        release: version,
+        source: "local-contract-test",
+        os: {
+          id: "ubuntu",
+          codename: "resolute",
+          architecture: "amd64",
         },
-      ]);
+        artifacts: ["waywire-gateway", "waywire-streamd"],
+        ports: { http: 8080 },
+      });
       for (const binary of manifest.artifacts) {
         const { stdout } = await exec(join(unpacked, "bin", binary), [
           "--version",
         ]);
         assert(stdout.startsWith(binary + " "));
       }
-      const packagedSession = await readFile(
-        join(unpacked, "bin/session.py"),
-        "utf8",
-      );
-      assert.equal(
-        packagedSession,
-        await readFile(join(root, "installer/session.py"), "utf8"),
-      );
+      for (const script of ["desktop.sh", "session.py"]) {
+        assert.equal(
+          await readFile(join(unpacked, "bin", script), "utf8"),
+          await readFile(join(root, "desktop", script), "utf8"),
+        );
+      }
       const sources = JSON.parse(
         await readFile(join(unpacked, "sources.lock"), "utf8"),
       );

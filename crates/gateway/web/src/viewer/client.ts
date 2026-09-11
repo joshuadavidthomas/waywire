@@ -1,9 +1,9 @@
-import { ProtocolVersionMismatchError } from "./sdk/messages.ts";
-import { WaywireSession, type SurfaceHandle } from "./sdk/waywire.ts";
+import { ProtocolVersionMismatchError } from "../sdk/messages.ts";
+import { WaywireSession, type SurfaceHandle } from "../sdk/waywire.ts";
 import {
   installViewerListeners,
   type ViewerElements,
-} from "./sdk/viewer-listeners.ts";
+} from "./viewer-listeners.ts";
 
 function requireElement<T extends Element>(
   selector: string,

@@ -9,7 +9,7 @@ use axum::response::Response;
 use rust_embed::Embed;
 
 #[derive(Embed)]
-#[folder = "../../apps/web/dist/"]
+#[folder = "web/dist/"]
 struct Assets;
 
 pub(super) async fn asset(axum::extract::OriginalUri(uri): axum::extract::OriginalUri) -> Response {

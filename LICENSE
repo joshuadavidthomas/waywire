@@ -6,9 +6,9 @@ Waymote core and example notice
 
 This notice applies to the Waymote-derived example frontend in:
 
-- apps/web/index.html
-- apps/web/src/client.ts
-- apps/web/src/style.css
+- crates/gateway/web/index.html
+- crates/gateway/web/src/viewer/client.ts
+- crates/gateway/web/src/viewer/style.css
 
 MIT License
 
@@ -36,7 +36,7 @@ Waymote browser SDK notice
 ==========================
 
 This notice applies to the Waymote-derived files in
-apps/web/src/sdk/, including apps/web/src/sdk/waywire.ts.
+crates/gateway/web/src/sdk/, including crates/gateway/web/src/sdk/waywire.ts.
 
 MIT License
 

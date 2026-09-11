@@ -36,7 +36,7 @@ if (sprite.urlSettings?.auth !== "sprite")
   );
 if (sprite.urlSettings.privateAccess !== "admins")
   throw new Error(
-    `Set private access first: sprite url update --private-access admins -s ${name}`,
+    `Set private access to admins in the Sprites dashboard for ${name}`,
   );
 if (!sprite.url) throw new Error("Sprite has no canonical URL");
 const origin = new URL(sprite.url).origin;

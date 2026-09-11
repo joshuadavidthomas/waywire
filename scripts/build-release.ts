@@ -46,15 +46,6 @@ const archive = join(output, archiveName);
 let createdOutput = false;
 let completed = false;
 
-const service = {
-  name: "waywire",
-  cmd: "/opt/waywire/current/bin/desktop.sh",
-  args: [],
-  http_port: 8080,
-  needs: [],
-  env: {},
-  dir: "/home/sprite",
-};
 const packages = [
   "breeze-cursor-theme",
   "breeze-icon-theme",
@@ -99,14 +90,8 @@ try {
       join(root, "target/release/waywire-streamd"),
       join(payload, "bin/waywire-streamd"),
     ),
-    copyFile(
-      join(root, "installer/desktop.sh"),
-      join(payload, "bin/desktop.sh"),
-    ),
-    copyFile(
-      join(root, "installer/session.py"),
-      join(payload, "bin/session.py"),
-    ),
+    copyFile(join(root, "desktop/desktop.sh"), join(payload, "bin/desktop.sh")),
+    copyFile(join(root, "desktop/session.py"), join(payload, "bin/session.py")),
   ]);
   await Promise.all(
     ["waywire-gateway", "waywire-streamd", "desktop.sh", "session.py"].map(
@@ -121,7 +106,6 @@ try {
     os: { id: "ubuntu", codename: "resolute", architecture: "amd64" },
     artifacts: ["waywire-gateway", "waywire-streamd"],
     ports: { http: 8080 },
-    services: [service],
   };
   const sources = {
     schema: 1,
@@ -178,7 +162,10 @@ try {
   const size = (await stat(archive)).size;
   await writeFile(join(output, "SHA256SUMS"), `${digest}  ${archiveName}\n`);
 
-  const template = await readFile(join(root, "installer/install.sh"), "utf8");
+  const template = await readFile(
+    join(root, "integrations/sprite/install.sh"),
+    "utf8",
+  );
   const installer = template
     .replaceAll("@WAYWIRE_VERSION@", version)
     .replaceAll("@WAYWIRE_ARCHIVE_SIZE@", String(size))

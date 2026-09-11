@@ -1,6 +1,6 @@
 packages:
-  - apps/*
-  - packages/*
+  - crates/gateway/web
+  - integrations/sprite
 
 allowBuilds:
   esbuild: true

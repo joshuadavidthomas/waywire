@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Own the compositor and gateway children for one desktop service."""
+"""Own the compositor and gateway children for one desktop session."""
 
 import contextlib
 import os
@@ -149,7 +149,7 @@ def main():
             # A second termination request must not interrupt bounded cleanup.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-        raise RuntimeError("a desktop child exited; stopping the service")
+        raise RuntimeError("a desktop child exited; stopping the session")
 
 
 if __name__ == "__main__":

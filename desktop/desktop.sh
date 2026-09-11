@@ -8,9 +8,8 @@ readonly runtime_dir=/tmp/waywire
 readonly wayland_display=wayland-0
 readonly wayland_socket="$runtime_dir/$wayland_display"
 
-[ "$(id -un)" = sprite ] || fail 'run as the sprite user'
-[ "$(</proc/self/cgroup)" = '0::/svc.waywire' ] || fail 'run through the waywire service'
-for command in dbus-run-session ffmpeg flock jq labwc lxqt-session python3 sprite-env ss wayland-info wlr-randr; do
+[ -n "${HOME:-}" ] || fail 'HOME is not set'
+for command in dbus-run-session ffmpeg flock labwc lxqt-session python3 ss wayland-info wlr-randr; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
 for binary in waywire-gateway waywire-streamd; do
@@ -18,10 +17,11 @@ for binary in waywire-gateway waywire-streamd; do
 done
 
 if [ "${1:-}" != --session ]; then
-  [ "$#" -eq 0 ] || fail "unknown argument: $1"
-  exec dbus-run-session -- "$0" --session
+  [ "$#" -eq 1 ] || fail 'expected one public origin argument'
+  exec dbus-run-session -- "$0" --session "$1"
 fi
-[ "$#" -eq 1 ] || fail 'unexpected session arguments'
+[ "$#" -eq 2 ] || fail 'unexpected session arguments'
+readonly origin=$2
 : "${DBUS_SESSION_BUS_ADDRESS:?dbus-run-session did not set DBUS_SESSION_BUS_ADDRESS}"
 
 [ ! -L "$runtime_dir" ] || fail "refusing symlinked runtime directory: $runtime_dir"
@@ -37,7 +37,6 @@ if [ -e "$wayland_socket" ]; then
   rm -f "$wayland_socket"
 fi
 
-export HOME=/home/sprite
 export XDG_RUNTIME_DIR="$runtime_dir"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1
 export WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
@@ -54,9 +53,6 @@ mkdir -p "$XDG_CONFIG_HOME" "$HOME/Desktop"
 if [ ! -d "$XDG_CONFIG_HOME/labwc" ]; then
   cp -a /usr/share/lxqt/wayland/labwc "$XDG_CONFIG_HOME/labwc"
 fi
-origin=$(sprite-env info | jq -er '.sprite_url | select(type == "string" and test("^https://[^/]+$"))') ||
-  fail 'sprite-env info did not return a canonical HTTPS origin'
-
 # Keep the launcher lock across exec. Python's child processes close inherited
 # descriptors and its pidfds keep teardown safe after a child exits.
 exec python3 "$root/bin/session.py" "$origin"

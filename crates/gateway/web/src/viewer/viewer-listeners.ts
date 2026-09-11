@@ -1,4 +1,8 @@
-import type { SurfaceHandle, WaywireSession, WaywireStats } from "./waywire.ts";
+import type {
+  SurfaceHandle,
+  WaywireSession,
+  WaywireStats,
+} from "../sdk/waywire.ts";
 
 export type ViewerElements = {
   readonly display: HTMLCanvasElement;
