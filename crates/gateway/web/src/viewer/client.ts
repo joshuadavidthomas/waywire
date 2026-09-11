@@ -192,7 +192,7 @@ function startViewer(): void {
         }
         elements.clipboardStatus.textContent = copied
           ? ""
-          : "The browser would not take the desktop's clipboard";
+          : "The browser would not take the remote clipboard";
         if (!copied) console.warn("remote clipboard write failed", error);
       }
     });

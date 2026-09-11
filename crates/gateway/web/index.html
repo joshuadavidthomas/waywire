@@ -9,11 +9,7 @@
   </head>
   <body>
     <main id="stage" class="stage" data-pointer="moving" data-panel="floating">
-      <canvas
-        id="display"
-        tabindex="0"
-        aria-label="Interactive streamed Wayland desktop"
-      ></canvas>
+      <canvas id="display" tabindex="0" aria-label="The remote screen"></canvas>
       <div id="signal" class="signal" data-state="idle" role="status">
         <p>
           <span id="signal-headline">Connecting</span>
@@ -81,7 +77,7 @@
             <label
               class="item"
               for="control-toggle"
-              title="Turn off to watch without touching the desktop"
+              title="Turn off to watch without touching anything"
             >
               <svg
                 class="glyph"
@@ -93,7 +89,7 @@
                   d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z"
                 />
               </svg>
-              <span class="label">Input to desktop</span>
+              <span class="label">Control the remote</span>
               <span class="toggle">
                 <span class="toggle-knob" aria-hidden="true"></span>
                 <input
@@ -111,7 +107,7 @@
               id="pointer-lock"
               class="item"
               type="button"
-              title="Give the pointer to the desktop. Escape ends it"
+              title="Give the pointer to the remote. Escape ends it"
             >
               <svg
                 class="glyph"
@@ -130,7 +126,7 @@
               id="keyboard"
               class="item"
               type="button"
-              title="Type into the desktop"
+              title="Type into the remote"
             >
               <svg
                 class="glyph"
@@ -174,7 +170,7 @@
                 />
                 <rect x="8" y="2" width="8" height="4" rx="1" />
               </svg>
-              <span class="label">Paste to desktop</span>
+              <span class="label">Paste to remote</span>
             </button>
           </li>
           <li>
@@ -182,7 +178,7 @@
               id="copy-clipboard"
               class="item"
               type="button"
-              title="The desktop clipboard is empty"
+              title="The remote clipboard is empty"
               disabled
             >
               <svg
@@ -199,7 +195,7 @@
                 <path d="M21 14H11" />
                 <path d="m15 10-4 4 4 4" />
               </svg>
-              <span class="label">Copy from desktop</span>
+              <span class="label">Copy from remote</span>
             </button>
           </li>
           <li id="clipboard-status" class="note" aria-live="polite"></li>

@@ -97,7 +97,7 @@ function signalHeadline(state: WaywireSessionState): string {
   switch (state.video.state) {
     case "idle":
     case "connecting":
-      return "Connecting to the desktop";
+      return "Connecting to the remote";
     case "connected":
       return "Waiting for the first frame";
     case "reconnecting":
@@ -185,7 +185,7 @@ export function installViewerListeners(
   };
 
   // Menu: floating (light dismiss, scrim, keys held) or pinned (a palette
-  // that stays and lets the desktop through).
+  // that stays and lets the remote through).
   let panel: Panel =
     readStored(PANEL_STORAGE_KEY) === "pinned" ? "pinned" : "floating";
   const panelOpen = (): boolean => elements.panel.matches(":popover-open");
@@ -210,7 +210,7 @@ export function installViewerListeners(
   applyPanelMode();
   if (panel === "pinned") elements.panel.showPopover();
 
-  // Reaching the desktop is seamless. The SDK ties the lease to canvas
+  // Reaching the remote is seamless. The SDK ties the lease to canvas
   // focus, so the screen takes focus whenever the pointer is over it or the
   // window comes back, unless the viewer switched their input off.
   let wheel: Wheel = "auto";
@@ -235,7 +235,7 @@ export function installViewerListeners(
   // The one mode a person forgets they are in gets the page's one pill.
   const renderLeaseNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent = "Input is off";
+      elements.leaseNotice.textContent = "Control is off";
       elements.leaseNotice.hidden = false;
     } else if (state.input.state === "busy") {
       elements.leaseNotice.textContent = "Another viewer has control";
@@ -271,7 +271,7 @@ export function installViewerListeners(
     }),
   );
 
-  // Stats live in their own overlay. Frames only arrive while the desktop
+  // Stats live in their own overlay. Frames only arrive while the remote
   // changes, so the overlay renders the last snapshot on switch-on and marks
   // the rate idle once frames stop.
   let lastStats: WaywireStats | null = null;
@@ -350,8 +350,8 @@ export function installViewerListeners(
       const empty = event.text === null || event.text.length === 0;
       elements.copyClipboardButton.disabled = empty;
       elements.copyClipboardButton.title = empty
-        ? "The desktop clipboard is empty"
-        : "Bring the desktop clipboard here";
+        ? "The remote clipboard is empty"
+        : "Bring the remote clipboard here";
       if (event.text !== null) elements.clipboardStatus.textContent = "";
     }),
   );
