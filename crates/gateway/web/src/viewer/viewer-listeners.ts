@@ -34,26 +34,34 @@ export type ViewerElements = {
 };
 
 type Field =
-  | "size"
-  | "fps"
+  | "resolution"
+  | "rate"
   | "bitrate"
+  | "scale"
   | "rtt"
   | "late"
+  | "target"
   | "clock"
-  | "queues"
+  | "input-queue"
+  | "decode-queue"
   | "dropped"
+  | "received"
   | "resize"
   | "codec";
 
 const FIELDS: readonly Field[] = [
-  "size",
-  "fps",
+  "resolution",
+  "rate",
   "bitrate",
+  "scale",
   "rtt",
   "late",
+  "target",
   "clock",
-  "queues",
+  "input-queue",
+  "decode-queue",
   "dropped",
+  "received",
   "resize",
   "codec",
 ];
@@ -68,6 +76,15 @@ export const LATENCY_STORAGE_KEY = "waywire.latency";
 
 type Wheel = "auto" | "handsOff";
 type Panel = "floating" | "pinned";
+
+// A menu item is an icon and a label, so its wording lives in the label span.
+function itemLabel(item: HTMLElement): HTMLElement {
+  const label = item.querySelector(".label");
+  if (!(label instanceof HTMLElement)) {
+    throw new Error(`Expected a .label inside #${item.id}`);
+  }
+  return label;
+}
 
 function hudField(hud: HTMLElement, name: Field): HTMLElement {
   const element = hud.querySelector(`[data-field="${name}"]`);
@@ -111,28 +128,27 @@ function videoLabel(state: WaywireSessionState): string {
 }
 
 function titleFor(state: WaywireSessionState): string {
-  if (state.video.state === "error") return "Waywire · video stopped";
-  if (state.video.state === "reconnecting") return "Waywire · reconnecting";
-  if (state.video.state !== "connected") return "Waywire · not connected";
-  if (state.input.state === "busy") return "Waywire · someone else has it";
-  return "Waywire · connected";
+  if (state.video.state === "error") return "Waywire (video stopped)";
+  if (state.video.state === "reconnecting") return "Waywire (reconnecting)";
+  if (state.video.state !== "connected") return "Waywire (not connected)";
+  if (state.input.state === "busy") return "Waywire (in use)";
+  return "Waywire";
 }
 
-// The second half of the status line answers the other question a person
-// has: do my mouse and keyboard reach that desktop?
+// The right of the status line says what your mouse and keyboard can do.
 function inputLabel(state: WaywireSessionState): string {
   switch (state.input.state) {
     case "active":
-      return "yours to use";
+      return "Control";
     case "requesting":
     case "connecting":
-      return "claiming it";
+      return "Requesting control";
     case "busy":
-      return "someone else has it";
+      return "Another viewer has control";
     case "ready":
     case "idle":
     case "disconnected":
-      return "watching only";
+      return "View only";
   }
 }
 
@@ -160,6 +176,8 @@ export function installViewerListeners(
   const fields = Object.fromEntries(
     FIELDS.map((name) => [name, hudField(elements.hud, name)]),
   ) as Record<Field, HTMLElement>;
+  const controlLabel = itemLabel(elements.controlToggle);
+  const pointerLockLabel = itemLabel(elements.pointerLockButton);
   const cleanup: Array<() => void> = [];
   const listen = <K extends keyof HTMLElementEventMap>(
     target: HTMLElement,
@@ -224,18 +242,16 @@ export function installViewerListeners(
   window.addEventListener("focus", onWindowFocus);
   cleanup.push(() => window.removeEventListener("focus", onWindowFocus));
   const renderWheel = (): void => {
-    elements.controlToggle.setAttribute(
-      "aria-pressed",
-      String(wheel === "auto"),
-    );
+    controlLabel.textContent =
+      wheel === "handsOff" ? "Take control" : "Release control";
   };
   // The one mode a person forgets they are in gets the page's one pill.
   const renderLeaseNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent = "Your mouse and keyboard are off";
+      elements.leaseNotice.textContent = "View only";
       elements.leaseNotice.hidden = false;
     } else if (state.input.state === "busy") {
-      elements.leaseNotice.textContent = "Someone else has this desktop";
+      elements.leaseNotice.textContent = "Another viewer has control";
       elements.leaseNotice.hidden = false;
     } else {
       elements.leaseNotice.hidden = true;
@@ -263,11 +279,10 @@ export function installViewerListeners(
       elements.controlStatus.textContent = inputLabel(state);
       elements.controlStatus.title = state.input.message;
       elements.controlStatus.dataset["state"] = state.input.state;
-      elements.pointerLockButton.setAttribute(
-        "aria-pressed",
-        String(state.input.pointerLocked),
-      );
-      fields.codec.textContent = state.video.codec ?? "—";
+      pointerLockLabel.textContent = state.input.pointerLocked
+        ? "Unlock pointer"
+        : "Lock pointer";
+      fields.codec.textContent = state.video.codec ?? "-";
       document.title = titleFor(state);
     }),
   );
@@ -282,18 +297,22 @@ export function installViewerListeners(
   let lastHud = Number.NEGATIVE_INFINITY;
   const hudVisible = (): boolean => !elements.hud.hidden;
   const renderStats = (stats: WaywireStats, idle: boolean): void => {
-    fields.size.textContent = `${stats.width}×${stats.height}`;
-    fields.fps.textContent = idle
+    fields.resolution.textContent = `${stats.width}×${stats.height}`;
+    fields.rate.textContent = idle
       ? "idle"
       : `${stats.renderedFps.toFixed(0)} fps`;
-    fields.bitrate.textContent = `${stats.bitrateKbps} kbps at ${stats.scalePercent}%`;
+    fields.bitrate.textContent = `${stats.bitrateKbps} kbps`;
+    fields.scale.textContent = `${stats.scalePercent}%`;
     fields.rtt.textContent = `${stats.rttMs.toFixed(1)} ms`;
-    fields.late.textContent = `${stats.latenessMs.toFixed(1)} ms of ${stats.latencyTargetMs} ms`;
+    fields.late.textContent = `${stats.latenessMs.toFixed(1)} ms`;
+    fields.target.textContent = `${stats.latencyTargetMs} ms`;
     fields.clock.textContent = stats.clockConfident
       ? `±${stats.clockUncertaintyMs?.toFixed(1) ?? "?"} ms`
       : "syncing";
-    fields.queues.textContent = `${stats.pendingInputCount} input · ${stats.decoderQueue} decode`;
-    fields.dropped.textContent = `${stats.droppedFrames} of ${stats.receivedFrames}`;
+    fields["input-queue"].textContent = String(stats.pendingInputCount);
+    fields["decode-queue"].textContent = String(stats.decoderQueue);
+    fields.dropped.textContent = String(stats.droppedFrames);
+    fields.received.textContent = String(stats.receivedFrames);
   };
   const renderHud = (): void => {
     hudTimer = null;
@@ -306,7 +325,7 @@ export function installViewerListeners(
   const idleTicker = setInterval(() => {
     if (!hudVisible() || !lastStats) return;
     if (performance.now() - lastStatsAt > HUD_IDLE_AFTER_MS) {
-      fields.fps.textContent = "idle";
+      fields.rate.textContent = "idle";
     }
   }, 1000);
   cleanup.push(() => clearInterval(idleTicker));
@@ -351,14 +370,12 @@ export function installViewerListeners(
   );
   cleanup.push(
     session.on("resize", (event) => {
-      const size =
-        event.width && event.height ? ` ${event.width}×${event.height}` : "";
       const latency =
         event.latencyMs === undefined
           ? ""
           : ` in ${event.latencyMs.toFixed(0)} ms`;
-      fields.size.dataset["resize"] = event.state;
-      fields.resize.textContent = `${event.state}${size}${latency}`;
+      fields.resolution.dataset["resize"] = event.state;
+      fields.resize.textContent = `${event.state}${latency}`;
     }),
   );
   cleanup.push(

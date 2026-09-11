@@ -186,10 +186,11 @@ canvas {
   top: 12px;
   right: 12px;
   z-index: 1;
+  width: 288px;
   margin: 0;
   padding: 10px 12px;
   display: grid;
-  grid-template-columns: max-content max-content;
+  grid-template-columns: max-content 1fr;
   column-gap: 14px;
   row-gap: 3px;
   border-radius: 8px;
@@ -299,7 +300,8 @@ canvas {
   }
 }
 
-/* One status line, not stacked lamps. */
+/* One status line: what the stream is doing on the left, what your input can
+   do on the right. No separator glyph between them. */
 .status {
   margin: 0;
   padding: 6px 8px 8px;
@@ -307,7 +309,7 @@ canvas {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  color: var(--ink-dim);
+  color: var(--ink);
 }
 
 .status > span {
@@ -317,8 +319,9 @@ canvas {
   white-space: nowrap;
 }
 
-.status-sep {
-  color: var(--ink-faint);
+#control-status {
+  margin-left: auto;
+  color: var(--ink-dim);
 }
 
 .dot {
@@ -382,14 +385,6 @@ canvas {
 
 .item .glyph {
   color: var(--ink-dim);
-}
-
-.item .check {
-  color: var(--lamp-live);
-}
-
-.item[aria-pressed="false"] .check {
-  visibility: hidden;
 }
 
 :is(button, label).item {
