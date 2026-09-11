@@ -232,10 +232,11 @@ export function installViewerListeners(
   const renderWheel = (): void => {
     elements.controlToggle.checked = wheel === "auto";
   };
-  // The one mode a person forgets they are in gets the page's one pill.
+  // The page's one notice, for the two states that explain a screen which
+  // does not answer. It reports the situation; the switch names the action.
   const renderLeaseNotice = (state: WaywireSessionState): void => {
     if (wheel === "handsOff") {
-      elements.leaseNotice.textContent = "Control is off";
+      elements.leaseNotice.textContent = "View only";
       elements.leaseNotice.hidden = false;
     } else if (state.input.state === "busy") {
       elements.leaseNotice.textContent = "Another viewer has control";
