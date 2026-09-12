@@ -32,6 +32,10 @@ fn kbps(value: u32) -> Kbps {
     Kbps::new(value).expect("valid test bitrate")
 }
 
+fn crf(value: u8) -> Crf {
+    Crf::new(value).expect("valid test CRF")
+}
+
 fn wire_metadata(
     sequence: u64,
     generation: u32,
@@ -52,6 +56,7 @@ fn wire_metadata(
                 .expect("test input sequence should be valid")
         }),
         fps,
+        chroma: Chroma::Yuv444,
     }
 }
 
@@ -73,6 +78,8 @@ fn frame(sequence: u64, generation: u32) -> RawFrame {
             encoded_height: dimension(2),
             fps: fps(60),
             bitrate_kbps: kbps(8_000),
+            crf: crf(23),
+            chroma: Chroma::Yuv444,
         },
     }
 }
@@ -93,6 +100,8 @@ fn sized_frame(sequence: u64, generation: u32, width: u32, height: u32) -> RawFr
         encoded_height: dimension(u16::try_from(height).expect("test frame height should fit u16")),
         fps: fps(60),
         bitrate_kbps: kbps(8_000),
+        crf: crf(23),
+        chroma: Chroma::Yuv444,
     };
     RawFrame {
         pixels: vec![
@@ -128,6 +137,8 @@ fn real_frame_at_fps(sequence: u64, generation: u32, frame_rate: u32) -> RawFram
         encoded_height: dimension(180),
         fps: fps(frame_rate),
         bitrate_kbps: kbps(8_000),
+        crf: crf(23),
+        chroma: Chroma::Yuv444,
     };
     RawFrame {
         pixels: vec![
@@ -455,7 +466,10 @@ fn parse_test_sps(nal: &[u8]) -> SpsColorContract {
     let level = u8::try_from(bits.bits(8)).expect("8-bit SPS level should fit u8");
     bits.unsigned_exp_golomb();
 
-    assert_eq!(profile, 244, "test parser only accepts High 4:4:4 SPS");
+    assert!(
+        matches!(profile, 100 | 244),
+        "test parser only accepts High and High 4:4:4 SPS"
+    );
     let chroma_format = bits.unsigned_exp_golomb();
     if chroma_format == 3 {
         bits.bit();
@@ -1244,6 +1258,16 @@ fn ffmpeg_flags_match_the_rtp_contract() {
 }
 
 #[test]
+fn ffmpeg_uses_capped_crf_without_a_target_bitrate() {
+    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
+
+    assert!(args.windows(2).any(|pair| pair == ["-crf", "23"]));
+    assert!(args.windows(2).any(|pair| pair == ["-maxrate", "8000k"]));
+    assert!(args.windows(2).any(|pair| pair == ["-bufsize", "16000k"]));
+    assert!(!args.iter().any(|argument| argument == "-b:v"));
+}
+
+#[test]
 fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
     for (rate, interval) in [(60, 15), (30, 8), (10, 3)] {
         let mut config = frame(1, 1).config;
@@ -1264,18 +1288,22 @@ fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
 }
 
 #[test]
-fn ffmpeg_converts_and_tags_desktop_srgb_consistently() {
-    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
-    for pair in [
-        ["-profile:v", H264_PROFILE.ffmpeg_profile()],
-        ["-pix_fmt", "yuv444p"],
-        ["-vf", "scale=2:2:out_color_matrix=bt709:out_range=pc"],
-        ["-colorspace", "bt709"],
-        ["-color_primaries", "bt709"],
-        ["-color_trc", "iec61966-2-1"],
-        ["-color_range", "pc"],
-    ] {
-        assert!(args.windows(2).any(|actual| actual == pair));
+fn ffmpeg_converts_and_tags_desktop_srgb_for_each_chroma_choice() {
+    for chroma in [Chroma::Yuv444, Chroma::Yuv420] {
+        let mut config = frame(1, 1).config;
+        config.chroma = chroma;
+        let args = ffmpeg_args(5000, config, generation(17));
+        for pair in [
+            ["-profile:v", chroma.h264_profile().ffmpeg_profile()],
+            ["-pix_fmt", chroma.ffmpeg_pixel_format()],
+            ["-vf", "scale=2:2:out_color_matrix=bt709:out_range=pc"],
+            ["-colorspace", "bt709"],
+            ["-color_primaries", "bt709"],
+            ["-color_trc", "iec61966-2-1"],
+            ["-color_range", "pc"],
+        ] {
+            assert!(args.windows(2).any(|actual| actual == pair));
+        }
     }
 }
 
@@ -1335,6 +1363,14 @@ fn every_same_generation_config_change_requests_a_new_generation() {
             bitrate_kbps: kbps(4_000),
             ..active
         },
+        EncoderConfig {
+            crf: crf(18),
+            ..active
+        },
+        EncoderConfig {
+            chroma: Chroma::Yuv420,
+            ..active
+        },
     ];
 
     for changed in changed_configs {
@@ -1355,54 +1391,59 @@ fn every_same_generation_config_change_requests_a_new_generation() {
 
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
-fn ffmpeg_actual_sps_matches_protocol_profile() {
-    let socket =
-        UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
-    socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .expect("test RTP socket timeout should be configured");
-    let port = socket
-        .local_addr()
-        .expect("bound test RTP socket should have a local address")
-        .port();
-    let encoder = VideoEncoder::start("ffmpeg".into(), port)
-        .expect("FFmpeg-backed test encoder should start");
-    submit_frame(&encoder, &real_frame(1, 1))
-        .expect("test frame should be accepted by the encoder");
-    assert!(matches!(
-        wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata {
-            generation,
-            sequence: 1,
-            ..
-        }) if generation.get() == 1
-    ));
+fn ffmpeg_actual_sps_matches_each_protocol_profile() {
+    for (chroma, profile, chroma_format) in [(Chroma::Yuv444, 244, 3), (Chroma::Yuv420, 100, 1)] {
+        let socket =
+            UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("test RTP socket timeout should be configured");
+        let port = socket
+            .local_addr()
+            .expect("bound test RTP socket should have a local address")
+            .port();
+        let encoder = VideoEncoder::start("ffmpeg".into(), port)
+            .expect("FFmpeg-backed test encoder should start");
+        let mut test_frame = real_frame(1, 1);
+        test_frame.config.chroma = chroma;
+        test_frame.metadata.chroma = chroma;
+        submit_frame(&encoder, &test_frame).expect("test frame should be accepted by the encoder");
+        assert!(matches!(
+            wait_for_notification(&encoder),
+            Notification::Submitted(FrameMetadata {
+                generation,
+                sequence: 1,
+                ..
+            }) if generation.get() == 1
+        ));
 
-    let access_unit = receive_first_rtp_access_unit(&socket);
-    let sps = access_unit
-        .iter()
-        .find(|nal| nal[0] & 0x1f == 7)
-        .expect("first RTP access unit had no SPS");
-    assert!(sps.len() >= 4, "SPS has no profile-level-id");
-    assert_eq!(&sps[1..4], &[0xf4, 0x00, 0x34]);
-    assert_eq!(
-        format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]),
-        H264_PROFILE.codec()
-    );
-    assert_eq!(
-        parse_test_sps(sps),
-        SpsColorContract {
-            profile: 244,
-            constraints: 0,
-            level: 52,
-            chroma_format: 3,
-            full_range: true,
-            color_primaries: 1,
-            transfer_characteristics: 13,
-            matrix_coefficients: 1,
-        }
-    );
-    encoder.stop();
+        let access_unit = receive_first_rtp_access_unit(&socket);
+        let sps = access_unit
+            .iter()
+            .find(|nal| nal[0] & 0x1f == 7)
+            .expect("first RTP access unit had no SPS");
+        assert!(sps.len() >= 4, "SPS has no profile-level-id");
+        assert_eq!(sps[1], profile);
+        assert_eq!(sps[3], 0x34);
+        assert_eq!(
+            format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]),
+            chroma.h264_profile().codec()
+        );
+        assert_eq!(
+            parse_test_sps(sps),
+            SpsColorContract {
+                profile,
+                constraints: sps[2],
+                level: 52,
+                chroma_format,
+                full_range: true,
+                color_primaries: 1,
+                transfer_characteristics: 13,
+                matrix_coefficients: 1,
+            }
+        );
+        encoder.stop();
+    }
 }
 
 #[test]
@@ -1594,7 +1635,7 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
 
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
-fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
+fn ffmpeg_chroma_reconfiguration_waits_for_a_new_generation_and_changes_sps() {
     let socket =
         UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
     socket
@@ -1616,10 +1657,16 @@ fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
             ..
         }) if generation.get() == 1
     ));
-    let old_ssrc = receive_frame_ssrc(&socket);
+    let old_access_unit = receive_first_rtp_access_unit(&socket);
+    let old_sps = old_access_unit
+        .iter()
+        .find(|nal| nal[0] & 0x1f == 7)
+        .expect("4:4:4 access unit should contain an SPS");
+    assert_eq!(parse_test_sps(old_sps).chroma_format, 3);
 
     let mut changed = real_frame(2, 1);
-    changed.config.bitrate_kbps = kbps(4_000);
+    changed.config.chroma = Chroma::Yuv420;
+    changed.metadata.chroma = Chroma::Yuv420;
     submit_frame(&encoder, &changed).expect("test frame should be accepted by the encoder");
     assert_eq!(
         wait_for_notification(&encoder),
@@ -1630,7 +1677,8 @@ fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
     assert!(encoder.child_pid().is_none());
 
     let mut replacement = real_frame(3, 2);
-    replacement.config.bitrate_kbps = kbps(4_000);
+    replacement.config.chroma = Chroma::Yuv420;
+    replacement.metadata.chroma = Chroma::Yuv420;
     encoder
         .set_generation(generation(2))
         .expect("valid next media generation should be accepted");
@@ -1643,8 +1691,11 @@ fn ffmpeg_config_change_waits_for_a_new_generation_before_new_ssrc() {
             ..
         }) if generation.get() == 2
     ));
-    let new_ssrc = receive_frame_ssrc(&socket);
-    assert_eq!(old_ssrc, 1);
-    assert_eq!(new_ssrc, 2);
+    let new_access_unit = receive_first_rtp_access_unit(&socket);
+    let new_sps = new_access_unit
+        .iter()
+        .find(|nal| nal[0] & 0x1f == 7)
+        .expect("4:2:0 access unit should contain an SPS");
+    assert_eq!(parse_test_sps(new_sps).chroma_format, 1);
     encoder.stop();
 }

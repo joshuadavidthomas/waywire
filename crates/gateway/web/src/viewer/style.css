@@ -414,7 +414,7 @@ canvas {
 
 .item:focus-visible,
 .item:has(input:focus-visible),
-.resolution-select:focus-visible {
+.menu-select:focus-visible {
   outline: 2px solid var(--lamp-live);
   outline-offset: -2px;
 }
@@ -451,14 +451,14 @@ canvas {
 
 /* Controls sit in their rows, with no card around them. */
 
-.resolution-control {
+.select-control {
   display: inline-grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   flex: 0 0 auto;
   min-width: 154px;
 }
 
-.resolution-select {
+.menu-select {
   grid-column: 1 / -1;
   grid-row: 1;
   width: 100%;
@@ -466,6 +466,7 @@ canvas {
   margin: 0;
   padding: 3px 28px 3px 8px;
   appearance: none;
+  color-scheme: dark;
   border: 0;
   border-radius: 6px;
   background: var(--sunk);
@@ -475,7 +476,27 @@ canvas {
   cursor: pointer;
 }
 
-.resolution-chevron {
+.menu-select option {
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.menu-select option:checked {
+  background: var(--panel-on);
+  color: var(--ink);
+}
+
+.menu-select option:disabled {
+  background: var(--panel);
+  color: var(--ink-dim);
+}
+
+.menu-select option:checked:disabled {
+  background: var(--panel-on);
+  color: var(--ink-dim);
+}
+
+.select-chevron {
   grid-column: 2;
   grid-row: 1;
   place-self: center;
@@ -486,7 +507,7 @@ canvas {
   stroke-width: 1;
 }
 
-.resolution-control:has(.resolution-select:hover) .resolution-chevron {
+.select-control:has(.menu-select:hover) .select-chevron {
   color: var(--ink);
 }
 
@@ -614,7 +635,7 @@ canvas {
     min-height: 44px;
   }
 
-  .resolution-select {
+  .menu-select {
     height: 36px;
   }
 

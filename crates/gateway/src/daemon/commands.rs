@@ -307,6 +307,8 @@ mod tests {
             bitrate_kbps: Kbps::new(8_000).expect("test bitrate should be valid"),
             fps: Fps::new(60).expect("test frame rate should be valid"),
             scale_percent: ScalePercent::new(100).expect("test scale should be valid"),
+            crf: waywire_protocol::pipe::Crf::new(23).expect("test CRF should be valid"),
+            chroma: waywire_protocol::pipe::Chroma::Yuv444,
         });
         let mut expected = Command::ReleaseAll(ReleaseAll).encode();
         expected.extend_from_slice(&second_input.encode());
@@ -386,7 +388,7 @@ mod tests {
         let feedback_task =
             tokio::spawn(async move { feedback_sessions.feedback(socket, feedback).await });
         timeout(Duration::from_secs(1), async {
-            while sessions.quality().bitrate.get() == 8_000 {
+            while sessions.quality_chroma() == waywire_protocol::pipe::Chroma::Yuv444 {
                 tokio::task::yield_now().await;
             }
         })
@@ -416,9 +418,11 @@ mod tests {
         assert_eq!(
             decoded,
             Command::Quality(Quality {
-                bitrate_kbps: Kbps::new(6_400).expect("expected bitrate should be valid"),
+                bitrate_kbps: Kbps::new(8_000).expect("expected bitrate should be valid"),
                 fps: Fps::new(60).expect("expected frame rate should be valid"),
                 scale_percent: ScalePercent::new(100).expect("expected scale should be valid"),
+                crf: waywire_protocol::pipe::Crf::new(23).expect("test CRF should be valid"),
+                chroma: waywire_protocol::pipe::Chroma::Yuv420,
             })
         );
         release_task

@@ -5,7 +5,7 @@ use tracing::info;
 use waywire_protocol::Record;
 use waywire_protocol::browser::ClientEvent;
 use waywire_protocol::browser::VideoSample;
-use waywire_protocol::pipe::H264_PROFILE;
+use waywire_protocol::pipe::Generation;
 
 use super::AppState;
 use super::admission::SocketAdmission;
@@ -27,16 +27,8 @@ pub(super) async fn stream_socket(
 }
 
 async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEnd {
-    let configuration = ClientEvent::video_config(H264_PROFILE.codec());
-    let configuration = match client_event_message(&configuration) {
-        Ok(message) => message,
-        Err(error) => return error.into(),
-    };
-    if let Err(error) = send(socket, configuration, &state.connections.cancellation).await {
-        return error;
-    }
-
     let mut subscription = state.hub.subscribe();
+    let mut announced_generation = None;
     loop {
         tokio::select! {
             () = state.connections.cancellation.cancelled() => {
@@ -60,6 +52,7 @@ async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEn
                 if let Err(reason) = send_video(
                     socket,
                     &frame,
+                    &mut announced_generation,
                     &state.connections.cancellation,
                 ).await {
                     return reason;
@@ -72,8 +65,18 @@ async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEn
 async fn send_video(
     socket: &mut WebSocket,
     frame: &VideoSample,
+    announced_generation: &mut Option<Generation>,
     cancellation: &CancellationToken,
 ) -> Result<(), SocketEnd> {
+    let generation = frame.metadata.generation;
+    if *announced_generation != Some(generation) {
+        let configuration = ClientEvent::video_config(frame.metadata.chroma.h264_profile().codec());
+        let configuration = client_event_message(&configuration)?;
+        // The JSON configuration and its generation's first keyframe share this
+        // socket, so WebSocket message order is the decoder reconfiguration contract.
+        send(socket, configuration, cancellation).await?;
+        *announced_generation = Some(generation);
+    }
     let bytes = frame.encode();
     send(socket, Message::Binary(bytes.into()), cancellation).await
 }

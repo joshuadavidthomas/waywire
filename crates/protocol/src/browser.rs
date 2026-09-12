@@ -114,12 +114,24 @@ pub struct QualityLevels {
     pub scale: ScalePercent,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QualityPreset {
+    Automatic,
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ClientMessage {
     AcquireControl,
     ReleaseControl,
     Ping {
         id: u64,
+    },
+    SetQuality {
+        preset: QualityPreset,
     },
     Feedback(Feedback),
     Text {
@@ -140,6 +152,7 @@ impl ClientMessage {
             JsonInput::Acquire => Ok(Self::AcquireControl),
             JsonInput::Release => Ok(Self::ReleaseControl),
             JsonInput::Ping { id } => Ok(Self::Ping { id }),
+            JsonInput::SetQuality { preset } => Ok(Self::SetQuality { preset }),
             JsonInput::Feedback(values) => Feedback::new(values).map(Self::Feedback),
             JsonInput::Text {
                 action,
@@ -165,6 +178,9 @@ enum JsonInput {
     Release,
     Ping {
         id: u64,
+    },
+    SetQuality {
+        preset: QualityPreset,
     },
     Feedback(FeedbackValues),
     Text {
@@ -356,8 +372,8 @@ impl RecordKind for BrowserKind {
 
     fn max_payload(self) -> usize {
         match self {
-            // Frame kind u8, continuity u8, 32-byte metadata, then the encoded access unit.
-            Self::Frame => 34 + MAX_VIDEO_DATA_BYTES,
+            // Frame kind u8, continuity u8, 33-byte metadata, then the encoded access unit.
+            Self::Frame => 35 + MAX_VIDEO_DATA_BYTES,
         }
     }
 }
@@ -409,7 +425,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![5, kind, 0, 0];
+        let mut bytes = vec![7, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -420,15 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn video_config_json_is_exact() {
-        let event = ClientEvent::video_config(pipe::H264_PROFILE.codec());
-        assert_eq!(
-            json(&event),
-            format!(
-                r#"{{"type":"video-config","version":5,"codec":"{}"}}"#,
-                pipe::H264_PROFILE.codec()
-            )
-        );
+    fn video_config_json_is_exact_for_each_chroma_profile() {
+        for (chroma, codec) in [
+            (pipe::Chroma::Yuv444, "avc1.F40034"),
+            (pipe::Chroma::Yuv420, "avc1.640034"),
+        ] {
+            let event = ClientEvent::video_config(chroma.h264_profile().codec());
+            assert_eq!(
+                json(&event),
+                format!(r#"{{"type":"video-config","version":7,"codec":"{codec}"}}"#)
+            );
+        }
     }
 
     #[test]
@@ -585,6 +603,8 @@ mod tests {
                 bitrate_kbps: value(Kbps::new(8_000)),
                 fps: value(Fps::new(60)),
                 scale_percent: value(ScalePercent::new(100)),
+                crf: value(pipe::Crf::new(23)),
+                chroma: pipe::Chroma::Yuv444,
             }),
             Command::Text(pipe::Text {
                 action: TextAction::Commit,
@@ -652,6 +672,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_quality_presets() {
+        let cases = [
+            ("automatic", QualityPreset::Automatic),
+            ("high", QualityPreset::High),
+            ("medium", QualityPreset::Medium),
+            ("low", QualityPreset::Low),
+        ];
+
+        for (name, preset) in cases {
+            let message = format!(r#"{{"type":"set-quality","preset":"{name}"}}"#);
+            assert_eq!(
+                ClientMessage::parse_json(message.as_bytes()).expect("quality preset should parse"),
+                ClientMessage::SetQuality { preset }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_quality_preset() {
+        assert!(ClientMessage::parse_json(br#"{"type":"set-quality","preset":"ultra"}"#).is_err());
+    }
+
+    #[test]
     fn parses_text_json() {
         assert_eq!(
             ClientMessage::parse_json(
@@ -701,11 +744,12 @@ mod tests {
                 sequence: 17,
                 input_sequence: Some(value(InputSequence::new(8))),
                 fps: value(Fps::new(60)),
+                chroma: pipe::Chroma::Yuv420,
             },
         };
         let bytes = vec![
-            5, 1, 0, 0, 36, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
-            17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 2,
+            7, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);
         assert_eq!(VideoSample::decode(&bytes), Ok(sample));

@@ -48,4 +48,6 @@ The ignored stream daemon tests require ffmpeg with libx264.
 
 The H.264 High 4:4:4 Predictive stream targets Chrome on Linux. Other browsers and hardware decoders may reject it. Audio is not implemented.
 
-See `LICENSE` for upstream notices.
+## License
+
+waywire is licensed under the MIT license. See the [`LICENSE`](LICENSE) file for more information.

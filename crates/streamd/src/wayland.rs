@@ -65,8 +65,10 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1;
 use waywire_protocol::Decoder;
+use waywire_protocol::pipe::Chroma;
 use waywire_protocol::pipe::ClipboardText;
 use waywire_protocol::pipe::Command;
+use waywire_protocol::pipe::Crf;
 use waywire_protocol::pipe::CursorPosition;
 use waywire_protocol::pipe::CursorVisibility;
 use waywire_protocol::pipe::Event;
@@ -75,9 +77,11 @@ use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::InputSequence;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::KeyframeState;
+use waywire_protocol::pipe::Quality;
 use waywire_protocol::pipe::ResetVideoRefusal;
 use waywire_protocol::pipe::ResizeApplied;
 use waywire_protocol::pipe::ScalePercent;
+use waywire_protocol::pipe::ScaleV120;
 
 use self::capture::Capture;
 use self::capture::CaptureFailureOutcome;
@@ -88,6 +92,7 @@ use self::cursor::Cursor;
 use self::cursor::ShapeTable;
 use self::input::Input;
 use self::output::AppliedResize;
+use self::output::CancelOutcome;
 use self::output::DimensionChange;
 use self::output::DisplayResetRefusal;
 use self::output::DisplayResetStart;
@@ -97,7 +102,10 @@ use self::output::OutputManager;
 use self::output::OutputTimeout;
 use self::output::RejectOutcome;
 use self::output::ResizeOperation;
+use self::output::RetryOperation;
 use self::output::SerialPublication;
+use self::output::StartupFailure;
+use self::output::StartupFailureReason;
 use crate::Options;
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
@@ -132,6 +140,8 @@ pub(crate) struct State {
     fps: Fps,
     bitrate_kbps: Kbps,
     encoded_scale: ScalePercent,
+    crf: Crf,
+    chroma: Chroma,
 }
 
 pub(crate) fn run(options: Options) -> Result<()> {
@@ -160,7 +170,7 @@ pub(crate) fn run(options: Options) -> Result<()> {
         capture: Capture::new(),
         capture_failures: CaptureFailures::new(),
         input: Input::new(options.xkb_layout),
-        outputs: OutputManager::new(),
+        outputs: OutputManager::with_startup(options.resolution, ScaleV120::new(120)?),
         clipboard: Clipboard::new(internal_sender),
         cursor,
         video: Some(video),
@@ -171,6 +181,8 @@ pub(crate) fn run(options: Options) -> Result<()> {
         fps: options.frame_rate,
         bitrate_kbps: options.bitrate,
         encoded_scale: ScalePercent::new(100)?,
+        crf: Crf::new(23)?,
+        chroma: Chroma::Yuv444,
     };
 
     connection.display().get_registry(&qh, ());
@@ -299,6 +311,121 @@ fn register_stdin(handle: &LoopHandle<'_, State>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputConfigurationFollowUp {
+    Continue,
+    ReportDisplayResetRefusal(DisplayResetRefusal),
+}
+
+fn warn_startup_failure(failure: StartupFailure) {
+    warn!(
+        requested_mode = %failure.requested(),
+        reason = failure.reason().reason(),
+        "startup output mode was not applied; keeping the existing output mode"
+    );
+}
+
+fn rejected_output_follow_up(outcome: Option<RejectOutcome>) -> OutputConfigurationFollowUp {
+    match outcome {
+        Some(RejectOutcome::StartupFailed(failure)) => {
+            warn_startup_failure(failure);
+            OutputConfigurationFollowUp::Continue
+        }
+        Some(RejectOutcome::SupersededExternal) => {
+            warn!(
+                reason = "a newer external resize is queued",
+                "compositor rejected an obsolete resize"
+            );
+            OutputConfigurationFollowUp::Continue
+        }
+        Some(RejectOutcome::Retrying {
+            operation,
+            failures,
+        }) => {
+            warn!(
+                ?operation,
+                consecutive_failures = failures,
+                maximum_failures = 3,
+                reason = "compositor rejected the output configuration",
+                "output configuration failed; retrying"
+            );
+            OutputConfigurationFollowUp::Continue
+        }
+        Some(RejectOutcome::Exhausted {
+            operation: RetryOperation::External,
+            failures,
+        }) => {
+            warn!(
+                consecutive_failures = failures,
+                maximum_failures = 3,
+                reason = "compositor rejected the output configuration",
+                "external resize failure limit reached; dropping request"
+            );
+            OutputConfigurationFollowUp::Continue
+        }
+        Some(RejectOutcome::Exhausted {
+            operation: RetryOperation::DisplayReset,
+            failures,
+        }) => {
+            warn!(
+                consecutive_failures = failures,
+                maximum_failures = 3,
+                reason = "compositor rejected the output configuration",
+                "display reset failure limit reached"
+            );
+            OutputConfigurationFollowUp::ReportDisplayResetRefusal(
+                DisplayResetRefusal::CompositorRejected,
+            )
+        }
+        None => OutputConfigurationFollowUp::Continue,
+    }
+}
+
+fn cancelled_output_follow_up(outcome: Option<CancelOutcome>) -> OutputConfigurationFollowUp {
+    match outcome {
+        Some(CancelOutcome::StartupFailed(failure)) => {
+            warn_startup_failure(failure);
+            OutputConfigurationFollowUp::Continue
+        }
+        Some(CancelOutcome::DisplayReset) => {
+            OutputConfigurationFollowUp::ReportDisplayResetRefusal(
+                DisplayResetRefusal::CompositorCancelled,
+            )
+        }
+        Some(CancelOutcome::External) | None => OutputConfigurationFollowUp::Continue,
+    }
+}
+
+fn timed_out_output_follow_up(timeout: OutputTimeout) -> OutputConfigurationFollowUp {
+    match timeout {
+        OutputTimeout::StartupConfiguration(failure) => {
+            warn_startup_failure(failure);
+            OutputConfigurationFollowUp::Continue
+        }
+        OutputTimeout::ExternalConfiguration => {
+            warn!(
+                deadline = ?OutputManager::configuration_deadline(),
+                reason = "compositor did not finish the output configuration",
+                "external resize timed out; dropping request"
+            );
+            OutputConfigurationFollowUp::Continue
+        }
+        OutputTimeout::DisplayResetConfiguration => {
+            OutputConfigurationFollowUp::ReportDisplayResetRefusal(
+                DisplayResetRefusal::CompositorTimedOut,
+            )
+        }
+        OutputTimeout::FreshSerial => {
+            warn!(
+                deadline = ?OutputManager::configuration_deadline(),
+                reason = "output manager did not publish a fresh serial",
+                "cancelled resize retry timed out; dropping request"
+            );
+            OutputConfigurationFollowUp::Continue
+        }
+    }
+}
+
 impl State {
     fn start_native(&mut self) -> Result<()> {
         let output = self.output.clone().context("compositor has no wl_output")?;
@@ -383,6 +510,25 @@ impl State {
         self.start_queued_resize_or_capture()
     }
 
+    fn apply_quality(&mut self, quality: Quality) -> Result<()> {
+        let current = Quality {
+            bitrate_kbps: self.bitrate_kbps,
+            fps: self.fps,
+            scale_percent: self.encoded_scale,
+            crf: self.crf,
+            chroma: self.chroma,
+        };
+        if quality != current {
+            self.bitrate_kbps = quality.bitrate_kbps;
+            self.fps = quality.fps;
+            self.encoded_scale = quality.scale_percent;
+            self.crf = quality.crf;
+            self.chroma = quality.chroma;
+            self.advance_generation()?;
+        }
+        Ok(())
+    }
+
     fn apply_command(&mut self, command: &Command) -> Result<()> {
         match command {
             Command::Resize(payload) => {
@@ -421,16 +567,7 @@ impl State {
             Command::Clipboard(text) => {
                 self.clipboard.set_text(text, &self.qh)?;
             }
-            Command::Quality(payload) => {
-                if (payload.bitrate_kbps, payload.fps, payload.scale_percent)
-                    != (self.bitrate_kbps, self.fps, self.encoded_scale)
-                {
-                    self.bitrate_kbps = payload.bitrate_kbps;
-                    self.fps = payload.fps;
-                    self.encoded_scale = payload.scale_percent;
-                    self.advance_generation()?;
-                }
-            }
+            Command::Quality(payload) => self.apply_quality(*payload)?,
             Command::KeyframeReadiness(payload) => {
                 if payload.generation == self.generation {
                     match payload.state {
@@ -544,25 +681,32 @@ impl State {
         Ok(())
     }
 
-    fn handle_output_timeout(&mut self, timeout: OutputTimeout) -> Result<()> {
-        match timeout {
-            OutputTimeout::Configuration {
-                operation: ResizeOperation::External,
-            } => warn!(
-                deadline = ?OutputManager::configuration_deadline(),
-                reason = "compositor did not finish the output configuration",
-                "external resize timed out; dropping request"
-            ),
-            OutputTimeout::Configuration {
-                operation: ResizeOperation::DisplayReset,
-            } => self.report_display_reset_refusal(DisplayResetRefusal::CompositorTimedOut)?,
-            OutputTimeout::FreshSerial => warn!(
-                deadline = ?OutputManager::configuration_deadline(),
-                reason = "output manager did not publish a fresh serial",
-                "cancelled resize retry timed out; dropping request"
-            ),
+    fn continue_after_output_configuration(
+        &mut self,
+        follow_up: OutputConfigurationFollowUp,
+    ) -> Result<()> {
+        match follow_up {
+            OutputConfigurationFollowUp::Continue => {}
+            OutputConfigurationFollowUp::ReportDisplayResetRefusal(refusal) => {
+                self.report_display_reset_refusal(refusal)?;
+            }
         }
         self.start_queued_resize_or_capture()
+    }
+
+    fn handle_output_rejected(&mut self) -> Result<()> {
+        let follow_up = rejected_output_follow_up(self.outputs.reject_pending());
+        self.continue_after_output_configuration(follow_up)
+    }
+
+    fn handle_output_cancelled(&mut self) -> Result<()> {
+        let follow_up = cancelled_output_follow_up(self.outputs.retry_cancelled());
+        self.continue_after_output_configuration(follow_up)
+    }
+
+    fn handle_output_timeout(&mut self, timeout: OutputTimeout) -> Result<()> {
+        let follow_up = timed_out_output_follow_up(timeout);
+        self.continue_after_output_configuration(follow_up)
     }
 
     fn resize_succeeded(&mut self) -> Result<()> {
@@ -571,6 +715,7 @@ impl State {
             .take_succeeded()
             .context("unexpected resize success")?;
         match applied {
+            AppliedResize::Startup => {}
             AppliedResize::External {
                 size,
                 scale_v120,
@@ -617,6 +762,21 @@ impl State {
             ) {
                 Ok(()) => return Ok(()),
                 Err(error) => match operation {
+                    ResizeOperation::Startup if self.output.is_some() => {
+                        let failure = StartupFailure::new(
+                            request.requested_size(),
+                            StartupFailureReason::ConfigurationUnavailable,
+                        );
+                        warn!(
+                            %error,
+                            requested_mode = %failure.requested(),
+                            reason = failure.reason().reason(),
+                            "startup output mode could not start; keeping the existing output mode"
+                        );
+                    }
+                    ResizeOperation::Startup => {
+                        return Err(error.context("start output configuration"));
+                    }
                     ResizeOperation::External => {
                         warn!(
                             %error,
@@ -795,9 +955,13 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                         capture_nanos,
                         state.generation,
                         state.latest_input_sequence,
-                        state.fps,
-                        state.bitrate_kbps,
-                        state.encoded_scale,
+                        Quality {
+                            fps: state.fps,
+                            bitrate_kbps: state.bitrate_kbps,
+                            scale_percent: state.encoded_scale,
+                            crf: state.crf,
+                            chroma: state.chroma,
+                        },
                     )?;
                     state
                         .video
@@ -951,76 +1115,14 @@ impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for S
         {
             return;
         }
-        match event {
-            zwlr_output_configuration_v1::Event::Succeeded => {
-                if let Err(error) = state.resize_succeeded() {
-                    state.fail(error);
-                }
-            }
-            zwlr_output_configuration_v1::Event::Failed => {
-                if let Some(outcome) = state.outputs.reject_pending() {
-                    match outcome {
-                        RejectOutcome::SupersededExternal => warn!(
-                            reason = "a newer external resize is queued",
-                            "compositor rejected an obsolete resize"
-                        ),
-                        RejectOutcome::Retrying {
-                            operation,
-                            failures,
-                        } => warn!(
-                            ?operation,
-                            consecutive_failures = failures,
-                            maximum_failures = 3,
-                            reason = "compositor rejected the output configuration",
-                            "output configuration failed; retrying"
-                        ),
-                        RejectOutcome::Exhausted {
-                            operation: ResizeOperation::External,
-                            failures,
-                        } => warn!(
-                            consecutive_failures = failures,
-                            maximum_failures = 3,
-                            reason = "compositor rejected the output configuration",
-                            "external resize failure limit reached; dropping request"
-                        ),
-                        RejectOutcome::Exhausted {
-                            operation: ResizeOperation::DisplayReset,
-                            failures,
-                        } => {
-                            warn!(
-                                consecutive_failures = failures,
-                                maximum_failures = 3,
-                                reason = "compositor rejected the output configuration",
-                                "display reset failure limit reached"
-                            );
-                            if let Err(error) = state.report_display_reset_refusal(
-                                DisplayResetRefusal::CompositorRejected,
-                            ) {
-                                state.fail(error);
-                                return;
-                            }
-                        }
-                    }
-                }
-                if let Err(error) = state.start_queued_resize_or_capture() {
-                    state.fail(error);
-                }
-            }
-            zwlr_output_configuration_v1::Event::Cancelled => {
-                if matches!(
-                    state.outputs.retry_cancelled(),
-                    Some(ResizeOperation::DisplayReset)
-                ) && let Err(error) =
-                    state.report_display_reset_refusal(DisplayResetRefusal::CompositorCancelled)
-                {
-                    state.fail(error);
-                    return;
-                }
-                if let Err(error) = state.start_queued_resize_or_capture() {
-                    state.fail(error);
-                }
-            }
-            _ => {}
+        let result = match event {
+            zwlr_output_configuration_v1::Event::Succeeded => state.resize_succeeded(),
+            zwlr_output_configuration_v1::Event::Failed => state.handle_output_rejected(),
+            zwlr_output_configuration_v1::Event::Cancelled => state.handle_output_cancelled(),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            state.fail(error);
         }
     }
 }
@@ -1224,10 +1326,41 @@ fn protocol_ready_nanos(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use super::CancelOutcome;
+    use super::OutputConfigurationFollowUp;
+    use super::OutputTimeout;
+    use super::RejectOutcome;
+    use super::StartupFailure;
+    use super::StartupFailureReason;
     use super::WaylandError;
+    use super::cancelled_output_follow_up;
     use super::capture_flush;
     use super::io;
+    use super::output::OutputSize;
     use super::protocol_ready_nanos;
+    use super::rejected_output_follow_up;
+    use super::timed_out_output_follow_up;
+
+    #[test]
+    fn startup_failure_handlers_continue_output_work_instead_of_stopping_state() {
+        let requested = OutputSize::new(1920, 1080).expect("valid test output size");
+        let rejected = StartupFailure::new(requested, StartupFailureReason::Rejected);
+        let cancelled = StartupFailure::new(requested, StartupFailureReason::Cancelled);
+        let timed_out = StartupFailure::new(requested, StartupFailureReason::TimedOut);
+
+        assert_eq!(
+            rejected_output_follow_up(Some(RejectOutcome::StartupFailed(rejected))),
+            OutputConfigurationFollowUp::Continue
+        );
+        assert_eq!(
+            cancelled_output_follow_up(Some(CancelOutcome::StartupFailed(cancelled))),
+            OutputConfigurationFollowUp::Continue
+        );
+        assert_eq!(
+            timed_out_output_follow_up(OutputTimeout::StartupConfiguration(timed_out)),
+            OutputConfigurationFollowUp::Continue
+        );
+    }
 
     #[test]
     fn capture_flush_accepts_backpressure_but_rejects_broken_connections() {

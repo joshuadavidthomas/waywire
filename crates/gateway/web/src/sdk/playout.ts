@@ -3,77 +3,62 @@ const minimumTargetMs = 50;
 const maximumTargetMs = 300;
 const targetStepMs = 25;
 const changeCooldownMs = 5_000;
-const idleAfterMs = 1_500;
 // Allow one ordinary 60 Hz animation-frame wait before calling a frame late.
 const lateThresholdMs = 25;
-const calmThresholdMs = 17;
 const busyDecodeQueue = 5;
 const badStreakThreshold = 4;
-const calmStreakThreshold = 120;
-
-type Streak =
-  | Readonly<{ kind: "none" }>
-  | Readonly<{ kind: "bad" | "calm"; count: number }>;
+const recoveryDelayMs = 10_000;
 
 export type PlayoutSample = Readonly<{
   latenessMs: number;
   decodeQueue: number;
 }>;
 
-/** A local playout ladder: brief trouble raises delay, sustained calm lowers it.
- * The caller supplies frame samples and monotonic time; no browser or timers.
+/** Four bad frames raise delay; time without bad evidence lowers it.
+ * The caller supplies frame samples and idle ticks using one monotonic clock.
  */
 export class Playout {
   private targetMs = initialPlayoutTargetMs;
-  private streak: Streak = { kind: "none" };
+  private badSamples = 0;
+  private quietSinceMs: number | null = null;
   private lastChangeMs: number | null = null;
-  private lastSampleMs: number | null = null;
+  private lastUpdateMs: number | null = null;
 
-  // null means there is no timed frame (for example, clock synchronization is
-  // incomplete). Idle gaps and mixed samples break streaks without changing delay.
+  // Damage-driven streams can be sparse or completely idle. Absence of frames
+  // is not evidence of trouble: recovery uses wall-clock time since the last bad
+  // sample, never a count or sum of calm samples. Null is an idle/untimed tick.
   update(sample: PlayoutSample | null, nowMs: number): number {
-    if (
-      this.lastSampleMs !== null &&
-      (nowMs - this.lastSampleMs > idleAfterMs || nowMs < this.lastSampleMs)
-    )
-      this.streak = { kind: "none" };
-    this.lastSampleMs = nowMs;
-    if (sample === null) {
-      this.streak = { kind: "none" };
-      return this.targetMs;
+    if (this.lastUpdateMs !== null && nowMs < this.lastUpdateMs) {
+      this.badSamples = 0;
+      this.quietSinceMs = nowMs;
+      this.lastChangeMs = null;
     }
-    const kind =
-      sample.latenessMs >= lateThresholdMs ||
-      sample.decodeQueue >= busyDecodeQueue
-        ? "bad"
-        : sample.latenessMs <= calmThresholdMs && sample.decodeQueue <= 1
-          ? "calm"
-          : "none";
-    if (kind === "none") {
-      this.streak = { kind };
-      return this.targetMs;
+    this.lastUpdateMs = nowMs;
+    // With no bad sample yet, start the quiet period at the first update.
+    this.quietSinceMs ??= nowMs;
+    const bad =
+      sample !== null &&
+      (sample.latenessMs >= lateThresholdMs ||
+        sample.decodeQueue >= busyDecodeQueue);
+    if (bad) {
+      this.quietSinceMs = nowMs;
+      this.badSamples = Math.min(badStreakThreshold, this.badSamples + 1);
+    } else if (sample !== null) {
+      this.badSamples = 0;
     }
-    const threshold = kind === "bad" ? badStreakThreshold : calmStreakThreshold;
-    this.streak = {
-      kind,
-      count:
-        this.streak.kind === kind
-          ? Math.min(threshold, this.streak.count + 1)
-          : 1,
-    };
     if (
-      this.streak.count < threshold ||
-      (this.lastChangeMs !== null &&
-        nowMs - this.lastChangeMs < changeCooldownMs)
+      this.lastChangeMs !== null &&
+      nowMs - this.lastChangeMs < changeCooldownMs
     )
       return this.targetMs;
 
     const old = this.targetMs;
-    this.targetMs =
-      kind === "bad"
-        ? Math.min(maximumTargetMs, old + targetStepMs)
-        : Math.max(minimumTargetMs, old - targetStepMs);
-    this.streak = { kind: "none" };
+    if (bad && this.badSamples >= badStreakThreshold) {
+      this.targetMs = Math.min(maximumTargetMs, old + targetStepMs);
+      this.badSamples = 0;
+    } else if (!bad && nowMs - this.quietSinceMs >= recoveryDelayMs) {
+      this.targetMs = Math.max(minimumTargetMs, old - targetStepMs);
+    }
     if (this.targetMs !== old) this.lastChangeMs = nowMs;
     return this.targetMs;
   }

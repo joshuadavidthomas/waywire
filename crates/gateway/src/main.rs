@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
             frame_rate: options.frame_rate,
             bitrate: options.bitrate,
             xkb_layout: options.xkb_layout,
+            resolution: options.resolution,
         },
         rtp,
         hub.clone(),

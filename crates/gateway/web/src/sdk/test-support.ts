@@ -209,6 +209,7 @@ export function videoPacket(
     readonly generation?: number;
     readonly width?: number;
     readonly height?: number;
+    readonly chroma?: 0 | 1;
   } = {},
 ): ArrayBuffer {
   return videoFrame(
@@ -222,6 +223,7 @@ export function videoPacket(
       sequence: 0n,
       inputSequence: 0,
       fps: 60,
+      chroma: options.chroma ?? 0,
     },
     new Uint8Array([0]),
   );
@@ -295,9 +297,11 @@ export function installQueueVideoDecoder(): {
 export function installDelayedVideoDecoder(): {
   readonly supportResolvers: Array<(value: { supported: boolean }) => void>;
   readonly counts: { constructions: number; decoded: number };
+  readonly configurations: VideoDecoderConfig[];
 } {
   const supportResolvers: Array<(value: { supported: boolean }) => void> = [];
   const counts = { constructions: 0, decoded: 0 };
+  const configurations: VideoDecoderConfig[] = [];
   installGlobal(
     "VideoDecoder",
     class {
@@ -317,7 +321,8 @@ export function installDelayedVideoDecoder(): {
       addEventListener(type: string, listener: (event: unknown) => void) {
         this.events.addEventListener(type, listener);
       }
-      configure() {
+      configure(configuration: VideoDecoderConfig) {
+        configurations.push(configuration);
         this.state = "configured";
       }
       reset() {
@@ -338,7 +343,7 @@ export function installDelayedVideoDecoder(): {
     },
   );
   installEncodedVideoChunk();
-  return { supportResolvers, counts };
+  return { supportResolvers, counts, configurations };
 }
 
 export async function flush(): Promise<void> {

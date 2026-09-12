@@ -16,13 +16,11 @@ use wayland_client::protocol::wl_output;
 use wayland_client::protocol::wl_shm;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
-use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameDimension;
 use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::InputSequence;
-use waywire_protocol::pipe::Kbps;
-use waywire_protocol::pipe::ScalePercent;
+use waywire_protocol::pipe::Quality;
 
 use super::State;
 use super::output::OutputSize;
@@ -200,10 +198,15 @@ impl Capture {
         capture_nanos: u64,
         generation: Generation,
         input_sequence: Option<InputSequence>,
-        fps: Fps,
-        bitrate_kbps: Kbps,
-        scale_percent: ScalePercent,
+        quality: Quality,
     ) -> Result<CapturedFrame<'_>> {
+        let Quality {
+            fps,
+            bitrate_kbps,
+            scale_percent,
+            crf,
+            chroma,
+        } = quality;
         let mapping = self.mapping.as_ref().context("missing capture mapping")?;
         let expected = usize::try_from(u64::from(self.width) * u64::from(self.height) * 4)?;
         if mapping.len() != expected {
@@ -219,6 +222,7 @@ impl Capture {
             sequence: self.sequence,
             input_sequence,
             fps,
+            chroma,
         };
         self.sequence = self
             .sequence
@@ -235,6 +239,8 @@ impl Capture {
                 encoded_height: FrameDimension::new(encoded_height)?,
                 fps,
                 bitrate_kbps,
+                crf,
+                chroma,
             },
         ))
     }

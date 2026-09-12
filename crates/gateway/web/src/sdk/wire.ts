@@ -273,6 +273,8 @@ export function pointerRelative(
   });
 }
 
+export type Chroma = 0 | 1;
+
 export type FrameMetadata = Readonly<{
   generation: number;
   width: number;
@@ -281,10 +283,11 @@ export type FrameMetadata = Readonly<{
   sequence: bigint;
   inputSequence: number;
   fps: number;
+  chroma: Chroma;
 }>;
 
 export function readFrameMetadata(reader: Reader): FrameMetadata {
-  return {
+  const metadata = {
     generation: reader.u32(),
     width: reader.u16(),
     height: reader.u16(),
@@ -293,6 +296,11 @@ export function readFrameMetadata(reader: Reader): FrameMetadata {
     inputSequence: reader.u32(),
     fps: reader.u32(),
   };
+  const chroma = reader.u8();
+  if (chroma !== 0 && chroma !== 1) {
+    throw new RangeError("unknown chroma sampling");
+  }
+  return { ...metadata, chroma };
 }
 
 export type FrameKind = 0 | 1;
@@ -314,6 +322,7 @@ export function videoFrame(
     payload.u64(metadata.sequence);
     payload.u32(metadata.inputSequence);
     payload.u32(metadata.fps);
+    payload.u8(metadata.chroma);
     payload.bytes(data);
   });
 }

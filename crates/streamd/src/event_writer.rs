@@ -258,6 +258,7 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use waywire_protocol::pipe::Chroma;
     use waywire_protocol::pipe::CursorPosition;
     use waywire_protocol::pipe::CursorShape;
     use waywire_protocol::pipe::CursorVisibility;
@@ -294,6 +295,7 @@ mod tests {
             sequence: 1,
             input_sequence: None,
             fps: Fps::new(60).expect("test frame rate should be valid"),
+            chroma: Chroma::Yuv444,
         }))
         .expect("frame metadata should queue");
         sink.send(&Event::CursorVisibility(CursorVisibility::Hidden))

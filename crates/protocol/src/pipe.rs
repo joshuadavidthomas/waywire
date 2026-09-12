@@ -1,4 +1,4 @@
-//! Gateway-to-streamd pipe vocabulary for protocol version 5.
+//! Gateway-to-streamd pipe vocabulary for protocol version 7.
 
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
@@ -134,6 +134,7 @@ ordered_ranged_newtype!(
     50_000,
     "bitrate must be between 300 and 50000 Kbps"
 );
+ranged_newtype!(Crf, u8, 0, 51, "CRF must be between 0 and 51");
 ordered_ranged_newtype!(
     Fps,
     u32,
@@ -241,8 +242,60 @@ impl ScalePercent {
     }
 }
 
-/// The stored `FFmpeg` profile name must encode `profile_idc`; the streamd test
-/// `ffmpeg_actual_sps_matches_protocol_profile` checks both against the emitted SPS.
+/// Chroma sampling chosen by the quality ladder for the encoded frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chroma {
+    Yuv444,
+    Yuv420,
+}
+
+impl Chroma {
+    #[must_use]
+    pub const fn h264_profile(self) -> H264Profile {
+        match self {
+            Self::Yuv444 => H264Profile {
+                profile_idc: 0xf4,
+                constraints: 0,
+                level_idc: 0x34,
+                ffmpeg_profile: "high444",
+            },
+            Self::Yuv420 => H264Profile {
+                profile_idc: 0x64,
+                constraints: 0,
+                level_idc: 0x34,
+                ffmpeg_profile: "high",
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn ffmpeg_pixel_format(self) -> &'static str {
+        match self {
+            Self::Yuv444 => "yuv444p",
+            Self::Yuv420 => "yuv420p",
+        }
+    }
+}
+
+impl Wire for Chroma {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Yuv444 => 0_u8,
+            Self::Yuv420 => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Yuv444),
+            1 => Ok(Self::Yuv420),
+            _ => Err(InvalidValue("unknown chroma sampling")),
+        }
+    }
+}
+
+/// The stored `FFmpeg` profile name must encode `profile_idc`; streamd's SPS
+/// tests check both choices against emitted encoder data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct H264Profile {
     profile_idc: u8,
@@ -250,13 +303,6 @@ pub struct H264Profile {
     level_idc: u8,
     ffmpeg_profile: &'static str,
 }
-
-pub const H264_PROFILE: H264Profile = H264Profile {
-    profile_idc: 0xf4,
-    constraints: 0,
-    level_idc: 0x34,
-    ffmpeg_profile: "high444",
-};
 
 impl H264Profile {
     #[must_use]
@@ -1006,6 +1052,8 @@ pub struct Quality {
     pub bitrate_kbps: Kbps,
     pub fps: Fps,
     pub scale_percent: ScalePercent,
+    pub crf: Crf,
+    pub chroma: Chroma,
 }
 
 impl Wire for Quality {
@@ -1013,6 +1061,8 @@ impl Wire for Quality {
         out.put(&self.bitrate_kbps);
         out.put(&self.fps);
         out.put(&self.scale_percent);
+        out.put(&self.crf);
+        out.put(&self.chroma);
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
@@ -1020,6 +1070,8 @@ impl Wire for Quality {
             bitrate_kbps: input.get()?,
             fps: input.get()?,
             scale_percent: input.get()?,
+            crf: input.get()?,
+            chroma: input.get()?,
         })
     }
 }
@@ -1138,11 +1190,10 @@ impl RecordKind for CommandKind {
 
     fn max_payload(self) -> usize {
         match self {
-            Self::PointerAbsolute
-            | Self::PointerScroll
-            | Self::Resize
-            | Self::PointerRelative
-            | Self::Quality => 12,
+            Self::PointerAbsolute | Self::PointerScroll | Self::Resize | Self::PointerRelative => {
+                12
+            }
+            Self::Quality => 14,
             Self::PointerButton | Self::KeyboardKey => 9,
             Self::ReleaseAll | Self::ResetVideo => 0,
             Self::Clipboard => MAX_CLIPBOARD_BYTES,
@@ -1257,6 +1308,7 @@ pub struct FrameMetadata {
     pub sequence: u64,
     pub input_sequence: Option<InputSequence>,
     pub fps: Fps,
+    pub chroma: Chroma,
 }
 
 impl Wire for FrameMetadata {
@@ -1268,6 +1320,7 @@ impl Wire for FrameMetadata {
         out.put(&self.sequence);
         out.put(&self.input_sequence);
         out.put(&self.fps);
+        out.put(&self.chroma);
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
@@ -1279,6 +1332,7 @@ impl Wire for FrameMetadata {
             sequence: input.get()?,
             input_sequence: input.get()?,
             fps: input.get()?,
+            chroma: input.get()?,
         })
     }
 }
@@ -1364,7 +1418,7 @@ impl RecordKind for EventKind {
     fn max_payload(self) -> usize {
         match self {
             Self::Clipboard => MAX_CLIPBOARD_BYTES,
-            Self::Frame => 32,
+            Self::Frame => 33,
             Self::ResizeApplied => 16,
             Self::CursorShape | Self::CursorVisibility | Self::ResetVideoRefused => 1,
             Self::CursorPosition => 8,
@@ -1440,7 +1494,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    5, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
+                    7, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1450,7 +1504,7 @@ mod tests {
                     state: ButtonState::Pressed,
                     sequence,
                 }),
-                vec![5, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
+                vec![7, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
             ),
             (
                 "pointer scroll",
@@ -1460,7 +1514,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    5, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    7, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1470,12 +1524,12 @@ mod tests {
                     state: KeyState::Repeated,
                     sequence,
                 }),
-                vec![5, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
+                vec![7, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
             ),
             (
                 "release all",
                 Command::ReleaseAll(ReleaseAll),
-                vec![5, 5, 0, 0, 0, 0, 0, 0],
+                vec![7, 5, 0, 0, 0, 0, 0, 0],
             ),
             (
                 "resize",
@@ -1485,7 +1539,7 @@ mod tests {
                     request_id: value(RequestId::new(9)),
                 }),
                 vec![
-                    5, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
+                    7, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
                 ],
             ),
         ]
@@ -1497,7 +1551,7 @@ mod tests {
             (
                 "clipboard",
                 Command::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![5, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![7, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "pointer relative",
@@ -1507,7 +1561,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    5, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    7, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1516,9 +1570,11 @@ mod tests {
                     bitrate_kbps: value(Kbps::new(8_000)),
                     fps: value(Fps::new(60)),
                     scale_percent: value(ScalePercent::new(75)),
+                    crf: value(Crf::new(23)),
+                    chroma: Chroma::Yuv420,
                 }),
                 vec![
-                    5, 9, 0, 0, 12, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0,
+                    7, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 1,
                 ],
             ),
             (
@@ -1528,7 +1584,7 @@ mod tests {
                     sequence,
                     text: value(InputText::new("hey".into())),
                 }),
-                vec![5, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
+                vec![7, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
             ),
             (
                 "keyframe readiness",
@@ -1536,12 +1592,12 @@ mod tests {
                     generation: value(Generation::new(4)),
                     state: KeyframeState::Cached,
                 }),
-                vec![5, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
+                vec![7, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
             ),
             (
                 "reset video",
                 Command::ResetVideo(ResetVideo),
-                vec![5, 12, 0, 0, 0, 0, 0, 0],
+                vec![7, 12, 0, 0, 0, 0, 0, 0],
             ),
         ]
     }
@@ -1557,7 +1613,7 @@ mod tests {
             (
                 "clipboard",
                 Event::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![5, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![7, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "frame",
@@ -1569,10 +1625,11 @@ mod tests {
                     sequence: 3,
                     input_sequence: Some(value(InputSequence::new(4))),
                     fps: value(Fps::new(60)),
+                    chroma: Chroma::Yuv420,
                 }),
                 vec![
-                    5, 2, 0, 0, 32, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
-                    0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0,
+                    7, 2, 0, 0, 33, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
+                    0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0, 1,
                 ],
             ),
             (
@@ -1584,28 +1641,28 @@ mod tests {
                     generation: value(Generation::new(4)),
                 }),
                 vec![
-                    5, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
+                    7, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
                 ],
             ),
             (
                 "cursor shape",
                 Event::CursorShape(CursorShape::Pointer),
-                vec![5, 4, 0, 0, 1, 0, 0, 0, 4],
+                vec![7, 4, 0, 0, 1, 0, 0, 0, 4],
             ),
             (
                 "cursor visibility",
                 Event::CursorVisibility(CursorVisibility::Hidden),
-                vec![5, 5, 0, 0, 1, 0, 0, 0, 0],
+                vec![7, 5, 0, 0, 1, 0, 0, 0, 0],
             ),
             (
                 "cursor position",
                 Event::CursorPosition(CursorPosition { x: 10, y: 20 }),
-                vec![5, 6, 0, 0, 8, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0],
+                vec![7, 6, 0, 0, 8, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0],
             ),
             (
                 "video reset refused",
                 Event::ResetVideoRefused(ResetVideoRefusal::CurrentModeUnknown),
-                vec![5, 7, 0, 0, 1, 0, 0, 0, 1],
+                vec![7, 7, 0, 0, 1, 0, 0, 0, 1],
             ),
         ]
     }
@@ -1651,9 +1708,38 @@ mod tests {
     }
 
     #[test]
+    fn crf_accepts_the_encoder_range_and_rejects_values_above_it() {
+        assert_eq!(Crf::new(0).map(Crf::get), Ok(0));
+        assert_eq!(Crf::new(51).map(Crf::get), Ok(51));
+        assert!(Crf::new(52).is_err());
+    }
+
+    #[test]
+    fn quality_wire_rejects_an_invalid_crf() {
+        let record = [
+            7, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 52, 0,
+        ];
+        assert!(matches!(
+            Command::decode(&record),
+            Err(ProtocolError::InvalidPayload { kind: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn quality_wire_rejects_unknown_chroma() {
+        let record = [
+            7, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 2,
+        ];
+        assert!(matches!(
+            Command::decode(&record),
+            Err(ProtocolError::InvalidPayload { kind: 9, .. })
+        ));
+    }
+
+    #[test]
     fn record_length_uses_the_common_header() {
-        let clipboard = [5, 7, 0, 0, 0, 0, 0, 0];
-        let release_all = [5, 5, 0, 0, 0, 0, 0, 0];
+        let clipboard = [7, 7, 0, 0, 0, 0, 0, 0];
+        let release_all = [7, 5, 0, 0, 0, 0, 0, 0];
 
         assert_eq!(Command::record_len(&clipboard), Ok(HEADER_BYTES));
         assert_eq!(Command::record_len(&release_all), Ok(HEADER_BYTES));
@@ -1670,7 +1756,7 @@ mod tests {
 
     #[test]
     fn nonzero_reserved_byte_is_an_invalid_header() {
-        let header = [5, 5, 1, 0, 0, 0, 0, 0];
+        let header = [7, 5, 1, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidHeader)
@@ -1679,7 +1765,7 @@ mod tests {
 
     #[test]
     fn unknown_command_kind_is_invalid_kind() {
-        let header = [5, 99, 0, 0, 0, 0, 0, 0];
+        let header = [7, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -1688,7 +1774,7 @@ mod tests {
 
     #[test]
     fn unknown_event_kind_is_invalid_kind() {
-        let header = [5, 99, 0, 0, 0, 0, 0, 0];
+        let header = [7, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Event::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -1697,7 +1783,7 @@ mod tests {
 
     #[test]
     fn command_text_payload_over_limit_is_too_large() {
-        let mut header = [5, 10, 0, 0, 0, 0, 0, 0];
+        let mut header = [7, 10, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_TEXT_BYTES + 6).expect("limit fits u32")).to_le_bytes(),
         );
@@ -1709,7 +1795,7 @@ mod tests {
 
     #[test]
     fn event_payload_over_limit_is_too_large() {
-        let mut header = [5, 1, 0, 0, 0, 0, 0, 0];
+        let mut header = [7, 1, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_CLIPBOARD_BYTES + 1).expect("limit fits u32")).to_le_bytes(),
         );
@@ -1721,7 +1807,7 @@ mod tests {
 
     #[test]
     fn clipboard_payload_must_be_utf8() {
-        let record = [5, 1, 0, 0, 1, 0, 0, 0, 0xff];
+        let record = [7, 1, 0, 0, 1, 0, 0, 0, 0xff];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 1, .. })
@@ -1730,7 +1816,7 @@ mod tests {
 
     #[test]
     fn text_payload_must_not_contain_nul() {
-        let record = [5, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let record = [7, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         assert!(matches!(
             Command::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 10, .. })
@@ -1739,8 +1825,8 @@ mod tests {
 
     #[test]
     fn short_frame_payload_is_invalid() {
-        let mut record = vec![5, 2, 0, 0, 31, 0, 0, 0];
-        let mut payload = [0; 31];
+        let mut record = vec![7, 2, 0, 0, 32, 0, 0, 0];
+        let mut payload = [0; 32];
         payload[0] = 1;
         payload[4] = 1;
         payload[6] = 1;
@@ -1761,7 +1847,7 @@ mod tests {
 
     #[test]
     fn command_payload_length_must_match_its_header() {
-        let record = [5, 7, 0, 0, 1, 0, 0, 0];
+        let record = [7, 7, 0, 0, 1, 0, 0, 0];
         assert_eq!(Command::decode(&record), Err(ProtocolError::Truncated));
     }
 
@@ -1819,7 +1905,7 @@ mod tests {
     fn every_cursor_shape_has_its_pinned_wire_byte() {
         for (index, shape) in CursorShape::ALL.into_iter().enumerate() {
             let wire = u8::try_from(index + 1).expect("36 cursor shapes fit in a byte");
-            let bytes = vec![5, 4, 0, 0, 1, 0, 0, 0, wire];
+            let bytes = vec![7, 4, 0, 0, 1, 0, 0, 0, wire];
             assert_eq!(Event::CursorShape(shape).encode(), bytes);
             assert_eq!(Event::decode(&bytes), Ok(Event::CursorShape(shape)));
         }
@@ -1827,7 +1913,7 @@ mod tests {
 
     #[test]
     fn unknown_cursor_shape_wire_byte_is_invalid() {
-        let record = [5, 4, 0, 0, 1, 0, 0, 0, 37];
+        let record = [7, 4, 0, 0, 1, 0, 0, 0, 37];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 4, .. })

@@ -283,8 +283,12 @@ export class VideoRuntime {
         });
       } else if (event.data instanceof ArrayBuffer) {
         const data = event.data;
+        // A later video-config can finish before this packet's decoder setup.
+        // Never submit an old profile's queued packet to the new decoder.
+        const generation = this.decoderGeneration;
         void decoderSetup.then(() => {
           if (
+            generation !== this.decoderGeneration ||
             this.socket !== socket ||
             this.owner.disposed() ||
             !this.owner.shouldRun()

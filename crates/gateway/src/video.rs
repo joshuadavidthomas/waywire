@@ -23,6 +23,8 @@ use waywire_protocol::browser::FrameKind;
 use waywire_protocol::browser::MAX_VIDEO_DATA_BYTES;
 #[cfg(test)]
 use waywire_protocol::browser::VideoSample;
+#[cfg(test)]
+use waywire_protocol::pipe::Chroma;
 use waywire_protocol::pipe::Command;
 #[cfg(test)]
 use waywire_protocol::pipe::Fps;
@@ -443,6 +445,7 @@ mod tests {
             sequence,
             input_sequence: None,
             fps: fps(30),
+            chroma: Chroma::Yuv444,
         }
     }
 

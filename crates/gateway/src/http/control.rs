@@ -41,6 +41,8 @@ use crate::session::FeedbackOutcome;
 use crate::session::InputOutcome;
 use crate::session::OwnershipAvailability;
 use crate::session::ReleaseOutcome;
+use crate::session::ResizeOutcome;
+use crate::session::SetQualityOutcome;
 use crate::session::SocketId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +170,14 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                                 )
                             });
                             match command {
+                                Ok(Command::Resize(resize)) => {
+                                    match state.sessions.resize(socket_id, resize).await {
+                                        Ok(ResizeOutcome::Sent | ResizeOutcome::InputOwnedByAnother) => Ok(()),
+                                        Err(error) => Err(SocketEnd::failed(
+                                            error.context("send resize"),
+                                        )),
+                                    }
+                                }
                                 Ok(command) => match ownership {
                                     InputOwnership::NotHeld => Ok(()),
                                     InputOwnership::Held => match state
@@ -456,6 +466,21 @@ async fn handle_text(
                 FeedbackOutcome::NotInputOwner => Ok(()),
             }
         }
+        ClientMessage::SetQuality { preset } => {
+            let outcome = state
+                .sessions
+                .set_quality(socket_id, preset)
+                .await
+                .map_err(|error| SocketEnd::failed(error.context("set quality preset")))?;
+            match outcome {
+                SetQualityOutcome::Changed(levels) | SetQualityOutcome::Unchanged(levels) => {
+                    outbound
+                        .enqueue_event(&ClientEvent::Quality(levels))
+                        .map_err(SocketEnd::from)
+                }
+                SetQualityOutcome::NotInputOwner => Ok(()),
+            }
+        }
         ClientMessage::Text {
             action,
             text,
@@ -548,6 +573,7 @@ mod tests {
     use waywire_protocol::pipe::InputSequence;
     use waywire_protocol::pipe::InputText;
     use waywire_protocol::pipe::Kbps;
+    use waywire_protocol::pipe::Quality as QualityCommand;
     use waywire_protocol::pipe::RequestId;
     use waywire_protocol::pipe::ResizeApplied;
     use waywire_protocol::pipe::ScaleV120;
@@ -926,6 +952,76 @@ mod tests {
         assert!(next_text(&mut events).await.contains(r#""type":"quality""#));
         assert!(matches!(commands.recv().await, Some(Command::Quality(_))));
     }
+    #[tokio::test]
+    async fn set_quality_enqueues_actual_levels_and_encoder_command() {
+        let (state, mut commands) = test_state();
+        let socket = SocketId::new(1);
+        acquire(&state, &mut commands, socket).await;
+        let (outbound, mut events) = outbound();
+        let mut ownership = InputOwnership::Held;
+
+        handle_test_text(
+            &outbound,
+            &state,
+            socket,
+            &mut ownership,
+            r#"{"type":"set-quality","preset":"medium"}"#,
+        )
+        .await
+        .expect("quality preset should apply");
+
+        let expected = QualityLevels {
+            bitrate: Kbps::new(4_000).expect("test bitrate should be valid"),
+            fps: Fps::new(60).expect("test frame rate should be valid"),
+            scale: waywire_protocol::pipe::ScalePercent::new(100)
+                .expect("test scale should be valid"),
+        };
+        assert_eq!(
+            next_text(&mut events).await,
+            serde_json::to_string(&ClientEvent::Quality(expected))
+                .expect("quality event should serialize")
+        );
+        assert_eq!(
+            commands.recv().await,
+            Some(Command::Quality(QualityCommand {
+                bitrate_kbps: expected.bitrate,
+                fps: expected.fps,
+                scale_percent: expected.scale,
+                crf: waywire_protocol::pipe::Crf::new(28).expect("test CRF should be valid"),
+                chroma: waywire_protocol::pipe::Chroma::Yuv444,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn nonowner_set_quality_enqueues_no_response_or_command() {
+        let (state, mut commands) = test_state();
+        acquire(&state, &mut commands, SocketId::new(1)).await;
+        let (outbound, mut events) = outbound();
+        let mut ownership = InputOwnership::NotHeld;
+
+        handle_test_text(
+            &outbound,
+            &state,
+            SocketId::new(2),
+            &mut ownership,
+            r#"{"type":"set-quality","preset":"low"}"#,
+        )
+        .await
+        .expect("nonowner quality preset should be ignored");
+
+        assert!(
+            timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn text_message_sends_text_command_without_an_event() {
         let (state, mut commands) = test_state();

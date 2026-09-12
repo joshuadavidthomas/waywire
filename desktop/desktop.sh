@@ -9,7 +9,7 @@ readonly wayland_display=wayland-0
 readonly wayland_socket="$runtime_dir/$wayland_display"
 
 [ -n "${HOME:-}" ] || fail 'HOME is not set'
-for command in dbus-run-session ffmpeg flock labwc lxqt-session python3 ss wayland-info wlr-randr; do
+for command in dbus-run-session ffmpeg flock labwc lxqt-session python3 ss wayland-info; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
 for binary in waywire-gateway waywire-streamd; do
@@ -41,6 +41,7 @@ export XDG_RUNTIME_DIR="$runtime_dir"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1
 export WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
 export WAYLAND_DISPLAY="$wayland_display"
+export WAYWIRE_RESOLUTION="${WAYWIRE_RESOLUTION:-1920x1080}"
 export WLR_NO_HARDWARE_CURSORS=0
 export XCURSOR_THEME=breeze_cursors XCURSOR_SIZE=24
 export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=LXQt:labwc:wlroots

@@ -19,6 +19,7 @@ use tokio::time::sleep;
 use tracing::info;
 use tracing::warn;
 use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Kbps;
 
 use self::commands::CommandReader;
@@ -93,6 +94,7 @@ pub(crate) struct Config {
     pub(crate) frame_rate: Fps,
     pub(crate) bitrate: Kbps,
     pub(crate) xkb_layout: XkbLayout,
+    pub(crate) resolution: FrameSize,
 }
 
 impl Daemon {

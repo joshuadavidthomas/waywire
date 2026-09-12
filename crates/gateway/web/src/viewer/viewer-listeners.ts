@@ -1,5 +1,6 @@
-import { Playout } from "../sdk/playout.ts";
+import { Playout, type PlayoutSample } from "../sdk/playout.ts";
 import type {
+  QualityPreset,
   RemoteDisplayPolicy,
   SurfaceHandle,
   WaywireSession,
@@ -25,7 +26,10 @@ export type ViewerElements = {
   readonly sendClipboardButton: HTMLButtonElement;
   readonly copyClipboardButton: HTMLButtonElement;
   readonly resolutionSelect: HTMLSelectElement;
+  readonly resolutionStatusOption: HTMLOptionElement;
   readonly resolutionLabel: HTMLLabelElement;
+  readonly qualitySelect: HTMLSelectElement;
+  readonly qualityLabel: HTMLLabelElement;
   readonly resetVideoButton: HTMLButtonElement;
   readonly clipboardStatus: HTMLElement;
   readonly hudToggle: HTMLInputElement;
@@ -84,6 +88,13 @@ export const RESOLUTION_VALUES = [
   "1280x720",
   "1024x768",
 ] as const;
+export const QUALITY_STORAGE_KEY = "waywire.quality";
+export const QUALITY_VALUES = [
+  "automatic",
+  "high",
+  "medium",
+  "low",
+] as const satisfies readonly QualityPreset[];
 
 type Resolution = (typeof RESOLUTION_VALUES)[number];
 type FixedResolution = Exclude<Resolution, "fit">;
@@ -171,6 +182,13 @@ function parseResolution(value: string | null): Resolution | null {
   return null;
 }
 
+function parseQuality(value: string | null): QualityPreset | null {
+  for (const allowed of QUALITY_VALUES) {
+    if (value === allowed) return allowed;
+  }
+  return null;
+}
+
 const FIXED_RESOLUTIONS: Record<
   FixedResolution,
   readonly [width: number, height: number]
@@ -211,13 +229,43 @@ export function installViewerListeners(
   surface: SurfaceHandle,
 ): ViewerControls {
   const storedResolution = readStored(RESOLUTION_STORAGE_KEY);
-  let resolution = parseResolution(storedResolution) ?? "fit";
-  elements.resolutionSelect.value = resolution;
-  session.remoteDisplay.setPolicy(
-    resolutionPolicy(resolution, elements.display),
-  );
-  if (storedResolution !== null && storedResolution !== resolution) {
-    writeStored(RESOLUTION_STORAGE_KEY, resolution);
+  let resolutionChoice = parseResolution(storedResolution);
+  if (resolutionChoice !== null) {
+    session.remoteDisplay.setPolicy(
+      resolutionPolicy(resolutionChoice, elements.display),
+    );
+  }
+  let liveResolution: Readonly<{ width: number; height: number }> | null = null;
+  const showLiveResolution = (): void => {
+    if (liveResolution === null) {
+      elements.resolutionStatusOption.hidden = false;
+      elements.resolutionStatusOption.value = "";
+      elements.resolutionStatusOption.textContent = "Waiting for video";
+      elements.resolutionSelect.value = "";
+      return;
+    }
+    const { width, height } = liveResolution;
+    const value = `${width}x${height}`;
+    const listed = parseResolution(value);
+    if (listed !== null && listed !== "fit") {
+      elements.resolutionStatusOption.hidden = true;
+      elements.resolutionStatusOption.value = "";
+      elements.resolutionSelect.value = listed;
+      return;
+    }
+    elements.resolutionStatusOption.hidden = false;
+    elements.resolutionStatusOption.value = value;
+    elements.resolutionStatusOption.textContent = `${width} × ${height}`;
+    elements.resolutionSelect.value = value;
+  };
+  showLiveResolution();
+
+  const storedQuality = readStored(QUALITY_STORAGE_KEY);
+  let quality = parseQuality(storedQuality) ?? "automatic";
+  elements.qualitySelect.value = quality;
+  session.video.setQuality(quality);
+  if (storedQuality !== null && storedQuality !== quality) {
+    writeStored(QUALITY_STORAGE_KEY, quality);
   }
 
   const fields = Object.fromEntries(
@@ -340,6 +388,14 @@ export function installViewerListeners(
   // changes, so the overlay renders the last snapshot on switch-on and marks
   // the rate idle once frames stop.
   const playout = new Playout();
+  let playoutTargetMs = playout.update(null, performance.now());
+  const updatePlayout = (sample: PlayoutSample | null): void => {
+    const target = playout.update(sample, performance.now());
+    if (target === playoutTargetMs) return;
+    playoutTargetMs = target;
+    session.video.setLatencyTarget(target);
+    fields["video-latency-target"].textContent = `${target} ms`;
+  };
   let lastStats: WaywireStats | null = null;
   let lastStatsAt = Number.NEGATIVE_INFINITY;
   let pendingStats: WaywireStats | null = null;
@@ -355,7 +411,7 @@ export function installViewerListeners(
     fields.scale.textContent = `${stats.scalePercent}%`;
     fields.rtt.textContent = `${stats.rttMs.toFixed(1)} ms`;
     fields.late.textContent = `${stats.latenessMs.toFixed(1)} ms`;
-    fields["video-latency-target"].textContent = `${stats.latencyTargetMs} ms`;
+    fields["video-latency-target"].textContent = `${playoutTargetMs} ms`;
     fields["clock-uncertainty"].textContent = stats.clockConfident
       ? `±${stats.clockUncertaintyMs?.toFixed(1) ?? "?"} ms`
       : "syncing";
@@ -375,6 +431,8 @@ export function installViewerListeners(
     renderStats(stats, false);
   };
   const idleTicker = setInterval(() => {
+    // Recovery must run even when damage-driven video emits no frames or the HUD is hidden.
+    updatePlayout(null);
     if (!hudVisible() || !lastStats) return;
     if (performance.now() - lastStatsAt > HUD_IDLE_AFTER_MS) {
       fields.rate.textContent = "idle";
@@ -395,14 +453,21 @@ export function installViewerListeners(
   setHud(readStored(HUD_STORAGE_KEY) === "on");
   cleanup.push(
     session.on("stats", (stats) => {
-      const target = playout.update(
+      if (
+        stats.width > 0 &&
+        stats.height > 0 &&
+        (liveResolution?.width !== stats.width ||
+          liveResolution.height !== stats.height)
+      ) {
+        liveResolution = { width: stats.width, height: stats.height };
+        // Rewriting the selection on every frame interrupts native menu navigation.
+        showLiveResolution();
+      }
+      updatePlayout(
         stats.clockConfident
           ? { latenessMs: stats.latenessMs, decodeQueue: stats.decoderQueue }
           : null,
-        stats.drawCompletedAtMs,
       );
-      if (target !== stats.latencyTargetMs)
-        session.video.setLatencyTarget(target);
       lastStats = stats;
       lastStatsAt = performance.now();
       if (framesSinceConnect === 0) {
@@ -443,15 +508,16 @@ export function installViewerListeners(
     session.on("error", (error) => console.warn("Waywire stream error", error)),
   );
 
-  // Buttons and switches keep input ownership on the screen. The resolution
-  // label stays native so pointer and keyboard users can focus and open its
-  // select without a prevented pointerdown cancelling the browser action.
+  // Buttons and switches keep input ownership on the screen. Select labels
+  // stay native so pointer and keyboard users can focus and open their selects
+  // without a prevented pointerdown cancelling the browser action.
   const keepScreenFocus = (event: PointerEvent): void => event.preventDefault();
   listen(elements.menuKey, "pointerdown", keepScreenFocus);
   for (const control of elements.panel.querySelectorAll("button, label")) {
     if (
       control instanceof HTMLElement &&
-      control !== elements.resolutionLabel
+      control !== elements.resolutionLabel &&
+      control !== elements.qualityLabel
     ) {
       listen(control, "pointerdown", keepScreenFocus);
     }
@@ -479,18 +545,24 @@ export function installViewerListeners(
   });
   listen(elements.resolutionSelect, "change", () => {
     const selected = parseResolution(elements.resolutionSelect.value);
+    if (selected !== null) {
+      resolutionChoice = selected;
+      session.remoteDisplay.setPolicy(
+        resolutionPolicy(resolutionChoice, elements.display),
+      );
+      writeStored(RESOLUTION_STORAGE_KEY, resolutionChoice);
+    }
+    showLiveResolution();
+  });
+  listen(elements.qualitySelect, "change", () => {
+    const selected = parseQuality(elements.qualitySelect.value);
     if (selected === null) {
-      elements.resolutionSelect.value = resolution;
+      elements.qualitySelect.value = quality;
       return;
     }
-    resolution = selected;
-    session.remoteDisplay.setPolicy(
-      resolutionPolicy(resolution, elements.display),
-    );
-    writeStored(RESOLUTION_STORAGE_KEY, resolution);
-    // The native select takes focus and releases canvas ownership. Request it
-    // for this explicit action so the saved policy is sent on the active reply.
-    // Keep focus on the select so keyboard users can continue choosing options.
+    quality = selected;
+    session.video.setQuality(quality);
+    writeStored(QUALITY_STORAGE_KEY, quality);
     if (wheel === "auto") session.input.acquire();
   });
   listen(elements.hudToggle, "change", () =>

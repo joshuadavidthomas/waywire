@@ -5,6 +5,7 @@ export {
   type InputController,
   type InputState,
   type QualityEvent,
+  type QualityPreset,
   type RemoteDisplayController,
   type ResizeEvent,
   type SurfaceHandle,

@@ -11,11 +11,13 @@ const { values } = parseArgs({
   options: {
     sprite: { type: "string" },
     release: { type: "string" },
+    resolution: { type: "string" },
   },
   strict: true,
 });
 const name = values.sprite;
 const release = values.release;
+const resolution = values.resolution;
 if (!name || !/^[a-z0-9][a-z0-9-]{0,62}$/u.test(name))
   throw new Error("--sprite must name an existing Sprite");
 if (
@@ -24,6 +26,8 @@ if (
   !valid(release)
 )
   throw new Error("--release must name a built version, such as v1.0.0");
+if (resolution !== undefined && !isSupportedResolution(resolution))
+  throw new Error("--resolution must use supported WIDTHxHEIGHT dimensions");
 const token = process.env.SPRITES_TOKEN;
 if (!token)
   throw new Error("SPRITES_TOKEN is required on the operator's machine");
@@ -55,11 +59,13 @@ await fs.mkdir(remote, { recursive: true });
 try {
   await fs.writeFile(`${remote}/install.sh`, installer, { mode: 0o700 });
   await fs.writeFile(`${remote}/${archiveName}`, archive, { mode: 0o600 });
-  const command = sprite.spawn("bash", [
+  const installerArgs = [
     `${remote}/install.sh`,
     "--archive",
     `${remote}/${archiveName}`,
-  ]);
+  ];
+  if (resolution !== undefined) installerArgs.push("--resolution", resolution);
+  const command = sprite.spawn("bash", installerArgs);
   command.stdout.pipe(process.stdout, { end: false });
   command.stderr.pipe(process.stderr, { end: false });
   const code = await command.wait();
@@ -145,3 +151,19 @@ for (const path of ["/stream", "/control"]) {
   });
 }
 console.log(`Installed ${release}. Open ${origin}`);
+
+function isSupportedResolution(value: string): boolean {
+  const match = /^([1-9]\d{2,3})x([1-9]\d{2,3})$/u.exec(value);
+  if (!match) return false;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  return (
+    width >= 320 &&
+    width <= 6000 &&
+    width % 2 === 0 &&
+    height >= 180 &&
+    height <= 6000 &&
+    height % 2 === 0 &&
+    width * height <= 3840 * 2160
+  );
+}

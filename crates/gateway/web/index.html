@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <title>Waywire</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="stylesheet" href="/src/viewer/style.css" />
   </head>
   <body>
@@ -216,12 +217,11 @@
               <label id="resolution-label" class="label" for="resolution">
                 Resolution
               </label>
-              <span class="resolution-control">
-                <select
-                  id="resolution"
-                  class="resolution-select"
-                  name="resolution"
-                >
+              <span class="select-control">
+                <select id="resolution" class="menu-select" name="resolution">
+                  <option id="resolution-status" value="" selected disabled>
+                    Waiting for video
+                  </option>
                   <option value="fit">Fit to window</option>
                   <option value="2560x1440">2560 × 1440</option>
                   <option value="1920x1080">1920 × 1080</option>
@@ -231,7 +231,41 @@
                   <option value="1024x768">1024 × 768</option>
                 </select>
                 <svg
-                  class="resolution-chevron"
+                  class="select-chevron"
+                  viewBox="0 0 8 5"
+                  width="8"
+                  height="5"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path d="M.5.5 4 4 7.5.5" />
+                </svg>
+              </span>
+            </div>
+          </li>
+          <li>
+            <div class="item" title="Choose the stream quality">
+              <svg
+                class="glyph"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path d="M12 14l4-4" />
+                <path d="M3.34 19a10 10 0 1 1 17.32 0" />
+              </svg>
+              <label id="quality-label" class="label" for="quality">
+                Quality
+              </label>
+              <span class="select-control">
+                <select id="quality" class="menu-select" name="quality">
+                  <option value="automatic">Automatic</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+                <svg
+                  class="select-chevron"
                   viewBox="0 0 8 5"
                   width="8"
                   height="5"

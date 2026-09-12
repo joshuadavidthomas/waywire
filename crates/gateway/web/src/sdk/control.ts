@@ -12,6 +12,7 @@ import { resize as resizeRecord } from "./wire.ts";
 import type {
   SurfaceHandle,
   SurfaceOptions,
+  QualityPreset,
   VideoState,
   WaywireEventMap,
   WaywireSessionOptions,
@@ -226,6 +227,7 @@ export class ControlRuntime {
   private resizePending = false;
   private lastResizeRequest: string | null = null;
   private resizeRequestID = 0;
+  private qualityPreset: QualityPreset = "automatic";
   private qualityBitrate = 0;
   private qualityScale = 100;
   private remoteClipboard: string | null = null;
@@ -632,9 +634,6 @@ export class ControlRuntime {
   }
 
   private sendResize(): void {
-    if (!this.controlActive) {
-      return;
-    }
     const policy = this.owner.remoteDisplayPolicy();
     if (policy.mode === "manual") return;
     if (policy.mode === "fixed") {
@@ -977,6 +976,7 @@ export class ControlRuntime {
           this.controlActive = false;
           socket.send(JSON.stringify({ type: "release" }));
         } else if (!wasControlActive) {
+          this.sendQualityPreset();
           this.sendResize();
         }
       } else if (message.state === "busy") {
@@ -1097,11 +1097,10 @@ export class ControlRuntime {
     window.removeEventListener("resize", this.scheduleResizeBound);
 
     const policy = this.owner.remoteDisplayPolicy();
-    if (!this.sessionConnected || !this.display) return;
-    const observedDisplay =
-      policy.mode === "observe"
-        ? (policy.element ?? this.display)
-        : this.display;
+    if (!this.sessionConnected || !this.display || policy.mode !== "observe") {
+      return;
+    }
+    const observedDisplay = policy.element ?? this.display;
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => this.scheduleResize());
       this.resizeObserver.observe(this.inputElement ?? this.display);
@@ -1110,9 +1109,7 @@ export class ControlRuntime {
     } else {
       this.scheduleResize();
     }
-    if (policy.mode === "observe") {
-      window.addEventListener("resize", this.scheduleResizeBound);
-    }
+    window.addEventListener("resize", this.scheduleResizeBound);
   }
 
   public remoteDisplayPolicyChanged(): void {
@@ -1330,6 +1327,30 @@ export class ControlRuntime {
     })();
     return this.disposePromise;
   }
+  public setQuality(preset: QualityPreset): void {
+    if (
+      preset !== "automatic" &&
+      preset !== "high" &&
+      preset !== "medium" &&
+      preset !== "low"
+    ) {
+      throw new TypeError(`Unknown quality preset: ${String(preset)}`);
+    }
+    this.qualityPreset = preset;
+    this.sendQualityPreset();
+  }
+
+  private sendQualityPreset(): void {
+    if (
+      this.controlActive &&
+      this.controlSocket?.readyState === WebSocket.OPEN
+    ) {
+      this.controlSocket.send(
+        JSON.stringify({ type: "set-quality", preset: this.qualityPreset }),
+      );
+    }
+  }
+
   public setLatencyTarget(milliseconds: number): void {
     this.video.setLatencyTarget(milliseconds);
   }

@@ -9,6 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Kbps;
 
 #[derive(Debug, Parser)]
@@ -28,6 +29,13 @@ struct Options {
     rtp_port: u16,
     #[arg(long, default_value = "us", value_parser = parse_layout)]
     xkb_layout: String,
+    #[arg(
+        long,
+        env = "WAYWIRE_RESOLUTION",
+        default_value = "1920x1080",
+        value_parser = parse_resolution
+    )]
+    resolution: FrameSize,
     #[arg(long, env = "XCURSOR_THEME", default_value = "breeze_cursors")]
     cursor_theme: String,
     #[arg(
@@ -59,6 +67,22 @@ fn parse_layout(value: &str) -> Result<String, String> {
     } else {
         Err("layout must be 1-32 ASCII letters, digits, '_' or '-'".into())
     }
+}
+
+fn parse_resolution(value: &str) -> Result<FrameSize, String> {
+    let (width, height) = value
+        .split_once('x')
+        .ok_or_else(|| "resolution must use WIDTHxHEIGHT".to_owned())?;
+    if height.contains('x') {
+        return Err("resolution must use WIDTHxHEIGHT".into());
+    }
+    let width = width
+        .parse()
+        .map_err(|error| format!("resolution width must be an integer: {error}"))?;
+    let height = height
+        .parse()
+        .map_err(|error| format!("resolution height must be an integer: {error}"))?;
+    FrameSize::new(width, height).map_err(|error| error.to_string())
 }
 
 fn default_cursor_theme_paths() -> Vec<PathBuf> {
@@ -104,4 +128,34 @@ fn main() -> Result<()> {
         .init();
 
     wayland::run(Options::parse())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn resolution_default_is_full_hd() {
+        let command = Options::command();
+        let argument = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "resolution")
+            .expect("resolution argument should exist");
+        assert_eq!(argument.get_default_values(), ["1920x1080"]);
+    }
+
+    #[test]
+    fn resolution_parser_accepts_supported_dimensions() {
+        let resolution = parse_resolution("2560x1440").expect("resolution should parse");
+        assert_eq!((resolution.width(), resolution.height()), (2560, 1440));
+    }
+
+    #[test]
+    fn resolution_parser_rejects_bad_shapes_and_unsupported_dimensions() {
+        for value in ["1920", "1920X1080", "1920x1080x60", "1919x1080", "8000x100"] {
+            assert!(parse_resolution(value).is_err(), "accepted {value}");
+        }
+    }
 }

@@ -54,12 +54,12 @@ async function videoFixture(): Promise<VideoFixture> {
   return { session, videoSocket, socketAttempts, draws };
 }
 
-function configure(socket: FakeWebSocket): void {
+function configure(socket: FakeWebSocket, codec = "avc1.42E01E"): void {
   socket.dispatch("message", {
     data: JSON.stringify({
       type: "video-config",
       version: PROTOCOL_VERSION,
-      codec: "avc1.42E01E",
+      codec,
     }),
   });
 }
@@ -127,6 +127,63 @@ test("keyframes wait for decoder configuration and old sessions are ignored", as
   assert.equal(decoder.counts.constructions, 1);
   assert.equal(decoder.counts.decoded, 1);
   await fixture.session.dispose();
+});
+
+test("chroma profile changes configure the decoder before the new generation is drawn", async () => {
+  const decoder = installDelayedVideoDecoder();
+  const fixture = await videoFixture();
+  try {
+    for (const [generation, chroma, codec] of [
+      [1, 0, "avc1.F40034"],
+      [2, 1, "avc1.640034"],
+      [3, 0, "avc1.F40034"],
+    ] as const) {
+      configure(fixture.videoSocket, codec);
+      fixture.videoSocket.dispatch("message", {
+        data: videoPacket(generation * 1_000, {
+          generation,
+          chroma,
+          keyframe: true,
+        }),
+      });
+      assert.equal(decoder.counts.decoded, generation - 1);
+      decoder.supportResolvers.shift()?.({ supported: true });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(decoder.counts.constructions, generation);
+      assert.equal(decoder.counts.decoded, generation);
+      assert.equal(decoder.configurations.at(-1)?.codec, codec);
+      assert.equal(fixture.session.state.video.codec, codec);
+      assert.equal(fixture.draws.at(-1), generation * 1_000);
+    }
+  } finally {
+    await fixture.session.dispose();
+  }
+});
+
+test("a superseded profile's queued packets cannot enter the new decoder", async () => {
+  const decoder = installDelayedVideoDecoder();
+  const fixture = await videoFixture();
+  try {
+    configure(fixture.videoSocket, "avc1.F40034");
+    fixture.videoSocket.dispatch("message", {
+      data: videoPacket(1_000, { generation: 1, chroma: 0, keyframe: true }),
+    });
+    configure(fixture.videoSocket, "avc1.640034");
+    fixture.videoSocket.dispatch("message", {
+      data: videoPacket(2_000, { generation: 2, chroma: 1, keyframe: true }),
+    });
+    // The new profile is supported first; the old async setup completes later.
+    decoder.supportResolvers[1]?.({ supported: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(fixture.draws, [2_000]);
+    decoder.supportResolvers[0]?.({ supported: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(fixture.draws, [2_000]);
+    assert.equal(decoder.counts.decoded, 1);
+    assert.equal(fixture.session.state.video.codec, "avc1.640034");
+  } finally {
+    await fixture.session.dispose();
+  }
 });
 
 test("decode queue overflow drops stale data and waits for a keyframe", async () => {

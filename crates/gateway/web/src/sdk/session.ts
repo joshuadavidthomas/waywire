@@ -126,8 +126,11 @@ export interface SurfaceHandle {
   dispose(): void;
 }
 
+export type QualityPreset = "automatic" | "high" | "medium" | "low";
+
 export interface VideoController {
   setLatencyTarget(milliseconds: number): void;
+  setQuality(preset: QualityPreset): void;
   reset(): void;
 }
 
@@ -166,6 +169,7 @@ export class WaywireSession {
   stats: Readonly<Partial<WaywireStats>>;
 
   constructor(options: WaywireSessionOptions = {}) {
+    // Connecting to look at a desktop must not change that desktop.
     this.#remoteDisplayPolicy = normalizeRemoteDisplayPolicy(
       options.remoteDisplay ?? { mode: "manual" },
     );
@@ -206,6 +210,10 @@ export class WaywireSession {
 
     const session = this;
     this.video = Object.freeze({
+      setQuality: (preset: QualityPreset) => {
+        this.#assertActive();
+        this.#runtime.setQuality(preset);
+      },
       setLatencyTarget: (milliseconds: number) => {
         this.#assertActive();
         this.#runtime.setLatencyTarget(milliseconds);

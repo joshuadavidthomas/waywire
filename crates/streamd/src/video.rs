@@ -31,11 +31,12 @@ use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
 use thiserror::Error;
 use tracing::error;
+use waywire_protocol::pipe::Chroma;
+use waywire_protocol::pipe::Crf;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameDimension;
 use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Generation;
-use waywire_protocol::pipe::H264_PROFILE;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::MAX_RAW_PIXELS;
 use waywire_protocol::pipe::ScalePercent;
@@ -60,6 +61,8 @@ pub(crate) struct EncoderConfig {
     pub(crate) encoded_height: FrameDimension,
     pub(crate) fps: Fps,
     pub(crate) bitrate_kbps: Kbps,
+    pub(crate) crf: Crf,
+    pub(crate) chroma: Chroma,
 }
 
 impl EncoderConfig {
@@ -95,6 +98,7 @@ impl<'a> CapturedFrame<'a> {
             || self.metadata.width != self.config.encoded_width
             || self.metadata.height != self.config.encoded_height
             || self.metadata.fps != self.config.fps
+            || self.metadata.chroma != self.config.chroma
         {
             return Err(VideoError::InvalidFrame);
         }
@@ -935,8 +939,9 @@ fn reset_signal_mask_before_exec(command: &mut Command) {
 fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> Vec<String> {
     let rate = config.fps.get().to_string();
     let keyframe_interval = config.fps.keyframe_interval().to_string();
-    let bitrate = format!("{}k", config.bitrate_kbps.get());
-    let peak = format!("{}k", config.bitrate_kbps.get() * 2);
+    let bitrate_ceiling = format!("{}k", config.bitrate_kbps.get());
+    let buffer = format!("{}k", config.bitrate_kbps.get() * 2);
+    let profile = config.chroma.h264_profile();
     vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -960,17 +965,17 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "-tune".into(),
         "zerolatency".into(),
         "-profile:v".into(),
-        H264_PROFILE.ffmpeg_profile().into(),
+        profile.ffmpeg_profile().into(),
         "-level:v".into(),
-        H264_PROFILE.ffmpeg_level(),
+        profile.ffmpeg_level(),
         "-pix_fmt".into(),
-        "yuv444p".into(),
-        "-b:v".into(),
-        bitrate,
+        config.chroma.ffmpeg_pixel_format().into(),
+        "-crf".into(),
+        config.crf.get().to_string(),
         "-maxrate".into(),
-        peak.clone(),
+        bitrate_ceiling,
         "-bufsize".into(),
-        peak,
+        buffer,
         "-g".into(),
         keyframe_interval.clone(),
         "-keyint_min".into(),
@@ -984,8 +989,8 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         // FFmpeg's frame metadata alone does not reach the SPS in every build.
         "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on".into(),
         "-vf".into(),
-        // Preserve the desktop's full-range sRGB values and 4:4:4 chroma
-        // through Chromium's WebCodecs-to-canvas path.
+        // Preserve the desktop's full-range sRGB values through Chromium's
+        // WebCodecs-to-canvas path. Chroma sampling comes from the quality ladder.
         format!(
             "scale={}:{}:out_color_matrix=bt709:out_range=pc",
             config.encoded_width.get(), config.encoded_height.get()

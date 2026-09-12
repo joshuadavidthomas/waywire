@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Kbps;
 
 use crate::daemon::XkbLayout;
@@ -26,6 +27,13 @@ pub(super) struct Options {
     pub(super) bitrate: Kbps,
     #[arg(long, default_value = "us", value_parser = XkbLayout::parse)]
     pub(super) xkb_layout: XkbLayout,
+    #[arg(
+        long,
+        env = "WAYWIRE_RESOLUTION",
+        default_value = "1920x1080",
+        value_parser = parse_resolution
+    )]
+    pub(super) resolution: FrameSize,
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -40,4 +48,50 @@ fn parse_kbps(value: &str) -> Result<Kbps, String> {
         .parse()
         .map_err(|error| format!("bitrate must be an integer: {error}"))?;
     Kbps::new(value).map_err(|error| error.to_string())
+}
+
+fn parse_resolution(value: &str) -> Result<FrameSize, String> {
+    let (width, height) = value
+        .split_once('x')
+        .ok_or_else(|| "resolution must use WIDTHxHEIGHT".to_owned())?;
+    if height.contains('x') {
+        return Err("resolution must use WIDTHxHEIGHT".into());
+    }
+    let width = width
+        .parse()
+        .map_err(|error| format!("resolution width must be an integer: {error}"))?;
+    let height = height
+        .parse()
+        .map_err(|error| format!("resolution height must be an integer: {error}"))?;
+    FrameSize::new(width, height).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn resolution_default_is_full_hd() {
+        let command = Options::command();
+        let argument = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "resolution")
+            .expect("resolution argument should exist");
+        assert_eq!(argument.get_default_values(), ["1920x1080"]);
+    }
+
+    #[test]
+    fn resolution_parser_accepts_supported_dimensions() {
+        let resolution = parse_resolution("2560x1440").expect("resolution should parse");
+        assert_eq!((resolution.width(), resolution.height()), (2560, 1440));
+    }
+
+    #[test]
+    fn resolution_parser_rejects_bad_shapes_and_unsupported_dimensions() {
+        for value in ["1920", "1920X1080", "1920x1080x60", "1919x1080", "8000x100"] {
+            assert!(parse_resolution(value).is_err(), "accepted {value}");
+        }
+    }
 }

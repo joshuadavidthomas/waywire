@@ -11,6 +11,7 @@ readonly VERSION_FILE='/etc/waywire/version.json'
 readonly RELEASE_DIR="/opt/waywire/releases/$RELEASE"
 readonly CURRENT_LINK='/opt/waywire/current'
 archive_path=
+resolution=1920x1080
 temporary=
 
 fail() { printf 'waywire installer: %s\n' "$*" >&2; exit 1; }
@@ -26,9 +27,26 @@ while [ "$#" -gt 0 ]; do
       archive_path=$2
       shift 2
       ;;
+    --resolution)
+      [ "$#" -ge 2 ] || fail '--resolution requires WIDTHxHEIGHT'
+      resolution=$2
+      shift 2
+      ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
+
+if [[ "$resolution" =~ ^([1-9][0-9]{2,3})x([1-9][0-9]{2,3})$ ]]; then
+  resolution_width=${BASH_REMATCH[1]}
+  resolution_height=${BASH_REMATCH[2]}
+else
+  fail '--resolution must use supported WIDTHxHEIGHT dimensions'
+fi
+if (( resolution_width < 320 || resolution_width > 6000 || resolution_width % 2 != 0 ||
+      resolution_height < 180 || resolution_height > 6000 || resolution_height % 2 != 0 ||
+      resolution_width * resolution_height > 3840 * 2160 )); then
+  fail '--resolution dimensions are outside the supported range'
+fi
 
 [[ "$RELEASE" != @* ]] || fail 'this is an unbuilt installer template'
 [ "$(id -un)" = sprite ] || fail 'run this installer as the sprite user, not as root'
@@ -126,7 +144,7 @@ running_artifacts_match() {
 }
 services_raw=$(api) || fail 'could not list Sprite services'
 live_services=$(jq -ce 'if type != "array" then error("expected service array") else [.[] | {name,cmd,args:(.args // []),http_port:(.http_port // null),needs:(.needs // []),env:(.env // {}),dir:(.dir // null)}] end' <<<"$services_raw") || fail 'Sprite services response is invalid'
-target_service=$(jq -cn --arg origin "$origin" '{name:"waywire",cmd:"/opt/waywire/current/bin/desktop.sh",args:[$origin],http_port:8080,needs:[],env:{},dir:"/home/sprite"}')
+target_service=$(jq -cn --arg origin "$origin" --arg resolution "$resolution" '{name:"waywire",cmd:"/opt/waywire/current/bin/desktop.sh",args:[$origin],http_port:8080,needs:[],env:{WAYWIRE_RESOLUTION:$resolution},dir:"/home/sprite"}')
 current_service=$(jq -c '.[] | select(.name == "waywire")' <<<"$live_services")
 record=
 if sudo test -f "$INSTALL_RECORD"; then

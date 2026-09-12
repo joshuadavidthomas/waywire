@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import type {
+  QualityPreset,
   RemoteDisplayPolicy,
   SurfaceHandle,
   WaywireSession,
@@ -10,6 +11,8 @@ import type {
 } from "../sdk/waywire.ts";
 import {
   installViewerListeners,
+  QUALITY_STORAGE_KEY,
+  QUALITY_VALUES,
   RESOLUTION_STORAGE_KEY,
   RESOLUTION_VALUES,
   type ViewerControls,
@@ -116,6 +119,10 @@ class FakeSelect extends FakeElement {
   value = "";
 }
 
+class FakeOption extends FakeElement {
+  value = "";
+}
+
 class FakeStorage {
   readonly values: Map<string, string>;
 
@@ -152,6 +159,7 @@ function installDom(
     HTMLElement: { configurable: true, value: FakeElement },
     HTMLInputElement: { configurable: true, value: FakeInput },
     HTMLSelectElement: { configurable: true, value: FakeSelect },
+    HTMLOptionElement: { configurable: true, value: FakeOption },
     document: { configurable: true, value: fakeDocument },
     window: { configurable: true, value: new FakeElement() },
     localStorage: { configurable: true, value: storage },
@@ -183,6 +191,9 @@ function viewerElements(): {
   readonly protectedLabel: FakeElement;
   readonly resolutionLabel: FakeElement;
   readonly resolutionSelect: FakeSelect;
+  readonly resolutionStatusOption: FakeOption;
+  readonly qualityLabel: FakeElement;
+  readonly qualitySelect: FakeSelect;
 } {
   const element = (): FakeElement => new FakeElement();
   const hud = element();
@@ -198,8 +209,17 @@ function viewerElements(): {
   const panel = element();
   const protectedLabel = element();
   const resolutionLabel = element();
-  panel.queryAllResults.set("button, label", [protectedLabel, resolutionLabel]);
+  const qualityLabel = element();
+  panel.queryAllResults.set("button, label", [
+    protectedLabel,
+    resolutionLabel,
+    qualityLabel,
+  ]);
   const resolutionSelect = new FakeSelect();
+  const resolutionStatusOption = new FakeOption();
+  resolutionStatusOption.disabled = true;
+  resolutionStatusOption.textContent = "Waiting for video";
+  const qualitySelect = new FakeSelect();
   return {
     elements: {
       stage: element(),
@@ -219,7 +239,10 @@ function viewerElements(): {
       sendClipboardButton: element(),
       copyClipboardButton: element(),
       resolutionSelect,
+      resolutionStatusOption,
       resolutionLabel,
+      qualitySelect,
+      qualityLabel,
       resetVideoButton: element(),
       clipboardStatus: element(),
       hudToggle: new FakeInput(),
@@ -233,6 +256,9 @@ function viewerElements(): {
     protectedLabel,
     resolutionLabel,
     resolutionSelect,
+    resolutionStatusOption,
+    qualityLabel,
+    qualitySelect,
   };
 }
 
@@ -244,6 +270,9 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
   readonly protectedLabel: FakeElement;
   readonly resolutionLabel: FakeElement;
   readonly resolutionSelect: FakeSelect;
+  readonly resolutionStatusOption: FakeOption;
+  readonly qualityLabel: FakeElement;
+  readonly qualitySelect: FakeSelect;
   readonly storage: FakeStorage;
   readonly emitStats: (stats: WaywireStats) => void;
   readonly calls: {
@@ -252,6 +281,7 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
     focused: number;
     textFocused: number;
     policies: RemoteDisplayPolicy[];
+    qualities: QualityPreset[];
     targets: number[];
   };
 } {
@@ -264,6 +294,7 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
     focused: 0,
     textFocused: 0,
     policies: [] as RemoteDisplayPolicy[],
+    qualities: [] as QualityPreset[],
     targets: [] as number[],
   };
   const statsListeners = new Set<(stats: WaywireStats) => void>();
@@ -279,6 +310,7 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
     video: {
       reset: () => undefined,
       setLatencyTarget: (target: number) => calls.targets.push(target),
+      setQuality: (quality: QualityPreset) => calls.qualities.push(quality),
     },
     remoteDisplay: {
       setPolicy: (policy: RemoteDisplayPolicy) => {
@@ -306,6 +338,9 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
     protectedLabel: created.protectedLabel,
     resolutionLabel: created.resolutionLabel,
     resolutionSelect: created.resolutionSelect,
+    resolutionStatusOption: created.resolutionStatusOption,
+    qualityLabel: created.qualityLabel,
+    qualitySelect: created.qualitySelect,
     storage,
     emitStats: (stats) => {
       for (const listener of statsListeners) listener(stats);
@@ -314,11 +349,10 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
   };
 }
 
-test("playout adapts through the SDK setter even with the stats readout hidden", () => {
-  const harness = setup();
-  const sample: WaywireStats = {
-    width: 1280,
-    height: 720,
+function stats(width: number, height: number): WaywireStats {
+  return {
+    width,
+    height,
     renderedFps: 60,
     renderedMediaTimestampMicros: 0,
     drawCompletedAtMs: 0,
@@ -326,10 +360,10 @@ test("playout adapts through the SDK setter even with the stats readout hidden",
     bitrateKbps: 8000,
     scalePercent: 100,
     rttMs: 20,
-    clockConfident: true,
-    clockUncertaintyMs: 1,
+    clockConfident: false,
+    clockUncertaintyMs: null,
     latencyTargetMs: 100,
-    latenessMs: 30,
+    latenessMs: 0,
     pendingInputCount: 0,
     decoderQueue: 0,
     receivedFrames: 1,
@@ -342,35 +376,78 @@ test("playout adapts through the SDK setter even with the stats readout hidden",
     decoderResets: 0,
     resizeState: "idle",
   };
+}
+
+test("playout adapts through the SDK setter using one wall clock with the HUD hidden", (context) => {
+  let now = 0;
+  context.mock.method(performance, "now", () => now);
+  const harness = setup();
+  const sample = { ...stats(1280, 720), clockConfident: true, latenessMs: 30 };
   try {
     assert.equal(harness.elements.hud.hidden, true);
-    for (let frame = 0; frame < 3; frame += 1)
-      harness.emitStats({ ...sample, drawCompletedAtMs: frame * 16 });
+    for (let frame = 0; frame < 3; frame += 1) {
+      now = frame * 16;
+      harness.emitStats(sample);
+    }
     assert.deepEqual(harness.calls.targets, []);
-    harness.emitStats({ ...sample, drawCompletedAtMs: 48 });
+    now = 48;
+    harness.emitStats(sample);
     assert.deepEqual(harness.calls.targets, [125]);
-    // Untimed frames cannot build a false calm streak while the clock is syncing.
-    for (let frame = 0; frame < 120; frame += 1)
-      harness.emitStats({
-        ...sample,
-        clockConfident: false,
-        latencyTargetMs: 125,
-        drawCompletedAtMs: 50 + frame * 16,
-      });
+    now = 10_047;
+    harness.emitStats({ ...sample, clockConfident: false });
     assert.deepEqual(harness.calls.targets, [125]);
-    for (let frame = 0; frame < 120; frame += 1)
-      harness.emitStats({
-        ...sample,
-        latenessMs: 0,
-        latencyTargetMs: 125,
-        drawCompletedAtMs: 6_000 + frame * 16,
-      });
+    now = 10_048;
+    harness.emitStats({ ...sample, latenessMs: 0 });
     assert.deepEqual(harness.calls.targets, [125, 100]);
     assert.equal(harness.storage.getItem("waywire.latency"), null);
     harness.controls.dispose();
-    for (let frame = 0; frame < 4; frame += 1)
-      harness.emitStats({ ...sample, drawCompletedAtMs: 12_000 + frame * 16 });
+    now = 20_000;
+    for (let frame = 0; frame < 4; frame += 1) harness.emitStats(sample);
     assert.deepEqual(harness.calls.targets, [125, 100]);
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("the viewer lowers the real target while completely idle and cancels ticks on disposal", (context) => {
+  let now = 0;
+  context.mock.method(performance, "now", () => now);
+  context.mock.timers.enable({ apis: ["setInterval"] });
+  const harness = setup();
+  const tick = (): void => {
+    now += 1_000;
+    context.mock.timers.tick(1_000);
+  };
+  try {
+    for (let frame = 0; frame < 4; frame += 1)
+      harness.emitStats({
+        ...stats(1280, 720),
+        clockConfident: true,
+        latenessMs: 30,
+      });
+    assert.deepEqual(harness.calls.targets, [125]);
+    assert.equal(harness.elements.hud.hidden, true);
+    for (let second = 1; second < 10; second += 1) tick();
+    assert.deepEqual(harness.calls.targets, [125]);
+    tick();
+    assert.deepEqual(harness.calls.targets, [125, 100]);
+    for (let second = 0; second < 5; second += 1) tick();
+    assert.deepEqual(harness.calls.targets, [125, 100, 75]);
+    const targetField = harness.elements.hud.querySelector(
+      '[data-field="video-latency-target"]',
+    );
+    assert.equal(
+      targetField?.textContent,
+      "75 ms",
+      "the idle HUD must not show the stale frame target",
+    );
+    // Opening the HUD must likewise render the current target, not the last frame's snapshot.
+    harness.elements.hudToggle.checked = true;
+    (harness.elements.hudToggle as unknown as FakeElement).dispatch("change");
+    assert.equal(targetField?.textContent, "75 ms");
+    harness.controls.dispose();
+    for (let second = 0; second < 10; second += 1) tick();
+    assert.deepEqual(harness.calls.targets, [125, 100, 75]);
   } finally {
     harness.controls.dispose();
   }
@@ -385,6 +462,10 @@ test("resolution options use the exact value order and display labels", () => {
     /<select[\s\S]*?id="resolution"[\s\S]*?>([\s\S]*?)<\/select>/,
   )?.[1];
   assert.ok(select, "resolution select was not found");
+  assert.match(
+    select,
+    /<option id="resolution-status" value="" selected disabled>[\s\S]*?Waiting for video[\s\S]*?<\/option>/,
+  );
   const options = [
     ...select.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g),
   ].map((match) => [match[1], match[2]]);
@@ -408,10 +489,64 @@ test("resolution options use the exact value order and display labels", () => {
   assert.doesNotMatch(html, /id="latency"|name="latency"/);
 });
 
+test("quality options use the exact value order and display labels", () => {
+  const html = readFileSync(
+    new URL("../../index.html", import.meta.url),
+    "utf8",
+  );
+  const select = html.match(
+    /<select[\s\S]*?id="quality"[\s\S]*?>([\s\S]*?)<\/select>/,
+  )?.[1];
+  assert.ok(select, "quality select was not found");
+  const options = [
+    ...select.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g),
+  ].map((match) => [match[1], match[2]]);
+
+  assert.deepEqual(
+    options.map(([value]) => value),
+    QUALITY_VALUES,
+  );
+  assert.deepEqual(
+    options.map(([, label]) => label),
+    ["Automatic", "High", "Medium", "Low"],
+  );
+  assert.ok(
+    html.indexOf('id="resolution"') < html.indexOf('id="quality"'),
+    "quality must follow resolution",
+  );
+});
+
+test("viewer favicon links the exact monitor glyph and ink", () => {
+  const html = readFileSync(
+    new URL("../../index.html", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    html,
+    /<link rel="icon" type="image\/svg\+xml" href="\/favicon\.svg" \/>/,
+  );
+  const favicon = readFileSync(
+    new URL("../../public/favicon.svg", import.meta.url),
+    "utf8",
+  );
+  assert.equal(
+    favicon,
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ededed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">\n' +
+      '  <rect width="20" height="14" x="2" y="3" rx="2" />\n' +
+      '  <path d="M8 21h8" />\n' +
+      '  <path d="M12 17v4" />\n' +
+      "</svg>\n",
+  );
+});
+
 test("stored fixed resolution is restored before viewer actions", () => {
   const harness = setup({ [RESOLUTION_STORAGE_KEY]: "1920x1080" });
   try {
-    assert.equal(harness.resolutionSelect.value, "1920x1080");
+    assert.equal(harness.resolutionSelect.value, "");
+    assert.equal(
+      harness.resolutionStatusOption.textContent,
+      "Waiting for video",
+    );
     assert.deepEqual(harness.calls.policies, [
       {
         mode: "fixed",
@@ -425,26 +560,69 @@ test("stored fixed resolution is restored before viewer actions", () => {
   }
 });
 
+test("stored quality is restored through the SDK setter", () => {
+  const harness = setup({ [QUALITY_STORAGE_KEY]: "medium" });
+  try {
+    assert.equal(harness.qualitySelect.value, "medium");
+    assert.deepEqual(harness.calls.qualities, ["medium"]);
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("quality changes persist and reject values outside the exact list", () => {
+  const harness = setup();
+  try {
+    assert.equal(harness.qualitySelect.value, "automatic");
+    assert.deepEqual(harness.calls.qualities, ["automatic"]);
+
+    harness.qualitySelect.value = "high";
+    harness.qualitySelect.dispatch("change");
+    assert.equal(harness.storage.getItem(QUALITY_STORAGE_KEY), "high");
+    assert.deepEqual(harness.calls.qualities, ["automatic", "high"]);
+    assert.equal(harness.calls.acquired, 1);
+    assert.equal(harness.calls.focused, 0, "selection keeps native focus");
+
+    harness.qualitySelect.value = "ultra";
+    harness.qualitySelect.dispatch("change");
+    assert.equal(harness.qualitySelect.value, "high");
+    assert.equal(harness.storage.getItem(QUALITY_STORAGE_KEY), "high");
+    assert.deepEqual(harness.calls.qualities, ["automatic", "high"]);
+    assert.equal(harness.calls.acquired, 1);
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("stored quality outside the exact list falls back to Automatic", () => {
+  const harness = setup({ [QUALITY_STORAGE_KEY]: "HIGH" });
+  try {
+    assert.equal(harness.qualitySelect.value, "automatic");
+    assert.deepEqual(harness.calls.qualities, ["automatic"]);
+    assert.equal(harness.storage.getItem(QUALITY_STORAGE_KEY), "automatic");
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
 test("resolution changes set exact fixed and Fit policies", () => {
   const harness = setup();
   try {
-    assert.equal(harness.resolutionSelect.value, "fit");
-    assert.deepEqual(harness.calls.policies, [
-      {
-        mode: "observe",
-        element: harness.elements.display,
-        devicePixelRatio: 1,
-      },
-    ]);
+    assert.equal(harness.resolutionSelect.value, "");
+    assert.deepEqual(harness.calls.policies, []);
+    assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), null);
 
     harness.resolutionSelect.value = "2560x1440";
     harness.resolutionSelect.dispatch("change");
-    assert.deepEqual(harness.calls.policies.at(-1), {
-      mode: "fixed",
-      width: 2560,
-      height: 1440,
-      scale: 1,
-    });
+    assert.deepEqual(harness.calls.policies, [
+      {
+        mode: "fixed",
+        width: 2560,
+        height: 1440,
+        scale: 1,
+      },
+    ]);
+    assert.equal(harness.resolutionSelect.value, "");
     assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), "2560x1440");
 
     harness.resolutionSelect.value = "fit";
@@ -454,11 +632,12 @@ test("resolution changes set exact fixed and Fit policies", () => {
       element: harness.elements.display,
       devicePixelRatio: 1,
     });
+    assert.equal(harness.resolutionSelect.value, "");
     assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), "fit");
     assert.equal(
       harness.calls.acquired,
-      2,
-      "each valid selection can reacquire ownership",
+      0,
+      "resolution changes do not acquire input ownership",
     );
     assert.equal(
       harness.calls.focused,
@@ -468,18 +647,38 @@ test("resolution changes set exact fixed and Fit policies", () => {
 
     harness.resolutionSelect.value = "800x600";
     harness.resolutionSelect.dispatch("change");
-    assert.equal(harness.resolutionSelect.value, "fit");
-    assert.equal(harness.calls.policies.length, 3);
+    assert.equal(harness.resolutionSelect.value, "");
+    assert.equal(harness.calls.policies.length, 2);
     assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), "fit");
   } finally {
     harness.controls.dispose();
   }
 });
 
-test("stored values outside the exact list fall back to Fit", () => {
-  const harness = setup({ [RESOLUTION_STORAGE_KEY]: "1920 × 1080" });
+test("absent and invalid stored resolutions leave the remote display alone", () => {
+  const fresh = setup();
+  const invalid = setup({ [RESOLUTION_STORAGE_KEY]: "1920 × 1080" });
   try {
-    assert.equal(harness.resolutionSelect.value, "fit");
+    assert.equal(fresh.resolutionSelect.value, "");
+    assert.deepEqual(fresh.calls.policies, []);
+    assert.equal(fresh.storage.getItem(RESOLUTION_STORAGE_KEY), null);
+
+    assert.equal(invalid.resolutionSelect.value, "");
+    assert.deepEqual(invalid.calls.policies, []);
+    assert.equal(
+      invalid.storage.getItem(RESOLUTION_STORAGE_KEY),
+      "1920 × 1080",
+    );
+  } finally {
+    fresh.controls.dispose();
+    invalid.controls.dispose();
+  }
+});
+
+test("stored Fit is restored while the menu waits for live video", () => {
+  const harness = setup({ [RESOLUTION_STORAGE_KEY]: "fit" });
+  try {
+    assert.equal(harness.resolutionSelect.value, "");
     assert.deepEqual(harness.calls.policies, [
       {
         mode: "observe",
@@ -493,7 +692,83 @@ test("stored values outside the exact list fall back to Fit", () => {
   }
 });
 
-test("resolution label keeps its native pointer action", () => {
+test("live frame dimensions drive the resolution display without changing its policy", () => {
+  const harness = setup();
+  try {
+    harness.emitStats(stats(0, 0));
+    assert.equal(harness.resolutionSelect.value, "");
+    assert.equal(
+      harness.resolutionStatusOption.textContent,
+      "Waiting for video",
+    );
+    harness.emitStats(stats(1920, 1080));
+    assert.equal(harness.resolutionSelect.value, "1920x1080");
+    assert.equal(harness.resolutionStatusOption.hidden, true);
+    assert.deepEqual(harness.calls.policies, []);
+    assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), null);
+
+    const dynamicOption = harness.resolutionStatusOption;
+    harness.emitStats(stats(1200, 674));
+    assert.equal(harness.resolutionSelect.value, "1200x674");
+    assert.equal(dynamicOption.hidden, false);
+    assert.equal(dynamicOption.value, "1200x674");
+    assert.equal(dynamicOption.textContent, "1200 × 674");
+
+    harness.emitStats(stats(100, 90));
+    harness.emitStats(stats(100, 90));
+    assert.equal(harness.resolutionStatusOption, dynamicOption);
+    assert.equal(dynamicOption.value, "100x90");
+    assert.equal(dynamicOption.textContent, "100 × 90");
+    assert.deepEqual(harness.calls.policies, []);
+    assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), null);
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("unchanged frame dimensions do not interrupt native resolution navigation", () => {
+  const harness = setup();
+  try {
+    harness.emitStats(stats(1920, 1080));
+    // The user is navigating the native popup but has not committed a change.
+    harness.resolutionSelect.value = "1280x720";
+    harness.emitStats(stats(1920, 1080));
+    assert.equal(harness.resolutionSelect.value, "1280x720");
+    assert.deepEqual(harness.calls.policies, []);
+    harness.resolutionSelect.dispatch("change");
+    assert.equal(harness.calls.policies.length, 1);
+    assert.equal(harness.resolutionSelect.value, "1920x1080");
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("a fixed action fires once and later frames only update the live display", () => {
+  const harness = setup();
+  try {
+    harness.emitStats(stats(1200, 674));
+    harness.resolutionSelect.value = "1600x900";
+    harness.resolutionSelect.dispatch("change");
+    assert.deepEqual(harness.calls.policies, [
+      { mode: "fixed", width: 1600, height: 900, scale: 1 },
+    ]);
+    assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), "1600x900");
+    assert.equal(
+      harness.resolutionSelect.value,
+      "1200x674",
+      "the known stream stays visible while the requested mode is pending",
+    );
+
+    harness.emitStats(stats(800, 450));
+    assert.equal(harness.resolutionSelect.value, "800x450");
+    assert.equal(harness.calls.policies.length, 1);
+    assert.equal(harness.storage.getItem(RESOLUTION_STORAGE_KEY), "1600x900");
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("select labels keep their native pointer action", () => {
   const harness = setup();
   try {
     assert.equal(
@@ -502,6 +777,10 @@ test("resolution label keeps its native pointer action", () => {
     );
     assert.equal(
       harness.resolutionLabel.dispatch("pointerdown").defaultPrevented,
+      false,
+    );
+    assert.equal(
+      harness.qualityLabel.dispatch("pointerdown").defaultPrevented,
       false,
     );
   } finally {
@@ -526,6 +805,11 @@ test("on-screen keyboard stays inert while Remote input is off", () => {
     assert.equal(harness.calls.released, 1);
     harness.resolutionSelect.value = "1280x720";
     harness.resolutionSelect.dispatch("change");
+    harness.qualitySelect.value = "low";
+    harness.qualitySelect.dispatch("change");
+    assert.deepEqual(harness.calls.qualities, ["automatic", "low"]);
+    assert.equal(harness.storage.getItem(QUALITY_STORAGE_KEY), "low");
+    assert.equal(harness.controlToggle.checked, false);
     assert.equal(
       harness.calls.acquired,
       0,

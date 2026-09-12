@@ -99,7 +99,90 @@ test("dispose cancels an asynchronous clipboard paste", async () => {
   }
 });
 
-test("resize observer burst sends its final viewport", async () => {
+test("default manual policy never observes or resizes on connect and acquire", async () => {
+  const { window } = installBrowser();
+  const observers = installResizeObserver();
+  const sockets = new Map<string, FakeWebSocket>();
+  const session = new WaywireSession({
+    endpoint: "https://desktop.example.com",
+    createWebSocket(path) {
+      const created = new FakeWebSocket();
+      sockets.set(path, created);
+      return socket(created);
+    },
+  });
+  session.attachSurface(surfaceOptions());
+  try {
+    assert.deepEqual(session.remoteDisplay.policy, { mode: "manual" });
+    assert.equal(observers.length, 0);
+    session.input.acquire();
+    session.connect();
+    await flush();
+    const control = sockets.get("/control");
+    if (!control) throw new Error("control socket was not created");
+    control.readyState = FakeWebSocket.OPEN;
+    control.dispatch("open", {});
+    control.dispatch("message", {
+      data: JSON.stringify({ type: "control-state", state: "active" }),
+    });
+    window.dispatch("resize", {});
+    await new Promise<void>((resolve) => setTimeout(resolve, 110));
+    assert.equal(observers.length, 0);
+    assert.deepEqual(resizeRecords(control), []);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("an explicit Fit action observes later window resizes", async () => {
+  const { window } = installBrowser();
+  installGlobal("Element", FakeTarget);
+  const observers = installResizeObserver();
+  const control = new FakeWebSocket();
+  const canvas = new FakeTarget();
+  const session = new WaywireSession({
+    endpoint: "https://desktop.example.com",
+    createWebSocket: (path) =>
+      socket(path === "/control" ? control : new FakeWebSocket()),
+  });
+  session.attachSurface(surfaceOptions(canvas));
+  try {
+    session.connect();
+    await flush();
+    control.readyState = FakeWebSocket.OPEN;
+    control.dispatch("open", {});
+
+    session.remoteDisplay.fixed({ width: 1600, height: 900, scale: 1 });
+    assert.equal(resizeRecords(control).length, 1);
+    assert.equal(observers.length, 0);
+
+    session.remoteDisplay.observe({
+      element: canvas as unknown as Element,
+      devicePixelRatio: 1,
+      debounceMs: 0,
+    });
+    await flush();
+    assert.equal(observers.length, 1);
+    assert.deepEqual(resizeRecords(control).map(resizeSize), [
+      [1600, 900],
+      [1280, 720],
+    ]);
+
+    canvas.rect.width = 1440;
+    canvas.rect.height = 810;
+    window.dispatch("resize", {});
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    assert.deepEqual(resizeRecords(control).map(resizeSize), [
+      [1600, 900],
+      [1280, 720],
+      [1440, 810],
+    ]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("resize observer burst sends its final viewport without input ownership", async () => {
   installBrowser();
   const observers = installResizeObserver();
   const sockets: FakeWebSocket[] = [];
@@ -115,16 +198,12 @@ test("resize observer burst sends its final viewport", async () => {
   });
   session.attachSurface(surfaceOptions(canvas));
   try {
-    session.input.acquire();
     session.connect();
     await flush();
     const control = sockets[0];
     if (!control) throw new Error("control socket was not created");
     control.readyState = FakeWebSocket.OPEN;
     control.dispatch("open", {});
-    control.dispatch("message", {
-      data: JSON.stringify({ type: "control-state", state: "active" }),
-    });
     const observer = observers[0];
     if (!observer) throw new Error("resize observer was not created");
     observer.trigger();
@@ -438,7 +517,7 @@ test("reconnect sends one unchanged resize across observer and ownership callbac
   }
 });
 
-test("a native resolution selection reacquires ownership and sends scale 120 without moving focus", async () => {
+test("a native resolution selection sends scale 120 after releasing ownership without moving focus", async () => {
   const { document } = installBrowser();
   const control = new FakeWebSocket();
   const canvas = new FakeTarget();
@@ -462,20 +541,24 @@ test("a native resolution selection reacquires ownership and sends scale 120 wit
     canvas.dispatch("blur", { relatedTarget: select });
     const before = resizeRecords(control).length;
     // These are the viewer's selection-change actions, in their actual order.
+    const acquireMessagesBefore = control.sent.filter(
+      (value) => value === JSON.stringify({ type: "acquire" }),
+    ).length;
     session.remoteDisplay.setPolicy({
       mode: "fixed",
       width: 1366,
       height: 768,
       scale: 1,
     });
-    session.input.acquire();
-    assert.equal(resizeRecords(control).length, before);
-    control.dispatch("message", {
-      data: JSON.stringify({ type: "control-state", state: "active" }),
-    });
     const resized = resizeRecords(control).at(-1);
     assert.ok(resized);
     assert.equal(resizeRecords(control).length, before + 1);
+    assert.equal(
+      control.sent.filter(
+        (value) => value === JSON.stringify({ type: "acquire" }),
+      ).length,
+      acquireMessagesBefore,
+    );
     assert.deepEqual(resizeSize(resized), [1366, 768]);
     assert.equal(new DataView(resized).getUint16(16, true), 120);
     assert.equal(document.activeElement, select);

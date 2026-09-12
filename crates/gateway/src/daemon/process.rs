@@ -28,16 +28,7 @@ const GROUP_EXIT_DEADLINE: Duration = Duration::from_secs(2);
 pub(super) fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaemon> {
     let mut command = ProcessCommand::new(&config.path);
     command
-        .args([
-            "--frame-rate",
-            &config.frame_rate.get().to_string(),
-            "--bitrate",
-            &config.bitrate.get().to_string(),
-            "--rtp-port",
-            &rtp_port.to_string(),
-            "--xkb-layout",
-            config.xkb_layout.as_str(),
-        ])
+        .args(daemon_args(config, rtp_port))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -62,6 +53,25 @@ pub(super) fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaem
         stdin,
         stdout,
     })
+}
+
+fn daemon_args(config: &Config, rtp_port: u16) -> Vec<String> {
+    vec![
+        "--frame-rate".into(),
+        config.frame_rate.get().to_string(),
+        "--bitrate".into(),
+        config.bitrate.get().to_string(),
+        "--rtp-port".into(),
+        rtp_port.to_string(),
+        "--xkb-layout".into(),
+        config.xkb_layout.as_str().into(),
+        "--resolution".into(),
+        format!(
+            "{}x{}",
+            config.resolution.width(),
+            config.resolution.height()
+        ),
+    ]
 }
 
 pub(super) async fn wait_for_leader_exit(pid: Pid) -> Result<WaitStatus> {
@@ -125,10 +135,45 @@ pub(super) async fn cleanup_group(child: &mut Child, pid: Pid) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use nix::errno::Errno;
+    use waywire_protocol::pipe::Fps;
+    use waywire_protocol::pipe::FrameSize;
+    use waywire_protocol::pipe::Kbps;
 
     use super::ProcessGroupState;
+    use super::daemon_args;
     use super::process_group_state;
+    use crate::daemon::Config;
+    use crate::daemon::XkbLayout;
+
+    #[test]
+    fn streamd_arguments_include_the_configured_resolution() {
+        let config = Config {
+            path: PathBuf::from("streamd"),
+            frame_rate: Fps::new(60).expect("valid frame rate"),
+            bitrate: Kbps::new(16_000).expect("valid bitrate"),
+            xkb_layout: XkbLayout::parse("us").expect("valid layout"),
+            resolution: FrameSize::new(2560, 1440).expect("valid resolution"),
+        };
+
+        assert_eq!(
+            daemon_args(&config, 5000),
+            [
+                "--frame-rate",
+                "60",
+                "--bitrate",
+                "16000",
+                "--rtp-port",
+                "5000",
+                "--xkb-layout",
+                "us",
+                "--resolution",
+                "2560x1440",
+            ]
+        );
+    }
 
     #[test]
     fn only_esrch_means_a_process_group_is_gone() {

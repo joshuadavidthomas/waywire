@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -54,6 +55,12 @@ impl OutputSize {
     }
 }
 
+impl fmt::Display for OutputSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}x{}", self.width, self.height)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentMode {
     Unknown,
@@ -74,6 +81,7 @@ struct OutputMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestPurpose {
+    Startup,
     External {
         request_id: RequestId,
         scale_v120: ScaleV120,
@@ -97,14 +105,29 @@ pub(crate) struct ResizeRequest {
 impl ResizeRequest {
     pub(crate) const fn operation(self) -> ResizeOperation {
         match self.purpose {
+            RequestPurpose::Startup => ResizeOperation::Startup,
             RequestPurpose::External { .. } => ResizeOperation::External,
             RequestPurpose::DisplayResetBounce { .. }
             | RequestPurpose::DisplayResetRestore { .. } => ResizeOperation::DisplayReset,
         }
     }
+
+    pub(crate) const fn requested_size(self) -> OutputSize {
+        self.mode.size
+    }
 }
 
 impl ResizeRequest {
+    fn startup(size: FrameSize, scale_v120: ScaleV120) -> Self {
+        Self {
+            mode: OutputMode {
+                size: OutputSize::external(size),
+                scale: ScaleChange::Set(scale_v120),
+            },
+            purpose: RequestPurpose::Startup,
+        }
+    }
+
     fn external(size: FrameSize, scale_v120: ScaleV120, request_id: RequestId) -> Self {
         Self {
             mode: OutputMode {
@@ -217,6 +240,7 @@ pub(crate) enum DimensionChange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppliedResize {
+    Startup,
     External {
         size: OutputSize,
         scale_v120: ScaleV120,
@@ -228,26 +252,82 @@ pub(crate) enum AppliedResize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResizeOperation {
+    Startup,
+    External,
+    DisplayReset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupFailureReason {
+    Rejected,
+    Cancelled,
+    TimedOut,
+    ConfigurationUnavailable,
+}
+
+impl StartupFailureReason {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Rejected => "compositor rejected the startup output configuration",
+            Self::Cancelled => "compositor cancelled the startup output configuration",
+            Self::TimedOut => "compositor did not finish the startup output configuration",
+            Self::ConfigurationUnavailable => "startup output configuration is unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupFailure {
+    requested: OutputSize,
+    reason: StartupFailureReason,
+}
+
+impl StartupFailure {
+    pub(crate) const fn new(requested: OutputSize, reason: StartupFailureReason) -> Self {
+        Self { requested, reason }
+    }
+
+    pub(crate) const fn requested(self) -> OutputSize {
+        self.requested
+    }
+
+    pub(crate) const fn reason(self) -> StartupFailureReason {
+        self.reason
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryOperation {
     External,
     DisplayReset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectOutcome {
+    StartupFailed(StartupFailure),
     SupersededExternal,
     Retrying {
-        operation: ResizeOperation,
+        operation: RetryOperation,
         failures: u8,
     },
     Exhausted {
-        operation: ResizeOperation,
+        operation: RetryOperation,
         failures: u8,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelOutcome {
+    StartupFailed(StartupFailure),
+    External,
+    DisplayReset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputTimeout {
-    Configuration { operation: ResizeOperation },
+    StartupConfiguration(StartupFailure),
+    ExternalConfiguration,
+    DisplayResetConfiguration,
     FreshSerial,
 }
 
@@ -263,6 +343,7 @@ pub(crate) struct OutputManager {
     pub(crate) heads: Vec<Head>,
     serial: Option<ManagerSerial>,
     pub(crate) pending: Option<PendingResize>,
+    startup: Option<ResizeRequest>,
     queued: Option<QueuedResize>,
     retry: Option<QueuedResize>,
     display_reset: DisplayResetSequence,
@@ -276,11 +357,18 @@ impl OutputManager {
             heads: Vec::new(),
             serial: None,
             pending: None,
+            startup: None,
             queued: None,
             retry: None,
             display_reset: DisplayResetSequence::Idle,
             current: CurrentMode::Unknown,
         }
+    }
+
+    pub(crate) fn with_startup(size: FrameSize, scale_v120: ScaleV120) -> Self {
+        let mut outputs = Self::new();
+        outputs.startup = Some(ResizeRequest::startup(size, scale_v120));
+        outputs
     }
 
     pub(crate) fn record_capture_size(&mut self, size: OutputSize) {
@@ -300,6 +388,7 @@ impl OutputManager {
     ) -> Result<()> {
         let request = ResizeRequest::external(size, scale_v120, request_id);
         if self.pending.is_some()
+            || self.startup.is_some()
             || self.retry.is_some()
             || !matches!(self.display_reset, DisplayResetSequence::Idle)
             || self.queued.is_some()
@@ -420,7 +509,8 @@ impl OutputManager {
                     retry.request = request;
                     return;
                 }
-                RequestPurpose::DisplayResetBounce { .. }
+                RequestPurpose::Startup
+                | RequestPurpose::DisplayResetBounce { .. }
                 | RequestPurpose::DisplayResetRestore { .. } => {}
             }
         }
@@ -443,6 +533,7 @@ impl OutputManager {
     ) -> AppliedResize {
         self.current = CurrentMode::Known(request.mode.size);
         match request.purpose {
+            RequestPurpose::Startup => AppliedResize::Startup,
             RequestPurpose::External {
                 request_id,
                 scale_v120,
@@ -490,6 +581,12 @@ impl OutputManager {
 
     fn retry_failed_request(&mut self, request: ResizeRequest) -> RejectOutcome {
         let (retry, operation, failures) = match request.purpose {
+            RequestPurpose::Startup => {
+                return RejectOutcome::StartupFailed(StartupFailure::new(
+                    request.mode.size,
+                    StartupFailureReason::Rejected,
+                ));
+            }
             RequestPurpose::External {
                 request_id,
                 scale_v120,
@@ -507,7 +604,7 @@ impl OutputManager {
                     },
                     ..request
                 };
-                (retry, ResizeOperation::External, failures)
+                (retry, RetryOperation::External, failures)
             }
             RequestPurpose::DisplayResetBounce { original, failures } => {
                 let failures = failures.saturating_add(1);
@@ -515,7 +612,7 @@ impl OutputManager {
                     purpose: RequestPurpose::DisplayResetBounce { original, failures },
                     ..request
                 };
-                (retry, ResizeOperation::DisplayReset, failures)
+                (retry, RetryOperation::DisplayReset, failures)
             }
             RequestPurpose::DisplayResetRestore { failures } => {
                 let failures = failures.saturating_add(1);
@@ -523,11 +620,11 @@ impl OutputManager {
                     purpose: RequestPurpose::DisplayResetRestore { failures },
                     ..request
                 };
-                (retry, ResizeOperation::DisplayReset, failures)
+                (retry, RetryOperation::DisplayReset, failures)
             }
         };
         if failures >= MAX_RESIZE_STEP_FAILURES {
-            if matches!(operation, ResizeOperation::DisplayReset) {
+            if matches!(operation, RetryOperation::DisplayReset) {
                 self.display_reset = DisplayResetSequence::Idle;
             }
             return RejectOutcome::Exhausted {
@@ -545,28 +642,38 @@ impl OutputManager {
         }
     }
 
-    pub(crate) fn retry_cancelled(&mut self) -> Option<ResizeOperation> {
+    pub(crate) fn retry_cancelled(&mut self) -> Option<CancelOutcome> {
         let pending = self.pending.take()?;
         pending.configuration.destroy();
-        match pending.request.purpose {
+        Some(self.cancel_request(pending.request, pending.serial, Instant::now()))
+    }
+
+    fn cancel_request(
+        &mut self,
+        request: ResizeRequest,
+        serial: ManagerSerial,
+        now: Instant,
+    ) -> CancelOutcome {
+        match request.purpose {
+            RequestPurpose::Startup => CancelOutcome::StartupFailed(StartupFailure::new(
+                request.mode.size,
+                StartupFailureReason::Cancelled,
+            )),
             RequestPurpose::External { .. } => {
-                let request = self
-                    .queued
-                    .take()
-                    .map_or(pending.request, |queued| queued.request);
+                let request = self.queued.take().map_or(request, |queued| queued.request);
                 self.retry = Some(QueuedResize {
                     request,
                     readiness: RetryReadiness::AwaitingFreshSerial {
-                        stale: pending.serial,
-                        since: Instant::now(),
+                        stale: serial,
+                        since: now,
                     },
                 });
-                Some(ResizeOperation::External)
+                CancelOutcome::External
             }
             RequestPurpose::DisplayResetBounce { .. }
             | RequestPurpose::DisplayResetRestore { .. } => {
                 self.display_reset = DisplayResetSequence::Idle;
-                Some(ResizeOperation::DisplayReset)
+                CancelOutcome::DisplayReset
             }
         }
     }
@@ -590,6 +697,9 @@ impl OutputManager {
     pub(crate) fn take_ready_queued(&mut self) -> Option<ResizeRequest> {
         if self.pending.is_some() {
             return None;
+        }
+        if let Some(startup) = self.startup.take() {
+            return Some(startup);
         }
         if let Some(retry) = self.retry {
             match retry.readiness {
@@ -631,6 +741,7 @@ impl OutputManager {
 
     pub(crate) fn capture_blocked(&self) -> bool {
         self.pending.is_some()
+            || self.startup.is_some()
             || self.retry.is_some()
             || self.queued.is_some()
             || !matches!(self.display_reset, DisplayResetSequence::Idle)
@@ -662,15 +773,7 @@ impl OutputManager {
         }) {
             let pending = self.pending.take()?;
             pending.configuration.destroy();
-            let operation = match pending.request.purpose {
-                RequestPurpose::External { .. } => ResizeOperation::External,
-                RequestPurpose::DisplayResetBounce { .. }
-                | RequestPurpose::DisplayResetRestore { .. } => {
-                    self.display_reset = DisplayResetSequence::Idle;
-                    ResizeOperation::DisplayReset
-                }
-            };
-            return Some(OutputTimeout::Configuration { operation });
+            return Some(self.recover_configuration_timeout(pending.request));
         }
         if self.retry.is_some_and(|retry| {
             matches!(
@@ -684,6 +787,21 @@ impl OutputManager {
         }
         None
     }
+
+    fn recover_configuration_timeout(&mut self, request: ResizeRequest) -> OutputTimeout {
+        match request.purpose {
+            RequestPurpose::Startup => OutputTimeout::StartupConfiguration(StartupFailure::new(
+                request.mode.size,
+                StartupFailureReason::TimedOut,
+            )),
+            RequestPurpose::External { .. } => OutputTimeout::ExternalConfiguration,
+            RequestPurpose::DisplayResetBounce { .. }
+            | RequestPurpose::DisplayResetRestore { .. } => {
+                self.display_reset = DisplayResetSequence::Idle;
+                OutputTimeout::DisplayResetConfiguration
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -691,9 +809,18 @@ mod tests {
     use super::*;
 
     fn request(request_id: u16, width: u32, height: u32) -> ResizeRequest {
+        request_at_scale(request_id, width, height, 120)
+    }
+
+    fn request_at_scale(
+        request_id: u16,
+        width: u32,
+        height: u32,
+        scale_v120: u16,
+    ) -> ResizeRequest {
         ResizeRequest::external(
             FrameSize::new(width, height).expect("valid test frame size"),
-            ScaleV120::new(120).expect("valid test output scale"),
+            ScaleV120::new(scale_v120).expect("valid test output scale"),
             RequestId::new(request_id).expect("valid test request ID"),
         )
     }
@@ -705,6 +832,158 @@ mod tests {
     fn accept(outputs: &mut OutputManager, request: ResizeRequest) -> AppliedResize {
         let change = output_dimensions_changed(outputs.current, request.mode.size);
         outputs.accept_succeeded(request, change)
+    }
+
+    fn startup(width: u32, height: u32) -> OutputManager {
+        OutputManager::with_startup(
+            FrameSize::new(width, height).expect("valid startup frame size"),
+            ScaleV120::new(120).expect("valid 1x output scale"),
+        )
+    }
+
+    #[test]
+    fn startup_mode_blocks_capture_until_success_at_scale_one() {
+        let mut outputs = startup(1920, 1080);
+        assert!(outputs.capture_blocked());
+
+        let request = outputs
+            .take_ready_queued()
+            .expect("startup should be queued");
+        assert_eq!(request.mode.size, size(1920, 1080));
+        assert_eq!(
+            request.mode.scale,
+            ScaleChange::Set(ScaleV120::new(120).expect("valid 1x output scale"))
+        );
+        assert_eq!(request.operation(), ResizeOperation::Startup);
+
+        assert_eq!(accept(&mut outputs, request), AppliedResize::Startup);
+        assert_eq!(outputs.current, CurrentMode::Known(size(1920, 1080)));
+        assert!(!outputs.capture_blocked());
+        assert!(outputs.take_ready_queued().is_none());
+    }
+
+    #[test]
+    fn configured_startup_mode_finishes_before_external_resize() {
+        let mut outputs = startup(2560, 1440);
+        outputs.queue_external(request(4, 1280, 720));
+
+        let startup = outputs
+            .take_ready_queued()
+            .expect("startup should run first");
+        assert_eq!(startup.mode.size, size(2560, 1440));
+        assert_eq!(accept(&mut outputs, startup), AppliedResize::Startup);
+        assert_eq!(outputs.take_ready_queued(), Some(request(4, 1280, 720)));
+    }
+
+    #[test]
+    fn rejected_startup_resumes_capture_and_retains_the_existing_mode() {
+        let mut outputs = startup(1920, 1080);
+        outputs.current = CurrentMode::Known(size(1366, 768));
+        let startup = outputs
+            .take_ready_queued()
+            .expect("startup should be queued");
+
+        assert_eq!(
+            outputs.retry_failed_request(startup),
+            RejectOutcome::StartupFailed(StartupFailure::new(
+                size(1920, 1080),
+                StartupFailureReason::Rejected,
+            ))
+        );
+        assert_eq!(outputs.current, CurrentMode::Known(size(1366, 768)));
+        assert!(outputs.retry.is_none());
+        assert!(outputs.take_ready_queued().is_none());
+        assert!(!outputs.capture_blocked());
+    }
+
+    #[test]
+    fn cancelled_startup_resumes_capture_and_retains_the_existing_mode() {
+        let mut outputs = startup(1920, 1080);
+        outputs.current = CurrentMode::Known(size(1366, 768));
+        let startup = outputs
+            .take_ready_queued()
+            .expect("startup should be queued");
+
+        assert_eq!(
+            outputs.cancel_request(startup, ManagerSerial::new(9), Instant::now()),
+            CancelOutcome::StartupFailed(StartupFailure::new(
+                size(1920, 1080),
+                StartupFailureReason::Cancelled,
+            ))
+        );
+        assert_eq!(outputs.current, CurrentMode::Known(size(1366, 768)));
+        assert!(outputs.retry.is_none());
+        assert!(outputs.take_ready_queued().is_none());
+        assert!(!outputs.capture_blocked());
+    }
+
+    #[test]
+    fn timed_out_startup_resumes_capture_and_retains_the_existing_mode() {
+        let mut outputs = startup(1920, 1080);
+        outputs.current = CurrentMode::Known(size(1366, 768));
+        let startup = outputs
+            .take_ready_queued()
+            .expect("startup should be queued");
+
+        assert_eq!(
+            outputs.recover_configuration_timeout(startup),
+            OutputTimeout::StartupConfiguration(StartupFailure::new(
+                size(1920, 1080),
+                StartupFailureReason::TimedOut,
+            ))
+        );
+        assert_eq!(outputs.current, CurrentMode::Known(size(1366, 768)));
+        assert!(outputs.retry.is_none());
+        assert!(outputs.take_ready_queued().is_none());
+        assert!(!outputs.capture_blocked());
+    }
+
+    #[test]
+    fn startup_failure_keeps_a_queued_viewer_resize_usable_without_a_false_ack() {
+        let mut outputs = startup(1920, 1080);
+        outputs.current = CurrentMode::Known(size(1366, 768));
+        let viewer_resize = request_at_scale(4, 1600, 900, 180);
+        outputs.queue_external(viewer_resize);
+        let startup = outputs
+            .take_ready_queued()
+            .expect("startup should run before the viewer resize");
+
+        assert!(matches!(
+            outputs.retry_failed_request(startup),
+            RejectOutcome::StartupFailed(_)
+        ));
+        assert_eq!(outputs.current, CurrentMode::Known(size(1366, 768)));
+        assert!(outputs.retry.is_none());
+        assert_eq!(outputs.take_ready_queued(), Some(viewer_resize));
+        assert!(!outputs.capture_blocked());
+    }
+
+    #[test]
+    fn startup_failure_keeps_requested_mode_and_warning_reason_typed() {
+        let cases = [
+            (
+                StartupFailureReason::Rejected,
+                "compositor rejected the startup output configuration",
+            ),
+            (
+                StartupFailureReason::Cancelled,
+                "compositor cancelled the startup output configuration",
+            ),
+            (
+                StartupFailureReason::TimedOut,
+                "compositor did not finish the startup output configuration",
+            ),
+            (
+                StartupFailureReason::ConfigurationUnavailable,
+                "startup output configuration is unavailable",
+            ),
+        ];
+
+        for (reason, warning_reason) in cases {
+            let failure = StartupFailure::new(size(1920, 1080), reason);
+            assert_eq!(failure.requested().to_string(), "1920x1080");
+            assert_eq!(failure.reason().reason(), warning_reason);
+        }
     }
 
     #[test]
@@ -839,7 +1118,7 @@ mod tests {
         assert_eq!(
             outputs.retry_failed_request(final_request),
             RejectOutcome::Retrying {
-                operation: ResizeOperation::External,
+                operation: RetryOperation::External,
                 failures: 1,
             }
         );
@@ -866,7 +1145,7 @@ mod tests {
             assert_eq!(
                 outputs.retry_failed_request(request),
                 RejectOutcome::Retrying {
-                    operation: ResizeOperation::DisplayReset,
+                    operation: RetryOperation::DisplayReset,
                     failures,
                 }
             );
@@ -875,7 +1154,7 @@ mod tests {
         assert_eq!(
             outputs.retry_failed_request(request),
             RejectOutcome::Exhausted {
-                operation: ResizeOperation::DisplayReset,
+                operation: RetryOperation::DisplayReset,
                 failures: MAX_RESIZE_STEP_FAILURES,
             }
         );

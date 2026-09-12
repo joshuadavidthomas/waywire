@@ -132,10 +132,6 @@ def main():
             if time.monotonic() >= deadline:
                 raise RuntimeError("labwc did not open its Wayland display within 15 seconds")
             time.sleep(0.1)
-        subprocess.run(
-            ["wlr-randr", "--output", "HEADLESS-1", "--custom-mode", "1280x720@60Hz"],
-            check=True, timeout=5,
-        )
         gateway = owned.enter_context(child([
             str(root / "waywire-gateway"), "--listen", "0.0.0.0:8080",
             "--streamd", str(root / "waywire-streamd"),

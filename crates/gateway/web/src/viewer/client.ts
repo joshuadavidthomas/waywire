@@ -27,6 +27,8 @@ function viewerElements(): ViewerElements {
     element instanceof HTMLInputElement;
   const select = (element: Element): element is HTMLSelectElement =>
     element instanceof HTMLSelectElement;
+  const option = (element: Element): element is HTMLOptionElement =>
+    element instanceof HTMLOptionElement;
   const label = (element: Element): element is HTMLLabelElement =>
     element instanceof HTMLLabelElement;
   return {
@@ -51,7 +53,10 @@ function viewerElements(): ViewerElements {
     sendClipboardButton: requireElement("#send-clipboard", button),
     copyClipboardButton: requireElement("#copy-clipboard", button),
     resolutionSelect: requireElement("#resolution", select),
+    resolutionStatusOption: requireElement("#resolution-status", option),
     resolutionLabel: requireElement("#resolution-label", label),
+    qualitySelect: requireElement("#quality", select),
+    qualityLabel: requireElement("#quality-label", label),
     hudToggle: requireElement("#hud-toggle", input),
     resetVideoButton: requireElement("#reset-video", button),
     clipboardStatus: requireElement("#clipboard-status", html),
@@ -68,11 +73,6 @@ function startViewer(): void {
     latency: initialPlayoutTargetMs,
     // Sample every drawn frame for playout control; the HUD throttles its own updates.
     statsIntervalMs: 0,
-    remoteDisplay: {
-      mode: "observe",
-      element: elements.display,
-      devicePixelRatio: 1,
-    },
   });
   const listeners = new AbortController();
   let surface: SurfaceHandle | undefined;

@@ -3,7 +3,7 @@ mod quality;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::PoisonError;
+use std::sync::MutexGuard;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -12,11 +12,13 @@ use tokio::sync::watch;
 use tracing::info;
 use waywire_protocol::browser::Feedback;
 use waywire_protocol::browser::QualityLevels;
+use waywire_protocol::browser::QualityPreset;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality as QualityCommand;
 use waywire_protocol::pipe::ReleaseAll;
+use waywire_protocol::pipe::Resize;
 
 use self::quality::Quality;
 use crate::daemon::CommandSink;
@@ -169,11 +171,61 @@ impl Sessions {
         Ok(InputOutcome::Sent)
     }
 
+    pub(crate) async fn resize(&self, socket: SocketId, resize: Resize) -> Result<ResizeOutcome> {
+        let book = self.ownership.lock().await;
+        if book
+            .input_owner
+            .is_some_and(|input_owner| input_owner.socket != socket)
+        {
+            return Ok(ResizeOutcome::InputOwnedByAnother);
+        }
+
+        // Resize changes shared display state rather than injecting user input.
+        // Holding the ownership lock orders an accepted resize before any later
+        // release or acquisition, and system authority keeps it valid in the queue.
+        self.commands.system(Command::Resize(resize)).await?;
+        Ok(ResizeOutcome::Sent)
+    }
+
     pub(crate) fn quality(&self) -> QualityLevels {
-        self.quality
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .levels()
+        self.quality_ladder().levels()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quality_chroma(&self) -> waywire_protocol::pipe::Chroma {
+        self.quality_ladder().chroma()
+    }
+
+    fn quality_ladder(&self) -> MutexGuard<'_, Quality> {
+        match self.quality.lock() {
+            Ok(quality) => quality,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) async fn set_quality(
+        &self,
+        socket: SocketId,
+        preset: QualityPreset,
+    ) -> Result<SetQualityOutcome> {
+        let book = self.ownership.lock().await;
+        let Some(input_owner) = book.input_owner else {
+            return Ok(SetQualityOutcome::NotInputOwner);
+        };
+        if input_owner.socket != socket {
+            return Ok(SetQualityOutcome::NotInputOwner);
+        }
+
+        let (change, levels) = {
+            let mut quality = self.quality_ladder();
+            let change = quality.select_preset(preset);
+            (change, quality.levels())
+        };
+        let Some(change) = change else {
+            return Ok(SetQualityOutcome::Unchanged(levels));
+        };
+        self.write_quality_change(socket, change).await?;
+        Ok(SetQualityOutcome::Changed(levels))
     }
 
     pub(crate) async fn feedback(
@@ -190,30 +242,45 @@ impl Sessions {
         }
 
         let (change, levels) = {
-            let mut quality = self.quality.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut quality = self.quality_ladder();
             let change = quality.update(&feedback, Instant::now());
             (change, quality.levels())
         };
         if let Some(change) = change {
-            info!(
-                ?socket,
-                old = ?change.old,
-                new = ?change.new,
-                "quality levels changed"
-            );
-            // Quality is daemon state, not user input. Holding the input ownership
-            // lock puts this command before a release and any later acquisition.
-            // The lock can be held for at worst two PIPE_DEADLINEs during the send.
-            self.commands
-                .system(Command::Quality(QualityCommand {
-                    bitrate_kbps: change.new.bitrate,
-                    fps: change.new.fps,
-                    scale_percent: change.new.scale,
-                }))
-                .await?;
+            self.write_quality_change(socket, change).await?;
         }
 
         Ok(FeedbackOutcome::Applied(levels))
+    }
+
+    async fn write_quality_change(
+        &self,
+        socket: SocketId,
+        change: quality::QualityChange,
+    ) -> Result<()> {
+        info!(
+            ?socket,
+            old = ?change.old,
+            new = ?change.new,
+            old_crf = ?change.old_crf,
+            new_crf = ?change.new_crf,
+            old_chroma = ?change.old_chroma,
+            new_chroma = ?change.new_chroma,
+            "quality levels changed"
+        );
+        // Quality is daemon state, not user input. Callers hold the input ownership
+        // lock, which puts this command before a release and any later acquisition.
+        // The lock can be held for at worst two PIPE_DEADLINEs during the send.
+        self.commands
+            .system(Command::Quality(QualityCommand {
+                bitrate_kbps: change.new.bitrate,
+                fps: change.new.fps,
+                scale_percent: change.new.scale,
+                crf: change.new_crf,
+                chroma: change.new_chroma,
+            }))
+            .await?;
+        Ok(())
     }
 }
 
@@ -236,8 +303,21 @@ pub(crate) enum InputOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeOutcome {
+    Sent,
+    InputOwnedByAnother,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeedbackOutcome {
     Applied(QualityLevels),
+    NotInputOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetQualityOutcome {
+    Changed(QualityLevels),
+    Unchanged(QualityLevels),
     NotInputOwner,
 }
 
@@ -248,6 +328,9 @@ mod tests {
     use tokio::time::timeout;
     use waywire_protocol::InvalidValue;
     use waywire_protocol::browser::FeedbackValues;
+    use waywire_protocol::pipe::FrameSize;
+    use waywire_protocol::pipe::RequestId;
+    use waywire_protocol::pipe::ScaleV120;
 
     use super::*;
     use crate::daemon::TestCommandReceiver;
@@ -301,6 +384,14 @@ mod tests {
             rtt,
         })
         .expect("test feedback should be valid")
+    }
+
+    fn resize_command(request_id: u16) -> Resize {
+        Resize {
+            size: value(FrameSize::new(1280, 720)),
+            scale_v120: value(ScaleV120::new(120)),
+            request_id: value(RequestId::new(request_id)),
+        }
     }
 
     pub(super) fn bad_feedback() -> Feedback {
@@ -439,6 +530,158 @@ mod tests {
             timeout(Duration::from_millis(20), commands.recv())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_without_an_input_owner_survives_a_later_acquisition() {
+        let (sessions, mut commands) = test_sessions();
+        let requester = SocketId::new(2);
+        let resize = resize_command(1);
+
+        assert_eq!(
+            sessions
+                .resize(requester, resize)
+                .await
+                .expect("unowned resize should succeed"),
+            ResizeOutcome::Sent
+        );
+        assert_eq!(
+            sessions
+                .acquire(SocketId::new(1))
+                .await
+                .expect("later ownership should acquire"),
+            OwnershipState::Active
+        );
+        assert_eq!(commands.recv().await, Some(Command::Resize(resize)));
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resize_from_another_socket_is_ignored_while_input_is_owned() {
+        let (sessions, mut commands) = test_sessions();
+        acquire_ownership_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
+
+        assert_eq!(
+            sessions
+                .resize(SocketId::new(2), resize_command(2))
+                .await
+                .expect("nonowner resize check should succeed"),
+            ResizeOutcome::InputOwnedByAnother
+        );
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn input_owner_resize_is_sent_as_shared_state() {
+        let (sessions, mut commands) = test_sessions();
+        let owner = SocketId::new(1);
+        let resize = resize_command(3);
+        acquire_ownership_and_drain(&sessions, &mut commands, owner).await;
+
+        assert_eq!(
+            sessions
+                .resize(owner, resize)
+                .await
+                .expect("owner resize should succeed"),
+            ResizeOutcome::Sent
+        );
+        assert_eq!(commands.recv().await, Some(Command::Resize(resize)));
+    }
+
+    #[tokio::test]
+    async fn non_input_owner_quality_preset_is_ignored() {
+        let (sessions, mut commands) = test_sessions();
+        acquire_ownership_and_drain(&sessions, &mut commands, SocketId::new(1)).await;
+        let before = sessions.quality();
+
+        assert_eq!(
+            sessions
+                .set_quality(SocketId::new(2), QualityPreset::Low)
+                .await
+                .expect("non-input-owner preset check should succeed"),
+            SetQualityOutcome::NotInputOwner
+        );
+        assert_eq!(sessions.quality(), before);
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_quality_preset_clamps_levels_and_only_sends_changed_settings() {
+        let (sessions, mut commands) = test_sessions();
+        let owner = SocketId::new(1);
+        acquire_ownership_and_drain(&sessions, &mut commands, owner).await;
+        let expected = QualityLevels {
+            bitrate: value(Kbps::new(4_000)),
+            fps: value(Fps::new(60)),
+            scale: value(waywire_protocol::pipe::ScalePercent::new(100)),
+        };
+
+        assert_eq!(
+            sessions
+                .set_quality(owner, QualityPreset::Medium)
+                .await
+                .expect("owner preset should apply"),
+            SetQualityOutcome::Changed(expected)
+        );
+        assert_eq!(
+            commands.recv().await,
+            Some(Command::Quality(QualityCommand {
+                bitrate_kbps: expected.bitrate,
+                fps: expected.fps,
+                scale_percent: expected.scale,
+                crf: value(waywire_protocol::pipe::Crf::new(28)),
+                chroma: waywire_protocol::pipe::Chroma::Yuv444,
+            }))
+        );
+        assert_eq!(
+            sessions
+                .set_quality(owner, QualityPreset::Medium)
+                .await
+                .expect("same preset should be accepted"),
+            SetQualityOutcome::Unchanged(expected)
+        );
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn crf_only_preset_change_sends_an_encoder_command() {
+        let (sessions, mut commands) = test_sessions();
+        let owner = SocketId::new(1);
+        acquire_ownership_and_drain(&sessions, &mut commands, owner).await;
+        let expected = sessions.quality();
+
+        assert_eq!(
+            sessions
+                .set_quality(owner, QualityPreset::High)
+                .await
+                .expect("high preset should apply"),
+            SetQualityOutcome::Changed(expected)
+        );
+        assert_eq!(
+            commands.recv().await,
+            Some(Command::Quality(QualityCommand {
+                bitrate_kbps: expected.bitrate,
+                fps: expected.fps,
+                scale_percent: expected.scale,
+                crf: value(waywire_protocol::pipe::Crf::new(18)),
+                chroma: waywire_protocol::pipe::Chroma::Yuv444,
+            }))
         );
     }
 
