@@ -1,0 +1,52 @@
+name: zizmor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/**
+      - .github/workflows/**
+      - .github/zizmor.yml
+  pull_request:
+    paths:
+      - .github/actions/**
+      - .github/workflows/**
+      - .github/zizmor.yml
+
+concurrency:
+  group: zizmor-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_COLOR: "1"
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Run zizmor 🌈
+        run: uvx zizmor --format=sarif . > results.sarif
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          sarif_file: results.sarif
+          category: zizmor

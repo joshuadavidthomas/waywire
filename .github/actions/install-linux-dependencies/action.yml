@@ -1,0 +1,17 @@
+name: Install Linux dependencies
+description: Install the native build tools and test dependencies required by waywire
+
+runs:
+  using: composite
+  steps:
+    # xkbcommon links libxkbcommon directly. Wayland uses its pure-Rust backend,
+    # so neither libwayland-dev nor pkg-config is needed. Tests do not run FFmpeg
+    # or a compositor; Python and ShellCheck cover the desktop scripts.
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          libxkbcommon-dev \
+          python3 \
+          shellcheck

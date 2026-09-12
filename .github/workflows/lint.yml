@@ -1,0 +1,240 @@
+name: lint
+
+on:
+  pull_request:
+    paths:
+      - .github/**
+      - .cargo/**
+      - .gitignore
+      - .pre-commit-config.yaml
+      - .prettierignore
+      - .prettierrc
+      - .rustfmt.toml
+      - "**/*.md"
+      - Cargo.lock
+      - Cargo.toml
+      - clippy.toml
+      - crates/**
+      - desktop/**
+      - integrations/**
+      - Justfile
+      - LICENSE
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - rust-toolchain.toml
+      - scripts/**
+      - tools/**
+      - tsconfig.base.json
+  push:
+    branches: [main]
+    paths:
+      - .github/**
+      - .cargo/**
+      - .gitignore
+      - .pre-commit-config.yaml
+      - .prettierignore
+      - .prettierrc
+      - .rustfmt.toml
+      - "**/*.md"
+      - Cargo.lock
+      - Cargo.toml
+      - clippy.toml
+      - crates/**
+      - desktop/**
+      - integrations/**
+      - Justfile
+      - LICENSE
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - rust-toolchain.toml
+      - scripts/**
+      - tools/**
+      - tsconfig.base.json
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_COLOR: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          activate-environment: true
+          enable-cache: true
+
+      # Keep uv discoverable by pre-commit environments, as in the other repos.
+      - run: |
+          mkdir -p ~/.local/bin
+          ln -sf "$(command -v uv)" ~/.local/bin/uv
+
+      - name: Install just
+        run: uv tool install rust-just
+
+      # Bootstrap with the runner's npm; the next step uses the declared Node
+      # range instead of whichever Node version the runner image provides.
+      - name: Install Node from package.json
+        run: |
+          npm install --prefix "$RUNNER_TEMP/waywire-node" --no-package-lock --no-audit --no-fund \
+            "node@$(node -p 'require("./package.json").engines.node')" corepack
+          echo "$RUNNER_TEMP/waywire-node/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install pnpm workspace
+        run: |
+          corepack enable --install-directory "$RUNNER_TEMP/waywire-node/node_modules/.bin"
+          pnpm install --frozen-lockfile
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit/
+          key: pre-commit-1|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run prek
+        # Point prek at the cached directory rather than its default ~/.cache/prek.
+        run: PREK_HOME="$HOME/.cache/pre-commit" SKIP=cargo-fmt,cargo-clippy just lint
+
+  rust-changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # paths-filter reads the changed-file list through the pull request API.
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '.github/actions/install-linux-dependencies/**'
+              - '.github/workflows/lint.yml'
+              - '.cargo/**'
+              - '.rustfmt.toml'
+              - 'crates/**/*.rs'
+              - 'crates/**/Cargo.toml'
+              - 'crates/**/Cargo.lock'
+              - 'crates/**/clippy.toml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'clippy.toml'
+              - 'Justfile'
+              - 'rust-toolchain.toml'
+              - 'tools/rustfmt/rust-toolchain.toml'
+
+  rustfmt:
+    runs-on: ubuntu-24.04
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache rustup toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup
+          key: ${{ runner.os }}-${{ runner.arch }}-rustup-nightly-${{ hashFiles('tools/rustfmt/rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rustup-nightly-
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-
+            ${{ runner.os }}-cargo-registry-
+
+      - id: rustfmt-toolchain
+        name: Read rustfmt toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' tools/rustfmt/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: ${{ steps.rustfmt-toolchain.outputs.channel }}
+          components: rustfmt
+
+      - name: Run rustfmt
+        working-directory: tools/rustfmt
+        run: cargo fmt --manifest-path "${{ github.workspace }}/Cargo.toml" --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/install-linux-dependencies
+
+      - name: Cache rustup toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup
+          key: ${{ runner.os }}-${{ runner.arch }}-rustup-pinned-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rustup-pinned-
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-
+            ${{ runner.os }}-cargo-registry-
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          components: clippy
+
+      - name: Install Node from package.json
+        run: |
+          npm install --prefix "$RUNNER_TEMP/waywire-node" --no-package-lock --no-audit --no-fund \
+            "node@$(node -p 'require("./package.json").engines.node')" corepack
+          echo "$RUNNER_TEMP/waywire-node/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Build embedded viewer
+        run: |
+          corepack enable --install-directory "$RUNNER_TEMP/waywire-node/node_modules/.bin"
+          pnpm install --frozen-lockfile
+          pnpm --filter @waywire/web build
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

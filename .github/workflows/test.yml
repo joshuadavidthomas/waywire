@@ -1,0 +1,112 @@
+name: test
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/actions/install-linux-dependencies/**
+      - .github/workflows/test.yml
+      - .cargo/**
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - desktop/**
+      - integrations/**
+      - Justfile
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - rust-toolchain.toml
+      - scripts/**
+      - tsconfig.base.json
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/install-linux-dependencies/**
+      - .github/workflows/test.yml
+      - .cargo/**
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - desktop/**
+      - integrations/**
+      - Justfile
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - rust-toolchain.toml
+      - scripts/**
+      - tsconfig.base.json
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_COLOR: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/install-linux-dependencies
+
+      - name: Cache rustup toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup
+          key: ${{ runner.os }}-${{ runner.arch }}-rustup-pinned-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rustup-pinned-
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-
+            ${{ runner.os }}-cargo-registry-
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install just
+        run: uv tool install rust-just
+
+      - name: Install Node from package.json
+        run: |
+          npm install --prefix "$RUNNER_TEMP/waywire-node" --no-package-lock --no-audit --no-fund \
+            "node@$(node -p 'require("./package.json").engines.node')" corepack
+          echo "$RUNNER_TEMP/waywire-node/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install pnpm workspace
+        run: |
+          corepack enable --install-directory "$RUNNER_TEMP/waywire-node/node_modules/.bin"
+          pnpm install --frozen-lockfile
+
+      # The archive test has a short deadline. Compile release dependencies first
+      # so a cold runner does not spend that deadline building them.
+      - name: Build release binaries
+        run: just build
+
+      - name: Test
+        run: just test

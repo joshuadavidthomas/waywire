@@ -56,7 +56,9 @@ done
 sudo -n true 2>/dev/null || fail 'the sprite user needs passwordless sudo'
 # shellcheck disable=SC1091 # fixed system file on the supported image
 . /etc/os-release
-[ "${ID:-}" = ubuntu ] && [ "${VERSION_CODENAME:-}" = resolute ] || fail 'only Ubuntu 26.04 (resolute) is supported'
+if [ "${ID:-}" != ubuntu ] || [ "${VERSION_CODENAME:-}" != resolute ]; then
+  fail 'only Ubuntu 26.04 (resolute) is supported'
+fi
 [ "$(dpkg --print-architecture)" = amd64 ] || fail 'only amd64 is supported'
 sudo install -d -m 1777 /run/lock
 exec 9>/var/lock/waywire-install.lock
