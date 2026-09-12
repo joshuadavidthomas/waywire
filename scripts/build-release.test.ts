@@ -18,19 +18,11 @@ test(
     const output = join(root, "dist/releases", version);
     const unpacked = await mkdtemp(join(tmpdir(), "socket-release-test-"));
     try {
-      await exec(
-        "pnpm",
-        [
-          "exec",
-          "tsx",
-          "scripts/build-release.ts",
-          "--version",
-          version,
-          "--source",
-          "local-contract-test",
-        ],
-        { cwd: root, timeout: 150_000, maxBuffer: 4 << 20 },
-      );
+      await exec("just", ["release", version, "local-contract-test"], {
+        cwd: root,
+        timeout: 150_000,
+        maxBuffer: 4 << 20,
+      });
       const archiveName = `waywire-${version}-linux-amd64.tar.gz`;
       const archive = join(output, archiveName);
       const digest = createHash("sha256")

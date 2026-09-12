@@ -1536,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "waywire-gateway"
-version = "0.1.0-dev"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "waywire-protocol"
-version = "0.1.0-dev"
+version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "waywire-streamd"
-version = "0.1.0-dev"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "calloop",

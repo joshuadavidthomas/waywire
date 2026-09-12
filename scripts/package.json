@@ -1,14 +1,14 @@
 {
-  "name": "@waywire/sprite",
+  "name": "@waywire/scripts",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
-    "provision": "tsx src/provision.ts"
+    "release": "tsx build-release.ts",
+    "test": "tsx --test build-release.test.ts"
   },
   "dependencies": {
-    "@fly/sprites": "0.2.2",
     "semver": "catalog:"
   },
   "devDependencies": {

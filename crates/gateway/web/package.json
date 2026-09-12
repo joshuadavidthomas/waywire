@@ -10,9 +10,9 @@
     "test": "tsx --test src/sdk/*.test.ts src/viewer/*.test.ts"
   },
   "devDependencies": {
-    "@types/node": "24.13.3",
-    "tsx": "4.21.0",
-    "typescript": "6.0.3",
+    "@types/node": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
     "vite": "8.2.2"
   }
 }

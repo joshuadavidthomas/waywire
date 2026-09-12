@@ -4,7 +4,7 @@ waywire streams a wlroots Wayland desktop to a browser. A Rust stream daemon cap
 
 ## Requirements
 
-- Node.js 24 or newer
+- Node.js 26 or newer
 - pnpm 11.9.0, as declared in `package.json`
 - the Rust toolchains declared in `rust-toolchain.toml` and `tools/rustfmt/rust-toolchain.toml`
 - [just](https://just.systems/) and [uv](https://docs.astral.sh/uv/)

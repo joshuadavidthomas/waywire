@@ -1,29 +1,28 @@
 [package]
 name = "waywire-streamd"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
-rust-version.workspace = true
-publish.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-calloop.workspace = true
-calloop-wayland-source.workspace = true
-clap.workspace = true
-memmap2.workspace = true
-nix.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-waywire-protocol.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-wayland-client.workspace = true
-wayland-protocols.workspace = true
-wayland-protocols-misc.workspace = true
-wayland-protocols-wlr.workspace = true
-xcursor.workspace = true
-xkbcommon.workspace = true
+waywire-protocol = { workspace = true }
+
+anyhow = { workspace = true }
+calloop = { workspace = true }
+calloop-wayland-source = { workspace = true }
+clap = { workspace = true }
+memmap2 = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true }
+wayland-protocols-misc = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+xcursor = { workspace = true }
+xkbcommon = { workspace = true }
 
 [lints]
 workspace = true

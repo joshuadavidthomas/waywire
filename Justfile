@@ -49,7 +49,7 @@ sprite-provision SPRITE RELEASE:
     pnpm --filter @waywire/sprite provision --sprite "{{ SPRITE }}" --release "{{ RELEASE }}"
 
 release VERSION SOURCE:
-    pnpm exec tsx scripts/build-release.ts --version "{{ VERSION }}" --source "{{ SOURCE }}"
+    pnpm --filter @waywire/scripts release --version "{{ VERSION }}" --source "{{ SOURCE }}"
 
 rustfmt-check:
     cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all -- --check
@@ -59,7 +59,7 @@ test: build-web
     cargo test --locked --workspace
     python3 -m unittest discover -s desktop -p 'test_*.py'
     shellcheck desktop/desktop.sh integrations/sprite/install.sh
-    pnpm exec tsx --test scripts/build-release.test.ts
+    pnpm --filter @waywire/scripts test
 
 test-streamd *ARGS:
     cargo test --locked -p waywire-streamd -- --ignored {{ ARGS }}
@@ -67,3 +67,4 @@ test-streamd *ARGS:
 typecheck:
     pnpm --filter @waywire/web check
     pnpm --filter @waywire/sprite check
+    pnpm --filter @waywire/scripts check
