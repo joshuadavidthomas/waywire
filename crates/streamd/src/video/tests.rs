@@ -178,7 +178,11 @@ fn shared() -> Arc<Shared> {
 fn nonblocking_pipe() -> (File, File, usize) {
     let (reader, writer) = pipe().expect("test pipe should open");
     let requested_capacity = 64 * 1024;
-    let _ = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(requested_capacity));
+    if let Err(error) = fcntl(&writer, FcntlArg::F_SETPIPE_SZ(requested_capacity)) {
+        // Pipe quotas may deny growth. These tests fill the measured capacity,
+        // not the requested capacity, so the existing pipe size is sufficient.
+        eprintln!("test pipe size request was refused; using measured capacity: {error}");
+    }
     let capacity = usize::try_from(
         fcntl(&writer, FcntlArg::F_GETPIPE_SZ).expect("test pipe capacity should be readable"),
     )
@@ -1224,7 +1228,11 @@ fn worker_inherits_blocked_signal_and_child_resets_mask_before_exec() {
     let status = match status_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(status) => status,
         Err(error) => {
-            let _ = kill(child_pid, Signal::SIGKILL);
+            if let Err(cleanup_error) = kill(child_pid, Signal::SIGKILL) {
+                // The timeout already fails this test, and the child may have
+                // exited meanwhile. Keep joining the worker to finish reaping it.
+                eprintln!("test child {child_pid} SIGKILL cleanup failed: {cleanup_error}");
+            }
             worker
                 .join()
                 .expect("test worker thread should finish cleanly");

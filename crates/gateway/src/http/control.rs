@@ -362,7 +362,16 @@ async fn finish_control_socket(
             Ok(Err(error)) => Some(anyhow::Error::new(error).context("control writer task failed")),
             Err(_elapsed) => {
                 writer.abort();
-                let _ = writer.await;
+                // Join after abort so the task releases its resources. Cancellation
+                // is expected; a raced failure or panic still deserves a diagnostic.
+                match writer.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!(%error, "control writer failed during timeout cleanup"),
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        warn!(%error, "control writer task failed during timeout cleanup");
+                    }
+                }
                 Some(anyhow!(
                     "control writer did not stop within {WRITE_LIMIT:?}"
                 ))

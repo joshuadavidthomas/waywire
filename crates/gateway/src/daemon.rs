@@ -16,6 +16,7 @@ use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 use waywire_protocol::pipe::Fps;
@@ -141,7 +142,11 @@ impl Daemon {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let _ = self.shutdown.send(()).await;
+        if let Err(error) = self.shutdown.send(()).await {
+            // Only the supervisor owns the receiver. If it is gone, shutdown
+            // is already in progress or complete; there is nobody left to notify.
+            debug!(%error, "daemon supervisor already stopped accepting shutdown requests");
+        }
     }
 }
 

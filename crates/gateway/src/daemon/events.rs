@@ -126,7 +126,11 @@ impl AppEvents {
     }
 
     fn publish(&self, value: ClientEvent) {
-        let _ = self.tx.send(value);
+        // Broadcast fails only when no viewer is subscribed. That is normal:
+        // current clipboard/cursor state is retained for the next subscriber's
+        // snapshot, and the successful send's receiver count is not needed.
+        let publication = self.tx.send(value);
+        drop(publication);
     }
 
     #[cfg(test)]

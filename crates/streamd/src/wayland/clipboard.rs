@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -19,6 +20,7 @@ use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use nix::unistd::pipe;
+use tracing::warn;
 use wayland_client::QueueHandle;
 use wayland_client::protocol::wl_seat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
@@ -35,6 +37,8 @@ const TEXT_MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/
 const MAX_INCOMING_TRANSFERS: usize = 4;
 const MAX_OUTGOING_TRANSFERS: usize = 4;
 const TRANSFER_STALL_LIMIT: Duration = Duration::from_secs(2);
+const COMPLETION_STALL_LIMIT: Duration = Duration::from_secs(2);
+const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 struct Offer {
     proxy: ext_data_control_offer_v1::ExtDataControlOfferV1,
@@ -328,11 +332,53 @@ fn spawn_read(
                 }
             };
             if let Some(result) = result {
-                let _ = sender.try_send(ControlMessage::ClipboardReceived { generation, result });
+                send_read_completion(
+                    &sender,
+                    &current_generation,
+                    generation,
+                    result,
+                    COMPLETION_STALL_LIMIT,
+                );
             }
             drop(permit_guard);
         })
         .context("start clipboard reader")
+}
+
+fn send_read_completion(
+    sender: &SyncSender<ControlMessage>,
+    current_generation: &AtomicU64,
+    generation: u64,
+    result: std::result::Result<ClipboardText, String>,
+    stall_limit: Duration,
+) {
+    let started = Instant::now();
+    let mut message = ControlMessage::ClipboardReceived { generation, result };
+    loop {
+        if current_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        match sender.try_send(message) {
+            Ok(()) => return,
+            Err(mpsc::TrySendError::Disconnected(_message)) => {
+                if current_generation.load(Ordering::SeqCst) == generation {
+                    warn!(generation, "clipboard completion receiver disconnected");
+                }
+                return;
+            }
+            Err(mpsc::TrySendError::Full(returned)) => {
+                message = returned;
+                if current_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if started.elapsed() >= stall_limit {
+                    warn!(generation, "clipboard completion queue remained full");
+                    return;
+                }
+                thread::sleep(COMPLETION_RETRY_INTERVAL);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -396,5 +442,119 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert!(TransferPermit::reserve(active, 1).is_some());
         drop(reader_guard);
+    }
+
+    #[test]
+    fn completed_read_retries_a_full_queue_until_delivery() {
+        let (sender, receiver) = calloop::channel::sync_channel(1);
+        assert!(
+            sender
+                .try_send(ControlMessage::ClipboardReceived {
+                    generation: 6,
+                    result: Err("queue filler".to_owned()),
+                })
+                .is_ok()
+        );
+        let (reader, writer) = pipe().expect("test pipe should open");
+        File::from(writer)
+            .write_all(b"latest clipboard")
+            .expect("test clipboard should be written");
+        let active = Arc::new(AtomicUsize::new(0));
+        let permit = TransferPermit::reserve(Arc::clone(&active), 1)
+            .expect("first incoming transfer slot should be available");
+        let current_generation = Arc::new(AtomicU64::new(7));
+        let handle = spawn_read(reader, 7, Arc::clone(&current_generation), sender, permit)
+            .expect("clipboard reader thread should start");
+
+        thread::sleep(Duration::from_millis(25));
+        let ControlMessage::ClipboardReceived {
+            generation: filler_generation,
+            ..
+        } = receiver
+            .try_recv()
+            .expect("the queue filler should still occupy the queue");
+        assert_eq!(filler_generation, 6);
+        handle
+            .join()
+            .expect("clipboard reader thread should finish cleanly");
+
+        let ControlMessage::ClipboardReceived { generation, result } = receiver
+            .try_recv()
+            .expect("the completed clipboard read should be retried");
+        assert_eq!(generation, 7);
+        assert_eq!(
+            result.expect("the test clipboard should be valid").as_str(),
+            "latest clipboard"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn superseding_a_completed_read_waiting_on_a_full_queue_releases_its_permit() {
+        let (sender, receiver) = calloop::channel::sync_channel(1);
+        assert!(
+            sender
+                .try_send(ControlMessage::ClipboardReceived {
+                    generation: 10,
+                    result: Err("queue filler".to_owned()),
+                })
+                .is_ok()
+        );
+        let (reader, writer) = pipe().expect("test pipe should open");
+        File::from(writer)
+            .write_all(b"superseded clipboard")
+            .expect("test clipboard should be written");
+        let active = Arc::new(AtomicUsize::new(0));
+        let permit = TransferPermit::reserve(Arc::clone(&active), 1)
+            .expect("first incoming transfer slot should be available");
+        let current_generation = Arc::new(AtomicU64::new(11));
+        let handle = spawn_read(
+            reader,
+            11,
+            Arc::clone(&current_generation),
+            sender.clone(),
+            permit,
+        )
+        .expect("clipboard reader thread should start");
+
+        thread::sleep(Duration::from_millis(25));
+        current_generation.store(12, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("superseded clipboard reader should finish cleanly");
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(TransferPermit::reserve(Arc::clone(&active), 1).is_some());
+        let ControlMessage::ClipboardReceived { generation, .. } = receiver
+            .try_recv()
+            .expect("the queue filler should remain queued");
+        assert_eq!(generation, 10);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn disconnected_completion_queue_does_not_strand_a_read_permit() {
+        let (sender, receiver) = calloop::channel::sync_channel(1);
+        drop(receiver);
+        let (reader, writer) = pipe().expect("test pipe should open");
+        File::from(writer)
+            .write_all(b"orphaned clipboard")
+            .expect("test clipboard should be written");
+        let active = Arc::new(AtomicUsize::new(0));
+        let permit = TransferPermit::reserve(Arc::clone(&active), 1)
+            .expect("first incoming transfer slot should be available");
+        let current_generation = Arc::new(AtomicU64::new(13));
+        let handle = spawn_read(reader, 13, current_generation, sender, permit)
+            .expect("clipboard reader thread should start");
+
+        handle
+            .join()
+            .expect("disconnected clipboard reader should finish cleanly");
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(TransferPermit::reserve(active, 1).is_some());
     }
 }

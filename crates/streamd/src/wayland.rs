@@ -235,7 +235,12 @@ pub(crate) fn run(options: Options) -> Result<()> {
             state.fail(error.into());
         }
     }
-    let _ = state.input.release_all();
+    if let Err(error) = state.input.release_all() {
+        // Finish all teardown even if releasing input fails. Report the failure
+        // and return it unless an earlier failure already explains the shutdown.
+        warn!(%error, "could not release input during shutdown");
+        state.fail(error.context("release input during shutdown"));
+    }
     state.clipboard.cancel_transfers();
     if let Some(video) = state.video.take() {
         video.stop();

@@ -11,6 +11,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tracing::debug;
 use waywire_protocol::Record;
 use waywire_protocol::pipe::Command;
 
@@ -160,9 +161,12 @@ impl CommandSink {
 
     fn fail<T>(&self, error: CommandSinkError) -> Result<T, CommandSinkError> {
         self.readiness.stop();
-        // The first fatal error shuts down the session. Later failures need
-        // neither additional queue space nor a second shutdown transition.
-        let _ = self.fatal.try_send(error.clone());
+        // A full queue already holds a fatal error; a closed queue means the
+        // supervisor is stopping. Neither needs another shutdown notification,
+        // and the original error still goes back to this caller.
+        if let Err(notification_error) = self.fatal.try_send(error.clone()) {
+            debug!(%notification_error, "fatal command notification no longer needed");
+        }
         Err(error)
     }
 

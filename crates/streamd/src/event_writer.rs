@@ -13,6 +13,7 @@ use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use thiserror::Error;
+use tracing::error;
 use waywire_protocol::Record;
 use waywire_protocol::pipe::Event;
 
@@ -126,8 +127,13 @@ impl EventWriter {
             queue.stopping = true;
             self.shared.ready.notify_one();
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Err(panic) = thread.join()
+        {
+            // The panic hook reported the payload. Keep Drop non-panicking so
+            // the remaining process and Wayland cleanup can still run.
+            error!("event writer thread panicked; continuing shutdown");
+            drop(panic);
         }
     }
 }

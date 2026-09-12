@@ -359,8 +359,13 @@ impl VideoEncoder {
             pool.stopping = true;
             self.shared.work.notify_all();
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(worker) = self.worker.take()
+            && let Err(panic) = worker.join()
+        {
+            // The panic hook reported the payload. Do not unwind from Drop
+            // and prevent the remaining shutdown steps from running.
+            error!("video worker thread panicked; continuing shutdown");
+            drop(panic);
         }
     }
 
@@ -429,9 +434,20 @@ impl EncoderProcess {
 }
 
 fn reap_child(child: &mut Child) {
-    if !matches!(child.try_wait(), Ok(Some(_))) {
-        let _ = child.kill();
-        let _ = child.wait();
+    match child.try_wait() {
+        Ok(Some(_status)) => return,
+        Ok(None) => {}
+        Err(error) => error!(pid = child.id(), %error, "could not inspect ffmpeg exit status"),
+    }
+    if let Err(error) = child.kill() {
+        // The child may have exited since try_wait. Still wait below to reap it;
+        // a failed signal alone does not establish that cleanup is complete.
+        error!(pid = child.id(), %error, "could not kill ffmpeg during cleanup");
+    }
+    if let Err(error) = child.wait() {
+        // This also runs while unwinding a failed spawn. Preserve that original
+        // failure and report reaping trouble without panicking during cleanup.
+        error!(pid = child.id(), %error, "could not reap ffmpeg during cleanup");
     }
 }
 
