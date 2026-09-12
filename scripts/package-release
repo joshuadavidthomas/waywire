@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+version=${1#v}
+
+just build
+
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+name="waywire-$version-linux-amd64"
+mkdir -p "$temporary/$name/bin"
+install -m 0755 target/release/waywire-gateway target/release/waywire-streamd \
+  desktop/desktop.sh desktop/session.py "$temporary/$name/bin/"
+install -m 0644 README.md LICENSE "$temporary/$name/"
+
+rm -rf dist/release
+mkdir -p dist/release
+tar_options=(--sort=name --owner=0 --group=0 --numeric-owner)
+if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+  tar_options+=(--mtime="@$SOURCE_DATE_EPOCH")
+fi
+tar "${tar_options[@]}" -czf "dist/release/$name.tar.gz" -C "$temporary" "$name"
+(cd dist/release && sha256sum ./*.tar.gz | sort -k2 > SHA256SUMS)
+echo "Release artifacts written to $(pwd)/dist/release"

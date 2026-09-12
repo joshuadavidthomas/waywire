@@ -9,12 +9,6 @@ catalogs:
     '@types/node':
       specifier: 26.5.1
       version: 26.5.1
-    '@types/semver':
-      specifier: 7.8.0
-      version: 7.8.0
-    semver:
-      specifier: 7.8.5
-      version: 7.8.5
     tsx:
       specifier: 4.21.0
       version: 4.21.0
@@ -44,47 +38,6 @@ importers:
       vite:
         specifier: 8.2.2
         version: 8.2.2(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.21.0)
-
-  integrations/sprite:
-    dependencies:
-      '@fly/sprites':
-        specifier: 0.2.2
-        version: 0.2.2
-      semver:
-        specifier: 'catalog:'
-        version: 7.8.5
-    devDependencies:
-      '@types/node':
-        specifier: 'catalog:'
-        version: 26.5.1
-      '@types/semver':
-        specifier: 'catalog:'
-        version: 7.8.0
-      tsx:
-        specifier: 'catalog:'
-        version: 4.21.0
-      typescript:
-        specifier: 'catalog:'
-        version: 6.0.3
-
-  scripts:
-    dependencies:
-      semver:
-        specifier: 'catalog:'
-        version: 7.8.5
-    devDependencies:
-      '@types/node':
-        specifier: 'catalog:'
-        version: 26.5.1
-      '@types/semver':
-        specifier: 'catalog:'
-        version: 7.8.0
-      tsx:
-        specifier: 'catalog:'
-        version: 4.21.0
-      typescript:
-        specifier: 'catalog:'
-        version: 6.0.3
 
 packages:
 
@@ -400,12 +353,6 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@fly/sprites@0.2.2':
-    resolution: {integrity: sha512-qlVLIvBBmS/c/i8Ah9ydcdkho/kEW2w5pX7UaUjp4Ye5mBD3eJi53lXBg33F0Rwna+U6fuEELLrDWxGe/Vk97A==}
-    engines: {node: '>=24.0.0'}
-    bundledDependencies:
-      - '@fly/client-signals'
-
   '@oxc-project/types@0.148.0':
     resolution: {integrity: sha512-Nm4s/jB+4FpFsPhWGEC4h7rzksesmtnMXomo6rCMcg/b8zLQuOziRgkCS1fxDCXOlJB/6Q8oABOZ/OP6RIPj9A==}
 
@@ -510,9 +457,6 @@ packages:
 
   '@types/node@26.5.1':
     resolution: {integrity: sha512-CzNm2FezW4VR/LjG6yUdiEgLE/rAQ9Slj5gCu/C2VrdcW7I0ahNZ8DRbHT7zOZ6r3ONgd/bsQIeSaoDGrd1C6g==}
-
-  '@types/semver@7.8.0':
-    resolution: {integrity: sha512-1mAINjtQCXXeLkJ9ehXkwOcBpqtLxiVtKhpUf83DdRNdQKV0iXZpaHYqRr7nj+wvxuJzoAmAwXI+sCNMv1CzLQ==}
 
   detect-libc@2.1.2:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
@@ -650,11 +594,6 @@ packages:
   rolldown@1.2.7:
     resolution: {integrity: sha512-g0EtLvBjTUB7jhyV0S/TCup3v/XSVl45vUIGbOGU4QPiyjTenCe4mKuFvW9fEgYmS2Fo42AUssRmNuMziXdrig==}
     engines: {node: ^20.19.0 || >=22.12.0}
-    hasBin: true
-
-  semver@7.8.5:
-    resolution: {integrity: sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==}
-    engines: {node: '>=10'}
     hasBin: true
 
   source-map-js@1.2.1:
@@ -879,8 +818,6 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@fly/sprites@0.2.2': {}
-
   '@oxc-project/types@0.148.0': {}
 
   '@rolldown/binding-android-arm-eabi@1.2.7':
@@ -933,8 +870,6 @@ snapshots:
   '@types/node@26.5.1':
     dependencies:
       undici-types: 8.9.0
-
-  '@types/semver@7.8.0': {}
 
   detect-libc@2.1.2: {}
 
@@ -1096,8 +1031,6 @@ snapshots:
       '@rolldown/binding-openharmony-arm64': 1.2.7
       '@rolldown/binding-win32-arm64-msvc': 1.2.7
       '@rolldown/binding-win32-x64-msvc': 1.2.7
-
-  semver@7.8.5: {}
 
   source-map-js@1.2.1: {}
 

@@ -9,28 +9,59 @@ waywire streams a wlroots Wayland desktop to a browser. A Rust stream daemon cap
 - the Rust toolchains declared in `rust-toolchain.toml` and `tools/rustfmt/rust-toolchain.toml`
 - [just](https://just.systems/) and [uv](https://docs.astral.sh/uv/)
 
-## Sprite integration
+## Releases
 
-The Sprite integration installs the headless LXQt/labwc desktop and registers it as a Sprite service. It requires:
-
-- a Fly Sprite with URL authentication set to `sprite`
-- private access set to `admins` in the Sprites dashboard
-- `SPRITES_TOKEN` in the operator's environment
-
-Install dependencies and build a release archive:
+Install development dependencies, then build the binaries and package them:
 
 ```sh
-pnpm install
-just release v1.0.0 REVISION
+pnpm install --frozen-lockfile
+just release 0.1.0-rc.1
 ```
 
-Provision an existing Sprite:
+`just release VERSION` builds the viewer before the Rust binaries and writes
+`dist/release/waywire-<version>-linux-amd64.tar.gz` and `SHA256SUMS`. The version
+must match `[workspace.package]` in `Cargo.toml`; a leading `v` is optional.
+Pushing a `v*` tag runs the tests and publishes a GitHub release. Versions with a
+hyphen are published as prereleases. Only Linux amd64 binaries are packaged.
+
+## Installation
+
+Any Ubuntu machine with the required desktop packages can host waywire; a Fly
+Sprite is one example. Use an amd64 machine with Ubuntu repositories that provide
+`lxqt-wayland-session` and the other packages installed by the setup script.
+
+From a source checkout, install the system packages:
 
 ```sh
-just sprite-provision SPRITE_NAME v1.0.0
+scripts/setup-desktop
 ```
 
-Open the Sprite's private URL after provisioning. The Sprite URL policy authenticates requests before they reach the gateway.
+The script uses sudo and installs Firefox from Mozilla's apt repository because
+Ubuntu's snap Firefox does not work in headless containers or microVMs.
+
+Download the release tarball and checksums, then verify before extracting:
+
+```sh
+version=0.1.0-rc.1
+release="https://github.com/joshuadavidthomas/sprite-desktop/releases/download/v$version"
+curl -fLO "$release/waywire-$version-linux-amd64.tar.gz"
+curl -fLO "$release/SHA256SUMS"
+sha256sum -c SHA256SUMS
+sudo mkdir -p /opt/waywire
+sudo tar -xzf "waywire-$version-linux-amd64.tar.gz" -C /opt/waywire
+sudo ln -sfn "waywire-$version-linux-amd64" /opt/waywire/current
+```
+
+The launcher expects its files at `/opt/waywire/current`. Run it as your regular
+user, passing the public origin your browser will use:
+
+```sh
+/opt/waywire/current/bin/desktop.sh https://desktop.example.com
+```
+
+Route that origin to the gateway on port 8080 with HTTPS and authentication.
+For a Fly Sprite, its private URL can provide this: keep URL authentication set
+to `sprite` and private access set to `admins`.
 
 ## Local checks
 

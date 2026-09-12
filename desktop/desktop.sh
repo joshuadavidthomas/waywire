@@ -9,7 +9,7 @@ readonly wayland_display=wayland-0
 readonly wayland_socket="$runtime_dir/$wayland_display"
 
 [ -n "${HOME:-}" ] || fail 'HOME is not set'
-for command in dbus-run-session ffmpeg flock labwc lxqt-session python3 ss wayland-info; do
+for command in dbus-run-session ffmpeg flock labwc lxqt-session python3 ss; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
 for binary in waywire-gateway waywire-streamd; do

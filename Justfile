@@ -9,6 +9,10 @@ default:
 build-web:
     pnpm --filter @waywire/web build
 
+bumpver *ARGS:
+    uvx bumpver {{ ARGS }}
+    cargo update --workspace
+
 build: build-web
     cargo build --locked --release --workspace
 
@@ -45,11 +49,8 @@ lint *ARGS:
 prettier-check:
     pnpm exec prettier --check .
 
-sprite-provision SPRITE RELEASE:
-    pnpm --filter @waywire/sprite provision --sprite "{{ SPRITE }}" --release "{{ RELEASE }}"
-
-release VERSION SOURCE:
-    pnpm --filter @waywire/scripts release --version "{{ VERSION }}" --source "{{ SOURCE }}"
+release VERSION:
+    scripts/package-release "{{ VERSION }}"
 
 rustfmt-check:
     cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all -- --check
@@ -58,13 +59,10 @@ test: build-web
     pnpm --filter @waywire/web test
     cargo test --locked --workspace
     python3 -m unittest discover -s desktop -p 'test_*.py'
-    shellcheck desktop/desktop.sh integrations/sprite/install.sh
-    pnpm --filter @waywire/scripts test
+    shellcheck desktop/desktop.sh scripts/package-release scripts/setup-desktop
 
 test-streamd *ARGS:
     cargo test --locked -p waywire-streamd -- --ignored {{ ARGS }}
 
 typecheck:
     pnpm --filter @waywire/web check
-    pnpm --filter @waywire/sprite check
-    pnpm --filter @waywire/scripts check

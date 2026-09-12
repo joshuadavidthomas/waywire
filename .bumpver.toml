@@ -1,0 +1,21 @@
+[bumpver]
+commit = true
+commit_message = ":bookmark: bump version {old_version} -> {new_version}"
+current_version = "0.1.0-rc.1"
+push = false
+tag = false
+version_pattern = "MAJOR.MINOR.PATCH[-TAG[.NUM]]"
+
+[bumpver.file_patterns]
+".bumpver.toml" = [
+  '^current_version = "{version}"',
+]
+"Cargo.toml" = [
+  '^version = "{version}"',
+]
+"package.json" = [
+  '"version": "{version}"',
+]
+"crates/gateway/web/package.json" = [
+  '"version": "{version}"',
+]

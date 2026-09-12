@@ -16,7 +16,6 @@ on:
       - clippy.toml
       - crates/**
       - desktop/**
-      - integrations/**
       - Justfile
       - LICENSE
       - package.json
@@ -42,7 +41,6 @@ on:
       - clippy.toml
       - crates/**
       - desktop/**
-      - integrations/**
       - Justfile
       - LICENSE
       - package.json

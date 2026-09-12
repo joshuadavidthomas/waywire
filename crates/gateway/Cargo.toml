@@ -1,6 +1,6 @@
 [package]
 name = "waywire-gateway"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 
 [dependencies]

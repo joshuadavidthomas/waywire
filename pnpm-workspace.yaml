@@ -1,7 +1,5 @@
 packages:
   - crates/gateway/web
-  - integrations/sprite
-  - scripts
 
 catalog:
   "@types/node": 26.5.1

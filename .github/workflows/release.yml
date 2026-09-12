@@ -1,46 +1,8 @@
-name: test
+name: release
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/actions/install-linux-dependencies/**
-      - .github/workflows/test.yml
-      - .github/workflows/release.yml
-      - .cargo/**
-      - Cargo.lock
-      - Cargo.toml
-      - crates/**
-      - desktop/**
-      - Justfile
-      - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
-      - rust-toolchain.toml
-      - scripts/**
-      - tsconfig.base.json
   push:
-    branches: [main]
-    paths:
-      - .github/actions/install-linux-dependencies/**
-      - .github/workflows/test.yml
-      - .github/workflows/release.yml
-      - .cargo/**
-      - Cargo.lock
-      - Cargo.toml
-      - crates/**
-      - desktop/**
-      - Justfile
-      - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
-      - rust-toolchain.toml
-      - scripts/**
-      - tsconfig.base.json
-
-concurrency:
-  group: test-${{ github.ref }}
-  cancel-in-progress: true
+    tags: ["v*"]
 
 permissions: {}
 
@@ -50,14 +12,23 @@ env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
-  test:
+  release:
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify tag is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME points at $GITHUB_SHA which is not on origin/main; refusing to release." >&2
+            exit 1
+          fi
 
       - uses: ./.github/actions/install-linux-dependencies
 
@@ -105,3 +76,22 @@ jobs:
 
       - name: Test
         run: just test
+
+      - name: Package
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          scripts/package-release "${GITHUB_REF_NAME#v}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          options=()
+          [[ "${GITHUB_REF_NAME#v}" == *-* ]] && options+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" \
+            dist/release/*.tar.gz \
+            dist/release/SHA256SUMS \
+            --title "waywire ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --verify-tag \
+            "${options[@]}"
