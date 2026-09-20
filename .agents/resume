@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# No authentication, backing services, or wake-time repairs are required.
+# Toolchains and dependencies are retained in the orb snapshot by setup.

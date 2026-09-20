@@ -16,3 +16,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Orb portal metadata
+.amp/portals/*

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() {
+  local label="$1" started=$SECONDS
+  shift
+  printf '\n==> %s\n' "$label"
+  "$@"
+  printf '==> %s finished in %ss\n' "$label" "$((SECONDS - started))"
+}
+
+system_dependencies() {
+  local package
+  local missing=()
+  for package in build-essential ca-certificates curl libxkbcommon-dev python3 shellcheck ffmpeg; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+      missing+=("$package")
+    fi
+  done
+  if ((${#missing[@]})); then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+  fi
+}
+
+toolchains() {
+  # Persist paths for subsequent Amp and service login shells, not just setup.
+  local marker='# waywire orb toolchains'
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<'PROFILE'
+
+# waywire orb toolchains
+export PATH="$HOME/.local/share/waywire-node/node_modules/.bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+PROFILE
+  fi
+  export PATH="$HOME/.local/share/waywire-node/node_modules/.bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+
+  if ! command -v rustup >/dev/null; then
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | bash -s -- -y --no-modify-path --default-toolchain none
+  fi
+  # rustup reads each directory's toolchain pin and installs missing components.
+  cargo --version
+  cargo clippy --version
+  (cd tools/rustfmt && cargo fmt --version)
+
+  if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 26 ? 0 : 1)' 2>/dev/null; then
+    npm install --prefix "$HOME/.local/share/waywire-node" --no-package-lock --no-audit --no-fund \
+      "node@$(node -p 'require("./package.json").engines.node')"
+  fi
+  local pnpm_package
+  pnpm_package="$(node -p 'require("./package.json").packageManager')"
+  if [[ "$(pnpm --version 2>/dev/null || true)" != "${pnpm_package#pnpm@}" ]]; then
+    npm install --prefix "$HOME/.local/share/waywire-node" --no-package-lock --no-audit --no-fund "$pnpm_package"
+  fi
+  uv tool install rust-just
+  uv tool install prek==0.5.2
+}
+
+step 'System dependencies' system_dependencies
+step 'Toolchains and check runners' toolchains
+step 'JavaScript dependencies' pnpm install --frozen-lockfile
+step 'Rust dependency cache' cargo fetch --locked
+step 'Embedded browser assets' just build-web
+step 'Pre-commit hook environments' prek install-hooks
