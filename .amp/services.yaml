@@ -1,0 +1,8 @@
+services:
+  waywire:
+    command: .agents/serve-desktop
+    platforms: [linux]
+    health: /healthz
+    portal:
+      title: Waywire desktop
+      description: Headless Labwc desktop streamed by this checkout. Restart the service after source changes.

@@ -14,7 +14,7 @@ step() {
 system_dependencies() {
   local package
   local missing=()
-  for package in build-essential ca-certificates curl libxkbcommon-dev python3 shellcheck ffmpeg; do
+  for package in build-essential ca-certificates curl libxkbcommon-dev python3 shellcheck ffmpeg dbus foot fonts-dejavu-core adwaita-icon-theme; do
     if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
       missing+=("$package")
     fi
@@ -63,4 +63,5 @@ step 'Toolchains and check runners' toolchains
 step 'JavaScript dependencies' pnpm install --frozen-lockfile
 step 'Rust dependency cache' cargo fetch --locked
 step 'Embedded browser assets' just build-web
+step 'Desktop service binaries' cargo build --locked --workspace
 step 'Pre-commit hook environments' prek install-hooks

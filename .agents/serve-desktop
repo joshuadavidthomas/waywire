@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+: "${PORT:?Start with amp orb services ensure}"
+: "${PUBLIC_URL:?Amp must supply the portal origin}"
+
+# Reuse snapshot build artifacts; pick up source changes on service restart.
+just build-web
+cargo build --locked --workspace
+
+# The orb bundles Labwc and its newer native libraries outside the default PATH.
+export PATH="/opt/amp-wayland/bin:$PATH"
+export LD_LIBRARY_PATH="/opt/amp-wayland/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_RUNTIME_DIR="$HOME/.cache/waywire-orb"
+install -d -m 0700 "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR/config"
+export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1
+export WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
+export XDG_SESSION_TYPE=wayland
+export XCURSOR_THEME=Adwaita
+unset WAYLAND_DISPLAY DISPLAY
+
+# Labwc supplies the Wayland display to both children. Its session option exits
+# when the gateway stops; Amp owns the whole process tree across stop/restart.
+exec dbus-run-session -- labwc --config-dir "$XDG_RUNTIME_DIR/config" \
+  --startup 'foot --title="Waywire orb"' \
+  --session "./target/debug/waywire-gateway --listen 127.0.0.1:$PORT --streamd ./target/debug/waywire-streamd"

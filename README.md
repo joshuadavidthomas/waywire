@@ -75,6 +75,26 @@ just test-streamd
 
 The ignored stream daemon tests require ffmpeg with libx264.
 
+## Amp orbs
+
+`.agents/setup` prepares the toolchains, dependencies, browser assets, and debug
+binaries for the orb snapshot. Start the desktop portal with:
+
+```sh
+amp orb services ensure
+```
+
+The `waywire` service uses the orb's bundled Labwc compositor with a private
+headless display and a Foot terminal. It runs this checkout's gateway and stream
+daemon, separate from Amp Desktop, without installing the Ubuntu LXQt session.
+Amp supplies the authenticated portal URL and supervises the whole session.
+Readiness requires `/healthz` to confirm video capture is working.
+
+After changing source, run `amp orb service restart waywire` to rebuild and restart
+the session. This closes applications in that session. Inspect startup failures
+with `amp orb service logs waywire`. The launcher requires the Amp orb's
+`/opt/amp-wayland` bundle; it is not a general-purpose desktop installer.
+
 ## Known limits
 
 The H.264 High 4:4:4 Predictive stream targets Chrome on Linux. Other browsers and hardware decoders may reject it. Audio is not implemented.
