@@ -112,6 +112,7 @@ async function configure(
   mode,
   playout = playoutMode,
   videoJitter = false,
+  clockDelayMs = 0,
 ) {
   const blockTargetMs = playout.mode === "fixed" ? playout.targetMs : null;
   if (
@@ -127,7 +128,7 @@ async function configure(
   const response = await fetch("/api/condition", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ fps, mode, videoJitter }),
+    body: JSON.stringify({ fps, mode, videoJitter, clockDelayMs }),
   });
   if (!response.ok) throw new Error(await response.text());
   current = {
@@ -461,6 +462,128 @@ async function runJitterSuite({
     "Jitter suite complete. Artificial video-only pauses recorded.";
   return { blocks: results.blocks.length, saved: await save(name) };
 }
+
+async function runClockRecovery({ name = "clock-recovery" } = {}) {
+  await configure(60, "motion", { mode: "fixed", targetMs: 100 }, false, 30);
+  const check = (condition, message) => {
+    if (!condition) throw new Error(message);
+  };
+  const evidence = (current.clockRecovery = { phases: [], polls: [] });
+  const samplesAfter = (at) =>
+    current.clockSamples.filter((s) => s.sentMs >= at);
+  const delay = async (oneWayMs, phase) => {
+    const response = await fetch("/api/clock-delay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ oneWayMs }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const atMs = performance.now();
+    evidence.phases.push({ phase, atMs, oneWayMs });
+    status.textContent = `Clock recovery: ${phase}; ${oneWayMs} ms each way.`;
+    return atMs;
+  };
+  const probe = async (phase) => {
+    const response = await input();
+    current.responses.push({ phase, ...response });
+    check(response.ok, `No matching canvas response during ${phase}`);
+  };
+  const monitor = setInterval(() => {
+    const stats = session.stats;
+    evidence.polls.push({
+      atMs: performance.now(),
+      confident: stats.clockConfident,
+      presented: stats.presentedFrames,
+      pending: stats.pendingVideoFrames,
+      decoderQueue: stats.decoderQueue,
+    });
+  }, 25);
+  recording = true;
+  current.measurementStartedAtMs = performance.now();
+  current.startStats = plain(session.stats);
+  try {
+    await until(
+      () =>
+        current.clockSamples.filter((s) => s.accepted).length >= 3 &&
+        session.stats.clockConfident,
+    );
+    const baseline = plain(session.stats);
+    await probe("baseline");
+
+    const transientAt = await delay(70, "transient jitter");
+    await until(() => samplesAfter(transientAt).length > 0);
+    const transient = samplesAfter(transientAt)[0];
+    check(
+      !transient.accepted && transient.confident,
+      "Transient high RTT must be rejected without losing confidence",
+    );
+    const steadyAt = await delay(30, "steady path restored");
+    await until(
+      () => samplesAfter(steadyAt).filter((s) => s.accepted).length >= 2,
+    );
+    await probe("after transient jitter");
+
+    const stepAt = await delay(70, "sustained RTT increase");
+    await until(() => !session.stats.clockConfident, 10000);
+    const fallbackAt = performance.now();
+    await probe("unsynchronized fallback");
+    // Baseline needs ~26 seconds here. Reacquisition must instead complete
+    // within a few real one-second heartbeat intervals, without a reconnect.
+    await until(
+      () => samplesAfter(stepAt).some((s) => s.accepted && s.confident),
+      4000,
+    );
+    const accepted = samplesAfter(stepAt).filter((s) => s.accepted);
+    check(
+      accepted.length >= 2 && !accepted[0].confident && accepted[1].confident,
+      "Reacquisition must require two fresh samples",
+    );
+    await probe("reacquired clock");
+    const end = session.stats;
+    check(
+      end.decodedOverflowDroppedFrames ===
+        baseline.decodedOverflowDroppedFrames,
+      "Presentation capacity overflowed during clock transition",
+    );
+    check(
+      end.decoderResets === baseline.decoderResets &&
+        end.decoderResetDroppedFrames === baseline.decoderResetDroppedFrames,
+      "Decoder reset during clock transition",
+    );
+    check(
+      evidence.polls.every((p) => p.pending <= 36 && p.decoderQueue <= 24),
+      "Video queues exceeded their bounds",
+    );
+    evidence.summary = {
+      passed: true,
+      fallbackMs: accepted[1].receivedMs - fallbackAt,
+      baselineRttMs: transient.bestRttMs,
+      reacquiredRttMs: accepted[1].bestRttMs,
+      pendingPeak: Math.max(...evidence.polls.map((p) => p.pending)),
+      decoderQueuePeak: Math.max(...evidence.polls.map((p) => p.decoderQueue)),
+      responses: current.responses.length,
+    };
+    status.textContent =
+      "Clock recovery passed: transient rejection, two-sample reacquisition, canvas responses, bounded queues.";
+    return evidence.summary;
+  } catch (error) {
+    evidence.error = String(error);
+    status.textContent = `Clock recovery failed: ${error}`;
+    throw error;
+  } finally {
+    clearInterval(monitor);
+    recording = false;
+    current.measurementEndedAtMs = performance.now();
+    current.endStats = plain(session.stats);
+    await save(name);
+    await fetch("/api/clock-delay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ oneWayMs: 0 }),
+    });
+  }
+}
+
 window.latency = {
   configure,
   input,
@@ -469,6 +592,7 @@ window.latency = {
   runSuite,
   runPlaybackSuite,
   runJitterSuite,
+  runClockRecovery,
   save,
   export: () => results,
   state: () => ({

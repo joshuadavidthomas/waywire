@@ -68,6 +68,30 @@ Ground-truth capture age is available only in this artificial replay. Raw draws,
 clock accept/reject decisions and confidence transitions are exported separately
 from initial buffering and steady-state summaries.
 
+### Real gateway clock-recovery regression
+
+On a fresh page, run `latency.runClockRecovery()` and export with
+`latency.export()`. It saves `clock-recovery.json`, including partial evidence
+on failure. Use separate sender and browser machines/orbs: competing encoder and
+decoder workloads can cause unrelated quality changes or decoder resets.
+
+The opt-in relay delays real control pings and pongs by 30 ms each way, briefly
+raises this to 70 ms each way, restores 30 ms, then sustains 70 ms. It preserves
+IDs, the gateway's `serverNanos`, and message order. Video traffic is not delayed.
+This exercises the production filter and presentation path, not a whole-network
+simulation or a performance comparison. Network RTT is additional to these
+injected delays. Ordinary conditions default to zero injected delay.
+
+The test requires rejection of the transient sample without losing confidence,
+then two fresh samples after confidence expires on the sustained slower path.
+Reacquisition must finish within four seconds after a visible fallback response.
+Exact native markers must reach the canvas before, during, and after the change;
+capacity loss, decoder resets after initial synchronization, or queue-bound
+violations fail the check. Live queue/confidence polls and actual relay delays
+are retained alongside draw-linked statistics. Stop client and sender using the
+same cleanup calls below. A timeout may indicate host/transport noise: inspect the
+raw evidence rather than silently discarding it or claiming a latency benefit.
+
 ## Build and run
 
 From the repository root, after `.agents/setup`:

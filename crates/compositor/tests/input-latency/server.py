@@ -49,6 +49,8 @@ class Sender:
         self.serial = 0
         self.video_jitter = False
         self.relay_stalls = []
+        self.clock_delay_ms = 0
+        self.clock_delays = []
         self.started = 0
 
     def encoder_command(self):
@@ -78,10 +80,15 @@ class Sender:
             raise web.HTTPBadRequest()
         if not isinstance(values.get("videoJitter", False), bool):
             raise web.HTTPBadRequest()
+        clock_delay = values.get("clockDelayMs", 0)
+        if type(clock_delay) is not int or not 0 <= clock_delay <= 200:
+            raise web.HTTPBadRequest(text="clockDelayMs must be an integer from 0 to 200")
         async with self.lock:
             await self.stop()
             self.video_jitter = values.get("videoJitter", False)
             self.relay_stalls = []
+            self.clock_delay_ms = clock_delay
+            self.clock_delays = []
             self.started = asyncio.get_running_loop().time()
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
@@ -101,11 +108,18 @@ class Sender:
                     try:
                         async with client.get(f"http://127.0.0.1:{self.port}/healthz") as response:
                             if response.status == 200:
-                                return web.json_response({"serial": self.serial, "fps": fps, "mode": mode, "videoJitter": self.video_jitter, "command": command, "encoder": self.encoder_command(), "sender": json.loads((BUILD / "sender.json").read_text())})
+                                return web.json_response({"serial": self.serial, "fps": fps, "mode": mode, "videoJitter": self.video_jitter, "clockDelayMs": clock_delay, "command": command, "encoder": self.encoder_command(), "sender": json.loads((BUILD / "sender.json").read_text())})
                     except OSError:
                         pass
                     await asyncio.sleep(.1)
             raise web.HTTPGatewayTimeout()
+
+    async def clock_delay(self, request):
+        value = (await request.json()).get("oneWayMs")
+        if type(value) is not int or not 0 <= value <= 200:
+            raise web.HTTPBadRequest(text="oneWayMs must be an integer from 0 to 200")
+        self.clock_delay_ms = value
+        return web.json_response({"oneWayMs": value})
 
     async def proxy(self, request):
         if self.process is None:
@@ -115,11 +129,22 @@ class Sender:
                 downstream = web.WebSocketResponse(max_msg_size=32 << 20)
                 await downstream.prepare(request)
                 stalls, started = self.relay_stalls, self.started
+                clock_delays = self.clock_delays
 
                 async def relay(source, destination, jitter=False):
                     loop = asyncio.get_running_loop()
                     next_stall = loop.time() + 2
                     async for message in source:
+                        # Delay real ping/pong delivery on both sides of the real
+                        # gateway timestamp. Never edit IDs or serverNanos. Other
+                        # control records retain order; video has its own relay.
+                        if request.path == "/control" and message.type == WSMsgType.TEXT:
+                            record = json.loads(message.data)
+                            if record.get("type") in ("ping", "pong"):
+                                delay = self.clock_delay_ms
+                                begin = loop.time()
+                                await asyncio.sleep(delay / 1000)
+                                clock_delays.append({"type": record["type"], "id": record["id"], "oneWayMs": delay, "senderRelativeSeconds": begin - started, "actualDelayMs": (loop.time() - begin) * 1000})
                         # A bounded video-only head-of-line pause, not a physical
                         # network model. Control/pongs and reverse traffic bypass it.
                         if jitter and loop.time() >= next_stall:
@@ -141,6 +166,7 @@ async def serve():
     sender = Sender()
     app = web.Application(client_max_size=64 << 20)
     app.router.add_post("/api/condition", sender.condition)
+    app.router.add_post("/api/clock-delay", sender.clock_delay)
     app.router.add_get("/control", sender.proxy)
     app.router.add_get("/stream", sender.proxy)
     app.router.add_get("/healthz", lambda _: web.Response(text="ok"))
@@ -152,7 +178,7 @@ async def serve():
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", name):
             raise web.HTTPBadRequest(text="Invalid result name")
         data = await request.json()
-        details = {"encoderAtSave": sender.encoder_command(), "relayStalls": sender.relay_stalls}
+        details = {"encoderAtSave": sender.encoder_command(), "relayStalls": sender.relay_stalls, "clockDelays": sender.clock_delays}
         if data.get("blocks"):
             data["blocks"][-1].update(details)
         path = BUILD / f"{name}.json"

@@ -27,7 +27,6 @@ export type WebSocketFactory = (
 ) => WebSocket | Promise<WebSocket>;
 
 const clockMaximumAgeMilliseconds = 5000;
-const clockResetAgeMilliseconds = 30_000;
 const maximumClockSampleRttMilliseconds = 60_000;
 
 export class SessionTransport {
@@ -89,7 +88,9 @@ export class ClockSynchronizer {
     const candidateOffset = (sent + received) * 500 - serverMicros;
     if (
       this.offsetMicros === null ||
-      received - this.lastSampleAt > clockResetAgeMilliseconds
+      // Once confidence has expired, an obsolete best RTT must not prevent
+      // reacquisition on a slower path. Two fresh samples are still required.
+      received - this.lastSampleAt > clockMaximumAgeMilliseconds
     ) {
       this.offsetMicros = candidateOffset;
       this.bestRttMilliseconds = sampleRtt;
