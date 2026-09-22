@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Waywire input-to-canvas measurement</title>
+<style>
+  body {
+    margin: 0;
+    background: #141821;
+    color: white;
+    font: 14px monospace;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    outline: none;
+  }
+  pre {
+    margin: 12px;
+    white-space: pre-wrap;
+  }
+</style>
+<pre id="status">Call latency.runSuite() from the browser console.</pre>
+<canvas id="display" tabindex="0" aria-label="Native latency response"></canvas>
+<script type="module" src="./latency.js"></script>

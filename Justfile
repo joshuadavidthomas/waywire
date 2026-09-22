@@ -57,12 +57,16 @@ rustfmt-check:
 
 test: build-web
     pnpm --filter @waywire/web test
+    pnpm --filter @waywire/web exec tsx --test "{{ justfile_directory() }}/crates/compositor/tests/input-latency/playback-replay.test.ts"
     cargo test --locked --workspace
+    python3 -m unittest discover -s crates/compositor/tests
+    node --test crates/compositor/tests/input-latency/marker.test.js
     shellcheck desktop/desktop.sh scripts/package-release scripts/setup-desktop scripts/setup-xwayland.sh
 
 test-compositor *ARGS:
     cargo test --locked -p waywire-compositor -- --ignored {{ ARGS }}
     cargo build --locked -p waywire-compositor --bins --examples
+    PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/input-latency/native-test.py
     PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/native-scene.py
     PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/interop.py
 
