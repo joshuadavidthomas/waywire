@@ -273,7 +273,8 @@ export function pointerRelative(
   });
 }
 
-export type Chroma = 0 | 1;
+// YUV444, YUV420, and full-range RGB (identity matrix), respectively.
+export type Chroma = 0 | 1 | 2;
 
 export type FrameMetadata = Readonly<{
   generation: number;
@@ -297,7 +298,7 @@ export function readFrameMetadata(reader: Reader): FrameMetadata {
     fps: reader.u32(),
   };
   const chroma = reader.u8();
-  if (chroma !== 0 && chroma !== 1) {
+  if (chroma !== 0 && chroma !== 1 && chroma !== 2) {
     throw new RangeError("unknown chroma sampling");
   }
   return { ...metadata, chroma };

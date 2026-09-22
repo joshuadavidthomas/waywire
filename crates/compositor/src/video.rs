@@ -960,6 +960,8 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
     let bitrate_ceiling = format!("{}k", config.bitrate_kbps.get());
     let buffer = format!("{}k", config.bitrate_kbps.get() * 2);
     let profile = config.chroma.h264_profile();
+    let rgb = config.chroma == Chroma::Rgb;
+    let matrix = if rgb { "gbr" } else { "bt709" };
     vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -968,7 +970,8 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "-f".into(),
         "rawvideo".into(),
         "-pixel_format".into(),
-        "bgra".into(),
+        // Pixman's opaque BGRA and BGR0 have the same packed byte layout.
+        if rgb { "bgr0" } else { "bgra" }.into(),
         "-video_size".into(),
         format!("{}x{}", config.raw_width.get(), config.raw_height.get()),
         "-framerate".into(),
@@ -977,9 +980,9 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "pipe:0".into(),
         "-an".into(),
         "-c:v".into(),
-        "libx264".into(),
+        if rgb { "libx264rgb" } else { "libx264" }.into(),
         "-preset".into(),
-        "superfast".into(),
+        if rgb { "ultrafast" } else { "superfast" }.into(),
         "-tune".into(),
         "zerolatency".into(),
         "-profile:v".into(),
@@ -1005,16 +1008,27 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "-x264-params".into(),
         // Write the desktop color contract into the H.264 VUI explicitly;
         // FFmpeg's frame metadata alone does not reach the SPS in every build.
-        "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on".into(),
-        "-vf".into(),
-        // Preserve the desktop's full-range sRGB values through Chromium's
-        // WebCodecs-to-canvas path. Chroma sampling comes from the quality ladder.
         format!(
-            "scale={}:{}:out_color_matrix=bt709:out_range=pc",
-            config.encoded_width.get(), config.encoded_height.get()
+            "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
         ),
+        "-vf".into(),
+        // Equal-size RGB is a no-op; reduced output still uses packed RGB scaling.
+        if rgb {
+            format!(
+                "scale={}:{}",
+                config.encoded_width.get(),
+                config.encoded_height.get()
+            )
+        } else {
+            format!(
+                "scale={}:{}:out_color_matrix=bt709:out_range=pc",
+                config.encoded_width.get(),
+                config.encoded_height.get()
+            )
+        },
         "-colorspace".into(),
-        "bt709".into(),
+        // FFmpeg names matrix 0 "rgb"; x264 names the same value "gbr".
+        if rgb { "rgb" } else { "bt709" }.into(),
         "-color_primaries".into(),
         "bt709".into(),
         "-color_trc".into(),

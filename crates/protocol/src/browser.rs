@@ -425,7 +425,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![8, kind, 0, 0];
+        let mut bytes = vec![9, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -440,11 +440,12 @@ mod tests {
         for (chroma, codec) in [
             (pipe::Chroma::Yuv444, "avc1.F40034"),
             (pipe::Chroma::Yuv420, "avc1.640034"),
+            (pipe::Chroma::Rgb, "avc1.F40034"),
         ] {
             let event = ClientEvent::video_config(chroma.h264_profile().codec());
             assert_eq!(
                 json(&event),
-                format!(r#"{{"type":"video-config","version":8,"codec":"{codec}"}}"#)
+                format!(r#"{{"type":"video-config","version":9,"codec":"{codec}"}}"#)
             );
         }
     }
@@ -751,7 +752,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            8, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            9, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

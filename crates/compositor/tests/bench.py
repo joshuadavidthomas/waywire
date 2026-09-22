@@ -57,6 +57,7 @@ def measure(binary, receiver, directory, mode, args):
             frames = []
             acknowledged = set()
             packets = 0
+            measured_bytes = 0
             start = time.monotonic() + args.warmup
             end = start + args.seconds
             cpu_start = None
@@ -69,7 +70,9 @@ def measure(binary, receiver, directory, mode, args):
                     raise RuntimeError("benchmark client exited: " + log.read_text())
                 for stream in select.select([process.stdout, udp], [], [], 0.02)[0]:
                     if stream is udp:
-                        udp.recv(65536)
+                        packet = udp.recv(65536)
+                        if now >= start:
+                            measured_bytes += len(packet)
                         packets += 1
                         continue
                     chunk = os.read(process.stdout.fileno(), 65536)
@@ -78,7 +81,7 @@ def measure(binary, receiver, directory, mode, args):
                     pending += chunk
                     while len(pending) >= 8:
                         version, kind, reserved, length = struct.unpack_from("<BBHI", pending)
-                        assert version == 8 and reserved == 0
+                        assert version in (8, 9) and reserved == 0
                         if len(pending) < 8 + length:
                             break
                         payload, pending = pending[8:8+length], pending[8+length:]
@@ -88,7 +91,7 @@ def measure(binary, receiver, directory, mode, args):
                         # Model the gateway caching the initial keyframe; otherwise
                         # the compositor deliberately repaints even an idle output.
                         if generation not in acknowledged:
-                            process.stdin.write(struct.pack("<BBHIIB", 8, 11, 0, 5, generation, 1))
+                            process.stdin.write(struct.pack("<BBHIIB", version, 11, 0, 5, generation, 1))
                             process.stdin.flush()
                             acknowledged.add(generation)
                         captured, sequence = struct.unpack_from("<QQ", payload, 8)
@@ -106,6 +109,7 @@ def measure(binary, receiver, directory, mode, args):
                 "binary": str(binary), "mode": mode, "resolution": args.resolution,
                 "target_fps": args.fps, "seconds": args.seconds, "frames": len(frames),
                 "submitted_fps": round(len(frames) / args.seconds, 2),
+                "rtp_kbps": round(measured_bytes * 8 / args.seconds / 1000, 2),
                 "interval_p50_ms": round(statistics.median(intervals), 2) if intervals else None,
                 "interval_p95_ms": round(sorted(intervals)[int((len(intervals)-1)*0.95)], 2) if intervals else None,
                 "replaced_frames": sum(b[1] - a[1] - 1 for a, b in zip(frames, frames[1:])),

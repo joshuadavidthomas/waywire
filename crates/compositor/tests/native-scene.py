@@ -101,7 +101,7 @@ class Scene:
         return path
 
     def command(self, kind, payload=b""):
-        self.process.stdin.write(struct.pack("<BBHI", 8, kind, 0, len(payload)) + payload)
+        self.process.stdin.write(struct.pack("<BBHI", 9, kind, 0, len(payload)) + payload)
         self.process.stdin.flush()
 
     def input(self, kind, fmt, *values):
@@ -125,7 +125,7 @@ class Scene:
             self.pending += data
         while len(self.pending) >= 8:
             version, kind, reserved, length = struct.unpack("<BBHI", self.pending[:8])
-            assert version == 8 and reserved == 0, "stdout protocol corrupted"
+            assert version == 9 and reserved == 0, "stdout protocol corrupted"
             if len(self.pending) < 8 + length:
                 break
             self.events.append((kind, self.pending[8:8+length]))

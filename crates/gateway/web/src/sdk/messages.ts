@@ -1,5 +1,5 @@
 // Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 export class ProtocolVersionMismatchError extends Error {
   constructor(

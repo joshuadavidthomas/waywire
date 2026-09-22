@@ -10,4 +10,4 @@ pub use wire::Record;
 /// Versions every wire format in this crate together: pipe records, browser control records,
 /// browser video frames, and the `version` field of the `video-config` message. Any byte-level
 /// change to any of them bumps this number.
-pub const PROTOCOL_VERSION: u8 = 8;
+pub const PROTOCOL_VERSION: u8 = 9;

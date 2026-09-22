@@ -57,7 +57,7 @@ def run():
         sequence = 0
 
         def command(kind, payload):
-            compositor.stdin.write(struct.pack("<BBHI", 8, kind, 0, len(payload)) + payload)
+            compositor.stdin.write(struct.pack("<BBHI", 9, kind, 0, len(payload)) + payload)
             compositor.stdin.flush()
 
         def browser_key(code, down):

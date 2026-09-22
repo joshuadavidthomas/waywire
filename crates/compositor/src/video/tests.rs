@@ -1316,6 +1316,32 @@ fn ffmpeg_converts_and_tags_desktop_srgb_for_each_chroma_choice() {
 }
 
 #[test]
+fn ffmpeg_rgb_preserves_components_at_full_and_reduced_size() {
+    for width in [320, 160] {
+        let mut config = real_frame(1, 1).config;
+        config.chroma = Chroma::Rgb;
+        config.encoded_width = dimension(width);
+        let args = ffmpeg_args(5000, config, generation(17));
+        for pair in [
+            ["-pixel_format", "bgr0"],
+            ["-c:v", "libx264rgb"],
+            ["-preset", "ultrafast"],
+            ["-pix_fmt", "bgr0"],
+            ["-colorspace", "rgb"],
+            ["-color_range", "pc"],
+            [
+                "-x264-params",
+                "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=gbr:fullrange=on",
+            ],
+        ] {
+            assert!(args.windows(2).any(|actual| actual == pair));
+        }
+        let scale = format!("scale={}:{}", width, config.encoded_height.get());
+        assert!(args.windows(2).any(|pair| pair == ["-vf", scale.as_str()]));
+    }
+}
+
+#[test]
 fn dimensions_enforce_level_and_four_k_budget() {
     assert_eq!(
         encoded_dimensions(
@@ -1400,7 +1426,11 @@ fn every_same_generation_config_change_requests_a_new_generation() {
 #[test]
 #[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
 fn ffmpeg_actual_sps_matches_each_protocol_profile() {
-    for (chroma, profile, chroma_format) in [(Chroma::Yuv444, 244, 3), (Chroma::Yuv420, 100, 1)] {
+    for (chroma, profile, chroma_format, matrix_coefficients) in [
+        (Chroma::Yuv444, 244, 3, 1),
+        (Chroma::Yuv420, 100, 1, 1),
+        (Chroma::Rgb, 244, 3, 0),
+    ] {
         let socket =
             UdpSocket::bind(("127.0.0.1", 0)).expect("test RTP socket should bind to localhost");
         socket
@@ -1447,7 +1477,7 @@ fn ffmpeg_actual_sps_matches_each_protocol_profile() {
                 full_range: true,
                 color_primaries: 1,
                 transfer_characteristics: 13,
-                matrix_coefficients: 1,
+                matrix_coefficients,
             }
         );
         encoder.stop();
@@ -1638,6 +1668,58 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
     let new_ssrc = receive_frame_ssrc(&socket);
     assert_eq!(old_ssrc, 1);
     assert_eq!(new_ssrc, 2);
+    encoder.stop();
+}
+
+#[test]
+#[ignore = "requires real FFmpeg with libx264; run the explicit ffmpeg_ suite"]
+fn ffmpeg_rgb_yuv_transitions_replace_the_color_matrix() {
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("test socket should bind");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("test timeout");
+    let encoder = VideoEncoder::start(
+        "ffmpeg".into(),
+        socket.local_addr().expect("test address").port(),
+    )
+    .expect("test encoder should start");
+    for (index, (chroma, matrix, components)) in [
+        (Chroma::Rgb, 0, 3),
+        (Chroma::Yuv420, 1, 1),
+        (Chroma::Rgb, 0, 3),
+        (Chroma::Yuv444, 1, 3),
+        (Chroma::Rgb, 0, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let next = u32::try_from(index + 1).expect("small generation");
+        if index > 0 {
+            encoder
+                .set_generation(generation(next))
+                .expect("next generation");
+        }
+        let mut frame = real_frame(u64::from(next), next);
+        frame.config.chroma = chroma;
+        frame.metadata.chroma = chroma;
+        frame.config.encoded_width = dimension(160);
+        frame.config.encoded_height = dimension(90);
+        frame.metadata.width = dimension(160);
+        frame.metadata.height = dimension(90);
+        submit_frame(&encoder, &frame).expect("frame accepted");
+        assert!(matches!(
+            wait_for_notification(&encoder),
+            Notification::Submitted(_)
+        ));
+        let access_unit = receive_first_rtp_access_unit(&socket);
+        let sps = access_unit
+            .iter()
+            .find(|nal| nal[0] & 0x1f == 7)
+            .expect("SPS");
+        let contract = parse_test_sps(sps);
+        assert_eq!(contract.matrix_coefficients, matrix);
+        assert_eq!(contract.chroma_format, components);
+    }
     encoder.stop();
 }
 
