@@ -245,6 +245,7 @@ export function videoPacket(
     readonly generation?: number;
     readonly width?: number;
     readonly height?: number;
+    readonly fps?: number;
     readonly chroma?: Chroma;
   } = {},
 ): ArrayBuffer {
@@ -258,7 +259,7 @@ export function videoPacket(
       captureNanos: BigInt(timestamp) * 1000n,
       sequence: 0n,
       inputSequence: 0,
-      fps: 60,
+      fps: options.fps ?? 60,
       chroma: options.chroma ?? 0,
     },
     new Uint8Array([0]),
@@ -273,13 +274,17 @@ export type QueueDecoder = {
 
 export function installQueueVideoDecoder(): {
   readonly decoder: () => QueueDecoder | undefined;
+  readonly closedTimestamps: number[];
 } {
   let decoder: QueueDecoder | undefined;
+  const closedTimestamps: number[] = [];
   class FakeVideoFrame {
     readonly displayWidth = 1280;
     readonly displayHeight = 720;
     constructor(readonly timestamp: number) {}
-    close(): void {}
+    close(): void {
+      closedTimestamps.push(this.timestamp);
+    }
   }
   installGlobal(
     "VideoDecoder",
@@ -327,7 +332,7 @@ export function installQueueVideoDecoder(): {
     },
   );
   installEncodedVideoChunk();
-  return { decoder: () => decoder };
+  return { decoder: () => decoder, closedTimestamps };
 }
 
 export function installDelayedVideoDecoder(): {

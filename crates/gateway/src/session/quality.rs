@@ -16,6 +16,7 @@ const QUALITY_CHANGE_COOLDOWN: Duration = Duration::from_secs(5);
 const ENCODER_WARMUP_NANOS: u64 = 1_000_000_000;
 const ENCODER_MIN_RENDERED: u64 = 20;
 const ENCODER_BAD_DROP_PERCENT: u64 = 10;
+const BROWSER_BAD_DROP_PERCENT: u64 = 10;
 const BAD_STREAK_THRESHOLD: u8 = 2;
 const GOOD_STREAK_THRESHOLD: u8 = 8;
 const GOOD_DROP_PERCENT: u64 = 2;
@@ -234,18 +235,23 @@ impl Quality {
             return None;
         }
         let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
+        let loss_percent = u64::from(feedback.dropped()) * 100;
         let browser_bad = feedback.received() > 0
-            && (queue_pressure >= 0.10 || feedback.queue_peak() >= 24 || feedback.rtt() > 250.0);
+            && (queue_pressure >= 0.10
+                || feedback.queue_peak() >= 24
+                || feedback.rtt() > 250.0
+                || loss_percent >= u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT);
         let is_bad = encoder_bad || browser_bad;
         // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
         // so one dropped frame does not erase an otherwise healthy recovery streak.
+        // Feedback excludes newest-due presentation skips. A 60Hz display may
+        // legitimately draw half a 120 FPS stream; zero draws cannot recover.
         let is_good = encoder_good
             && queue_pressure < 0.05
             && feedback.queue_peak() < 24
-            && u64::from(feedback.dropped()) * 100
-                <= u64::from(feedback.received()) * GOOD_DROP_PERCENT
+            && loss_percent <= u64::from(feedback.received()) * GOOD_DROP_PERCENT
             && feedback.rtt() < 120.0
-            && u64::from(feedback.presented()) * 10 >= u64::from(feedback.received()) * 9;
+            && feedback.presented() > 0;
         self.streak = match (is_bad, is_good, self.streak) {
             (true, _, Streak::Bad(count)) => Streak::Bad(count.saturating_add(1)),
             (true, _, Streak::None | Streak::Good(_)) => Streak::Bad(1),
@@ -582,6 +588,42 @@ mod tests {
             assert_eq!(quality.update(&good_feedback(), now), None);
         }
         quality.update(&good_feedback(), now)
+    }
+
+    #[test]
+    fn recovery_requires_drawing_and_low_loss_not_one_draw_per_received_frame() {
+        for (received, presented, dropped, recovers) in [
+            (90, 60, 0, true),
+            (120, 60, 0, true),
+            (120, 30, 0, true),
+            (120, 60, 2, true),
+            (120, 60, 3, false),
+            (120, 0, 0, false),
+        ] {
+            let mut quality = Quality::new(value(Kbps::new(16_000)), value(Fps::new(120)));
+            quality.levels.fps = value(Fps::new(90));
+            let sample = feedback(received, presented, 1, 0.0, dropped, 20.0);
+            let now = Instant::now();
+            for _ in 0..7 {
+                assert_eq!(quality.update(&sample, now), None);
+            }
+            assert_eq!(
+                quality.update(&sample, now).is_some(),
+                recovers,
+                "received={received}, presented={presented}, dropped={dropped}"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_capacity_loss_is_pressure_even_with_an_empty_decoder_queue() {
+        for (dropped, changes) in [(11, false), (12, true), (120, true)] {
+            let mut quality = Quality::new(value(Kbps::new(16_000)), value(Fps::new(120)));
+            let sample = feedback(120, 0, 0, 0.0, dropped, 20.0);
+            let now = Instant::now();
+            assert_eq!(quality.update(&sample, now), None);
+            assert_eq!(quality.update(&sample, now).is_some(), changes);
+        }
     }
 
     #[test]
@@ -976,7 +1018,11 @@ mod tests {
 
     #[test]
     fn drop_rates_above_two_percent_discard_recovery_progress() {
-        for (received, dropped) in [(49, 1), (100, 3), (1, 1)] {
+        for (received, dropped, streak) in [
+            (49, 1, Streak::None),
+            (100, 3, Streak::None),
+            (1, 1, Streak::Bad(1)),
+        ] {
             let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
             let now = Instant::now();
             assert!(trigger_bad(&mut quality, now).is_some());
@@ -986,7 +1032,7 @@ mod tests {
             }
             let lossy = feedback(received, received - dropped, 0, 0.0, dropped, 20.0);
             assert_eq!(quality.update(&lossy, now), None);
-            assert_eq!(quality.streak, Streak::None);
+            assert_eq!(quality.streak, streak);
             assert_eq!(quality.update(&good_feedback(), now), None);
             assert_eq!(quality.chroma, Chroma::Yuv420);
         }

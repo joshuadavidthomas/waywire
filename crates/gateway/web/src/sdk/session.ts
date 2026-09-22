@@ -9,6 +9,7 @@ import {
 
 export interface WaywireSessionOptions {
   readonly endpoint?: string | URL;
+  /** Presentation delay; decoded-frame storage grows with delay and source FPS. */
   readonly latency?: number;
   readonly createWebSocket?: (
     path: TransportPath,
@@ -68,11 +69,13 @@ export interface WaywireStats {
   readonly latenessMs: number;
   readonly pendingInputCount: number;
   readonly decoderQueue: number;
+  readonly pendingVideoFrames: number;
   /** Monotonic video diagnostics for this session. */
   readonly receivedFrames: number;
   readonly decodedFrames: number;
   readonly presentedFrames: number;
   readonly droppedFrames: number;
+  /** Decoded frames superseded by a newer draw, not decoder/capacity loss. */
   readonly overdueDroppedFrames: number;
   readonly decodedOverflowDroppedFrames: number;
   readonly decoderResetDroppedFrames: number;
@@ -166,7 +169,11 @@ export class WaywireSession {
   readonly clipboard: ClipboardController;
   readonly remoteDisplay: RemoteDisplayController;
   state: WaywireSessionState;
-  stats: Readonly<Partial<WaywireStats>>;
+
+  /** Live counters, including while stalled. Draw timestamps change only on a draw. */
+  get stats(): Readonly<Partial<WaywireStats>> {
+    return this.#runtime.stats;
+  }
 
   constructor(options: WaywireSessionOptions = {}) {
     // Connecting to look at a desktop must not change that desktop.
@@ -186,16 +193,10 @@ export class WaywireSession {
         pointerLocked: false,
       }),
     });
-    this.stats = Object.freeze({});
     this.#runtime = new ControlRuntime(
       {
         emit: (type, value) => this.#emit(type, value),
         updateState: (section, changes) => this.#updateState(section, changes),
-        setStats: (stats) => {
-          const snapshot = Object.freeze(stats);
-          this.stats = snapshot;
-          this.#emit("stats", snapshot);
-        },
         halt: (error) => this.#halt(error),
         remoteDisplayPolicy: () => this.#remoteDisplayPolicy,
         controlOnFocus: () => this.#controlOnFocus,

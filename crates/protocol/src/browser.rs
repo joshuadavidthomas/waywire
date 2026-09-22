@@ -202,6 +202,7 @@ pub struct FeedbackValues {
     pub queue_peak: u32,
     pub queue_busy_ms: f64,
     pub sample_ms: f64,
+    /// Capacity/reset loss, not decoded frames superseded by a newer canvas draw.
     pub dropped: u32,
     pub rtt: f64,
 }

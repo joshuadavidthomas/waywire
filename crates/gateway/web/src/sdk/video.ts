@@ -7,8 +7,7 @@ import {
 } from "./messages.ts";
 import type { WaywireStats } from "./session.ts";
 import { decodeRecord, readFrameMetadata } from "./wire.ts";
-export const maximumPendingVideoFrames = 24;
-export const maximumVideoDecodeQueueSize = maximumPendingVideoFrames;
+export const maximumVideoDecodeQueueSize = 24;
 const busyDecodeQueueSize = 5;
 const initialReconnectDelayMilliseconds = 250;
 const maximumReconnectDelayMilliseconds = 5000;
@@ -25,6 +24,7 @@ export type VideoFeedback = Readonly<{
   queuePeak: number;
   queueBusyMs: number;
   sampleMs: number;
+  /** Capacity/reset loss, excluding frames superseded by a newer canvas draw. */
   dropped: number;
 }>;
 
@@ -70,6 +70,7 @@ export type VideoPacket = Readonly<{
   latestAppliedInput: number;
   width: number;
   height: number;
+  fps: number;
 }>;
 
 export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
@@ -96,13 +97,17 @@ export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
       latestAppliedInput: metadata.inputSequence,
       width: metadata.width,
       height: metadata.height,
+      fps: metadata.fps,
     };
   } catch {
     return null;
   }
 }
 
-type FrameMetadata = Pick<VideoPacket, "generation" | "width" | "height">;
+type FrameMetadata = Pick<
+  VideoPacket,
+  "generation" | "width" | "height" | "fps"
+>;
 type PendingVideoFrame = Readonly<{
   frame: VideoFrame;
   metadata: FrameMetadata;
@@ -150,6 +155,7 @@ export class VideoRuntime {
   private decodedOverflowDroppedFrames = 0;
   private decoderResetDroppedFrames = 0;
   private decoderResets = 0;
+  private lastDrawStats: WaywireStats | null = null;
 
   constructor(
     private readonly owner: VideoOwner,
@@ -178,6 +184,37 @@ export class VideoRuntime {
 
   get renderedFrameCount(): number {
     return this.renderedFrames;
+  }
+
+  // Polling diagnostics must still work when no frame is being drawn. Events
+  // remain draw-linked so callers never mistake an idle sample for a new frame.
+  get stats(): Readonly<Partial<WaywireStats>> {
+    return Object.freeze({ ...this.lastDrawStats, ...this.diagnostics() });
+  }
+
+  private diagnostics(now = performance.now()) {
+    while ((this.renderedFrameTimes[0] ?? now) < now - 1000) {
+      this.renderedFrameTimes.shift();
+    }
+    const elapsed = now - (this.renderedFrameTimes[0] ?? now);
+    return {
+      ...this.owner.statsContext(),
+      renderedFps:
+        elapsed > 0
+          ? ((this.renderedFrameTimes.length - 1) * 1000) / elapsed
+          : 0,
+      latencyTargetMs: this.targetLatencyMilliseconds,
+      decoderQueue: this.decoder?.decodeQueueSize ?? 0,
+      pendingVideoFrames: this.pendingFrames.length,
+      receivedFrames: this.receivedChunks,
+      decodedFrames: this.decodedFrames,
+      presentedFrames: this.presentedFrames,
+      droppedFrames: this.droppedFrames,
+      overdueDroppedFrames: this.overdueDroppedFrames,
+      decodedOverflowDroppedFrames: this.decodedOverflowDroppedFrames,
+      decoderResetDroppedFrames: this.decoderResetDroppedFrames,
+      decoderResets: this.decoderResets,
+    };
   }
 
   attach(display: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
@@ -451,7 +488,14 @@ export class VideoRuntime {
         }
         this.decodedFrames += 1;
         this.pendingFrames.push({ frame, metadata });
-        if (this.pendingFrames.length > maximumPendingVideoFrames) {
+        // The playout buffer must cover its delay AND one bounded decoder batch
+        // before the next animation frame. A fixed 24-frame cap evicts future-due
+        // frames forever at 90/120 FPS with a 300ms target. This does not relax
+        // the decoder-backlog limit or preallocate frames.
+        const capacity =
+          maximumVideoDecodeQueueSize +
+          Math.ceil((metadata.fps * this.targetLatencyMilliseconds) / 1000);
+        while (this.pendingFrames.length > capacity) {
           this.pendingFrames.shift()?.frame.close();
           this.droppedFrames += 1;
           this.intervalDroppedFrames += 1;
@@ -516,6 +560,7 @@ export class VideoRuntime {
       generation: packet.generation,
       width: packet.width,
       height: packet.height,
+      fps: packet.fps,
     };
     const entries = this.decodingFrames.get(packet.timestamp);
     if (entries) entries.push(metadata);
@@ -667,53 +712,26 @@ export class VideoRuntime {
     this.presentedFrames += 1;
     this.intervalPresentedFrames += 1;
     this.renderedFrameTimes.push(now);
-    const windowStart = now - 1000;
-    while (
-      this.renderedFrameTimes.length > 1 &&
-      (this.renderedFrameTimes[0] ?? now) < windowStart
-    )
-      this.renderedFrameTimes.shift();
+    this.lastDrawStats = Object.freeze({
+      width: display.width,
+      height: display.height,
+      renderedMediaTimestampMicros,
+      drawCompletedAtMs,
+      generation: metadata.generation,
+      latenessMs: this.videoLateness,
+      ...this.diagnostics(now),
+    });
     if (now - this.lastStatsPublishedAt >= this.statsIntervalMilliseconds) {
       this.lastStatsPublishedAt = now;
-      const elapsed = now - (this.renderedFrameTimes[0] ?? now);
-      const renderedFps =
-        elapsed > 0
-          ? ((this.renderedFrameTimes.length - 1) * 1000) / elapsed
-          : 0;
-      const contextStats = this.owner.statsContext();
-      this.owner.publishStats({
-        width: display.width,
-        height: display.height,
-        renderedFps,
-        renderedMediaTimestampMicros,
-        drawCompletedAtMs,
-        generation: metadata.generation,
-        bitrateKbps: contextStats.bitrateKbps,
-        scalePercent: contextStats.scalePercent,
-        rttMs: contextStats.rttMs,
-        clockConfident: contextStats.clockConfident,
-        clockUncertaintyMs: contextStats.clockUncertaintyMs,
-        latencyTargetMs: this.targetLatencyMilliseconds,
-        latenessMs: this.videoLateness,
-        pendingInputCount: contextStats.pendingInputCount,
-        decoderQueue: this.decoder?.decodeQueueSize || 0,
-        receivedFrames: this.receivedChunks,
-        decodedFrames: this.decodedFrames,
-        presentedFrames: this.presentedFrames,
-        droppedFrames: this.droppedFrames,
-        overdueDroppedFrames: this.overdueDroppedFrames,
-        decodedOverflowDroppedFrames: this.decodedOverflowDroppedFrames,
-        decoderResetDroppedFrames: this.decoderResetDroppedFrames,
-        decoderResets: this.decoderResets,
-        resizeState: contextStats.resizeState,
-      });
+      this.owner.publishStats(this.lastDrawStats);
     }
     this.schedulePresentation();
   }
 
   private recordOverdueDrop(): void {
     this.droppedFrames += 1;
-    this.intervalDroppedFrames += 1;
+    // Newest-due selection is normal when source FPS exceeds display refresh.
+    // Retain the diagnostic count, but do not report it as capacity loss.
     this.overdueDroppedFrames += 1;
   }
 }

@@ -366,6 +366,7 @@ function stats(width: number, height: number): WaywireStats {
     latenessMs: 0,
     pendingInputCount: 0,
     decoderQueue: 0,
+    pendingVideoFrames: 0,
     receivedFrames: 1,
     decodedFrames: 1,
     presentedFrames: 1,

@@ -191,6 +191,8 @@ test("a superseded profile's queued packets cannot enter the new decoder", async
 test("decode queue overflow drops stale data and waits for a keyframe", async () => {
   const installed = installQueueVideoDecoder();
   const fixture = await videoFixture();
+  let statsEvents = 0;
+  fixture.session.on("stats", () => statsEvents++);
   configure(fixture.videoSocket);
   await new Promise<void>((resolve) => setImmediate(resolve));
   const decoder = installed.decoder();
@@ -206,11 +208,27 @@ test("decode queue overflow drops stale data and waits for a keyframe", async ()
   }
   await flush();
   assert.equal(decoder.decodeQueueSize, 24);
+  assert.equal(fixture.session.stats.receivedFrames, 24);
+  assert.equal(fixture.session.stats.decoderQueue, 24);
+  const snapshot = fixture.session.stats;
+  assert.ok(Object.isFrozen(snapshot));
 
   fixture.videoSocket.dispatch("message", { data: videoPacket(2_024) });
   await flush();
   assert.equal(decoder.resetCalls, 2);
   assert.equal(decoder.decodeQueueSize, 0);
+  assert.equal(fixture.session.stats.decoderResetDroppedFrames, 24);
+  assert.equal(fixture.session.stats.decoderQueue, 0);
+  assert.equal(
+    snapshot.decoderQueue,
+    24,
+    "previous snapshots remain immutable",
+  );
+  assert.equal(
+    statsEvents,
+    0,
+    "loss telemetry must not pretend a draw happened",
+  );
   fixture.videoSocket.dispatch("message", { data: videoPacket(2_026) });
   await flush();
   assert.equal(decoder.decodeQueueSize, 0);

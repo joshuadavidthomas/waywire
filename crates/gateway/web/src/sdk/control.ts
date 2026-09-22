@@ -157,7 +157,6 @@ type RuntimeOwner = {
     section: K,
     changes: Partial<WaywireSessionState[K]>,
   ): void;
-  setStats(stats: WaywireStats): void;
   halt(error: Error): void;
   remoteDisplayPolicy(): RemoteDisplayPolicy;
   controlOnFocus(): boolean;
@@ -191,6 +190,10 @@ export class ControlRuntime {
       options.createWebSocket,
     );
     this.video = this.createVideo();
+  }
+
+  get stats(): Readonly<Partial<WaywireStats>> {
+    return this.video.stats;
   }
 
   private display: HTMLCanvasElement | null = null;
@@ -275,7 +278,7 @@ export class ControlRuntime {
         },
         presentResizeGeneration: (generation, width, height) =>
           this.presentResizeGeneration(generation, width, height),
-        publishStats: (stats) => this.owner.setStats(stats),
+        publishStats: (stats) => this.emit("stats", stats),
       },
       this.options.latency,
       this.options.statsIntervalMs,
