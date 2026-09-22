@@ -88,6 +88,11 @@ impl CompositorHandler for State {
                 .find(|w| w.wl_surface().is_some_and(|s| *s == root))
                 .cloned();
             if let Some(window) = window {
+                let old_size = window.bbox().size;
+                let resizing = self
+                    .windows
+                    .get(&window)
+                    .is_some_and(|state| state.resize.is_some());
                 window.on_commit();
                 self.resize_committed(&window);
                 let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(
@@ -97,6 +102,34 @@ impl CompositorHandler for State {
                 .unwrap_or(false);
                 let previous = self.windows.entry(window.clone()).or_default().mapped;
                 self.windows.entry(window.clone()).or_default().mapped = mapped;
+                if mapped
+                    && (!previous || old_size != window.bbox().size)
+                    && !resizing
+                    && let (Some(location), Some(output)) = (
+                        self.space.element_location(&window),
+                        self.window_output_geometry(&window),
+                    )
+                {
+                    // Clients can grow after their first commit. Keep their
+                    // geometry on output without disturbing resize-grab anchors.
+                    let size = window.geometry().size;
+                    let location = (
+                        location
+                            .x
+                            .clamp(output.loc.x, output.loc.x + (output.size.w - size.w).max(0)),
+                        location
+                            .y
+                            .clamp(output.loc.y, output.loc.y + (output.size.h - size.h).max(0)),
+                    )
+                        .into();
+                    self.space.map_element(window.clone(), location, false);
+                    if let Some(x11) = window.x11_surface()
+                        && let Err(error) =
+                            x11.configure(smithay::utils::Rectangle::new(location, size))
+                    {
+                        tracing::warn!(%error, "place X11 window");
+                    }
+                }
                 if mapped && !previous {
                     self.focus_window(Some(window.clone()));
                 } else if previous && !mapped {

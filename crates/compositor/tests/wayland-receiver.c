@@ -126,6 +126,7 @@ static void paint_surface(struct wl_surface *target, int width, int height) {
     wl_surface_commit(target);
 }
 static void paint(void) {
+    if (getenv("WAYWIRE_TEST_GEOMETRY")) xdg_surface_set_window_geometry(toplevel_xdg, 17, 29, width - 17, height - 29);
     if (animation_frames > 0) wl_callback_add_listener(wl_surface_frame(surface), &frame_listener, NULL);
     paint_surface(surface, width, height);
     printf("paint %d %d\n", width, height);
@@ -202,6 +203,7 @@ static void key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t ti
     (void)data; (void)kb; (void)serial; (void)time; printf("key %u %u\n", code, state);
     if (!state || !getenv("WAYWIRE_TEST_ACTIONS")) return;
     if (code == 34) { animation_frames = 4; paint(); }
+    if (code == 38) { width += 240; height += 160; paint(); }
     if (code == 50) xdg_toplevel_set_maximized(toplevel);
     if (code == 22) xdg_toplevel_unset_maximized(toplevel);
     if (code == 33) xdg_toplevel_set_fullscreen(toplevel, NULL);

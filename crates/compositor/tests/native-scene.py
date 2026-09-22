@@ -93,9 +93,9 @@ class Scene:
         self.process.wait(timeout=8)
         assert self.process.returncode == 0, self.log.read_text()
 
-    def client(self, width, height):
+    def client(self, width, height, **extra_env):
         path = self.directory / f"client-{len(self.clients)}.log"
-        process = subprocess.Popen([str(self.receiver), str(width), str(height)], env=self.env, stdout=path.open("wb"), stderr=subprocess.STDOUT)
+        process = subprocess.Popen([str(self.receiver), str(width), str(height)], env={**self.env, **extra_env}, stdout=path.open("wb"), stderr=subprocess.STDOUT)
         self.clients.append((process, path))
         wait(lambda: "keyboard-enter" in path.read_text(), "first-map focus")
         return path
@@ -255,10 +255,33 @@ def main():
             wait(lambda: second.read_text().count("keyboard-enter") == 2, "focus restored after client disconnect")
             scene.key(32)
             wait(lambda: "key 32 1" in second.read_text(), "focus restored after close")
+            # A 400x260 client fits the 420x300 logical output only when its
+            # cascade is clamped to (20,34), reserving the 24px bar and 6px strip.
+            large = scene.client(400, 260)
+            scene.motion(60, 81)  # Physical (60,81) is logical (40,54) at 1.5x.
+            wait(lambda: "pointer-enter" in large.read_text(), "large initial window stays on output")
+            match = re.search(r"pointer-enter ([\d.]+) ([\d.]+)", large.read_text())
+            assert all(abs(float(value) - 20) < 0.02 for value in match.groups()), match.groups()
+            # A client-side decoration inset moves the surface origin, not the
+            # window geometry. Rendering and input must agree on that offset.
+            inset = scene.client(120, 90, WAYWIRE_TEST_GEOMETRY="1")
+            scene.motion(240, 225)
+            wait(lambda: "pointer-enter" in inset.read_text(), "inset window receives input")
+            match = re.search(r"pointer-enter ([\d.]+) ([\d.]+)", inset.read_text())
+            assert all(abs(float(value) - expected) < 0.02 for value, expected in zip(match.groups(), (49, 51))), match.groups()
+            wait(lambda: scene.pixel(scene.frame(2), 240, 225) == (48, 176, 224), "CSD pixels align with surface-local input")
+            scene.key(38)  # A later client commit grows the buffer to 360x250.
+            wait(lambda: "paint 360 250" in inset.read_text(), "client-driven growth")
+            scene.motion(180, 126)
+            # Geometry is now (77,73,343,221), surface origin (60,44).
+            wait(lambda: any(abs(float(x)-60) < 0.02 and abs(float(y)-40) < 0.02
+                for x, y in re.findall(r"(?:motion|pointer-enter) ([\d.]+) ([\d.]+)", inset.read_text())),
+                "later client size change stays on output")
+            wait(lambda: scene.pixel(scene.frame(2), 180, 126) == (32, 48, 255), "grown client pixels align with input")
             assert all(a < b for a, b in zip(
                 [struct.unpack_from("<Q", p, 16)[0] for k, p in scene.events if k == 2],
                 [struct.unpack_from("<Q", p, 16)[0] for k, p in scene.events if k == 2][1:])), "frame sequence is monotonic"
-            print("PASS: asymmetric BGRA, text-input-v3, stacking/focus, SSD move/close, top-left resize, popup constrain/grab/dismiss, frame callbacks/damage, repeat/release, bidirectional clipboard, nested maximize/fullscreen, fractional resize/generation/cursor, restored focus")
+            print("PASS: asymmetric BGRA, text-input-v3, stacking/focus, SSD move/close, top-left resize, popup constrain/grab/dismiss, frame callbacks/damage, repeat/release, bidirectional clipboard, nested maximize/fullscreen, fractional resize/generation/cursor, restored focus, initial placement, CSD input/render alignment")
         except Exception:
             print(scene.log.read_text(), file=sys.stderr)
             for _, log in scene.clients:

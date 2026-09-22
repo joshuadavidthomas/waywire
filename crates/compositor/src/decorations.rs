@@ -63,8 +63,9 @@ impl State {
     ) -> Option<(Window, DecorationAction)> {
         for window in self.space.elements().rev() {
             let location = self.space.element_location(window)?;
+            let surface_location = location - window.geometry().loc;
             if window
-                .surface_under(point - location.to_f64(), WindowSurfaceType::ALL)
+                .surface_under(point - surface_location.to_f64(), WindowSurfaceType::ALL)
                 .is_some()
             {
                 return None;
@@ -102,7 +103,7 @@ impl State {
             };
             elements.extend(window.render_elements::<SceneElement<PixmanRenderer>>(
                 renderer,
-                location.to_physical_precise_round(scale),
+                (location - window.geometry().loc).to_physical_precise_round(scale),
                 scale.into(),
                 1.0,
             ));
