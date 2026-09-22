@@ -60,6 +60,7 @@ use self::rtp::RtpSequence;
 use self::rtp::RtpTimestamp;
 use self::rtp::decode_packet;
 use crate::daemon::CommandSink;
+use crate::session::Sessions;
 
 const MAX_ACCESS_UNIT: usize = MAX_VIDEO_DATA_BYTES;
 const UNMATCHED_DEADLINE: Duration = Duration::from_secs(2);
@@ -178,6 +179,7 @@ impl MetadataDropSummary {
 pub(crate) struct VideoPipeline {
     tx: mpsc::Sender<PipelineMessage>,
     unit_budget: Arc<Semaphore>,
+    sessions: Sessions,
 }
 
 pub(crate) struct VideoWorker {
@@ -192,11 +194,16 @@ impl VideoPipeline {
         hub: VideoHub,
         commands: CommandSink,
         readiness: Readiness,
+        sessions: Sessions,
     ) -> (Self, VideoWorker) {
         let (tx, rx) = mpsc::channel(PENDING_RECORD_CAPACITY);
         let unit_budget = Arc::new(Semaphore::new(MAX_PENDING_UNIT_BYTES));
         (
-            Self { tx, unit_budget },
+            Self {
+                tx,
+                unit_budget,
+                sessions,
+            },
             VideoWorker {
                 rx,
                 hub,
@@ -207,6 +214,9 @@ impl VideoPipeline {
     }
 
     pub(crate) async fn metadata(&self, value: FrameMetadata) -> anyhow::Result<()> {
+        // Observe ordered Submitted events before correlation can discard them.
+        // Gaps here are producer replacement/backpressure, not RTP/browser loss.
+        self.sessions.submitted(&value);
         self.tx
             .send(PipelineMessage::Metadata(value))
             .await
@@ -525,11 +535,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submitted_gaps_adapt_only_for_the_owner_before_rtp_correlation() {
+        use waywire_protocol::browser::Feedback;
+        use waywire_protocol::browser::FeedbackValues;
+        use waywire_protocol::pipe::Kbps;
+        use waywire_protocol::pipe::ScalePercent;
+
+        use crate::session::FeedbackOutcome;
+        use crate::session::SocketId;
+
+        for step in [1, 2] {
+            let (commands, mut command_events) = test_command_sink();
+            let sessions = Sessions::new(
+                commands.clone(),
+                Kbps::new(8_000).expect("bitrate"),
+                fps(60),
+            );
+            let owner = SocketId::new(1);
+            sessions.acquire(owner).await.expect("acquire");
+            assert!(matches!(
+                command_events.recv().await,
+                Some(Command::ReleaseAll(_))
+            ));
+            let (pipeline, mut worker) =
+                VideoPipeline::new(video_hub(), commands, Readiness::new(), sessions.clone());
+            // Drain metadata without ever correlating RTP: producer pressure must
+            // not depend on successful encoded delivery or correlate-time drops.
+            let drain = tokio::spawn(async move { while worker.rx.recv().await.is_some() {} });
+            let feedback = Feedback::new(FeedbackValues {
+                received: 30,
+                presented: 30,
+                dropped: 0,
+                queue_peak: 0,
+                queue_busy_ms: 0.0,
+                sample_ms: 1000.0,
+                rtt: 20.0,
+            })
+            .expect("healthy browser feedback");
+            let mut frame = metadata(1, 1);
+            pipeline.metadata(frame.clone()).await.expect("baseline");
+            frame.sequence += 1;
+            frame.capture_nanos = 2_000_000_000;
+            pipeline.metadata(frame.clone()).await.expect("warmup");
+            for _ in 0..2 {
+                for _ in 0..30 {
+                    frame.sequence += step;
+                    frame.capture_nanos += 33_000_000;
+                    pipeline.metadata(frame.clone()).await.expect("submitted");
+                }
+                assert_eq!(
+                    sessions
+                        .feedback(SocketId::new(2), feedback)
+                        .await
+                        .expect("non-owner"),
+                    FeedbackOutcome::NotInputOwner
+                );
+                sessions
+                    .feedback(owner, feedback)
+                    .await
+                    .expect("owner feedback");
+            }
+            assert_eq!(
+                sessions.quality_chroma(),
+                if step == 1 {
+                    Chroma::Yuv444
+                } else {
+                    Chroma::Yuv420
+                }
+            );
+            if step == 2 {
+                assert_eq!(
+                    command_events.recv().await,
+                    Some(Command::Quality(waywire_protocol::pipe::Quality {
+                        bitrate_kbps: Kbps::new(8_000).expect("bitrate"),
+                        fps: fps(60),
+                        scale_percent: ScalePercent::new(100).expect("scale"),
+                        crf: waywire_protocol::pipe::Crf::new(23).expect("crf"),
+                        chroma: Chroma::Yuv420,
+                    }))
+                );
+            }
+            drop(pipeline);
+            drain.await.expect("metadata drained");
+        }
+    }
+
+    #[tokio::test]
     async fn worker_resync_waits_for_a_fresh_keyframe_before_resuming_delivery() {
         let (commands, mut command_events) = test_command_sink();
         let readiness = Readiness::new();
         let hub = video_hub();
-        let (pipeline, worker) = VideoPipeline::new(hub.clone(), commands, readiness.clone());
+        let sessions = Sessions::new(
+            commands.clone(),
+            waywire_protocol::pipe::Kbps::new(8_000).expect("valid bitrate"),
+            Fps::new(60).expect("valid fps"),
+        );
+        let (pipeline, worker) =
+            VideoPipeline::new(hub.clone(), commands, readiness.clone(), sessions);
         let worker_task = tokio::spawn(worker.run());
 
         pipeline

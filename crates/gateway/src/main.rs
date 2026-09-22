@@ -21,7 +21,6 @@ use crate::daemon::Config;
 use crate::daemon::Daemon;
 use crate::http::AppState;
 use crate::http::SocketConnections;
-use crate::session::Sessions;
 use crate::shutdown::Stop;
 use crate::shutdown::finish_shutdown;
 use crate::shutdown::http_listener;
@@ -61,12 +60,11 @@ async fn main() -> Result<()> {
     )?;
     let daemon = started.daemon;
     let mut daemon_task = started.supervisor;
-    let sessions = Sessions::new(daemon.commands.clone(), options.bitrate, options.frame_rate);
     let connections = SocketConnections::new();
     let app = http::router(AppState {
         readiness: daemon.readiness.clone(),
         events: daemon.events.clone(),
-        sessions,
+        sessions: daemon.sessions.clone(),
         hub,
         origin: options.origin,
         connections: connections.clone(),

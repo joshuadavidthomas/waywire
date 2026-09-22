@@ -15,6 +15,7 @@ use waywire_protocol::browser::QualityLevels;
 use waywire_protocol::browser::QualityPreset;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality as QualityCommand;
 use waywire_protocol::pipe::ReleaseAll;
@@ -119,6 +120,7 @@ impl Sessions {
             .await?;
         let epoch = book.next_epoch;
         book.next_epoch = epoch.next();
+        self.quality_ladder().reset_samples();
         book.input_owner = Some(InputOwnership { socket, epoch });
         self.commands.set_active_ownership(epoch);
         self.ownership_changes
@@ -189,6 +191,10 @@ impl Sessions {
 
     pub(crate) fn quality(&self) -> QualityLevels {
         self.quality_ladder().levels()
+    }
+
+    pub(crate) fn submitted(&self, metadata: &FrameMetadata) {
+        self.quality_ladder().submitted(metadata);
     }
 
     #[cfg(test)]
@@ -682,6 +688,71 @@ mod tests {
                 crf: value(waywire_protocol::pipe::Crf::new(18)),
                 chroma: waywire_protocol::pipe::Chroma::Yuv444,
             }))
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_transfer_discards_encoder_pressure_and_streak() {
+        let (sessions, mut commands) = test_sessions();
+        let first = SocketId::new(1);
+        let second = SocketId::new(2);
+        acquire_ownership_and_drain(&sessions, &mut commands, first).await;
+        let mut metadata = FrameMetadata {
+            generation: value(waywire_protocol::pipe::Generation::new(1)),
+            sequence: 1,
+            capture_nanos: 0,
+            width: value(waywire_protocol::pipe::FrameDimension::new(1280)),
+            height: value(waywire_protocol::pipe::FrameDimension::new(720)),
+            input_sequence: None,
+            fps: value(Fps::new(60)),
+            chroma: waywire_protocol::pipe::Chroma::Yuv444,
+        };
+        sessions.submitted(&metadata);
+        metadata.sequence += 1;
+        metadata.capture_nanos = 2_000_000_000;
+        sessions.submitted(&metadata);
+        for _ in 0..2 {
+            metadata.sequence += 60;
+            metadata.capture_nanos += 1_000_000_000;
+            sessions.submitted(&metadata);
+            if metadata.sequence == 62 {
+                sessions
+                    .feedback(first, good_feedback())
+                    .await
+                    .expect("first bad interval");
+            }
+        }
+        sessions.release(first).await.expect("release");
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+        acquire_ownership_and_drain(&sessions, &mut commands, second).await;
+        sessions
+            .feedback(second, good_feedback())
+            .await
+            .expect("new owner feedback");
+        assert_eq!(
+            sessions.quality_chroma(),
+            waywire_protocol::pipe::Chroma::Yuv444
+        );
+        // Also reset the sequence baseline: old-owner frames cannot leak into
+        // the new owner's first sample even without a generation change.
+        metadata.sequence += 1000;
+        metadata.capture_nanos += 2_000_000_000;
+        sessions.submitted(&metadata);
+        sessions
+            .feedback(second, good_feedback())
+            .await
+            .expect("new baseline");
+        assert_eq!(
+            sessions.quality_chroma(),
+            waywire_protocol::pipe::Chroma::Yuv444
+        );
+        assert!(
+            timeout(Duration::from_millis(20), commands.recv())
+                .await
+                .is_err()
         );
     }
 

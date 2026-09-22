@@ -37,6 +37,7 @@ use self::events::read_events;
 use self::process::cleanup_group;
 use self::process::spawn_daemon;
 use self::process::wait_for_leader_exit;
+use crate::session::Sessions;
 use crate::video::Readiness;
 use crate::video::VideoHub;
 use crate::video::VideoPipeline;
@@ -80,7 +81,7 @@ pub(crate) enum XkbLayoutError {
 }
 
 pub(crate) struct Daemon {
-    pub(crate) commands: CommandSink,
+    pub(crate) sessions: Sessions,
     pub(crate) readiness: Readiness,
     pub(crate) events: AppEvents,
     shutdown: mpsc::Sender<()>,
@@ -116,7 +117,9 @@ impl Daemon {
             readiness.clone(),
         );
         let (shutdown, shutdown_rx) = mpsc::channel(1);
-        let (pipeline, video_worker) = VideoPipeline::new(hub, commands.clone(), readiness.clone());
+        let sessions = Sessions::new(commands.clone(), config.bitrate, config.frame_rate);
+        let (pipeline, video_worker) =
+            VideoPipeline::new(hub, commands, readiness.clone(), sessions.clone());
         let process = spawn_daemon(config, socket.local_addr()?.port())?;
         let receivers = DaemonReceivers {
             commands: command_reader,
@@ -134,7 +137,7 @@ impl Daemon {
         ));
         Ok(StartedDaemon {
             daemon: Self {
-                commands,
+                sessions,
                 readiness,
                 events,
                 shutdown,

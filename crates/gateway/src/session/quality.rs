@@ -7,10 +7,15 @@ use waywire_protocol::browser::QualityPreset;
 use waywire_protocol::pipe::Chroma;
 use waywire_protocol::pipe::Crf;
 use waywire_protocol::pipe::Fps;
+use waywire_protocol::pipe::FrameMetadata;
+use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::ScalePercent;
 
 const QUALITY_CHANGE_COOLDOWN: Duration = Duration::from_secs(5);
+const ENCODER_WARMUP_NANOS: u64 = 1_000_000_000;
+const ENCODER_MIN_RENDERED: u64 = 20;
+const ENCODER_BAD_DROP_PERCENT: u64 = 10;
 const BAD_STREAK_THRESHOLD: u8 = 2;
 const GOOD_STREAK_THRESHOLD: u8 = 8;
 const GOOD_DROP_PERCENT: u64 = 2;
@@ -47,6 +52,54 @@ enum Streak {
     None,
     Bad(u8),
     Good(u8),
+}
+
+#[derive(Default)]
+struct EncoderPressure {
+    previous: Option<(Generation, u64, u64)>,
+    warmup_until: u64,
+    rendered: u64,
+    dropped: u64,
+}
+
+impl EncoderPressure {
+    fn observe(&mut self, metadata: &FrameMetadata) -> bool {
+        let previous = self.previous.replace((
+            metadata.generation,
+            metadata.sequence,
+            metadata.capture_nanos,
+        ));
+        let Some((generation, sequence, captured)) = previous else {
+            self.warmup_until = metadata.capture_nanos.saturating_add(ENCODER_WARMUP_NANOS);
+            return true;
+        };
+        if generation != metadata.generation || metadata.sequence <= sequence {
+            self.rendered = 0;
+            self.dropped = 0;
+            self.warmup_until = metadata.capture_nanos.saturating_add(ENCODER_WARMUP_NANOS);
+            return true;
+        }
+        // The first second can replace frames while ffmpeg starts. Keep moving
+        // the baseline, so neither startup nor generation-discarded frames count.
+        if captured <= self.warmup_until {
+            return false;
+        }
+        let rendered = metadata.sequence - sequence;
+        self.rendered = self.rendered.saturating_add(rendered);
+        self.dropped = self.dropped.saturating_add(rendered - 1);
+        false
+    }
+
+    fn take(&mut self) -> (bool, bool) {
+        let rendered = std::mem::take(&mut self.rendered);
+        let dropped = std::mem::take(&mut self.dropped);
+        (
+            rendered >= ENCODER_MIN_RENDERED
+                && u128::from(dropped) * 100
+                    >= u128::from(rendered) * u128::from(ENCODER_BAD_DROP_PERCENT),
+            u128::from(dropped) * 100 <= u128::from(rendered) * u128::from(GOOD_DROP_PERCENT),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +154,8 @@ pub(super) struct Quality {
     preset: QualityPreset,
     streak: Streak,
     last_change: Option<Instant>,
+    encoder: EncoderPressure,
+    encoder_was_bad: bool,
 }
 
 impl Quality {
@@ -118,11 +173,26 @@ impl Quality {
             preset: QualityPreset::Automatic,
             streak: Streak::None,
             last_change: None,
+            encoder: EncoderPressure::default(),
+            encoder_was_bad: false,
         }
     }
 
     pub(super) fn levels(&self) -> QualityLevels {
         self.levels
+    }
+
+    pub(super) fn reset_samples(&mut self) {
+        self.encoder = EncoderPressure::default();
+        self.encoder_was_bad = false;
+        self.streak = Streak::None;
+    }
+
+    pub(super) fn submitted(&mut self, metadata: &FrameMetadata) {
+        if self.encoder.observe(metadata) {
+            self.streak = Streak::None;
+            self.encoder_was_bad = false;
+        }
     }
 
     #[cfg(test)]
@@ -136,7 +206,7 @@ impl Quality {
         }
 
         self.preset = preset;
-        self.streak = Streak::None;
+        self.reset_samples();
         self.last_change = None;
         let old = self.levels;
         let old_crf = self.crf;
@@ -153,17 +223,26 @@ impl Quality {
     }
 
     pub(super) fn update(&mut self, feedback: &Feedback, now: Instant) -> Option<QualityChange> {
+        let (encoder_bad, encoder_good) = self.encoder.take();
+        let encoder_was_bad = std::mem::replace(&mut self.encoder_was_bad, encoder_bad);
         // The stream is damage-driven: absence of frames says nothing about its
-        // health. Idle feedback neither advances nor discards recovery progress.
-        if feedback.received() == 0 {
+        // health. Idle feedback preserves recovery, but interrupts producer overload.
+        if feedback.received() == 0 && !encoder_bad {
+            if encoder_was_bad {
+                self.streak = Streak::None;
+            }
             return None;
         }
         let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
-        let is_bad =
-            queue_pressure >= 0.10 || feedback.queue_peak() >= 24 || feedback.rtt() > 250.0;
+        let is_bad = encoder_bad
+            || (feedback.received() > 0
+                && (queue_pressure >= 0.10
+                    || feedback.queue_peak() >= 24
+                    || feedback.rtt() > 250.0));
         // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
         // so one dropped frame does not erase an otherwise healthy recovery streak.
-        let is_good = queue_pressure < 0.05
+        let is_good = encoder_good
+            && queue_pressure < 0.05
             && feedback.queue_peak() < 24
             && u64::from(feedback.dropped()) * 100
                 <= u64::from(feedback.received()) * GOOD_DROP_PERCENT
@@ -284,6 +363,187 @@ mod tests {
     use crate::session::tests::feedback;
     use crate::session::tests::good_feedback;
     use crate::session::tests::value;
+
+    fn warmed_encoder(quality: &mut Quality) -> FrameMetadata {
+        let mut metadata = FrameMetadata {
+            generation: value(Generation::new(1)),
+            sequence: 1,
+            capture_nanos: 0,
+            width: value(waywire_protocol::pipe::FrameDimension::new(1280)),
+            height: value(waywire_protocol::pipe::FrameDimension::new(720)),
+            input_sequence: None,
+            fps: value(Fps::new(60)),
+            chroma: Chroma::Yuv444,
+        };
+        quality.submitted(&metadata);
+        metadata.sequence = 2;
+        metadata.capture_nanos = 2_000_000_000;
+        quality.submitted(&metadata);
+        metadata
+    }
+
+    fn encoder_sample(
+        quality: &mut Quality,
+        metadata: &mut FrameMetadata,
+        submitted: u64,
+        dropped: u64,
+    ) {
+        metadata.sequence += dropped;
+        for _ in 0..submitted {
+            metadata.sequence += 1;
+            metadata.capture_nanos += 20_000_000;
+            quality.submitted(metadata);
+        }
+    }
+
+    #[test]
+    fn healthy_browser_cannot_hide_sustained_encoder_drops() {
+        for (submitted, dropped, changes) in [
+            (30, 0, false),
+            (30, 30, true),
+            (18, 2, true),
+            (19, 1, false),
+            (17, 2, false),
+        ] {
+            let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+            let mut metadata = warmed_encoder(&mut quality);
+            let now = Instant::now();
+            encoder_sample(&mut quality, &mut metadata, submitted, dropped);
+            assert_eq!(quality.update(&good_feedback(), now), None);
+            encoder_sample(&mut quality, &mut metadata, submitted, dropped);
+            let change = quality.update(&good_feedback(), now);
+            assert_eq!(
+                change.is_some(),
+                changes,
+                "submitted={submitted}, dropped={dropped}"
+            );
+            assert_eq!(
+                quality.levels(),
+                QualityLevels {
+                    bitrate: value(Kbps::new(8_000)),
+                    fps: value(Fps::new(60)),
+                    scale: FULL_SCALE,
+                }
+            );
+            assert_eq!(
+                quality.chroma,
+                if changes {
+                    Chroma::Yuv420
+                } else {
+                    Chroma::Yuv444
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_overload_idle_and_sparse_damage_do_not_lower_quality() {
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+        let mut metadata = warmed_encoder(&mut quality);
+        let now = Instant::now();
+        for _ in 0..10 {
+            encoder_sample(&mut quality, &mut metadata, 30, 30);
+            assert_eq!(quality.update(&good_feedback(), now), None);
+            assert_eq!(quality.update(&feedback(0, 0, 0, 0.0, 0, 20.0), now), None);
+            // One damaged frame after a minute is not 3,599 lost frames.
+            metadata.capture_nanos += 60_000_000_000;
+            encoder_sample(&mut quality, &mut metadata, 1, 0);
+            assert_eq!(quality.update(&feedback(1, 1, 0, 0.0, 0, 20.0), now), None);
+        }
+        assert_eq!(quality.chroma, Chroma::Yuv444);
+        assert_eq!(quality.levels().scale, FULL_SCALE);
+    }
+
+    #[test]
+    fn generation_and_startup_gaps_discard_pressure_and_streaks() {
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+        let mut metadata = warmed_encoder(&mut quality);
+        let now = Instant::now();
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        assert_eq!(quality.update(&good_feedback(), now), None);
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        metadata.generation = value(Generation::new(2));
+        metadata.sequence += 10_000;
+        quality.submitted(&metadata);
+        encoder_sample(&mut quality, &mut metadata, 30, 300);
+        assert_eq!(quality.update(&good_feedback(), now), None);
+        // The interval crossing the grace boundary is also discarded.
+        metadata.capture_nanos += 2_000_000_000;
+        encoder_sample(&mut quality, &mut metadata, 1, 300);
+        assert_eq!(quality.update(&good_feedback(), now), None);
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        assert_eq!(quality.update(&good_feedback(), now), None);
+        assert_eq!(quality.chroma, Chroma::Yuv444);
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        assert_eq!(
+            quality
+                .update(&good_feedback(), now)
+                .expect("two fresh bad windows")
+                .new_chroma,
+            Chroma::Yuv420
+        );
+    }
+
+    #[test]
+    fn encoder_pressure_obeys_cooldown_and_healthy_recovery() {
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+        let mut metadata = warmed_encoder(&mut quality);
+        let now = Instant::now();
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        assert_eq!(quality.update(&good_feedback(), now), None);
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        assert_eq!(
+            quality
+                .update(&good_feedback(), now)
+                .expect("lower chroma")
+                .new_chroma,
+            Chroma::Yuv420
+        );
+        for seconds in 1..5 {
+            encoder_sample(&mut quality, &mut metadata, 30, 30);
+            assert_eq!(
+                quality.update(&good_feedback(), now + Duration::from_secs(seconds)),
+                None
+            );
+        }
+        encoder_sample(&mut quality, &mut metadata, 30, 30);
+        let change = quality
+            .update(&good_feedback(), now + Duration::from_secs(5))
+            .expect("next rung at five seconds");
+        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
+        assert_eq!(change.new.bitrate, value(Kbps::new(8_000)));
+        assert_eq!(change.new.fps, value(Fps::new(60)));
+        for seconds in 6..13 {
+            encoder_sample(&mut quality, &mut metadata, 49, 1);
+            assert_eq!(
+                quality.update(&good_feedback(), now + Duration::from_secs(seconds)),
+                None
+            );
+        }
+        // 3% replacement must block recovery even when the browser is healthy.
+        encoder_sample(&mut quality, &mut metadata, 97, 3);
+        assert_eq!(
+            quality.update(&good_feedback(), now + Duration::from_secs(13)),
+            None
+        );
+        for seconds in 14..21 {
+            encoder_sample(&mut quality, &mut metadata, 49, 1);
+            assert_eq!(
+                quality.update(&good_feedback(), now + Duration::from_secs(seconds)),
+                None
+            );
+        }
+        encoder_sample(&mut quality, &mut metadata, 49, 1);
+        assert_eq!(
+            quality
+                .update(&good_feedback(), now + Duration::from_secs(21))
+                .expect("eight healthy windows")
+                .new
+                .scale,
+            FULL_SCALE
+        );
+        assert_eq!(quality.chroma, Chroma::Yuv420);
+    }
 
     fn trigger_bad(quality: &mut Quality, now: Instant) -> Option<QualityChange> {
         assert_eq!(quality.update(&bad_feedback(), now), None);
