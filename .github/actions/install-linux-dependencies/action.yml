@@ -4,14 +4,14 @@ description: Install the native build tools and test dependencies required by wa
 runs:
   using: composite
   steps:
-    # xkbcommon links libxkbcommon directly. Wayland uses its pure-Rust backend,
-    # so neither libwayland-dev nor pkg-config is needed. Tests do not run FFmpeg
-    # or a compositor; Python and ShellCheck cover the desktop scripts.
+    # Smithay uses the pure-Rust Wayland backend and Pixman CPU rendering.
+    # Headless compositor tests need no display server or GPU.
     - shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           build-essential \
+          pkg-config \
+          libpixman-1-dev \
           libxkbcommon-dev \
-          python3 \
           shellcheck

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::Duration;
@@ -55,14 +56,14 @@ pub(super) fn spawn_daemon(config: &Config, rtp_port: u16) -> Result<SpawnedDaem
     })
 }
 
-fn daemon_args(config: &Config, rtp_port: u16) -> Vec<String> {
-    vec![
+fn daemon_args(config: &Config, rtp_port: u16) -> Vec<OsString> {
+    let mut args = vec![
         "--frame-rate".into(),
-        config.frame_rate.get().to_string(),
+        config.frame_rate.get().to_string().into(),
         "--bitrate".into(),
-        config.bitrate.get().to_string(),
+        config.bitrate.get().to_string().into(),
         "--rtp-port".into(),
-        rtp_port.to_string(),
+        rtp_port.to_string().into(),
         "--xkb-layout".into(),
         config.xkb_layout.as_str().into(),
         "--resolution".into(),
@@ -70,8 +71,14 @@ fn daemon_args(config: &Config, rtp_port: u16) -> Vec<String> {
             "{}x{}",
             config.resolution.width(),
             config.resolution.height()
-        ),
-    ]
+        )
+        .into(),
+    ];
+    if !config.session.is_empty() {
+        args.push("--".into());
+        args.extend(config.session.iter().cloned());
+    }
+    args
 }
 
 pub(super) async fn wait_for_leader_exit(pid: Pid) -> Result<WaitStatus> {
@@ -135,44 +142,130 @@ pub(super) async fn cleanup_group(child: &mut Child, pid: Pid) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::time::Duration;
 
     use nix::errno::Errno;
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::Pid;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::BufReader;
+    use tokio::process::Command;
+    use tokio::time::Instant;
+    use tokio::time::sleep;
+    use tokio::time::timeout;
     use waywire_protocol::pipe::Fps;
     use waywire_protocol::pipe::FrameSize;
     use waywire_protocol::pipe::Kbps;
 
     use super::ProcessGroupState;
+    use super::cleanup_group;
     use super::daemon_args;
     use super::process_group_state;
+    use super::wait_for_leader_exit;
     use crate::daemon::Config;
     use crate::daemon::XkbLayout;
 
     #[test]
-    fn streamd_arguments_include_the_configured_resolution() {
-        let config = Config {
-            path: PathBuf::from("streamd"),
+    fn compositor_arguments_preserve_resolution_and_session_argv() {
+        let mut config = Config {
+            path: PathBuf::from("waywire-compositor"),
             frame_rate: Fps::new(60).expect("valid frame rate"),
             bitrate: Kbps::new(16_000).expect("valid bitrate"),
             xkb_layout: XkbLayout::parse("us").expect("valid layout"),
             resolution: FrameSize::new(2560, 1440).expect("valid resolution"),
+            session: Vec::new(),
         };
 
+        let mut expected = vec![
+            "--frame-rate",
+            "60",
+            "--bitrate",
+            "16000",
+            "--rtp-port",
+            "5000",
+            "--xkb-layout",
+            "us",
+            "--resolution",
+            "2560x1440",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert_eq!(daemon_args(&config, 5000), expected);
+
+        config.session = vec![
+            "foot".into(),
+            "--title=A desktop terminal".into(),
+            OsString::from_vec(b"non-UTF8-\xff".to_vec()),
+        ];
+        expected.extend([
+            OsString::from("--"),
+            OsString::from("foot"),
+            OsString::from("--title=A desktop terminal"),
+            OsString::from_vec(b"non-UTF8-\xff".to_vec()),
+        ]);
+        assert_eq!(daemon_args(&config, 5000), expected);
+    }
+
+    #[tokio::test]
+    async fn exited_compositor_keeps_descendants_owned_until_cleanup() {
+        // The child inherits ignored SIGTERM and survives its leader. Reaping
+        // the leader early or signalling only its PID would leave this running.
+        let mut leader = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 60 & echo $!; exit 0"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn process group");
+        let pid = Pid::from_raw(i32::try_from(leader.id().expect("leader PID")).expect("PID fits"));
+        let mut output = BufReader::new(leader.stdout.take().expect("leader stdout"));
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), output.read_line(&mut line))
+            .await
+            .expect("child PID deadline")
+            .expect("read child PID");
+        let child: u32 = line.trim().parse().expect("child PID");
         assert_eq!(
-            daemon_args(&config, 5000),
-            [
-                "--frame-rate",
-                "60",
-                "--bitrate",
-                "16000",
-                "--rtp-port",
-                "5000",
-                "--xkb-layout",
-                "us",
-                "--resolution",
-                "2560x1440",
-            ]
+            timeout(Duration::from_secs(5), wait_for_leader_exit(pid))
+                .await
+                .expect("leader exit deadline")
+                .expect("observe leader"),
+            WaitStatus::Exited(pid, 0)
         );
+        cleanup_group(&mut leader, pid)
+            .await
+            .expect("clean up exited leader's group");
+        assert_eq!(
+            leader
+                .try_wait()
+                .expect("leader wait")
+                .expect("leader reaped")
+                .code(),
+            Some(0)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{child}/stat")) {
+                Ok(stat) => {
+                    let state = stat.rsplit_once(')').expect("process stat").1.trim_start();
+                    if state.starts_with('Z') {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "application survived group cleanup"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => panic!("read child process state: {error}"),
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[test]

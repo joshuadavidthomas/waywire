@@ -83,7 +83,7 @@ pub struct CursorState {
     #[serde(rename = "visible")]
     pub visibility: CursorVisibility,
     pub shape: CursorShape,
-    /// `None` until streamd has reported a position.
+    /// `None` until the compositor has reported a position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<CursorPosition>,
 }
@@ -425,7 +425,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![7, kind, 0, 0];
+        let mut bytes = vec![8, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -444,7 +444,7 @@ mod tests {
             let event = ClientEvent::video_config(chroma.h264_profile().codec());
             assert_eq!(
                 json(&event),
-                format!(r#"{{"type":"video-config","version":7,"codec":"{codec}"}}"#)
+                format!(r#"{{"type":"video-config","version":8,"codec":"{codec}"}}"#)
             );
         }
     }
@@ -454,7 +454,10 @@ mod tests {
         let cursor = CursorState {
             visibility: CursorVisibility::Visible,
             shape: CursorShape::Pointer,
-            position: Some(CursorPosition { x: 10, y: 20 }),
+            position: Some(CursorPosition {
+                x: value(pipe::PointerCoordinate::new(10)),
+                y: value(pipe::PointerCoordinate::new(20)),
+            }),
         };
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
@@ -748,7 +751,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            7, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            8, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

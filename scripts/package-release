@@ -10,8 +10,8 @@ temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
 name="waywire-$version-linux-amd64"
 mkdir -p "$temporary/$name/bin"
-install -m 0755 target/release/waywire-gateway target/release/waywire-streamd \
-  desktop/desktop.sh desktop/session.py "$temporary/$name/bin/"
+install -m 0755 target/release/waywire-gateway target/release/waywire-compositor \
+  desktop/desktop.sh "$temporary/$name/bin/"
 install -m 0644 README.md LICENSE "$temporary/$name/"
 
 rm -rf dist/release

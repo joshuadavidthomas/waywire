@@ -328,9 +328,15 @@ mod tests {
             .expect("new cursor shape should replace old shape");
         sink.send(&Event::CursorVisibility(CursorVisibility::Visible))
             .expect("cursor visibility should queue separately");
-        sink.send(&Event::CursorPosition(CursorPosition { x: 1, y: 2 }))
-            .expect("first cursor position should queue");
-        let position = Event::CursorPosition(CursorPosition { x: 3, y: 4 });
+        sink.send(&Event::CursorPosition(CursorPosition {
+            x: waywire_protocol::pipe::PointerCoordinate::new(1).expect("valid coordinate"),
+            y: waywire_protocol::pipe::PointerCoordinate::new(2).expect("valid coordinate"),
+        }))
+        .expect("first cursor position should queue");
+        let position = Event::CursorPosition(CursorPosition {
+            x: waywire_protocol::pipe::PointerCoordinate::new(3).expect("valid coordinate"),
+            y: waywire_protocol::pipe::PointerCoordinate::new(4).expect("valid coordinate"),
+        });
         sink.send(&position)
             .expect("new cursor position should replace old position");
 

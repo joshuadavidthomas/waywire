@@ -20,6 +20,5 @@ APT
 
 sudo env DEBIAN_FRONTEND=noninteractive apt-get update
 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  ca-certificates curl dbus-x11 ffmpeg fonts-dejavu-core labwc lxqt-core \
-  lxqt-menu-data lxqt-wayland-session featherpad breeze-cursor-theme \
-  breeze-icon-theme qt6-svg-plugins qt6-wayland python3 xdg-utils firefox
+  ca-certificates curl dbus-x11 ffmpeg fonts-dejavu-core foot \
+  libpixman-1-0 libxkbcommon0 xwayland xdg-utils firefox

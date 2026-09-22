@@ -58,11 +58,13 @@ rustfmt-check:
 test: build-web
     pnpm --filter @waywire/web test
     cargo test --locked --workspace
-    python3 -m unittest discover -s desktop -p 'test_*.py'
-    shellcheck desktop/desktop.sh scripts/package-release scripts/setup-desktop
+    shellcheck desktop/desktop.sh scripts/package-release scripts/setup-desktop scripts/setup-xwayland.sh
 
-test-streamd *ARGS:
-    cargo test --locked -p waywire-streamd -- --ignored {{ ARGS }}
+test-compositor *ARGS:
+    cargo test --locked -p waywire-compositor -- --ignored {{ ARGS }}
+    cargo build --locked -p waywire-compositor --bins --examples
+    PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/native-scene.py
+    PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/interop.py
 
 typecheck:
     pnpm --filter @waywire/web check

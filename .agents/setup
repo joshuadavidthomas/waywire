@@ -14,7 +14,9 @@ step() {
 system_dependencies() {
   local package
   local missing=()
-  for package in build-essential ca-certificates curl libxkbcommon-dev python3 shellcheck ffmpeg dbus foot fonts-dejavu-core adwaita-icon-theme; do
+  for package in build-essential ca-certificates curl pkg-config libpixman-1-dev libxkbcommon-dev python3 shellcheck ffmpeg dbus foot fonts-dejavu-core \
+    xz-utils bzip2 meson ninja-build python3-jinja2 python3-attr libwayland-dev libx11-dev libxkbfile-dev libxfont-dev libxcvt-dev libdrm-dev libssl-dev libtirpc-dev libxshmfence-dev xtrans-dev x11proto-dev x11-xkb-utils xkb-data \
+    wayland-protocols xterm xdotool wmctrl xclip x11-utils libxtst-dev; do
     if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
       missing+=("$package")
     fi
@@ -59,6 +61,7 @@ PROFILE
 }
 
 step 'System dependencies' system_dependencies
+step 'CPU-only Xwayland with native input emulation' bash scripts/setup-xwayland.sh
 step 'Toolchains and check runners' toolchains
 step 'JavaScript dependencies' pnpm install --frozen-lockfile
 step 'Rust dependency cache' cargo fetch --locked

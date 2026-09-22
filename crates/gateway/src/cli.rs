@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -12,13 +13,13 @@ use crate::http::Origin;
 #[command(
     name = "waywire-gateway",
     version,
-    about = "Unauthenticated HTTP and WebSocket gateway for waywire-streamd; WebSocket upgrades require the configured Origin. Bind to loopback or put an authenticating proxy, such as the Sprite URL policy, in front."
+    about = "Unauthenticated HTTP and WebSocket gateway for waywire-compositor; WebSocket upgrades require the configured Origin. Bind to loopback or put an authenticating proxy, such as the Sprite URL policy, in front."
 )]
 pub(super) struct Options {
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub(super) listen: String,
-    #[arg(long)]
-    pub(super) streamd: PathBuf,
+    #[arg(long, default_value = "waywire-compositor")]
+    pub(super) compositor: PathBuf,
     #[arg(long = "public-url", env = "PUBLIC_URL", value_parser = Origin::parse)]
     pub(super) origin: Origin,
     #[arg(long, default_value = "60", value_parser = parse_fps)]
@@ -34,6 +35,9 @@ pub(super) struct Options {
         value_parser = parse_resolution
     )]
     pub(super) resolution: FrameSize,
+    /// Application to launch inside the desktop, followed by its arguments.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub(super) session: Vec<OsString>,
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -93,5 +97,24 @@ mod tests {
         for value in ["1920", "1920X1080", "1920x1080x60", "1919x1080", "8000x100"] {
             assert!(parse_resolution(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn session_arguments_are_not_interpreted_as_gateway_options() {
+        let options = Options::try_parse_from([
+            "waywire-gateway",
+            "--public-url",
+            "https://desktop.example.com",
+            "--",
+            "foot",
+            "--title",
+            "A desktop terminal",
+        ])
+        .expect("session argv should parse");
+        assert_eq!(options.compositor, PathBuf::from("waywire-compositor"));
+        assert_eq!(
+            options.session,
+            ["foot", "--title", "A desktop terminal"].map(OsString::from)
+        );
     }
 }

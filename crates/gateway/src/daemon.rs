@@ -2,6 +2,7 @@ mod commands;
 mod events;
 mod process;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -96,6 +97,7 @@ pub(crate) struct Config {
     pub(crate) bitrate: Kbps,
     pub(crate) xkb_layout: XkbLayout,
     pub(crate) resolution: FrameSize,
+    pub(crate) session: Vec<OsString>,
 }
 
 impl Daemon {

@@ -293,11 +293,15 @@ mod tests {
     use tokio::time::timeout;
     use waywire_protocol::Record;
     use waywire_protocol::pipe::CursorPosition;
+    use waywire_protocol::pipe::PointerCoordinate;
 
     use super::*;
 
-    fn event(x: i32) -> Event {
-        Event::CursorPosition(CursorPosition { x, y: x + 1 })
+    fn event(x: u32) -> Event {
+        Event::CursorPosition(CursorPosition {
+            x: PointerCoordinate::new(x).expect("valid test position"),
+            y: PointerCoordinate::new(x + 1).expect("valid test position"),
+        })
     }
 
     #[tokio::test]
@@ -474,9 +478,18 @@ mod tests {
     #[test]
     fn cursor_position_gate_publishes_first_and_latest_without_idle_deadline() {
         let now = Instant::now();
-        let first = CursorPosition { x: 1, y: 2 };
-        let replaced = CursorPosition { x: 3, y: 4 };
-        let latest = CursorPosition { x: 5, y: 6 };
+        let first = CursorPosition {
+            x: PointerCoordinate::new(1).expect("valid test position"),
+            y: PointerCoordinate::new(2).expect("valid test position"),
+        };
+        let replaced = CursorPosition {
+            x: PointerCoordinate::new(3).expect("valid test position"),
+            y: PointerCoordinate::new(4).expect("valid test position"),
+        };
+        let latest = CursorPosition {
+            x: PointerCoordinate::new(5).expect("valid test position"),
+            y: PointerCoordinate::new(6).expect("valid test position"),
+        };
         let mut gate = CursorPositionGate::Open;
 
         assert_eq!(gate.push(first, now), Some(first));

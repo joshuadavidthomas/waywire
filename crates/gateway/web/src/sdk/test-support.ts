@@ -6,6 +6,8 @@ export class FakeTarget {
   readonly style = {
     cursor: "",
     priority: "",
+    display: "",
+    transform: "",
     getPropertyValue: (): string => this.style.cursor,
     getPropertyPriority: (): string => this.style.priority,
     setProperty: (_name: string, value: string, priority = ""): void => {
@@ -17,6 +19,12 @@ export class FakeTarget {
       this.style.priority = "";
     },
   };
+  readonly children: FakeTarget[] = [];
+  parent: FakeTarget | null = null;
+  get parentElement(): FakeTarget | null {
+    return this.parent;
+  }
+  attributes = new Map<string, string>();
   devicePixelRatio = 1;
   VideoDecoder: unknown = true;
   hidden = false;
@@ -34,6 +42,29 @@ export class FakeTarget {
   hasPointerCapture = (_pointerId: number): boolean => false;
   setPointerCapture(_pointerId: number): void {}
   releasePointerCapture(_pointerId: number): void {}
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  append(child: FakeTarget): void {
+    child.remove();
+    child.parent = this;
+    this.children.push(child);
+  }
+
+  contains(target: FakeTarget): boolean {
+    return (
+      target === this || this.children.some((child) => child.contains(target))
+    );
+  }
+
+  remove(): void {
+    if (!this.parent) return;
+    const index = this.parent.children.indexOf(this);
+    if (index >= 0) this.parent.children.splice(index, 1);
+    this.parent = null;
+  }
 
   addEventListener(type: string, listener: (event: unknown) => void): void {
     let listeners = this.listeners.get(type);
@@ -144,6 +175,11 @@ export function installBrowser(): {
 } {
   const fakeWindow = new FakeTarget();
   const fakeDocument = new FakeTarget();
+  const body = new FakeTarget();
+  Object.assign(fakeDocument, {
+    body,
+    createElement: () => new FakeTarget(),
+  });
   installGlobal("window", fakeWindow);
   installGlobal("document", fakeDocument);
   installGlobal("WebSocket", FakeWebSocket);

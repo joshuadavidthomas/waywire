@@ -325,7 +325,7 @@ export class ControlRuntime {
       }
     },
     updatePointerLocked: (pointerLocked) => {
-      if (!pointerLocked) this.localCursor?.forget();
+      this.localCursor?.setPointerLocked(pointerLocked);
       this.owner.updateState("input", { pointerLocked });
     },
     visibilityChanged: () => this.handleVisibilityChange(),
@@ -610,6 +610,7 @@ export class ControlRuntime {
     width: number,
     height: number,
   ): void {
+    this.localCursor?.setVideoDimensions(width, height);
     let settledState = this.resizeState;
     for (const [id, request] of this.resizeRequests) {
       if (request.state === "requested") continue;
@@ -1179,7 +1180,7 @@ export class ControlRuntime {
     }
 
     this.video.attach(attachedCanvas, this.context);
-    this.localCursor = new LocalCursor(attachedInput);
+    this.localCursor = new LocalCursor(attachedInput, attachedCanvas);
     this.clipboardAutoSync = Boolean(surfaceOptions.clipboardAutoSync);
     this.owner.setControlOnFocus(Boolean(surfaceOptions.controlOnFocus));
     if (surfaceOptions.remoteDisplay) {

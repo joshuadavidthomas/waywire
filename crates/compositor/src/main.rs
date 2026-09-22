@@ -1,9 +1,10 @@
+mod compositor;
+mod eis;
 mod event_writer;
 mod video;
-mod wayland;
+mod xwayland;
 
-use std::env;
-use std::path::PathBuf;
+use std::ffi::OsString;
 
 use anyhow::Result;
 use clap::Parser;
@@ -14,9 +15,9 @@ use waywire_protocol::pipe::Kbps;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "waywire-streamd",
+    name = "waywire-compositor",
     version,
-    about = "Captures one Wayland output and streams H.264 RTP"
+    about = "Headless Wayland compositor streaming H.264 RTP"
 )]
 struct Options {
     #[arg(long, default_value = "ffmpeg")]
@@ -36,15 +37,10 @@ struct Options {
         value_parser = parse_resolution
     )]
     resolution: FrameSize,
-    #[arg(long, env = "XCURSOR_THEME", default_value = "breeze_cursors")]
-    cursor_theme: String,
-    #[arg(
-        long,
-        env = "XCURSOR_PATH",
-        value_delimiter = ':',
-        default_values_os_t = default_cursor_theme_paths()
-    )]
-    cursor_theme_path: Vec<PathBuf>,
+    /// Application argv after --. If absent, `WAYWIRE_SESSION` names one executable.
+    /// No shell parsing is performed. Without either, only serve external clients.
+    #[arg(last = true)]
+    session: Vec<OsString>,
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -62,7 +58,12 @@ fn parse_kbps(value: &str) -> Result<Kbps, String> {
 }
 
 fn parse_layout(value: &str) -> Result<String, String> {
-    if wayland::input::valid_layout(value) {
+    if !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    {
         Ok(value.to_owned())
     } else {
         Err("layout must be 1-32 ASCII letters, digits, '_' or '-'".into())
@@ -85,39 +86,6 @@ fn parse_resolution(value: &str) -> Result<FrameSize, String> {
     FrameSize::new(width, height).map_err(|error| error.to_string())
 }
 
-fn default_cursor_theme_paths() -> Vec<PathBuf> {
-    let home = env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let mut paths = Vec::new();
-    if let Some(data_home) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-        paths.push(PathBuf::from(data_home).join("icons"));
-    } else if let Some(home) = &home {
-        paths.push(home.join(".local/share/icons"));
-    }
-    if let Some(home) = &home {
-        paths.push(home.join(".icons"));
-    }
-    if let Some(data_dirs) = env::var_os("XDG_DATA_DIRS").filter(|value| !value.is_empty()) {
-        paths.extend(
-            env::split_paths(&data_dirs)
-                .filter(|path| !path.as_os_str().is_empty())
-                .map(|path| path.join("icons")),
-        );
-    } else {
-        paths.extend([
-            PathBuf::from("/usr/local/share/icons"),
-            PathBuf::from("/usr/share/icons"),
-        ]);
-    }
-    paths.push(PathBuf::from("/usr/share/pixmaps"));
-    if let Some(home) = home {
-        paths.push(home.join(".cursors"));
-    }
-    paths.push(PathBuf::from("/usr/share/cursors/xorg-x11"));
-    paths
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -127,7 +95,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    wayland::run(Options::parse())
+    compositor::run(Options::parse())
 }
 
 #[cfg(test)]

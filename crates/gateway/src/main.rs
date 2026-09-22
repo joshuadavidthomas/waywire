@@ -49,11 +49,12 @@ async fn main() -> Result<()> {
     let hub = VideoHub::new(options.frame_rate);
     let started = Daemon::start(
         &Config {
-            path: options.streamd,
+            path: options.compositor,
             frame_rate: options.frame_rate,
             bitrate: options.bitrate,
             xkb_layout: options.xkb_layout,
             resolution: options.resolution,
+            session: options.session,
         },
         rtp,
         hub.clone(),

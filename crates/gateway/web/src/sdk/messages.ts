@@ -1,5 +1,5 @@
 // Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 export class ProtocolVersionMismatchError extends Error {
   constructor(
@@ -64,9 +64,18 @@ export type CursorState = {
   readonly type: "cursor";
   readonly visible: boolean;
   readonly shape: CursorShape;
-  // Null until the server has sent its first cursor position.
+  // Null until the server has sent its first normalized 0..65535 position.
   readonly position: { readonly x: number; readonly y: number } | null;
 };
+
+function isPointerCoordinate(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= 65_535
+  );
+}
 
 export type VideoConfiguration = {
   readonly type: "video-config";
@@ -174,8 +183,8 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
         };
       }
       return isRecord(value.position) &&
-        typeof value.position.x === "number" &&
-        typeof value.position.y === "number"
+        isPointerCoordinate(value.position.x) &&
+        isPointerCoordinate(value.position.y)
         ? {
             type: value.type,
             visible: value.visible,

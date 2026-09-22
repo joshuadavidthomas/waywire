@@ -38,10 +38,8 @@ waywire-protocol = { path = "crates/protocol" }
 anyhow = "1.0.100"
 axum = { version = "0.8.9", features = ["ws"] }
 calloop = { version = "0.14.4", features = ["signals"] }
-calloop-wayland-source = "0.4.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 futures-util = "0.3.31"
-memmap2 = "0.9.9"
 # Pin the tested syscall wrappers: both binaries rely on their FD, polling,
 # signal and process-control behavior for backpressure and child cleanup.
 nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "time"] }
@@ -50,6 +48,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
 socket2 = "0.6.1"
+smithay = { git = "https://github.com/Smithay/smithay", rev = "d33a9c98fbd4d0ddd85315f93d436747bf3393a6", default-features = false, features = ["desktop", "wayland_frontend", "renderer_pixman", "xwayland", "backend_libei"] }
 tempfile = "3.26.0"
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -57,12 +56,3 @@ tokio-util = { version = "0.7.19", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 url = "2.5.8"
-# Pin these together: generated bindings import wayland-client's core interfaces
-# and share its scanner/backend types; misc and wlr also import wayland-protocols.
-# Upgrade and test the client and protocol bindings as one set.
-wayland-client = "=0.31.15"
-wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"] }
-wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
-wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
-xcursor = "0.3.11"
-xkbcommon = "0.9.0"

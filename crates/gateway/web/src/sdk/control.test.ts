@@ -99,7 +99,7 @@ test("dispose cancels an asynchronous clipboard paste", async () => {
   }
 });
 
-test("default manual policy never observes or resizes on connect and acquire", async () => {
+test("default manual policy never observes remote sizing or resizes on connect and acquire", async () => {
   const { window } = installBrowser();
   const observers = installResizeObserver();
   const sockets = new Map<string, FakeWebSocket>();
@@ -114,7 +114,7 @@ test("default manual policy never observes or resizes on connect and acquire", a
   session.attachSurface(surfaceOptions());
   try {
     assert.deepEqual(session.remoteDisplay.policy, { mode: "manual" });
-    assert.equal(observers.length, 0);
+    assert.equal(observers.length, 1, "the cursor observes canvas layout only");
     session.input.acquire();
     session.connect();
     await flush();
@@ -127,7 +127,7 @@ test("default manual policy never observes or resizes on connect and acquire", a
     });
     window.dispatch("resize", {});
     await new Promise<void>((resolve) => setTimeout(resolve, 110));
-    assert.equal(observers.length, 0);
+    assert.equal(observers.length, 1, "manual sizing adds no observer");
     assert.deepEqual(resizeRecords(control), []);
   } finally {
     await session.dispose();
@@ -154,7 +154,7 @@ test("an explicit Fit action observes later window resizes", async () => {
 
     session.remoteDisplay.fixed({ width: 1600, height: 900, scale: 1 });
     assert.equal(resizeRecords(control).length, 1);
-    assert.equal(observers.length, 0);
+    assert.equal(observers.length, 1, "the cursor observes canvas layout only");
 
     session.remoteDisplay.observe({
       element: canvas as unknown as Element,
@@ -162,7 +162,7 @@ test("an explicit Fit action observes later window resizes", async () => {
       debounceMs: 0,
     });
     await flush();
-    assert.equal(observers.length, 1);
+    assert.equal(observers.length, 2);
     assert.deepEqual(resizeRecords(control).map(resizeSize), [
       [1600, 900],
       [1280, 720],
@@ -204,7 +204,7 @@ test("resize observer burst sends its final viewport without input ownership", a
     if (!control) throw new Error("control socket was not created");
     control.readyState = FakeWebSocket.OPEN;
     control.dispatch("open", {});
-    const observer = observers[0];
+    const observer = observers[1];
     if (!observer) throw new Error("resize observer was not created");
     observer.trigger();
 
@@ -504,7 +504,7 @@ test("reconnect sends one unchanged resize across observer and ownership callbac
     second.readyState = FakeWebSocket.OPEN;
     second.dispatch("open", {});
     await new Promise<void>((resolve) => setTimeout(resolve, 15));
-    assert.equal(observers.length, 2);
+    assert.equal(observers.length, 3);
     assert.equal(resizeRecords(second).length, 0);
 
     second.dispatch("message", {

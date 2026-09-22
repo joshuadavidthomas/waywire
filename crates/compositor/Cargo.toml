@@ -1,0 +1,20 @@
+[package]
+name = "waywire-compositor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+waywire-protocol = { workspace = true }
+
+anyhow = { workspace = true }
+calloop = { workspace = true }
+clap = { workspace = true }
+nix = { workspace = true }
+smithay = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
