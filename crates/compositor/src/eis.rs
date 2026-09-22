@@ -23,7 +23,7 @@ use smithay::reexports::calloop::PostAction;
 use smithay::reexports::reis::calloop::EisListenerSource;
 use smithay::reexports::reis::eis;
 
-use crate::compositor::State;
+use crate::State;
 
 // Keep the adapter's lifecycle and event dispatch together. EI scale is f32,
 // and its discrete scroll is an i32 exposed as f64 by the generic input trait.

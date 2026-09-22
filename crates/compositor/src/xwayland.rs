@@ -30,8 +30,8 @@ use smithay::xwayland::xwm::Reorder;
 use smithay::xwayland::xwm::ResizeEdge;
 use smithay::xwayland::xwm::XwmId;
 
-use crate::compositor::State;
-use crate::compositor::clipboard::SelectionData;
+use crate::State;
+use crate::clipboard::SelectionData;
 
 // Keep X11 hit testing in the scene's stacking order. This also flushes XWM
 // requests issued by Wayland callbacks (notably new_selection, which does not

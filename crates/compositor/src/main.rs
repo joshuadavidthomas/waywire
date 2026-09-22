@@ -1,14 +1,9 @@
-mod compositor;
-mod eis;
-mod event_writer;
-mod video;
-mod xwayland;
-
 use std::ffi::OsString;
 
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+use waywire_compositor::Config;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Kbps;
@@ -95,7 +90,16 @@ fn main() -> Result<()> {
         )
         .init();
 
-    compositor::run(Options::parse())
+    let options = Options::parse();
+    waywire_compositor::run(Config {
+        ffmpeg: options.ffmpeg,
+        frame_rate: options.frame_rate,
+        bitrate: options.bitrate,
+        rtp_port: options.rtp_port,
+        xkb_layout: options.xkb_layout,
+        resolution: options.resolution,
+        session: options.session,
+    })
 }
 
 #[cfg(test)]

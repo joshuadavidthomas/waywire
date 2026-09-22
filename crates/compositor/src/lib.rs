@@ -1,5 +1,18 @@
+//! Headless Wayland compositor streaming H.264 RTP.
+
+mod clipboard;
+mod decorations;
+mod eis;
+mod event_writer;
+mod focus;
+mod grabs;
+mod shell;
+mod video;
+mod xwayland;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -71,17 +84,18 @@ use smithay::wayland::viewporter::ViewporterState;
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
+use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameDimension;
 use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::InputSequence;
+use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality;
 use waywire_protocol::pipe::{
     self,
 };
 
-use crate::Options;
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
 use crate::video::CapturedFrame;
@@ -90,16 +104,18 @@ use crate::video::Notification;
 use crate::video::VideoEncoder;
 use crate::video::encoded_dimensions;
 
-#[path = "clipboard.rs"]
-pub(crate) mod clipboard;
-#[path = "decorations.rs"]
-mod decorations;
-#[path = "focus.rs"]
-pub(crate) mod focus;
-#[path = "grabs.rs"]
-mod grabs;
-#[path = "shell.rs"]
-mod shell;
+/// Startup settings for the compositor and its initial video stream.
+#[derive(Debug)]
+pub struct Config {
+    pub ffmpeg: String,
+    pub frame_rate: Fps,
+    pub bitrate: Kbps,
+    pub rtp_port: u16,
+    pub xkb_layout: String,
+    pub resolution: FrameSize,
+    /// Application argv. When empty, `WAYWIRE_SESSION` names one executable.
+    pub session: Vec<OsString>,
+}
 
 #[expect(
     clippy::struct_field_names,
@@ -140,7 +156,7 @@ pub(crate) struct State {
 impl State {
     fn new(
         display_handle: DisplayHandle,
-        options: &Options,
+        options: &Config,
         event_sink: EventSink,
         video: VideoEncoder,
     ) -> Result<Self> {
@@ -696,11 +712,12 @@ impl State {
     }
 }
 
+/// Run the compositor until shutdown, reading pipe commands from stdin and writing events to stdout.
 #[expect(
     clippy::too_many_lines,
     reason = "the single calloop owner registers sources and performs ordered shutdown here"
 )]
-pub(crate) fn run(mut options: Options) -> Result<()> {
+pub fn run(mut options: Config) -> Result<()> {
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
     let runtime = tempfile::Builder::new().prefix("waywire-").tempdir()?;
     let socket_path = runtime.path().join("wayland-0");
