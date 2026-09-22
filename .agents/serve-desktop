@@ -5,9 +5,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${PORT:?Start with amp orb services ensure}"
 : "${PUBLIC_URL:?Amp must supply the portal origin}"
 
-# Reuse snapshot build artifacts; pick up source changes on service restart.
+# Run the optimized pipeline used by performance benchmarks.
 just build-web
-cargo build --locked --workspace
+cargo build --locked --release --workspace
 
 export XDG_RUNTIME_DIR="$HOME/.cache/waywire-orb"
 install -d -m 0700 "$XDG_RUNTIME_DIR"
@@ -16,6 +16,6 @@ export PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin
 
 # The gateway owns the compositor, which supplies the display to its application.
 # Amp supervises the whole session; this is separate from Amp's bundled Desktop.
-exec dbus-run-session -- ./target/debug/waywire-gateway \
-  --listen "127.0.0.1:$PORT" --compositor ./target/debug/waywire-compositor \
+exec dbus-run-session -- ./target/release/waywire-gateway \
+  --listen "127.0.0.1:$PORT" --compositor ./target/release/waywire-compositor \
   -- foot --title="Waywire"

@@ -648,7 +648,7 @@ mod tests {
                 fps: expected.fps,
                 scale_percent: expected.scale,
                 crf: value(waywire_protocol::pipe::Crf::new(28)),
-                chroma: waywire_protocol::pipe::Chroma::Yuv444,
+                chroma: waywire_protocol::pipe::Chroma::Rgb,
             }))
         );
         assert_eq!(
@@ -686,7 +686,7 @@ mod tests {
                 fps: expected.fps,
                 scale_percent: expected.scale,
                 crf: value(waywire_protocol::pipe::Crf::new(18)),
-                chroma: waywire_protocol::pipe::Chroma::Yuv444,
+                chroma: waywire_protocol::pipe::Chroma::Rgb,
             }))
         );
     }
@@ -705,7 +705,7 @@ mod tests {
             height: value(waywire_protocol::pipe::FrameDimension::new(720)),
             input_sequence: None,
             fps: value(Fps::new(60)),
-            chroma: waywire_protocol::pipe::Chroma::Yuv444,
+            chroma: waywire_protocol::pipe::Chroma::Rgb,
         };
         sessions.submitted(&metadata);
         metadata.sequence += 1;
@@ -734,8 +734,10 @@ mod tests {
             .expect("new owner feedback");
         assert_eq!(
             sessions.quality_chroma(),
-            waywire_protocol::pipe::Chroma::Yuv444
+            waywire_protocol::pipe::Chroma::Rgb
         );
+        assert_eq!(sessions.quality().scale.get(), 100);
+        assert_eq!(sessions.quality().fps.get(), 60);
         // Also reset the sequence baseline: old-owner frames cannot leak into
         // the new owner's first sample even without a generation change.
         metadata.sequence += 1000;
@@ -747,8 +749,10 @@ mod tests {
             .expect("new baseline");
         assert_eq!(
             sessions.quality_chroma(),
-            waywire_protocol::pipe::Chroma::Yuv444
+            waywire_protocol::pipe::Chroma::Rgb
         );
+        assert_eq!(sessions.quality().scale.get(), 100);
+        assert_eq!(sessions.quality().fps.get(), 60);
         assert!(
             timeout(Duration::from_millis(20), commands.recv())
                 .await

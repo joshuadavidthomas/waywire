@@ -169,7 +169,7 @@ impl Quality {
             max_bitrate: bitrate,
             max_fps: fps,
             crf: AUTOMATIC_CRF,
-            chroma: Chroma::Yuv444,
+            chroma: Chroma::Rgb,
             preset: QualityPreset::Automatic,
             streak: Streak::None,
             last_change: None,
@@ -234,11 +234,9 @@ impl Quality {
             return None;
         }
         let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
-        let is_bad = encoder_bad
-            || (feedback.received() > 0
-                && (queue_pressure >= 0.10
-                    || feedback.queue_peak() >= 24
-                    || feedback.rtt() > 250.0));
+        let browser_bad = feedback.received() > 0
+            && (queue_pressure >= 0.10 || feedback.queue_peak() >= 24 || feedback.rtt() > 250.0);
+        let is_bad = encoder_bad || browser_bad;
         // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
         // so one dropped frame does not erase an otherwise healthy recovery streak.
         let is_good = encoder_good
@@ -264,7 +262,7 @@ impl Quality {
         let old_chroma = self.chroma;
         match self.streak {
             Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD => {
-                self.lower_one_level();
+                self.lower_one_level(encoder_bad && !browser_bad);
                 self.streak = Streak::None;
             }
             Streak::Good(count) if count >= GOOD_STREAK_THRESHOLD => {
@@ -311,16 +309,21 @@ impl Quality {
         self.crf = bounds.crf;
     }
 
-    // Every encoder configuration change restarts it. Order these rungs by what
-    // the viewer sees, not by the cost of making the change: chroma and scale
-    // soften the picture before a low bitrate cap makes it blocky. Frame rate is last.
+    // Every encoder configuration change restarts it. For browser/network pressure,
+    // chroma and scale soften the picture before a low bitrate cap makes it blocky.
     // Seamless bitrate changes need an in-process encoder rather than a child
     // process with fixed arguments; that must change before treating bitrate as free.
-    fn lower_one_level(&mut self) {
+    fn lower_one_level(&mut self, encoder_only: bool) {
         let bounds = self.bounds();
+        if encoder_only && self.chroma == Chroma::Rgb {
+            // Both YUV conversion and packed RGB scaling were slower than full-size
+            // RGB in CPU benchmarks. Reduce work by pacing, preserving resolution.
+            self.levels.fps = self.levels.fps.lowered_by(FPS_STEP, bounds.fps_floor);
+            return;
+        }
         // 4:2:0 softens photos and gradients well, but small colored terminal text suffers.
         // Scale changes only the encoder frame, never the Wayland output.
-        if self.chroma == Chroma::Yuv444 {
+        if self.chroma != Chroma::Yuv420 {
             self.chroma = Chroma::Yuv420;
         } else if self.levels.scale > bounds.scale_floor {
             self.levels.scale = self.levels.scale.lowered_by(SCALE_STEP, bounds.scale_floor);
@@ -351,7 +354,7 @@ impl Quality {
                 .scale
                 .raised_by(SCALE_STEP, bounds.scale_ceiling);
         } else if self.chroma == Chroma::Yuv420 {
-            self.chroma = Chroma::Yuv444;
+            self.chroma = Chroma::Rgb;
         }
     }
 }
@@ -373,7 +376,7 @@ mod tests {
             height: value(waywire_protocol::pipe::FrameDimension::new(720)),
             input_sequence: None,
             fps: value(Fps::new(60)),
-            chroma: Chroma::Yuv444,
+            chroma: Chroma::Rgb,
         };
         quality.submitted(&metadata);
         metadata.sequence = 2;
@@ -421,19 +424,39 @@ mod tests {
                 quality.levels(),
                 QualityLevels {
                     bitrate: value(Kbps::new(8_000)),
-                    fps: value(Fps::new(60)),
+                    fps: value(Fps::new(if changes { 50 } else { 60 })),
                     scale: FULL_SCALE,
                 }
             );
-            assert_eq!(
-                quality.chroma,
-                if changes {
-                    Chroma::Yuv420
-                } else {
-                    Chroma::Yuv444
-                }
-            );
+            assert_eq!(quality.chroma, Chroma::Rgb);
         }
+    }
+
+    #[test]
+    fn encoder_only_preserves_rgb_resolution_at_the_floor_but_browser_pressure_uses_yuv() {
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+        let mut metadata = warmed_encoder(&mut quality);
+        let mut now = Instant::now();
+        for expected in [50, 40, 30, 20, 20] {
+            for _ in 0..2 {
+                encoder_sample(&mut quality, &mut metadata, 30, 30);
+                quality.update(&good_feedback(), now);
+            }
+            assert_eq!(quality.levels().fps.get(), expected);
+            assert_eq!(quality.levels().scale, FULL_SCALE);
+            assert_eq!(quality.levels().bitrate.get(), 8_000);
+            assert_eq!(quality.chroma, Chroma::Rgb);
+            now += QUALITY_CHANGE_COOLDOWN;
+        }
+        // Browser pressure must still get the more widely decoded format even
+        // when the encoder is also overloaded. CPU pressure cannot mask it.
+        for _ in 0..2 {
+            encoder_sample(&mut quality, &mut metadata, 30, 30);
+            quality.update(&bad_feedback(), now);
+        }
+        assert_eq!(quality.chroma, Chroma::Yuv420);
+        assert_eq!(quality.levels().fps.get(), 20);
+        assert_eq!(quality.levels().scale, FULL_SCALE);
     }
 
     #[test]
@@ -450,8 +473,9 @@ mod tests {
             encoder_sample(&mut quality, &mut metadata, 1, 0);
             assert_eq!(quality.update(&feedback(1, 1, 0, 0.0, 0, 20.0), now), None);
         }
-        assert_eq!(quality.chroma, Chroma::Yuv444);
+        assert_eq!(quality.chroma, Chroma::Rgb);
         assert_eq!(quality.levels().scale, FULL_SCALE);
+        assert_eq!(quality.levels().fps.get(), 60);
     }
 
     #[test]
@@ -473,15 +497,17 @@ mod tests {
         assert_eq!(quality.update(&good_feedback(), now), None);
         encoder_sample(&mut quality, &mut metadata, 30, 30);
         assert_eq!(quality.update(&good_feedback(), now), None);
-        assert_eq!(quality.chroma, Chroma::Yuv444);
+        assert_eq!(quality.levels().fps.get(), 60);
         encoder_sample(&mut quality, &mut metadata, 30, 30);
         assert_eq!(
             quality
                 .update(&good_feedback(), now)
                 .expect("two fresh bad windows")
-                .new_chroma,
-            Chroma::Yuv420
+                .new
+                .fps,
+            value(Fps::new(50))
         );
+        assert_eq!(quality.chroma, Chroma::Rgb);
     }
 
     #[test]
@@ -495,9 +521,10 @@ mod tests {
         assert_eq!(
             quality
                 .update(&good_feedback(), now)
-                .expect("lower chroma")
-                .new_chroma,
-            Chroma::Yuv420
+                .expect("lower frame rate without adding conversion or scaling")
+                .new
+                .fps,
+            value(Fps::new(50))
         );
         for seconds in 1..5 {
             encoder_sample(&mut quality, &mut metadata, 30, 30);
@@ -510,9 +537,9 @@ mod tests {
         let change = quality
             .update(&good_feedback(), now + Duration::from_secs(5))
             .expect("next rung at five seconds");
-        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
+        assert_eq!(change.new.scale, FULL_SCALE);
         assert_eq!(change.new.bitrate, value(Kbps::new(8_000)));
-        assert_eq!(change.new.fps, value(Fps::new(60)));
+        assert_eq!(change.new.fps, value(Fps::new(40)));
         for seconds in 6..13 {
             encoder_sample(&mut quality, &mut metadata, 49, 1);
             assert_eq!(
@@ -539,10 +566,10 @@ mod tests {
                 .update(&good_feedback(), now + Duration::from_secs(21))
                 .expect("eight healthy windows")
                 .new
-                .scale,
-            FULL_SCALE
+                .fps,
+            value(Fps::new(50))
         );
-        assert_eq!(quality.chroma, Chroma::Yuv420);
+        assert_eq!(quality.chroma, Chroma::Rgb);
     }
 
     fn trigger_bad(quality: &mut Quality, now: Instant) -> Option<QualityChange> {
@@ -580,7 +607,7 @@ mod tests {
                 },
                 old_crf: AUTOMATIC_CRF,
                 new_crf: AUTOMATIC_CRF,
-                old_chroma: Chroma::Yuv444,
+                old_chroma: Chroma::Rgb,
                 new_chroma: Chroma::Yuv420,
             }
         );
@@ -677,7 +704,7 @@ mod tests {
             (1_000, 40, 50, Chroma::Yuv420),
             (1_000, 40, 75, Chroma::Yuv420),
             (1_000, 40, 100, Chroma::Yuv420),
-            (1_000, 40, 100, Chroma::Yuv444),
+            (1_000, 40, 100, Chroma::Rgb),
         ];
 
         for (bitrate, frame_rate, scale, chroma) in expected {
@@ -797,7 +824,7 @@ mod tests {
             assert_eq!(quality.levels().bitrate, bounds.bitrate_ceiling);
             assert_eq!(quality.levels().fps, bounds.fps_ceiling);
             assert_eq!(quality.levels().scale, bounds.scale_ceiling);
-            assert_eq!(quality.chroma, Chroma::Yuv444);
+            assert_eq!(quality.chroma, Chroma::Rgb);
         }
     }
 
@@ -898,7 +925,7 @@ mod tests {
         );
         assert_eq!(quality.streak, Streak::None);
         assert_eq!(quality.update(&bad_feedback(), now), None);
-        assert_eq!(quality.chroma, Chroma::Yuv444);
+        assert_eq!(quality.chroma, Chroma::Rgb);
     }
 
     #[test]
@@ -928,7 +955,7 @@ mod tests {
             assert_eq!(quality.last_change, last_change);
         }
         assert!(quality.update(&good_feedback(), now).is_some());
-        assert_eq!(quality.chroma, Chroma::Yuv444);
+        assert_eq!(quality.chroma, Chroma::Rgb);
     }
 
     #[test]
@@ -943,7 +970,7 @@ mod tests {
             }
             let recovered = feedback(received, received - dropped, 0, 0.0, dropped, 20.0);
             assert!(quality.update(&recovered, now).is_some());
-            assert_eq!(quality.chroma, Chroma::Yuv444);
+            assert_eq!(quality.chroma, Chroma::Rgb);
         }
     }
 

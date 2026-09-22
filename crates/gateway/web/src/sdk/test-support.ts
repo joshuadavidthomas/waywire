@@ -1,5 +1,5 @@
 import type { SurfaceOptions, WaywireSessionOptions } from "./session.ts";
-import { videoFrame } from "./wire.ts";
+import { type Chroma, videoFrame } from "./wire.ts";
 
 export class FakeTarget {
   readonly listeners = new Map<string, Set<(event: unknown) => void>>();
@@ -245,7 +245,7 @@ export function videoPacket(
     readonly generation?: number;
     readonly width?: number;
     readonly height?: number;
-    readonly chroma?: 0 | 1;
+    readonly chroma?: Chroma;
   } = {},
 ): ArrayBuffer {
   return videoFrame(

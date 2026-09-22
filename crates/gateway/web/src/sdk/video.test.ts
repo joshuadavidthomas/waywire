@@ -134,9 +134,11 @@ test("chroma profile changes configure the decoder before the new generation is 
   const fixture = await videoFixture();
   try {
     for (const [generation, chroma, codec] of [
-      [1, 0, "avc1.F40034"],
+      [1, 2, "avc1.F40034"],
       [2, 1, "avc1.640034"],
-      [3, 0, "avc1.F40034"],
+      [3, 2, "avc1.F40034"],
+      [4, 0, "avc1.F40034"],
+      [5, 2, "avc1.F40034"],
     ] as const) {
       configure(fixture.videoSocket, codec);
       fixture.videoSocket.dispatch("message", {

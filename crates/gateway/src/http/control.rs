@@ -997,7 +997,7 @@ mod tests {
                 fps: expected.fps,
                 scale_percent: expected.scale,
                 crf: waywire_protocol::pipe::Crf::new(28).expect("test CRF should be valid"),
-                chroma: waywire_protocol::pipe::Chroma::Yuv444,
+                chroma: waywire_protocol::pipe::Chroma::Rgb,
             }))
         );
     }

@@ -115,9 +115,17 @@ real encoder and Xwayland input and clipboard paths.
 animation, 96×64 damage, and idle at 1080p/60 with real Wayland buffers and FFmpeg.
 It reuses two immutable client buffers, acknowledges the initial keyframe, and
 discards two seconds of warmup. Each case runs three times. JSONL output includes
-encoder-submitted FPS, frame intervals, replaced frames, compositor RSS, and
+encoder-submitted FPS, RTP bitrate, frame intervals, replaced frames, compositor RSS, and
 separate compositor/encoder CPU usage (100% = one core). This measures the server
 path, not browser FPS or network latency; unchanged output should submit no frames.
+
+The default is full-resolution RGB H.264 (`libx264rgb`, ultrafast): it avoids
+RGB-to-YUV conversion and preserves colored text, at a higher bitrate than the
+YUV paths. Browser/network pressure can select YUV420; encoder-only pressure
+lowers FPS while keeping RGB and resolution. Packed RGB downscaling was slower
+than full-size encoding in FFmpeg 5.1, so it is not a CPU fallback. All formats
+retain the existing bitrate cap and low-latency settings; short measurements can
+exceed the cap while the encoder's two-second VBV buffer fills.
 
 For a before/after comparison, save the old release binary before editing:
 
@@ -145,7 +153,8 @@ Start the desktop portal with:
 amp orb services ensure
 ```
 
-The `waywire` service runs this checkout's compositor, gateway, and a Foot terminal
+The `waywire` service builds and runs this checkout's release compositor and gateway,
+and a Foot terminal
 with a private Wayland socket. It is separate from Amp Desktop and does not use
 the orb's bundled Labwc or Waymote binaries.
 Amp supplies the authenticated portal URL and supervises the whole session.
