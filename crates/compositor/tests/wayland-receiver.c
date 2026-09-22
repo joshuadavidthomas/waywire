@@ -34,6 +34,8 @@ static struct wl_data_offer *selection_offer;
 static int clipboard_fd = -1;
 static int width = 480, height = 320;
 static int animation_frames, revision;
+static const char *benchmark;
+static int benchmark_pending;
 #ifdef NATIVE_SCENE_TEST
 static struct zxdg_decoration_manager_v1 *decorations;
 static struct wp_fractional_scale_manager_v1 *fractional;
@@ -87,7 +89,7 @@ static void data_selection(void *d, struct wl_data_device *o, struct wl_data_off
 static const struct wl_data_device_listener data_listener = { .data_offer = data_offer, .selection = data_selection };
 
 static void released(void *data, struct wl_buffer *buffer) {
-    (void)data;
+    if (data) return; // Benchmark buffers are immutable and reused until exit.
     wl_buffer_destroy(buffer);
 }
 static const struct wl_buffer_listener buffer_listener = { .release = released };
@@ -96,10 +98,47 @@ static void paint(void);
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
     (void)data; (void)time;
     wl_callback_destroy(callback);
+    if (benchmark) { benchmark_pending = 0; revision++; paint(); return; }
     printf("frame-done %d\n", revision);
     if (animation_frames > 0) { animation_frames--; revision++; paint(); }
 }
 static const struct wl_callback_listener frame_listener = { .done = frame_done };
+
+// Two prepainted, immutable buffers keep client allocation/painting out of the
+// steady-state benchmark. Small-damage buffers differ only inside 96x64 pixels.
+static void benchmark_paint(void) {
+    static struct wl_buffer *buffers[2];
+    int full = !strcmp(benchmark, "full");
+    if (!buffers[0]) {
+        size_t size = (size_t)width * height * 4;
+        int fd = memfd_create("benchmark", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, 2 * size) < 0) abort();
+        uint32_t *pixels = mmap(NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (pixels == MAP_FAILED) abort();
+        struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, 2 * size);
+        for (int i = 0; i < 2; i++) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    uint32_t color = 0xff000000 | ((x / 8 % 256) << 16) | ((y / 4 % 256) << 8) | ((x + y) % 256);
+                    if (i && (full || (x < 96 && y < 64))) color ^= 0x003f7f3f;
+                    pixels[i * width * height + y * width + x] = color;
+                }
+            }
+            buffers[i] = wl_shm_pool_create_buffer(pool, i * size, width, height, width * 4, WL_SHM_FORMAT_XRGB8888);
+            wl_buffer_add_listener(buffers[i], &buffer_listener, buffers);
+        }
+        wl_shm_pool_destroy(pool);
+        munmap(pixels, 2 * size);
+        close(fd);
+    }
+    if (strcmp(benchmark, "idle") && !benchmark_pending) {
+        wl_callback_add_listener(wl_surface_frame(surface), &frame_listener, NULL);
+        benchmark_pending = 1;
+    }
+    wl_surface_attach(surface, buffers[revision % 2], 0, 0);
+    wl_surface_damage(surface, 0, 0, full || !revision ? width : 96, full || !revision ? height : 64);
+    wl_surface_commit(surface);
+}
 
 static void paint_surface(struct wl_surface *target, int width, int height) {
     size_t size = (size_t)width * height * 4;
@@ -126,6 +165,7 @@ static void paint_surface(struct wl_surface *target, int width, int height) {
     wl_surface_commit(target);
 }
 static void paint(void) {
+    if (benchmark) { benchmark_paint(); return; }
     if (getenv("WAYWIRE_TEST_GEOMETRY")) xdg_surface_set_window_geometry(toplevel_xdg, 17, 29, width - 17, height - 29);
     if (animation_frames > 0) wl_callback_add_listener(wl_surface_frame(surface), &frame_listener, NULL);
     paint_surface(surface, width, height);
@@ -288,6 +328,7 @@ static const struct wl_registry_listener registry_listener = { .global = global,
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    benchmark = getenv("WAYWIRE_BENCH");
     if (argc == 3) { width = atoi(argv[1]); height = atoi(argv[2]); }
     if (width < 1 || width > 4096 || height < 1 || height > 4096) return 2;
     struct wl_display *display = wl_display_connect(NULL);

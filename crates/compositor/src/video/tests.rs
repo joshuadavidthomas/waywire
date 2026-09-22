@@ -747,7 +747,7 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
                 .iter()
                 .filter(|slot| matches!(slot, FrameSlot::Free(_)))
                 .count(),
-            1
+            0
         );
     }
 
@@ -882,7 +882,7 @@ fn generation_changes_are_positive_checked_increments() {
 }
 
 #[test]
-fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
+fn two_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
     let shared = shared();
     let encoder = VideoEncoder {
         shared: Arc::clone(&shared),
@@ -907,7 +907,7 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
 
     let mut pointers = [std::ptr::null(); SLOT_COUNT];
     let mut capacities = [0; SLOT_COUNT];
-    for sequence in 4..=6 {
+    for sequence in 3..=4 {
         let large = sized_frame(sequence, 1, 64, 64);
         encoder
             .submit(captured(&large))
@@ -920,11 +920,11 @@ fn three_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
         release_slot(&shared, slot, stored);
     }
     assert_ne!(pointers[0], pointers[1]);
-    assert_ne!(pointers[0], pointers[2]);
-    assert_ne!(pointers[1], pointers[2]);
 
-    for sequence in 7..=106 {
-        let source = if sequence % 2 == 0 {
+    for sequence in 5..=104 {
+        // Both slots must see both sizes, rather than each slot always receiving
+        // the same size on alternating submissions.
+        let source = if sequence % 4 < 2 {
             sized_frame(sequence, 1, 64, 64)
         } else {
             sized_frame(sequence, 1, 2, 2)

@@ -41,7 +41,9 @@ use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::MAX_RAW_PIXELS;
 use waywire_protocol::pipe::ScalePercent;
 
-const SLOT_COUNT: usize = 3;
+// One worker-owned frame and one replaceable pending frame. Capture borrows the
+// compositor's separate image, so a third pool slot only retains unused memory.
+const SLOT_COUNT: usize = 2;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
 // rather than changing the RTP identity or retrying an encoder that cannot start.
 const MAX_MEDIA_GENERATION: u32 = i32::MAX as u32;
@@ -116,8 +118,8 @@ struct RawFrame {
 impl RawFrame {
     fn copy_from(storage: Vec<u8>, frame: CapturedFrame<'_>) -> Self {
         let mut pixels = storage;
-        pixels.resize(frame.pixels.len(), 0);
-        pixels.copy_from_slice(frame.pixels);
+        pixels.clear();
+        pixels.extend_from_slice(frame.pixels);
         Self {
             pixels,
             metadata: frame.metadata,
@@ -126,8 +128,8 @@ impl RawFrame {
     }
 
     fn replace_from(&mut self, frame: CapturedFrame<'_>) {
-        self.pixels.resize(frame.pixels.len(), 0);
-        self.pixels.copy_from_slice(frame.pixels);
+        self.pixels.clear();
+        self.pixels.extend_from_slice(frame.pixels);
         self.metadata = frame.metadata;
         self.config = frame.config;
     }

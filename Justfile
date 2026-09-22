@@ -66,5 +66,9 @@ test-compositor *ARGS:
     PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/native-scene.py
     PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/interop.py
 
+bench-compositor *ARGS:
+    cargo build --locked --release -p waywire-compositor
+    PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/bench.py {{ ARGS }}
+
 typecheck:
     pnpm --filter @waywire/web check

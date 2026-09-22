@@ -30,7 +30,6 @@ use smithay::backend::input::ButtonState;
 use smithay::backend::input::InputTime;
 use smithay::backend::input::KeyState;
 use smithay::backend::renderer::Bind;
-use smithay::backend::renderer::ExportMem;
 use smithay::backend::renderer::Offscreen;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::pixman::PixmanRenderer;
@@ -57,7 +56,6 @@ use smithay::reexports::wayland_server::ListeningSocket;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Logical;
 use smithay::utils::Point;
-use smithay::utils::Rectangle;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
@@ -622,19 +620,32 @@ impl State {
             self.focus_window(next);
         }
         let elements = self.scene_elements(renderer);
-        let mut target = renderer.bind(image)?;
         let forced = self.dirty || self.acknowledged != Some(self.generation);
-        let result = tracker.render_output(
-            renderer,
-            &mut target,
-            usize::from(!forced),
-            &elements,
-            [0.08, 0.09, 0.12, 1.0],
-        )?;
-        if result.damage.is_some() || forced {
-            let mapping =
-                renderer.copy_framebuffer(&target, Rectangle::from_size(size), Fourcc::Argb8888)?;
-            let pixels = renderer.map_texture(&mapping)?;
+        let damaged = {
+            let mut target = renderer.bind(image)?;
+            tracker
+                .render_output(
+                    renderer,
+                    &mut target,
+                    usize::from(!forced),
+                    &elements,
+                    [0.08, 0.09, 0.12, 1.0],
+                )?
+                .damage
+                .is_some()
+        };
+        if damaged || forced {
+            // Pixman finishes synchronously. Borrow our target instead of allocating
+            // and blitting a second full image through ExportMem::copy_framebuffer.
+            // SAFETY: create_buffer owns and initializes the complete image storage;
+            // the renderer's exclusive target borrow has ended.
+            let data = unsafe { image.data() };
+            // SAFETY: stride * height covers this live image's allocation. Nothing
+            // mutates it before submit finishes copying into worker-owned storage.
+            let pixels = unsafe {
+                std::slice::from_raw_parts(data.cast::<u8>(), image.stride() * image.height())
+            };
+            debug_assert_eq!(image.stride(), image.width() * 4);
             let (width, height) = encoded_dimensions(
                 self.size.width(),
                 self.size.height(),
@@ -735,10 +746,10 @@ pub(crate) fn run(mut options: Options) -> Result<()> {
     let flags = OFlag::from_bits_truncate(fcntl(&stdin, FcntlArg::F_GETFL)?);
     fcntl(&stdin, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     let mut decoder = Some(Decoder::<Command>::new());
+    let mut bytes = vec![0; 65536];
     handle.insert_source(
         Generic::new(stdin, Interest::READ, Mode::Level),
         move |_, input, state| {
-            let mut bytes = vec![0; 65536];
             // SAFETY: reading does not move or drop the registered File.
             match unsafe { input.get_mut() }.read(&mut bytes) {
                 Ok(0) => {
@@ -838,8 +849,11 @@ pub(crate) fn run(mut options: Options) -> Result<()> {
             if let Err(error) = state.render(&mut renderer, &mut image, &mut tracker) {
                 state.fail(error);
             }
-            next_frame =
-                Instant::now() + Duration::from_secs_f64(1.0 / f64::from(state.quality.fps.get()));
+            next_frame = frame_deadline(
+                next_frame,
+                Instant::now(),
+                Duration::from_secs_f64(1.0 / f64::from(state.quality.fps.get())),
+            );
         }
         if let Err(error) = state.display_handle.flush_clients() {
             state.fail(error.into());
@@ -862,6 +876,12 @@ pub(crate) fn run(mut options: Options) -> Result<()> {
     }
     event_writer.stop();
     state.failure.map_or(Ok(()), Err)
+}
+
+fn frame_deadline(previous: Instant, finished: Instant, interval: Duration) -> Instant {
+    // Render time is part of the period, not added to it. On overrun, discard
+    // the missed deadlines rather than accumulating a burst of catch-up frames.
+    (previous + interval).max(finished)
 }
 
 #[expect(
@@ -888,6 +908,47 @@ impl Drop for Session {
             // An already exited child is normal; cleanup errors cannot be returned from Drop.
             drop(child.kill());
             drop(child.wait());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_work_does_not_lengthen_the_period() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(20);
+        let next = frame_deadline(start, start + Duration::from_millis(7), interval);
+        assert_eq!(next, start + interval);
+        assert_eq!(
+            frame_deadline(next, next + Duration::from_millis(13), interval),
+            start + interval * 2,
+        );
+        // A new FPS takes effect without preserving the old period.
+        assert_eq!(
+            frame_deadline(
+                next,
+                next + Duration::from_millis(2),
+                Duration::from_millis(10)
+            ),
+            start + Duration::from_millis(30),
+        );
+    }
+
+    #[test]
+    fn frame_overrun_discards_missed_deadlines() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(20);
+        for elapsed in [20, 21, 137] {
+            let finished = start + Duration::from_millis(elapsed);
+            let next = frame_deadline(start, finished, interval);
+            assert_eq!(next, finished);
+            assert_eq!(
+                frame_deadline(next, next + Duration::from_millis(3), interval),
+                finished + interval,
+            );
         }
     }
 }
