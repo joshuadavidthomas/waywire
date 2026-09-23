@@ -1,6 +1,8 @@
 use std::time::Duration;
 use std::time::Instant;
 
+use tracing::debug;
+use tracing::debug_span;
 use waywire_protocol::browser::Feedback;
 use waywire_protocol::browser::QualityLevels;
 use waywire_protocol::browser::QualityPreset;
@@ -91,14 +93,16 @@ impl EncoderPressure {
         false
     }
 
-    fn take(&mut self) -> (bool, bool) {
-        let rendered = std::mem::take(&mut self.rendered);
-        let dropped = std::mem::take(&mut self.dropped);
+    fn take(&mut self) -> (u64, u64, bool, bool) {
+        let attempted = std::mem::take(&mut self.rendered);
+        let replaced = std::mem::take(&mut self.dropped);
         (
-            rendered >= ENCODER_MIN_RENDERED
-                && u128::from(dropped) * 100
-                    >= u128::from(rendered) * u128::from(ENCODER_BAD_DROP_PERCENT),
-            u128::from(dropped) * 100 <= u128::from(rendered) * u128::from(GOOD_DROP_PERCENT),
+            attempted,
+            replaced,
+            attempted >= ENCODER_MIN_RENDERED
+                && u128::from(replaced) * 100
+                    >= u128::from(attempted) * u128::from(ENCODER_BAD_DROP_PERCENT),
+            u128::from(replaced) * 100 <= u128::from(attempted) * u128::from(GOOD_DROP_PERCENT),
         )
     }
 }
@@ -224,34 +228,67 @@ impl Quality {
     }
 
     pub(super) fn update(&mut self, feedback: &Feedback, now: Instant) -> Option<QualityChange> {
-        let (encoder_bad, encoder_good) = self.encoder.take();
+        let (attempted, replaced, encoder_bad, encoder_good) = self.encoder.take();
         let encoder_was_bad = std::mem::replace(&mut self.encoder_was_bad, encoder_bad);
+        let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
+        let loss_percent = u64::from(feedback.dropped()) * 100;
+        let active = feedback.received() > 0;
+        let pressure = [
+            (encoder_bad, "encoder-replacement"),
+            (active && queue_pressure >= 0.10, "decoder-busy"),
+            (active && feedback.queue_peak() >= 24, "decoder-peak"),
+            (active && feedback.rtt() > 250.0, "rtt"),
+            (
+                active && loss_percent >= u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT,
+                "browser-loss",
+            ),
+        ];
+        // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
+        // so one dropped frame does not erase an otherwise healthy recovery streak.
+        // Feedback excludes newest-due presentation skips. A 60Hz display may
+        // legitimately draw half a 120 FPS stream; zero draws cannot recover.
+        let recovery_vetoes = [
+            (!encoder_good, "encoder-replacement"),
+            (queue_pressure >= 0.05, "decoder-busy"),
+            (feedback.queue_peak() >= 24, "decoder-peak"),
+            (
+                loss_percent > u64::from(feedback.received()) * GOOD_DROP_PERCENT,
+                "browser-loss",
+            ),
+            (feedback.rtt() >= 120.0, "rtt"),
+            (feedback.presented() == 0, "no-presentation"),
+        ];
+        let cooldown = self.last_change.map_or(Duration::ZERO, |last| {
+            QUALITY_CHANGE_COOLDOWN.saturating_sub(now.saturating_duration_since(last))
+        });
+        let _sample = debug_span!(
+            "quality_sample",
+            generation = ?self.encoder.previous.map(|(generation, _, _)| generation),
+            capture_nanos = ?self.encoder.previous.map(|(_, _, captured)| captured),
+            warmup_until = self.encoder.warmup_until,
+            attempted,
+            submitted = attempted - replaced,
+            replaced,
+            sufficient_encoder_sample = attempted >= ENCODER_MIN_RENDERED,
+            ?feedback,
+            bad_reasons = ?pressure.iter().filter_map(|(active, reason)| active.then_some(*reason)).collect::<Vec<_>>(),
+            recovery_vetoes = ?recovery_vetoes.iter().filter_map(|(active, reason)| active.then_some(*reason)).collect::<Vec<_>>(),
+            streak_before = ?self.streak,
+            levels = ?self.levels,
+            cooldown_ms = cooldown.as_millis(),
+        )
+        .entered();
         // The stream is damage-driven: absence of frames says nothing about its
         // health. Idle feedback preserves recovery, but interrupts producer overload.
         if feedback.received() == 0 && !encoder_bad {
             if encoder_was_bad {
                 self.streak = Streak::None;
             }
+            debug!(decision = "idle", streak_after = ?self.streak, "quality decision");
             return None;
         }
-        let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
-        let loss_percent = u64::from(feedback.dropped()) * 100;
-        let browser_bad = feedback.received() > 0
-            && (queue_pressure >= 0.10
-                || feedback.queue_peak() >= 24
-                || feedback.rtt() > 250.0
-                || loss_percent >= u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT);
-        let is_bad = encoder_bad || browser_bad;
-        // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
-        // so one dropped frame does not erase an otherwise healthy recovery streak.
-        // Feedback excludes newest-due presentation skips. A 60Hz display may
-        // legitimately draw half a 120 FPS stream; zero draws cannot recover.
-        let is_good = encoder_good
-            && queue_pressure < 0.05
-            && feedback.queue_peak() < 24
-            && loss_percent <= u64::from(feedback.received()) * GOOD_DROP_PERCENT
-            && feedback.rtt() < 120.0
-            && feedback.presented() > 0;
+        let is_bad = pressure.iter().any(|(active, _)| *active);
+        let is_good = !recovery_vetoes.iter().any(|(active, _)| *active);
         self.streak = match (is_bad, is_good, self.streak) {
             (true, _, Streak::Bad(count)) => Streak::Bad(count.saturating_add(1)),
             (true, _, Streak::None | Streak::Good(_)) => Streak::Bad(1),
@@ -259,27 +296,33 @@ impl Quality {
             (false, true, Streak::None | Streak::Bad(_)) => Streak::Good(1),
             (false, false, _) => Streak::None,
         };
-        if self.last_change.is_some_and(|last_change| {
-            now.saturating_duration_since(last_change) < QUALITY_CHANGE_COOLDOWN
-        }) {
+        if !cooldown.is_zero() {
+            debug!(decision = "cooldown", streak_after = ?self.streak, "quality decision");
             return None;
         }
         let old = self.levels;
         let old_chroma = self.chroma;
-        match self.streak {
+        let direction = match self.streak {
             Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD => {
                 self.lower_one_level();
                 self.streak = Streak::None;
+                "lower"
             }
             Streak::Good(count) if count >= GOOD_STREAK_THRESHOLD => {
                 self.raise_one_level();
                 self.streak = Streak::None;
+                "raise"
             }
-            Streak::None | Streak::Bad(_) | Streak::Good(_) => return None,
-        }
+            Streak::None | Streak::Bad(_) | Streak::Good(_) => {
+                debug!(decision = "hold", streak_after = ?self.streak, "quality decision");
+                return None;
+            }
+        };
         if self.levels == old && self.chroma == old_chroma {
+            debug!(decision = "bound", direction, streak_after = ?self.streak, "quality decision");
             return None;
         }
+        debug!(decision = direction, streak_after = ?self.streak, new = ?self.levels, "quality decision");
         self.last_change = Some(now);
         Some(QualityChange {
             old,
@@ -362,6 +405,98 @@ mod tests {
     use crate::session::tests::feedback;
     use crate::session::tests::good_feedback;
     use crate::session::tests::value;
+
+    #[test]
+    fn diagnostics_preserve_decisions_and_explain_pressure_recovery_and_idle() {
+        #[derive(Clone, Default)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+            let mut metadata = warmed_encoder(&mut quality);
+            let now = Instant::now();
+            let overloaded = feedback(50, 20, 24, 200.0, 10, 251.0);
+            encoder_sample(&mut quality, &mut metadata, 30, 30);
+            assert_eq!(quality.update(&overloaded, now), None);
+            encoder_sample(&mut quality, &mut metadata, 30, 30);
+            assert_eq!(
+                quality
+                    .update(&overloaded, now)
+                    .expect("downshift")
+                    .new
+                    .scale
+                    .get(),
+                75
+            );
+            assert_eq!(
+                quality.update(
+                    &feedback(50, 50, 0, 0.0, 0, 120.0),
+                    now + Duration::from_secs(1)
+                ),
+                None
+            );
+            let recovered_at = now + QUALITY_CHANGE_COOLDOWN;
+            assert_eq!(quality.update(&good_feedback(), recovered_at), None);
+            assert_eq!(
+                quality.update(&feedback(0, 0, 0, 0.0, 0, 20.0), recovered_at),
+                None
+            );
+            assert_eq!(quality.streak, Streak::Good(1));
+            for _ in 0..6 {
+                assert_eq!(quality.update(&good_feedback(), recovered_at), None);
+            }
+            assert_eq!(
+                quality
+                    .update(&good_feedback(), recovered_at)
+                    .expect("recovery")
+                    .new
+                    .scale
+                    .get(),
+                100
+            );
+            assert_eq!(
+                trigger_good(&mut quality, recovered_at + QUALITY_CHANGE_COOLDOWN),
+                None
+            );
+        });
+        let output = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("UTF-8 log");
+        let lines: Vec<_> = output.lines().collect();
+        assert!(lines[0].contains("attempted=60 submitted=30 replaced=30"));
+        assert!(lines[0].contains("sufficient_encoder_sample=true"));
+        assert!(lines[0].contains("bad_reasons=[\"encoder-replacement\", \"decoder-busy\", \"decoder-peak\", \"rtt\", \"browser-loss\"]"));
+        assert!(lines[1].contains("decision=\"lower\""));
+        assert!(lines[2].contains("bad_reasons=[] recovery_vetoes=[\"rtt\"]"));
+        assert!(lines[2].contains("cooldown_ms=4000"));
+        assert!(lines[2].contains("decision=\"cooldown\" streak_after=None"));
+        assert!(lines[4].contains("decision=\"idle\" streak_after=Good(1)"));
+        assert!(lines.iter().any(|line| line.contains("decision=\"raise\"")));
+        assert!(
+            lines
+                .last()
+                .expect("bound log")
+                .contains("decision=\"bound\" direction=\"raise\"")
+        );
+    }
 
     fn warmed_encoder(quality: &mut Quality) -> FrameMetadata {
         let mut metadata = FrameMetadata {

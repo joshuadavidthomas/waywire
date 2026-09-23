@@ -102,6 +102,11 @@ After changing source, run `amp orb service restart waywire` to rebuild and rest
 the session. This closes applications in that session. Inspect startup failures
 with `amp orb service logs waywire`.
 
+For quality-decision tracing, launch the gateway with
+`RUST_LOG=info,waywire_gateway::session::quality=debug`. Each sample includes pressure
+reasons, recovery vetoes, encoder counts after warmup, streaks, and cooldown state.
+The browser's debug console logs decoder configuration and reset causes separately.
+
 ## Known limits
 
 This is a prototype, not a general-purpose desktop environment. There is one

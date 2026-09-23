@@ -230,19 +230,43 @@ test("a superseded profile's queued packets cannot enter the new decoder", async
   }
 });
 
-test("decode queue overflow drops stale data and waits for a keyframe", async () => {
+test("decode queue overflow drops stale data and waits for a keyframe", async (t) => {
+  const debug = t.mock.method(console, "debug", () => {});
   const installed = installQueueVideoDecoder();
   const fixture = await videoFixture();
+  t.after(() => fixture.session.dispose());
   let statsEvents = 0;
   fixture.session.on("stats", () => statsEvents++);
   configure(fixture.videoSocket);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(debug.mock.calls[0]?.arguments, [
+    "video decoder configuration",
+    {
+      codec: "avc1.42E01E",
+      previousGeneration: 0,
+      decoderQueue: 0,
+      pendingVideoFrames: 0,
+    },
+  ]);
   const decoder = installed.decoder();
   if (!decoder) throw new Error("decoder was not installed");
 
   fixture.videoSocket.dispatch("message", {
     data: videoPacket(2_000, { keyframe: true }),
   });
+  await flush();
+  assert.deepEqual(debug.mock.calls.at(-1)?.arguments, [
+    "video decoder reset",
+    {
+      previousGeneration: 0,
+      generation: 1,
+      generationChanged: true,
+      discontinuity: false,
+      queueOverflow: false,
+      decoderQueue: 0,
+      pendingVideoFrames: 0,
+    },
+  ]);
   for (let index = 1; index < 24; index += 1) {
     fixture.videoSocket.dispatch("message", {
       data: videoPacket(2_000 + index),
@@ -259,6 +283,18 @@ test("decode queue overflow drops stale data and waits for a keyframe", async ()
   await flush();
   assert.equal(decoder.resetCalls, 2);
   assert.equal(decoder.decodeQueueSize, 0);
+  assert.deepEqual(debug.mock.calls.at(-1)?.arguments, [
+    "video decoder reset",
+    {
+      previousGeneration: 1,
+      generation: 1,
+      generationChanged: false,
+      discontinuity: false,
+      queueOverflow: true,
+      decoderQueue: 24,
+      pendingVideoFrames: 0,
+    },
+  ]);
   assert.equal(fixture.session.stats.decoderResetDroppedFrames, 24);
   assert.equal(fixture.session.stats.decoderQueue, 0);
   assert.equal(
@@ -284,5 +320,20 @@ test("decode queue overflow drops stale data and waits for a keyframe", async ()
   decoder.outputAll();
   await flush();
   assert.deepEqual(fixture.draws, [2_028]);
-  await fixture.session.dispose();
+  fixture.videoSocket.dispatch("message", {
+    data: videoPacket(2_029, { keyframe: true, discontinuity: true }),
+  });
+  await flush();
+  assert.deepEqual(debug.mock.calls.at(-1)?.arguments, [
+    "video decoder reset",
+    {
+      previousGeneration: 1,
+      generation: 1,
+      generationChanged: false,
+      discontinuity: true,
+      queueOverflow: false,
+      decoderQueue: 0,
+      pendingVideoFrames: 0,
+    },
+  ]);
 });

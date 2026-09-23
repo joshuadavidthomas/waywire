@@ -439,6 +439,12 @@ export class VideoRuntime {
     configuration: VideoConfiguration,
   ): Promise<void> {
     const generation = ++this.decoderGeneration;
+    console.debug("video decoder configuration", {
+      codec: configuration.codec,
+      previousGeneration: this.currentGeneration,
+      decoderQueue: this.decoder?.decodeQueueSize ?? 0,
+      pendingVideoFrames: this.pendingFrames.length,
+    });
     this.decoder?.close();
     this.decoder = null;
     this.decodingFrames.clear();
@@ -544,6 +550,7 @@ export class VideoRuntime {
     }
     this.owner.setLatestAppliedInput(packet.latestAppliedInput);
     const generationChanged = packet.generation !== this.currentGeneration;
+    const previousGeneration = this.currentGeneration;
     if (generationChanged) this.currentGeneration = packet.generation;
     const queuedBeforeDecode = decoder.decodeQueueSize;
     this.observeDecodeQueue(queuedBeforeDecode);
@@ -551,8 +558,18 @@ export class VideoRuntime {
       generationChanged ||
       packet.discontinuity ||
       queuedBeforeDecode >= maximumVideoDecodeQueueSize
-    )
+    ) {
+      console.debug("video decoder reset", {
+        previousGeneration,
+        generation: packet.generation,
+        generationChanged,
+        discontinuity: packet.discontinuity,
+        queueOverflow: queuedBeforeDecode >= maximumVideoDecodeQueueSize,
+        decoderQueue: queuedBeforeDecode,
+        pendingVideoFrames: this.pendingFrames.length,
+      });
       this.resetDecoder(decoder);
+    }
     if (
       this.decoder !== decoder ||
       decoder.state !== "configured" ||
