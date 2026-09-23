@@ -124,6 +124,7 @@ pub(super) fn upgrade_socket(
     let socket_id = state.allocate_socket_id();
     match kind {
         SocketKind::Stream => upgrade
+            .read_buffer_size(4096)
             .max_message_size(4096)
             .max_frame_size(4096)
             .on_upgrade(move |socket| stream_socket(socket, state, socket_id, admission))
