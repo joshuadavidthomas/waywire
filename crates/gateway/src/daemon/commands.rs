@@ -392,7 +392,7 @@ mod tests {
         let feedback_task =
             tokio::spawn(async move { feedback_sessions.feedback(socket, feedback).await });
         timeout(Duration::from_secs(1), async {
-            while sessions.quality_chroma() == waywire_protocol::pipe::Chroma::Yuv444 {
+            while sessions.quality().scale.get() == 100 {
                 tokio::task::yield_now().await;
             }
         })
@@ -424,7 +424,7 @@ mod tests {
             Command::Quality(Quality {
                 bitrate_kbps: Kbps::new(8_000).expect("expected bitrate should be valid"),
                 fps: Fps::new(60).expect("expected frame rate should be valid"),
-                scale_percent: ScalePercent::new(100).expect("expected scale should be valid"),
+                scale_percent: ScalePercent::new(75).expect("expected scale should be valid"),
                 crf: waywire_protocol::pipe::Crf::new(23).expect("test CRF should be valid"),
                 chroma: waywire_protocol::pipe::Chroma::Yuv420,
             })

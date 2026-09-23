@@ -66,13 +66,17 @@ requires libx264. It is excluded from the ordinary test command.
 
 ## Video encoding
 
-The default is full-resolution RGB H.264 (`libx264rgb`, ultrafast): it avoids
-RGB-to-YUV conversion and preserves colored text, at a higher bitrate than the
-YUV paths. Browser/network pressure can select YUV420; encoder-only pressure
-lowers FPS while keeping RGB and resolution. Packed RGB downscaling was slower
-than full-size encoding in FFmpeg 5.1, so it is not a CPU fallback. All formats
-retain the existing bitrate cap and low-latency settings; short measurements can
-exceed the cap while the encoder's two-second VBV buffer fills.
+The default is H.264 High with YUV 4:2:0 (`libx264`, superfast), including startup,
+quality presets, and automatic recovery. This works with browsers that reject
+High 4:4:4 Predictive, including the tested Amp macOS embedded viewer.
+The compositor still renders RGB pixels; FFmpeg converts them to YUV for encoding.
+Chroma subsampling can soften small colored text.
+
+Adaptation lowers encoded scale, then bitrate, then FPS under sustained pressure,
+and recovers in reverse order without switching away from 4:2:0. These changes
+restart the encoder; changing encoded scale does not resize the desktop itself.
+The existing bitrate cap and low-latency settings are unchanged; short measurements
+can exceed the cap while the encoder's two-second VBV buffer fills.
 
 ## Development environment
 
@@ -102,8 +106,8 @@ with `amp orb service logs waywire`.
 
 This is a prototype, not a general-purpose desktop environment. There is one
 output and no panel, dock, workspaces, audio, or GPU acceleration. Custom surface
-cursors fall back to the default shape. The H.264 High 4:4:4 Predictive stream
-targets Chrome on Linux; other browsers and hardware decoders may reject it.
+cursors fall back to the default shape. Browser playback requires WebCodecs H.264
+High decoding; support depends on the browser and its available decoders.
 The XTest bridge covers input, not desktop capture: X11 screenshot tools do not
 capture native Wayland windows. A compositor screenshot API is not implemented.
 

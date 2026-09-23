@@ -244,7 +244,7 @@ impl State {
                 bitrate_kbps: options.bitrate,
                 scale_percent: pipe::ScalePercent::new(100)?,
                 crf: pipe::Crf::new(23)?,
-                chroma: pipe::Chroma::Rgb,
+                chroma: pipe::Chroma::Yuv420,
             },
             size: options.resolution,
             generation: Generation::new(1)?,

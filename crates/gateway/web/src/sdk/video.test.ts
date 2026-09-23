@@ -162,6 +162,48 @@ test("chroma profile changes configure the decoder before the new generation is 
   }
 });
 
+test("received packets preserve an unsupported codec error until a supported profile arrives", async () => {
+  const decoder = installDelayedVideoDecoder();
+  const fixture = await videoFixture();
+  try {
+    configure(fixture.videoSocket, "avc1.F40034");
+    decoder.supportResolvers.shift()?.({ supported: false });
+    await flush();
+    assert.equal(fixture.session.state.video.state, "error");
+    assert.equal(
+      fixture.session.state.video.message,
+      "This browser cannot decode avc1.F40034.",
+    );
+
+    fixture.videoSocket.dispatch("message", {
+      data: videoPacket(1_000, { generation: 1, keyframe: true }),
+    });
+    fixture.videoSocket.dispatch("message", {
+      data: videoPacket(2_000, { generation: 1 }),
+    });
+    await flush();
+    assert.equal(fixture.session.stats.receivedFrames, 2);
+    assert.equal(fixture.session.state.video.state, "error");
+    assert.equal(
+      fixture.session.state.video.message,
+      "This browser cannot decode avc1.F40034.",
+    );
+    assert.deepEqual(fixture.draws, []);
+
+    configure(fixture.videoSocket, "avc1.640034");
+    fixture.videoSocket.dispatch("message", {
+      data: videoPacket(3_000, { generation: 2, chroma: 1, keyframe: true }),
+    });
+    decoder.supportResolvers.shift()?.({ supported: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(fixture.session.state.video.state, "connected");
+    assert.equal(fixture.session.state.video.message, "Streaming video");
+    assert.deepEqual(fixture.draws, [3_000]);
+  } finally {
+    await fixture.session.dispose();
+  }
+});
+
 test("a superseded profile's queued packets cannot enter the new decoder", async () => {
   const decoder = installDelayedVideoDecoder();
   const fixture = await videoFixture();

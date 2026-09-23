@@ -573,7 +573,7 @@ mod tests {
             })
             .expect("healthy browser feedback");
             let mut frame = metadata(1, 1);
-            frame.chroma = Chroma::Rgb;
+            frame.chroma = Chroma::Yuv420;
             pipeline.metadata(frame.clone()).await.expect("baseline");
             frame.sequence += 1;
             frame.capture_nanos = 2_000_000_000;
@@ -596,21 +596,21 @@ mod tests {
                     .await
                     .expect("owner feedback");
             }
-            assert_eq!(sessions.quality_chroma(), Chroma::Rgb);
+            assert_eq!(sessions.quality_chroma(), Chroma::Yuv420);
+            assert_eq!(sessions.quality().fps.get(), 60);
             assert_eq!(
-                sessions.quality().fps.get(),
-                if step == 1 { 60 } else { 50 }
+                sessions.quality().scale.get(),
+                if step == 1 { 100 } else { 75 }
             );
-            assert_eq!(sessions.quality().scale.get(), 100);
             if step == 2 {
                 assert_eq!(
                     command_events.recv().await,
                     Some(Command::Quality(waywire_protocol::pipe::Quality {
                         bitrate_kbps: Kbps::new(8_000).expect("bitrate"),
-                        fps: fps(50),
-                        scale_percent: ScalePercent::new(100).expect("scale"),
+                        fps: fps(60),
+                        scale_percent: ScalePercent::new(75).expect("scale"),
                         crf: waywire_protocol::pipe::Crf::new(23).expect("crf"),
-                        chroma: Chroma::Rgb,
+                        chroma: Chroma::Yuv420,
                     }))
                 );
             }

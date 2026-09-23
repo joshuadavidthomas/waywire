@@ -648,7 +648,7 @@ mod tests {
                 fps: expected.fps,
                 scale_percent: expected.scale,
                 crf: value(waywire_protocol::pipe::Crf::new(28)),
-                chroma: waywire_protocol::pipe::Chroma::Rgb,
+                chroma: waywire_protocol::pipe::Chroma::Yuv420,
             }))
         );
         assert_eq!(
@@ -686,7 +686,7 @@ mod tests {
                 fps: expected.fps,
                 scale_percent: expected.scale,
                 crf: value(waywire_protocol::pipe::Crf::new(18)),
-                chroma: waywire_protocol::pipe::Chroma::Rgb,
+                chroma: waywire_protocol::pipe::Chroma::Yuv420,
             }))
         );
     }
@@ -705,7 +705,7 @@ mod tests {
             height: value(waywire_protocol::pipe::FrameDimension::new(720)),
             input_sequence: None,
             fps: value(Fps::new(60)),
-            chroma: waywire_protocol::pipe::Chroma::Rgb,
+            chroma: waywire_protocol::pipe::Chroma::Yuv420,
         };
         sessions.submitted(&metadata);
         metadata.sequence += 1;
@@ -734,7 +734,7 @@ mod tests {
             .expect("new owner feedback");
         assert_eq!(
             sessions.quality_chroma(),
-            waywire_protocol::pipe::Chroma::Rgb
+            waywire_protocol::pipe::Chroma::Yuv420
         );
         assert_eq!(sessions.quality().scale.get(), 100);
         assert_eq!(sessions.quality().fps.get(), 60);
@@ -749,7 +749,7 @@ mod tests {
             .expect("new baseline");
         assert_eq!(
             sessions.quality_chroma(),
-            waywire_protocol::pipe::Chroma::Rgb
+            waywire_protocol::pipe::Chroma::Yuv420
         );
         assert_eq!(sessions.quality().scale.get(), 100);
         assert_eq!(sessions.quality().fps.get(), 60);

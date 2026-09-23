@@ -522,7 +522,11 @@ export class VideoRuntime {
     decoder.configure(this.decoderConfiguration);
     this.decoder = decoder;
     this.observeDecodeQueue(decoder.decodeQueueSize);
-    this.owner.updateState({ codec: configuration.codec });
+    this.owner.updateState({
+      state: "connected",
+      message: "Connected",
+      codec: configuration.codec,
+    });
   }
 
   private decodeMessage(buffer: ArrayBuffer): void {
@@ -531,13 +535,13 @@ export class VideoRuntime {
     this.receivedChunks += 1;
     this.intervalReceivedFrames += 1;
     if (packet.keyframe) this.receivedKeyframes += 1;
+    const decoder = this.decoder;
+    if (!decoder || decoder.state !== "configured") return;
     if (this.renderedFrames === 0) {
       this.owner.updateState({
         message: `Receiving video · ${this.receivedChunks} chunks · ${this.receivedKeyframes} keyframes`,
       });
     }
-    const decoder = this.decoder;
-    if (!decoder || decoder.state !== "configured") return;
     this.owner.setLatestAppliedInput(packet.latestAppliedInput);
     const generationChanged = packet.generation !== this.currentGeneration;
     if (generationChanged) this.currentGeneration = packet.generation;
