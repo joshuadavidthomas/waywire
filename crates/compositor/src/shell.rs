@@ -102,49 +102,15 @@ impl CompositorHandler for State {
                 .unwrap_or(false);
                 let previous = self.windows.entry(window.clone()).or_default().mapped;
                 self.windows.entry(window.clone()).or_default().mapped = mapped;
-                if mapped
-                    && (!previous || old_size != window.bbox().size)
-                    && !resizing
-                    && let (Some(location), Some(output)) = (
-                        self.space.element_location(&window),
-                        self.window_output_geometry(&window),
-                    )
-                {
+                if mapped && (!previous || old_size != window.bbox().size) && !resizing {
                     // Clients can grow after their first commit. Keep their
                     // geometry on output without disturbing resize-grab anchors.
-                    let size = window.geometry().size;
-                    let location = (
-                        location
-                            .x
-                            .clamp(output.loc.x, output.loc.x + (output.size.w - size.w).max(0)),
-                        location
-                            .y
-                            .clamp(output.loc.y, output.loc.y + (output.size.h - size.h).max(0)),
-                    )
-                        .into();
-                    self.space.map_element(window.clone(), location, false);
-                    if let Some(x11) = window.x11_surface()
-                        && let Err(error) =
-                            x11.configure(smithay::utils::Rectangle::new(location, size))
-                    {
-                        tracing::warn!(%error, "place X11 window");
-                    }
+                    self.constrain_window(&window);
                 }
                 if mapped && !previous {
                     self.focus_window(Some(window.clone()));
                 } else if previous && !mapped {
-                    let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
-                    if focused == super::focus::KeyboardFocus::window(&window) {
-                        let next = self
-                            .space
-                            .elements()
-                            .rev()
-                            .find(|w| {
-                                *w != &window && self.windows.get(*w).is_some_and(|s| s.mapped)
-                            })
-                            .cloned();
-                        self.focus_window(next);
-                    }
+                    self.window_unmapped(&window);
                 }
                 if let Some(top) = window.toplevel()
                     && !top.is_initial_configure_sent()
@@ -405,6 +371,65 @@ impl XdgShellHandler for State {
     }
 }
 impl State {
+    pub(crate) fn window_unmapped(&mut self, window: &Window) {
+        if let Some(state) = self.windows.get_mut(window) {
+            state.mapped = false;
+            state.resize = None;
+        }
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        if focused.is_some() && focused == super::focus::KeyboardFocus::window(window) {
+            let next = self
+                .space
+                .elements()
+                .rev()
+                .find(|candidate| {
+                    *candidate != window
+                        && self
+                            .windows
+                            .get(*candidate)
+                            .is_some_and(|state| state.mapped)
+                        && !candidate
+                            .x11_surface()
+                            .is_some_and(smithay::xwayland::X11Surface::is_override_redirect)
+                })
+                .cloned();
+            self.focus_window(next);
+        }
+    }
+
+    fn constrain_window(&mut self, window: &Window) {
+        if window
+            .x11_surface()
+            .is_some_and(smithay::xwayland::X11Surface::is_override_redirect)
+        {
+            return;
+        }
+        let (Some(location), Some(output)) = (
+            self.space.element_location(window),
+            self.window_output_geometry(window),
+        ) else {
+            return;
+        };
+        let size = window.geometry().size;
+        let location = (
+            location
+                .x
+                .clamp(output.loc.x, output.loc.x + (output.size.w - size.w).max(0)),
+            location
+                .y
+                .clamp(output.loc.y, output.loc.y + (output.size.h - size.h).max(0)),
+        );
+        self.space.map_element(window.clone(), location, false);
+        if let Some(x11) = window.x11_surface()
+            && let Err(error) = x11.configure(smithay::utils::Rectangle::new(location.into(), size))
+        {
+            tracing::warn!(%error, "place X11 window");
+        }
+    }
+
     pub(crate) fn window_output_geometry(
         &self,
         window: &Window,
@@ -450,6 +475,8 @@ impl State {
             };
             if expanded {
                 self.space.map_element(window, geometry.loc, false);
+            } else {
+                self.constrain_window(&window);
             }
         }
         if let Some(pointer) = self.seat.get_pointer() {

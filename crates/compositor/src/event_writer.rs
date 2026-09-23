@@ -263,6 +263,33 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 }
 
 #[cfg(test)]
+impl EventSink {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(Queue {
+                    records: VecDeque::new(),
+                    bytes: 0,
+                    stopping: false,
+                    failure: None,
+                }),
+                ready: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn take_events(&self) -> Vec<Event> {
+        let mut queue = self.shared.queue.lock().expect("test event queue");
+        queue.bytes = 0;
+        queue
+            .records
+            .drain(..)
+            .map(|record| Event::decode(&record.bytes).expect("encoded event"))
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use waywire_protocol::pipe::Chroma;
     use waywire_protocol::pipe::CursorPosition;
@@ -275,23 +302,9 @@ mod tests {
 
     use super::*;
 
-    fn sink_with_queue(records: VecDeque<QueuedEvent>, bytes: usize) -> EventSink {
-        EventSink {
-            shared: Arc::new(Shared {
-                queue: Mutex::new(Queue {
-                    records,
-                    bytes,
-                    stopping: false,
-                    failure: None,
-                }),
-                ready: Condvar::new(),
-            }),
-        }
-    }
-
     #[test]
     fn replaceable_cursor_does_not_discard_required_metadata() {
-        let sink = sink_with_queue(VecDeque::new(), 0);
+        let sink = EventSink::for_test();
         let shared = Arc::clone(&sink.shared);
         sink.send(&Event::Frame(FrameMetadata {
             generation: Generation::new(1).expect("test generation should be valid"),
@@ -320,7 +333,7 @@ mod tests {
 
     #[test]
     fn cursor_updates_replace_only_the_same_kind() {
-        let sink = sink_with_queue(VecDeque::new(), 0);
+        let sink = EventSink::for_test();
         sink.send(&Event::CursorShape(CursorShape::Default))
             .expect("first cursor shape should queue");
         let shape = Event::CursorShape(CursorShape::Pointer);

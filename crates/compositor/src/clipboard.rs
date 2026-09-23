@@ -34,14 +34,12 @@ pub(super) struct Clipboard {
     pending_offer: Option<Vec<String>>,
     read: Option<(File, Vec<u8>, Instant)>,
     writes: Vec<(File, Arc<str>, usize, Instant)>,
-    last_text: Option<ClipboardText>,
 }
 
 impl State {
     pub(super) fn clipboard_set(&mut self, text: &ClipboardText) {
         self.clipboard.pending_offer = None;
         self.clipboard.read = None;
-        self.clipboard.last_text = Some(text.clone());
         set_data_device_selection(
             &self.display_handle,
             &self.seat,
@@ -56,6 +54,7 @@ impl State {
         {
             tracing::warn!(%error, "forward clipboard ownership to X11");
         }
+        self.emit(Event::Clipboard(text.clone()));
     }
 
     pub(crate) fn send_clipboard(&mut self, mime: String, fd: OwnedFd) {
@@ -175,10 +174,8 @@ impl State {
         if !keep {
             self.clipboard.read = None;
         }
-        if let Some(text) = completed
-            && self.clipboard.last_text.as_ref() != Some(&text)
-        {
-            self.clipboard.last_text = Some(text.clone());
+        // A fresh selection completes a copy even when its text is unchanged.
+        if let Some(text) = completed {
             self.emit(Event::Clipboard(text));
         }
         self.clipboard
@@ -199,5 +196,79 @@ impl State {
                     ),
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offer_read(state: &mut State, text: &str) {
+        let (read, write) =
+            nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).expect("clipboard test pipe");
+        File::from(write)
+            .write_all(text.as_bytes())
+            .expect("write clipboard offer");
+        state.clipboard.read = Some((read.into(), Vec::new(), Instant::now() + TIMEOUT));
+    }
+
+    #[test]
+    fn each_completed_selection_notifies_even_when_text_is_identical() {
+        let (_display, mut state) = crate::tests::test_state();
+        let text = ClipboardText::new("copy β 73".into()).expect("valid clipboard text");
+        for _ in 0..2 {
+            offer_read(&mut state, text.as_str());
+            state.clipboard_tick();
+            state.clipboard_tick();
+            assert_eq!(
+                state.event_sink.take_events(),
+                vec![Event::Clipboard(text.clone())]
+            );
+            state.clipboard_tick();
+            assert!(
+                state.event_sink.take_events().is_empty(),
+                "idle is not a new selection"
+            );
+        }
+        for _ in 0..2 {
+            state.clipboard_offer(Vec::new());
+            state.clipboard_tick();
+            assert_eq!(
+                state.event_sink.take_events(),
+                vec![Event::Clipboard(
+                    ClipboardText::new(String::new()).expect("empty clipboard")
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn browser_write_publishes_the_new_snapshot_and_cancels_obsolete_reads() {
+        let (_display, mut state) = crate::tests::test_state();
+        offer_read(&mut state, "old native text");
+        state.clipboard_tick(); // Buffered, but not yet published at EOF.
+        assert!(state.event_sink.take_events().is_empty());
+        let text = ClipboardText::new("new browser text".into()).expect("valid clipboard text");
+        state.clipboard_set(&text);
+        state.clipboard_tick();
+        assert!(state.clipboard.read.is_none());
+        assert_eq!(
+            state.event_sink.take_events(),
+            vec![Event::Clipboard(text.clone())]
+        );
+
+        // A later native copy of the browser's text is still a fresh copy event.
+        offer_read(&mut state, text.as_str());
+        state.clipboard_tick();
+        state.clipboard_tick();
+        assert_eq!(
+            state.event_sink.take_events(),
+            vec![Event::Clipboard(text.clone())]
+        );
+
+        state.clipboard_offer(Vec::new()); // A queued clear must not replace a newer write.
+        state.clipboard_set(&text);
+        state.clipboard_tick();
+        assert_eq!(state.event_sink.take_events(), vec![Event::Clipboard(text)]);
     }
 }

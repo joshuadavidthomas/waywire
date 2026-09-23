@@ -279,6 +279,15 @@ impl PointerGrab<State> for WindowGrab {
             {
                 *final_serial = Some(serial);
             }
+        } else if self.edges.is_some()
+            && let Some(surface) = self.window.x11_surface()
+        {
+            // X11 has no xdg configure acknowledgment to retire the resize anchor.
+            // Keep the final configured position even if an older buffer commits later.
+            state.windows.entry(self.window.clone()).or_default().resize = None;
+            state
+                .space
+                .map_element(self.window.clone(), surface.last_configure().loc, false);
         }
     }
     fn start_data(&self) -> &GrabStartData<State> {
