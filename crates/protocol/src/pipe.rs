@@ -188,11 +188,6 @@ impl Kbps {
     pub fn at_most(self, maximum: Self) -> Self {
         Self(self.get().min(maximum.get()))
     }
-
-    #[must_use]
-    pub fn divided_by(self, divisor: NonZeroU32) -> Self {
-        Self(self.get() / divisor.get())
-    }
 }
 
 impl Fps {

@@ -1,9 +1,6 @@
 node_modules
 target
-.svelte-kit
 build
 dist
 coverage
-.wrangler
 pnpm-lock.yaml
-worker-configuration.d.ts

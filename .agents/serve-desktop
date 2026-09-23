@@ -5,7 +5,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${PORT:?Start with amp orb services ensure}"
 : "${PUBLIC_URL:?Amp must supply the portal origin}"
 
-# Run the optimized pipeline used by performance benchmarks.
+# Development smoke session using optimized binaries and Foot as a sample client.
 just build-web
 cargo build --locked --release --workspace
 

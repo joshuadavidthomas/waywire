@@ -49,22 +49,16 @@ lint *ARGS:
 prettier-check:
     pnpm exec prettier --check .
 
-release VERSION:
-    scripts/package-release "{{ VERSION }}"
-
 rustfmt-check:
     cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all -- --check
 
 test: build-web
     pnpm --filter @waywire/web test
     cargo test --locked --workspace
-    shellcheck desktop/desktop.sh scripts/package-release scripts/setup-desktop scripts/setup-xwayland.sh
+    shellcheck .agents/setup .agents/serve-desktop
 
-test-compositor *ARGS:
+test-ffmpeg *ARGS:
     cargo test --locked -p waywire-compositor -- --ignored {{ ARGS }}
-    cargo build --locked -p waywire-compositor --bins --examples
-    PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/native-scene.py
-    PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH" python3 crates/compositor/tests/interop.py
 
 typecheck:
     pnpm --filter @waywire/web check

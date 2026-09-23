@@ -4,39 +4,33 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - .agents/**
       - .github/actions/install-linux-dependencies/**
       - .github/workflows/test.yml
-      - .github/workflows/release.yml
       - .cargo/**
       - Cargo.lock
       - Cargo.toml
       - crates/**
-      - desktop/**
       - Justfile
       - package.json
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
       - rust-toolchain.toml
-      - scripts/**
-      - tsconfig.base.json
   push:
     branches: [main]
     paths:
+      - .agents/**
       - .github/actions/install-linux-dependencies/**
       - .github/workflows/test.yml
-      - .github/workflows/release.yml
       - .cargo/**
       - Cargo.lock
       - Cargo.toml
       - crates/**
-      - desktop/**
       - Justfile
       - package.json
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
       - rust-toolchain.toml
-      - scripts/**
-      - tsconfig.base.json
 
 concurrency:
   group: test-${{ github.ref }}
