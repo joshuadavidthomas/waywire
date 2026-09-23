@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
 static struct wl_compositor *compositor;
@@ -35,12 +34,6 @@ static struct wl_data_offer *selection_offer;
 static int clipboard_fd = -1;
 static int width = 480, height = 320;
 static int animation_frames, revision;
-static const char *benchmark;
-static int benchmark_pending;
-static const char *latency;
-static int latency_pending, latency_ready, latency_dirty = 1;
-static unsigned latency_requested, latency_visible;
-static double latency_due;
 #ifdef NATIVE_SCENE_TEST
 static struct zxdg_decoration_manager_v1 *decorations;
 static struct wp_fractional_scale_manager_v1 *fractional;
@@ -94,137 +87,19 @@ static void data_selection(void *d, struct wl_data_device *o, struct wl_data_off
 static const struct wl_data_device_listener data_listener = { .data_offer = data_offer, .selection = data_selection };
 
 static void released(void *data, struct wl_buffer *buffer) {
-    if (data) return; // Benchmark buffers are immutable and reused until exit.
+    (void)data;
     wl_buffer_destroy(buffer);
 }
 static const struct wl_buffer_listener buffer_listener = { .release = released };
 
 static void paint(void);
-static double milliseconds(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) abort();
-    return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
-}
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
     (void)data; (void)time;
     wl_callback_destroy(callback);
-    if (latency) { latency_pending = 0; revision++; paint(); return; }
-    if (benchmark) { benchmark_pending = 0; revision++; paint(); return; }
     printf("frame-done %d\n", revision);
     if (animation_frames > 0) { animation_frames--; revision++; paint(); }
 }
 static const struct wl_callback_listener frame_listener = { .done = frame_done };
-
-// Opt-in latency fixture: four prepainted full-size backgrounds; only the small
-// marker changes. A buffer is never written or reattached until wl_buffer.release.
-// F8 responds immediately; F9 delays its visual response by 350ms, while motion
-// and compositor input acknowledgments continue. A newer F8 supersedes F9.
-struct latency_buffer { struct wl_buffer *buffer; uint32_t *pixels; int busy; unsigned marker; };
-static struct latency_buffer latency_buffers[4];
-static void latency_release(void *data, struct wl_buffer *buffer) {
-    (void)buffer;
-    ((struct latency_buffer *)data)->busy = 0;
-}
-static const struct wl_buffer_listener latency_listener = { .release = latency_release };
-static void latency_paint(void) {
-    static int configured_width, configured_height;
-    if (!latency_buffers[0].buffer) {
-        configured_width = width; configured_height = height;
-        if (width < 640 || height < 160) abort();
-        size_t size = (size_t)width * height * 4;
-        int fd = memfd_create("latency", MFD_CLOEXEC);
-        if (fd < 0 || ftruncate(fd, 4 * size) < 0) abort();
-        uint32_t *pixels = mmap(NULL, 4 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (pixels == MAP_FAILED) abort();
-        struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, 4 * size);
-        for (int i = 0; i < 4; i++) {
-            struct latency_buffer *b = &latency_buffers[i];
-            b->pixels = pixels + i * width * height;
-            for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
-                // Quiet buffers must have identical backgrounds. Motion changes
-                // every pixel, but does not spend the fixed VBV budget on XOR
-                // noise and destroy the response marker at maximum quantization.
-                int phase = !strcmp(latency, "motion") ? (i & 1) * 8 : 0;
-                b->pixels[y * width + x] = 0xff000000
-                    | ((16 + x * 200 / width + phase) << 16)
-                    | ((16 + y * 200 / height + phase) << 8)
-                    | (16 + (x + y) * 200 / (width + height) + phase);
-            }
-            b->marker = 65536; // Force initial marker painting.
-            b->buffer = wl_shm_pool_create_buffer(pool, i * size, width, height, width * 4, WL_SHM_FORMAT_XRGB8888);
-            wl_buffer_add_listener(b->buffer, &latency_listener, b);
-        }
-        wl_shm_pool_destroy(pool); close(fd);
-    }
-    // Resizing is deliberately outside this fixed-resolution measurement.
-    if (width != configured_width || height != configured_height) abort();
-    if (latency_requested != latency_visible && milliseconds() >= latency_due) {
-        latency_visible = latency_requested;
-        latency_dirty = 1;
-    }
-    int motion = !strcmp(latency, "motion");
-    if (!motion && !latency_dirty) return;
-    struct latency_buffer *b = NULL;
-    for (int offset = 0; offset < 4; offset++) {
-        int i = (revision + offset) % 4;
-        if (!latency_buffers[i].busy) { b = &latency_buffers[i]; break; }
-    }
-    if (!b) { latency_dirty = 1; return; } // Retry after release, without allocating.
-    if (b->marker != latency_visible) {
-        for (int row = 0; row < 2; row++) for (int cell = 0; cell < 17; cell++) {
-            uint32_t color = cell == 0 ? (row ? 0xff00ffff : 0xffff00ff)
-                : ((((latency_visible >> (cell - 1)) & 1) ^ row) ? 0xffeeeeee : 0xff111111);
-            for (int y = 64 + row * 32; y < 96 + row * 32; y++)
-                for (int x = 32 + cell * 32; x < 64 + cell * 32; x++) b->pixels[y * width + x] = color;
-        }
-        b->marker = latency_visible;
-        printf("latency-paint %u buffer %ld\n", latency_visible, b - latency_buffers);
-    }
-    if (motion && !latency_pending) {
-        wl_callback_add_listener(wl_surface_frame(surface), &frame_listener, NULL);
-        latency_pending = 1;
-    }
-    b->busy = 1; latency_dirty = 0;
-    wl_surface_attach(surface, b->buffer, 0, 0);
-    wl_surface_damage(surface, 0, 0, width, height);
-    wl_surface_commit(surface);
-}
-
-// Two prepainted, immutable buffers keep client allocation/painting out of the
-// steady-state benchmark. Small-damage buffers differ only inside 96x64 pixels.
-static void benchmark_paint(void) {
-    static struct wl_buffer *buffers[2];
-    int full = !strcmp(benchmark, "full");
-    if (!buffers[0]) {
-        size_t size = (size_t)width * height * 4;
-        int fd = memfd_create("benchmark", MFD_CLOEXEC);
-        if (fd < 0 || ftruncate(fd, 2 * size) < 0) abort();
-        uint32_t *pixels = mmap(NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (pixels == MAP_FAILED) abort();
-        struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, 2 * size);
-        for (int i = 0; i < 2; i++) {
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    uint32_t color = 0xff000000 | ((x / 8 % 256) << 16) | ((y / 4 % 256) << 8) | ((x + y) % 256);
-                    if (i && (full || (x < 96 && y < 64))) color ^= 0x003f7f3f;
-                    pixels[i * width * height + y * width + x] = color;
-                }
-            }
-            buffers[i] = wl_shm_pool_create_buffer(pool, i * size, width, height, width * 4, WL_SHM_FORMAT_XRGB8888);
-            wl_buffer_add_listener(buffers[i], &buffer_listener, buffers);
-        }
-        wl_shm_pool_destroy(pool);
-        munmap(pixels, 2 * size);
-        close(fd);
-    }
-    if (strcmp(benchmark, "idle") && !benchmark_pending) {
-        wl_callback_add_listener(wl_surface_frame(surface), &frame_listener, NULL);
-        benchmark_pending = 1;
-    }
-    wl_surface_attach(surface, buffers[revision % 2], 0, 0);
-    wl_surface_damage(surface, 0, 0, full || !revision ? width : 96, full || !revision ? height : 64);
-    wl_surface_commit(surface);
-}
 
 static void paint_surface(struct wl_surface *target, int width, int height) {
     size_t size = (size_t)width * height * 4;
@@ -251,8 +126,6 @@ static void paint_surface(struct wl_surface *target, int width, int height) {
     wl_surface_commit(target);
 }
 static void paint(void) {
-    if (latency) { latency_paint(); return; }
-    if (benchmark) { benchmark_paint(); return; }
     if (getenv("WAYWIRE_TEST_GEOMETRY")) xdg_surface_set_window_geometry(toplevel_xdg, 17, 29, width - 17, height - 29);
     if (animation_frames > 0) wl_callback_add_listener(wl_surface_frame(surface), &frame_listener, NULL);
     paint_surface(surface, width, height);
@@ -294,7 +167,6 @@ static void open_popup(uint32_t serial) {
 static void configured(void *data, struct xdg_surface *xdg, uint32_t serial) {
     (void)data;
     xdg_surface_ack_configure(xdg, serial);
-    latency_ready = 1;
     paint();
 }
 static const struct xdg_surface_listener surface_listener = { .configure = configured };
@@ -329,13 +201,6 @@ static void key_leave(void *data, struct wl_keyboard *kb, uint32_t serial, struc
 }
 static void key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t time, uint32_t code, uint32_t state) {
     (void)data; (void)kb; (void)serial; (void)time; printf("key %u %u\n", code, state);
-    if (latency && state && (code == 66 || code == 67)) {
-        if (++latency_requested >= 65536) abort();
-        printf("latency-request %u\n", latency_requested);
-        latency_due = milliseconds() + (code == 67 ? 350 : 0);
-        paint();
-        return;
-    }
     if (!state || !getenv("WAYWIRE_TEST_ACTIONS")) return;
     if (code == 34) { animation_frames = 4; paint(); }
     if (code == 38) { width += 240; height += 160; paint(); }
@@ -423,9 +288,6 @@ static const struct wl_registry_listener registry_listener = { .global = global,
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    benchmark = getenv("WAYWIRE_BENCH");
-    latency = getenv("WAYWIRE_LATENCY");
-    if (latency && (benchmark || (strcmp(latency, "quiet") && strcmp(latency, "motion")))) return 2;
     if (argc == 3) { width = atoi(argv[1]); height = atoi(argv[2]); }
     if (width < 1 || width > 4096 || height < 1 || height > 4096) return 2;
     struct wl_display *display = wl_display_connect(NULL);
@@ -442,7 +304,6 @@ int main(int argc, char **argv) {
     xdg_toplevel_add_listener(top, &top_listener, NULL);
     xdg_toplevel_set_title(top, "Waywire native receiver");
     xdg_toplevel_set_app_id(top, "waywire-test-receiver");
-    if (latency) xdg_toplevel_set_fullscreen(top, NULL);
     if (data_manager && input_seat) {
         data_device = wl_data_device_manager_get_data_device(data_manager, input_seat);
         wl_data_device_add_listener(data_device, &data_listener, NULL);
@@ -465,11 +326,9 @@ int main(int argc, char **argv) {
     wl_surface_commit(surface);
     while (1) {
         if (wl_display_dispatch_pending(display) < 0) break;
-        if (latency && latency_ready && (latency_dirty || (latency_requested != latency_visible && milliseconds() >= latency_due))) paint();
         wl_display_flush(display);
         struct pollfd fds[] = {{wl_display_get_fd(display), POLLIN, 0}, {clipboard_fd, POLLIN, 0}};
-        int timeout = latency && latency_requested != latency_visible ? 5 : -1;
-        if (poll(fds, 2, timeout) < 0) break;
+        if (poll(fds, 2, -1) < 0) break;
         if (fds[0].revents && wl_display_dispatch(display) < 0) break;
         if (fds[1].revents) {
             char text[4096];

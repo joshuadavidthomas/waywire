@@ -109,15 +109,7 @@ and XTest development packages, `xterm`, `xdotool`, `wmctrl`, `xclip`, and
 scene test checks raw pixels before encoding; the interop test exercises the
 real encoder and Xwayland input and clipboard paths.
 
-### Performance benchmarks
-
-`just bench-compositor` builds an optimized compositor and measures full-window
-animation, 96×64 damage, and idle at 1080p/60 with real Wayland buffers and FFmpeg.
-It reuses two immutable client buffers, acknowledges the initial keyframe, and
-discards two seconds of warmup. Each case runs three times. JSONL output includes
-encoder-submitted FPS, RTP bitrate, frame intervals, replaced frames, compositor RSS, and
-separate compositor/encoder CPU usage (100% = one core). This measures the server
-path, not browser FPS or network latency; unchanged output should submit no frames.
+## Video encoding
 
 The default is full-resolution RGB H.264 (`libx264rgb`, ultrafast): it avoids
 RGB-to-YUV conversion and preserves colored text, at a higher bitrate than the
@@ -126,22 +118,6 @@ lowers FPS while keeping RGB and resolution. Packed RGB downscaling was slower
 than full-size encoding in FFmpeg 5.1, so it is not a CPU fallback. All formats
 retain the existing bitrate cap and low-latency settings; short measurements can
 exceed the cap while the encoder's two-second VBV buffer fills.
-
-For a before/after comparison, save the old release binary before editing:
-
-```sh
-cargo build --locked --release -p waywire-compositor
-cp target/release/waywire-compositor /tmp/waywire-before
-# Make changes, then compare both binaries in alternating order:
-just bench-compositor /tmp/waywire-before target/release/waywire-compositor
-just bench-compositor --resolution 1280x720 --seconds 10
-```
-
-Use the same machine, resolution, FPS, and FFmpeg version. Avoid concurrent builds
-or other active desktops during measurements. Compare CPU per submitted frame as
-well as FPS: a slower producer can look cheaper simply because it does less work.
-The benchmark needs the native-client prerequisites of `just test-compositor`,
-but does not use the X11 test applications or the running desktop session.
 
 ## Amp orbs
 
