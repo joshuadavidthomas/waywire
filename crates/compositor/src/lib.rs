@@ -138,6 +138,7 @@ pub(crate) struct State {
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
+    decoration_press: Option<(KeyboardSource, Window)>,
     start: Instant,
     running: bool,
     failure: Option<anyhow::Error>,
@@ -232,6 +233,7 @@ impl State {
             eis_seats: HashMap::new(),
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
+            decoration_press: None,
             start: Instant::now(),
             running: true,
             failure: None,
@@ -338,6 +340,12 @@ impl State {
             );
             pointer.frame(self);
         }
+        if self.decoration_press.as_ref().is_some_and(|(_, window)| {
+            self.decoration_under(location)
+                != Some((window.clone(), decorations::DecorationAction::Close))
+        }) {
+            self.decoration_press = None;
+        }
         self.emit(Event::CursorPosition(pipe::CursorPosition {
             x: normalized_coordinate(location.x * scale, self.size.width()),
             y: normalized_coordinate(location.y * scale, self.size.height()),
@@ -362,6 +370,17 @@ impl State {
         }
         let after = self.buttons.values().any(|keys| keys.contains(&button));
         if before == after {
+            // Another input source can keep the aggregate button held. It must
+            // not inherit an armed Close after its original owner releases it.
+            if button == 0x110
+                && state == ButtonState::Released
+                && self
+                    .decoration_press
+                    .as_ref()
+                    .is_some_and(|(owner, _)| *owner == source)
+            {
+                self.decoration_press = None;
+            }
             return;
         }
         let Some(pointer) = self.seat.get_pointer() else {
@@ -391,14 +410,7 @@ impl State {
                     self.start_decoration_grab(window, serial, true);
                 }
                 decorations::DecorationAction::Close => {
-                    if let Some(top) = window.toplevel() {
-                        top.send_close();
-                    }
-                    if let Some(x11) = window.x11_surface()
-                        && let Err(error) = x11.close()
-                    {
-                        tracing::warn!(%error, "close X11 window");
-                    }
+                    self.decoration_press = Some((source, window));
                 }
             }
             pointer.frame(self);
@@ -421,9 +433,33 @@ impl State {
             },
         );
         pointer.frame(self);
+        if state == ButtonState::Released
+            && button == 0x110
+            && let Some((owner, window)) = self.decoration_press.take()
+            && owner == source
+            && self.decoration_under(pointer.current_location())
+                == Some((window.clone(), decorations::DecorationAction::Close))
+        {
+            if let Some(top) = window.toplevel() {
+                top.send_close();
+            }
+            if let Some(x11) = window.x11_surface()
+                && let Err(error) = x11.close()
+            {
+                tracing::warn!(%error, "close X11 window");
+            }
+        }
     }
 
     pub(crate) fn release_input(&mut self, source: KeyboardSource) {
+        // Disconnect/ownership loss must release buttons without activating Close.
+        if self
+            .decoration_press
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == source)
+        {
+            self.decoration_press = None;
+        }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.release_source(self, source);
         }
@@ -439,6 +475,13 @@ impl State {
         reason = "owned target avoids borrowing the mutable Space across focus changes"
     )]
     pub(crate) fn focus_window(&mut self, window: Option<Window>) {
+        if self
+            .decoration_press
+            .as_ref()
+            .is_some_and(|(_, target)| Some(target) != window.as_ref())
+        {
+            self.decoration_press = None;
+        }
         if let Some(window) = &window {
             self.space.raise_element(window, true);
             if let (Some(xwm), Some(surface)) = (&mut self.xwm, window.x11_surface())
@@ -635,7 +678,7 @@ impl State {
                 .cloned();
             self.focus_window(next);
         }
-        let elements = self.scene_elements(renderer);
+        let elements = self.scene_elements(renderer)?;
         let forced = self.dirty || self.acknowledged != Some(self.generation);
         let damaged = {
             let mut target = renderer.bind(image)?;

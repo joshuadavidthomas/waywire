@@ -43,6 +43,7 @@ futures-util = "0.3.31"
 # Pin the tested syscall wrappers: both binaries rely on their FD, polling,
 # signal and process-control behavior for backpressure and child cleanup.
 nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "time"] }
+pangocairo = "0.22.9"
 rust-embed = { version = "8.11.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

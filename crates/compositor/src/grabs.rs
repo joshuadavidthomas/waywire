@@ -35,8 +35,7 @@ use super::State;
 #[derive(Default)]
 pub(super) struct WindowState {
     pub mapped: bool,
-    pub decoration_buffers:
-        Option<[smithay::backend::renderer::element::solid::SolidColorBuffer; 3]>,
+    pub decoration: Option<super::decorations::Decoration>,
     pub restore: Option<Rectangle<i32, Logical>>,
     pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
 }

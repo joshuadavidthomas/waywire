@@ -14,4 +14,7 @@ runs:
           pkg-config \
           libpixman-1-dev \
           libxkbcommon-dev \
+          libcairo2-dev \
+          libpango1.0-dev \
+          fonts-dejavu-core \
           shellcheck

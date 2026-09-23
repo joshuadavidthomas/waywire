@@ -372,9 +372,17 @@ impl XdgShellHandler for State {
 }
 impl State {
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
+        if self
+            .decoration_press
+            .as_ref()
+            .is_some_and(|(_, target)| target == window)
+        {
+            self.decoration_press = None;
+        }
         if let Some(state) = self.windows.get_mut(window) {
             state.mapped = false;
             state.resize = None;
+            state.decoration = None;
         }
         let focused = self
             .seat

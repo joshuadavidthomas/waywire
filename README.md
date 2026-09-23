@@ -19,7 +19,7 @@ quality and output scaling.
 - pnpm 11.9.0, as declared in `package.json`
 - the Rust toolchains declared in `rust-toolchain.toml` and `tools/rustfmt/rust-toolchain.toml`
 - [just](https://just.systems/) and [uv](https://docs.astral.sh/uv/)
-- Linux, pkg-config, and the Pixman and xkbcommon development packages
+- Linux, pkg-config, and the Pixman, xkbcommon, Cairo, and Pango development packages
 
 ```sh
 pnpm install --frozen-lockfile
@@ -29,6 +29,10 @@ just build
 This builds the browser viewer and embeds it in `target/release/waywire-gateway`,
 alongside `target/release/waywire-compositor`. These are the current two binaries;
 there is no packaged desktop distribution or installer.
+
+Window decorations use Cairo and Pango shared libraries and the host's system
+fonts. Titles request generic Sans, with system fallback for other scripts; no
+font or desktop theme is bundled.
 
 At runtime, the compositor needs FFmpeg with libx264, Xwayland, and the application
 you choose to launch. It currently starts the X11 bridge even for native Wayland
