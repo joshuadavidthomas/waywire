@@ -678,7 +678,7 @@ impl State {
                 .cloned();
             self.focus_window(next);
         }
-        let elements = self.scene_elements(renderer)?;
+        let elements = self.scene_elements(renderer);
         let forced = self.dirty || self.acknowledged != Some(self.generation);
         let damaged = {
             let mut target = renderer.bind(image)?;

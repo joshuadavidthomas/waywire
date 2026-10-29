@@ -168,6 +168,16 @@ fn raster_size(size: Size<i32, Logical>, scale: f64) -> Size<i32, Buffer> {
     (size.w.max(1), size.h.max(1)).into()
 }
 
+/// Cairo rejects image surfaces wider than 32767 px and the width times scale
+/// error would otherwise end the session through `State::fail`. A window wider
+/// than the output has no visible area past the output edge, so decorations
+/// clamp to the output's logical width.
+fn decoration_width(window_width: i32, output_width: u32) -> i32 {
+    // FrameSize caps the output at 6000 px, so this conversion cannot fail.
+    let output_width = i32::try_from(output_width).unwrap_or(i32::MAX);
+    window_width.min(output_width).max(1)
+}
+
 fn color(context: &cairo::Context, rgb: u32) {
     context.set_source_rgb(
         f64::from((rgb >> 16) & 255) / 255.0,
@@ -346,7 +356,14 @@ impl State {
             {
                 continue;
             }
-            if let Some(action) = Layout(window.geometry().size).hit(point - location.to_f64()) {
+            let layout = Layout(
+                (
+                    decoration_width(window.geometry().size.w, self.size.width()),
+                    window.geometry().size.h,
+                )
+                    .into(),
+            );
+            if let Some(action) = layout.hit(point - location.to_f64()) {
                 return Some((window.clone(), action));
             }
         }
@@ -356,9 +373,10 @@ impl State {
     pub(super) fn scene_elements(
         &mut self,
         renderer: &mut PixmanRenderer,
-    ) -> Result<Vec<SceneElement<PixmanRenderer>>> {
+    ) -> Vec<SceneElement<PixmanRenderer>> {
         let mut elements = Vec::new();
         let scale = self.output.current_scale().fractional_scale();
+        let output_width = self.size.width();
         let pointer = self.seat.get_pointer();
         let hit = pointer
             .as_ref()
@@ -410,14 +428,15 @@ impl State {
             };
             let state = self.windows.entry(window.clone()).or_default();
             let size = window.geometry().size;
+            let width = decoration_width(size.w, output_width);
             let decoration = state.decoration.get_or_insert_with(Decoration::default);
-            decoration.update(Appearance {
+            let appearance = Appearance {
                 title: if title.is_empty() {
                     "Untitled".into()
                 } else {
                     title
                 },
-                width: size.w,
+                width,
                 scale,
                 active,
                 hover: hover
@@ -428,15 +447,21 @@ impl State {
                     .decoration_press
                     .as_ref()
                     .is_some_and(|(_, target)| target == window),
-            })?;
-            elements.extend(
-                decoration
-                    .elements(renderer, &Layout(size), location, scale)?
-                    .into_iter()
-                    .map(Into::into),
-            );
+            };
+            // One broken decoration must not fail the render — and the session
+            // — so log it and skip this window's decoration.
+            if let Err(error) = decoration.update(appearance) {
+                tracing::warn!(%error, "decoration update failed; skipping window decoration");
+                continue;
+            }
+            match decoration.elements(renderer, &Layout((width, size.h).into()), location, scale) {
+                Ok(parts) => elements.extend(parts.into_iter().map(Into::into)),
+                Err(error) => {
+                    tracing::warn!(%error, "decoration elements failed; skipping window decoration");
+                }
+            }
         }
-        Ok(elements)
+        elements
     }
 }
 
@@ -458,6 +483,35 @@ mod tests {
             hover: None,
             pressed: false,
         }
+    }
+
+    #[test]
+    fn a_very_wide_window_clamps_its_decoration_to_the_output_width() {
+        let output_width = 3840_u32;
+        assert_eq!(
+            decoration_width(50_000, output_width),
+            i32::try_from(output_width).expect("test output width")
+        );
+        assert_eq!(decoration_width(13, output_width), 13);
+
+        let mut look = appearance(1.0);
+        look.width = 50_000;
+        assert!(
+            paint(&look, BAR).is_err(),
+            "cairo must reject an unclamped very wide decoration"
+        );
+        look.width = decoration_width(look.width, output_width);
+        let surface = paint(&look, BAR).expect("clamped very wide decoration should paint");
+        assert_eq!(surface.width(), raster_size((look.width, 0).into(), 1.0).w);
+
+        // Hit testing follows the clamped paint: the close button sits at the
+        // clamped right edge, not at the window's own right edge.
+        let layout = Layout((look.width, 57).into());
+        assert_eq!(
+            layout.hit((f64::from(look.width) - 1.0, -1.0).into()),
+            Some(DecorationAction::Close)
+        );
+        assert_eq!(layout.hit((f64::from(look.width) + 0.5, -1.0).into()), None);
     }
 
     #[test]

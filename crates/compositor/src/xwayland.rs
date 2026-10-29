@@ -8,6 +8,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::SigmaskHow;
+use nix::sys::signal::pthread_sigmask;
 use smithay::desktop::Window;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::calloop::timer::TimeoutAction;
@@ -50,7 +53,18 @@ pub(crate) fn start(
     state: &mut State,
     eis_path: &Path,
 ) -> Result<()> {
-    let (xwayland, client) = XWayland::spawn(
+    // `Signals::new` in run() blocked SIGTERM and SIGINT before this spawn, and
+    // the fork inherits the blocked mask. Smithay's XWayland::spawn offers no
+    // pre-exec hook for the signal mask, so clear it around the spawn call and
+    // restore the previous mask afterwards.
+    let mut previous_mask = SigSet::empty();
+    pthread_sigmask(
+        SigmaskHow::SIG_SETMASK,
+        Some(&SigSet::empty()),
+        Some(&mut previous_mask),
+    )
+    .map_err(|error| anyhow!("could not unblock signals before Xwayland spawn: {error}"))?;
+    let spawned = XWayland::spawn(
         &state.display_handle,
         None,
         [("LIBEI_SOCKET", eis_path.as_os_str())],
@@ -59,7 +73,11 @@ pub(crate) fn start(
         Stdio::null(),
         Stdio::inherit(),
         |_| {},
-    )?;
+    );
+    if let Err(error) = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous_mask), None) {
+        tracing::warn!(%error, "could not restore signals after Xwayland spawn");
+    }
+    let (xwayland, client) = spawned?;
     let ready_handle = handle.clone();
     let ready_client = client.clone();
     let token = handle.insert_source(xwayland, move |event, (), state| match event {

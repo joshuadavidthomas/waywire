@@ -623,6 +623,135 @@ fn repeated_spawn_failures_publish_fatal_at_the_attempt_bound() {
 }
 
 #[test]
+fn a_process_that_runs_longer_than_the_crash_window_resets_the_count() {
+    let shared = shared();
+    let (sender, receiver) = mpsc::sync_channel(8);
+    let (notification_wake, _wake_source) =
+        make_ping().expect("test notification ping should open");
+    let mut worker = Worker {
+        shared: &shared,
+        notifications: &sender,
+        notification_wake: &notification_wake,
+        ffmpeg: "test-encoder",
+        rtp_port: 0,
+        process: None,
+        spawned_at: None,
+        restart: RestartState::new(RestartBackoff {
+            min: Duration::from_millis(1),
+            max: Duration::from_millis(1),
+        }),
+        consecutive_spawn_failures: MAX_CONSECUTIVE_SPAWN_FAILURES - 2,
+    };
+
+    // A short run keeps counting toward the fatal bound.
+    assert!(worker.account_process_exit(Duration::ZERO).is_continue());
+    assert_eq!(
+        worker.consecutive_spawn_failures,
+        MAX_CONSECUTIVE_SPAWN_FAILURES - 1
+    );
+    // A run at or beyond the crash window resets the count instead.
+    assert!(worker.account_process_exit(CRASH_WINDOW).is_continue());
+    assert_eq!(worker.consecutive_spawn_failures, 0);
+    assert!(receiver.try_recv().is_err(), "no fatal before the bound");
+
+    // Counting resumes after the reset.
+    assert!(
+        worker
+            .account_process_exit(
+                CRASH_WINDOW
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("test crash window")
+            )
+            .is_continue()
+    );
+    assert_eq!(worker.consecutive_spawn_failures, 1);
+
+    // Reaching the bound publishes a fatal notification.
+    worker.consecutive_spawn_failures = MAX_CONSECUTIVE_SPAWN_FAILURES - 1;
+    assert!(worker.account_process_exit(Duration::ZERO).is_break());
+    match receiver.try_recv() {
+        Ok(Notification::Fatal(message)) => {
+            assert!(message.contains("did not stay running"), "{message}");
+        }
+        Ok(other) => panic!("expected a fatal notification, got {other:?}"),
+        Err(error) => panic!("the fatal bound should publish a notification: {error}"),
+    }
+}
+
+#[test]
+fn a_crash_loop_publishes_fatal_at_the_attempt_bound() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let spawn_attempts = Arc::clone(&attempts);
+    let encoder =
+        encoder_with_spawner(Duration::from_millis(5), move |_, _, config, generation| {
+            spawn_attempts.fetch_add(1, Ordering::SeqCst);
+            // A process that exits immediately after spawning.
+            let mut command = Command::new("true");
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            reset_signal_mask_before_exec(&mut command);
+            let mut child = command.spawn()?;
+            let input = child
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("test crasher stdin unavailable"))?;
+            Ok(EncoderProcess {
+                child,
+                input,
+                config,
+                generation,
+            })
+        });
+
+    let mut generation_value = 1_u32;
+    submit_frame(&encoder, &frame(1, generation_value))
+        .expect("test frame should be accepted by the encoder");
+    let error = loop {
+        match wait_for_notification(&encoder) {
+            Notification::Submitted(_) => {}
+            Notification::RestartRequired { .. } => {
+                generation_value += 1;
+                encoder
+                    .set_generation(generation(generation_value))
+                    .expect("test generation should advance");
+                submit_frame(
+                    &encoder,
+                    &frame(u64::from(generation_value), generation_value),
+                )
+                .expect("test frame should be accepted by the encoder");
+            }
+            Notification::Fatal(error) => break error,
+        }
+    };
+    assert!(error.contains("did not stay running"), "{error}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        usize::from(MAX_CONSECUTIVE_SPAWN_FAILURES)
+    );
+    encoder.stop();
+}
+
+#[test]
+fn a_worker_panic_publishes_a_fatal_notification() {
+    let encoder = encoder_with_spawner(Duration::from_millis(1), |_, _, _, _| {
+        panic!("injected worker panic");
+    });
+    submit_frame(&encoder, &frame(1, 1)).expect("test frame should be accepted by the encoder");
+
+    match wait_for_notification(&encoder) {
+        Notification::Fatal(message) => {
+            assert!(message.contains("panicked"), "{message}");
+        }
+        Notification::Submitted(_) | Notification::RestartRequired { .. } => {
+            panic!("a worker panic should publish a fatal notification")
+        }
+    }
+    encoder.stop();
+}
+
+#[test]
 fn generation_change_and_stop_discard_spawn_retry_frame() {
     for stop in [false, true] {
         let shared = shared();

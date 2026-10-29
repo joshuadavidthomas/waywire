@@ -36,6 +36,7 @@ enum Replacement {
     Shape,
     Visibility,
     Position,
+    Clipboard,
 }
 
 impl Replacement {
@@ -44,10 +45,10 @@ impl Replacement {
             Event::CursorShape(_) => Some(Self::Shape),
             Event::CursorVisibility(_) => Some(Self::Visibility),
             Event::CursorPosition(_) => Some(Self::Position),
-            Event::Clipboard(_)
-            | Event::Frame(_)
-            | Event::ResizeApplied(_)
-            | Event::ResetVideoRefused(_) => None,
+            // Only the latest clipboard contents matter to a viewer; without
+            // replacement, 1 MiB clipboards would fill the 4 MiB queue.
+            Event::Clipboard(_) => Some(Self::Clipboard),
+            Event::Frame(_) | Event::ResizeApplied(_) | Event::ResetVideoRefused(_) => None,
         }
     }
 }
@@ -292,6 +293,7 @@ impl EventSink {
 #[cfg(test)]
 mod tests {
     use waywire_protocol::pipe::Chroma;
+    use waywire_protocol::pipe::ClipboardText;
     use waywire_protocol::pipe::CursorPosition;
     use waywire_protocol::pipe::CursorShape;
     use waywire_protocol::pipe::CursorVisibility;
@@ -299,6 +301,7 @@ mod tests {
     use waywire_protocol::pipe::FrameDimension;
     use waywire_protocol::pipe::FrameMetadata;
     use waywire_protocol::pipe::Generation;
+    use waywire_protocol::pipe::MAX_CLIPBOARD_BYTES;
 
     use super::*;
 
@@ -362,5 +365,60 @@ mod tests {
         assert_eq!(queue.records[0].bytes, shape.encode());
         assert_eq!(queue.records[1].replacement, Some(Replacement::Visibility));
         assert_eq!(queue.records[2].bytes, position.encode());
+    }
+
+    fn clipboard(text: &str) -> Event {
+        Event::Clipboard(ClipboardText::new(text.to_owned()).expect("test clipboard text"))
+    }
+
+    #[test]
+    fn clipboard_updates_replace_only_the_latest_queued_event() {
+        let sink = EventSink::for_test();
+        let shared = Arc::clone(&sink.shared);
+        sink.send(&clipboard("first"))
+            .expect("first clipboard should queue");
+        sink.send(&Event::Frame(FrameMetadata {
+            generation: Generation::new(1).expect("test generation should be valid"),
+            width: FrameDimension::new(2).expect("test frame width should be valid"),
+            height: FrameDimension::new(2).expect("test frame height should be valid"),
+            capture_nanos: 1,
+            sequence: 1,
+            input_sequence: None,
+            fps: Fps::new(60).expect("test frame rate should be valid"),
+            chroma: Chroma::Yuv444,
+        }))
+        .expect("frame metadata should queue");
+        let latest = clipboard("latest");
+        sink.send(&latest)
+            .expect("latest clipboard should replace the first");
+
+        let queue = shared
+            .queue
+            .lock()
+            .expect("queue lock should not be poisoned");
+        assert_eq!(queue.records.len(), 2);
+        assert_eq!(queue.records[0].bytes, latest.encode());
+        assert_eq!(queue.records[0].replacement, Some(Replacement::Clipboard));
+        assert_eq!(queue.records[1].replacement, None);
+    }
+
+    #[test]
+    fn queued_clipboards_stay_within_the_byte_budget() {
+        let sink = EventSink::for_test();
+        let shared = Arc::clone(&sink.shared);
+        let clipboard_bytes = MAX_CLIPBOARD_BYTES - 1;
+        let text = "x".repeat(clipboard_bytes);
+        for round in 0..6 {
+            sink.send(&clipboard(&text))
+                .unwrap_or_else(|error| panic!("clipboard {round} should queue: {error}"));
+        }
+
+        let queue = shared
+            .queue
+            .lock()
+            .expect("queue lock should not be poisoned");
+        assert_eq!(queue.records.len(), 1);
+        assert!(queue.bytes <= MAX_QUEUED_BYTES);
+        assert_eq!(queue.bytes, clipboard(&text).encode().len());
     }
 }

@@ -95,11 +95,16 @@ pub(crate) fn listen(
                                 .entry(event.device().id())
                                 .or_insert_with(KeyboardSource::new_auxiliary);
                             // Smithay's adapter converts evdev to XKB; our shared entry point accepts evdev.
-                            state.keyboard_key(
-                                source,
-                                u32::from(event.key_code()) - 8,
-                                event.state(),
-                            );
+                            // Evdev key codes below KEY_ESC (9) are not key events;
+                            // subtracting the 8-code XKB offset would underflow.
+                            let Some(key) = u32::from(event.key_code()).checked_sub(8) else {
+                                tracing::debug!(
+                                    key_code = u32::from(event.key_code()),
+                                    "dropped EI key code below the evdev key range"
+                                );
+                                return;
+                            };
+                            state.keyboard_key(source, key, event.state());
                         }
                         InputEvent::PointerButton { event } => {
                             let source = *sources

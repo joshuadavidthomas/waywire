@@ -54,6 +54,10 @@ const PIPE_WRITE_POLL_INTERVAL_MS: u16 = 20;
 const RESTART_DELAY_MIN: Duration = Duration::from_secs(1);
 const RESTART_DELAY_MAX: Duration = Duration::from_secs(30);
 const MAX_CONSECUTIVE_SPAWN_FAILURES: u8 = 6;
+// A process that exits within this window of its spawn counts toward the
+// consecutive-failure bound, alongside failed spawns, so an FFmpeg crash loop
+// becomes fatal instead of restarting forever.
+const CRASH_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EncoderConfig {
@@ -233,6 +237,12 @@ impl VideoEncoder {
         let worker = thread::Builder::new()
             .name("streamd-ffmpeg".into())
             .spawn(move || {
+                // Records the failure and wakes the notification source if the
+                // worker unwinds; otherwise a panic would freeze video silently.
+                let _guard = WorkerFailureGuard {
+                    shared: Arc::clone(&worker_shared),
+                    notification_wake: notification_wake.clone(),
+                };
                 Worker {
                     shared: &worker_shared,
                     notifications: &notifications_tx,
@@ -240,6 +250,7 @@ impl VideoEncoder {
                     ffmpeg: &ffmpeg,
                     rtp_port,
                     process: None,
+                    spawned_at: None,
                     restart: RestartState::new(RestartBackoff {
                         min: restart_delay_min,
                         max: restart_delay_max,
@@ -336,7 +347,7 @@ impl VideoEncoder {
     pub(crate) fn try_notification(&self) -> Option<Notification> {
         match self.notifications.try_recv() {
             Ok(notification) => Some(notification),
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => self
+            Err(mpsc::TryRecvError::Empty) => self
                 .shared
                 .pool
                 .lock()
@@ -344,6 +355,24 @@ impl VideoEncoder {
                 .notification_failure
                 .take()
                 .map(Notification::Fatal),
+            // A dropped channel while the encoder is not stopping means the
+            // worker ended without a stopping request: report it as fatal so
+            // video does not freeze silently.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let mut pool = self
+                    .shared
+                    .pool
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if pool.stopping {
+                    return pool.notification_failure.take().map(Notification::Fatal);
+                }
+                let failure = pool
+                    .notification_failure
+                    .take()
+                    .unwrap_or_else(|| "video worker stopped unexpectedly".into());
+                Some(Notification::Fatal(failure))
+            }
         }
     }
 
@@ -384,6 +413,33 @@ impl VideoEncoder {
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
         self.stop_inner();
+    }
+}
+
+/// Runs for the lifetime of the video worker thread. If the worker unwinds,
+/// the pool records a fatal failure and the notification source is woken so
+/// the event loop observes it instead of video freezing silently.
+struct WorkerFailureGuard {
+    shared: Arc<Shared>,
+    notification_wake: Ping,
+}
+
+impl Drop for WorkerFailureGuard {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        {
+            let mut pool = self
+                .shared
+                .pool
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pool.notification_failure.is_none() {
+                pool.notification_failure = Some("video worker thread panicked".into());
+            }
+        }
+        self.notification_wake.ping();
     }
 }
 
@@ -489,6 +545,7 @@ struct Worker<'a> {
     ffmpeg: &'a str,
     rtp_port: u16,
     process: Option<EncoderProcess>,
+    spawned_at: Option<Instant>,
     restart: RestartState,
     consecutive_spawn_failures: u8,
 }
@@ -497,6 +554,13 @@ impl Worker<'_> {
     fn on_process_exit(&mut self, exited: EncoderProcess) -> ControlFlow<()> {
         let generation = exited.generation;
         stop_process(self.shared, Some(exited));
+        let runtime = self
+            .spawned_at
+            .take()
+            .map_or(Duration::ZERO, |at| at.elapsed());
+        if self.account_process_exit(runtime).is_break() {
+            return ControlFlow::Break(());
+        }
         if current_generation(self.shared) == generation {
             if !request_new_generation(
                 self.shared,
@@ -511,6 +575,31 @@ impl Worker<'_> {
         ControlFlow::Continue(())
     }
 
+    /// Counts a process that spawned but exited on its own. A process that ran
+    /// longer than `CRASH_WINDOW` resets the consecutive-failure count; a
+    /// shorter run counts like a spawn failure and can reach the fatal bound.
+    fn account_process_exit(&mut self, runtime: Duration) -> ControlFlow<()> {
+        if runtime >= CRASH_WINDOW {
+            self.consecutive_spawn_failures = 0;
+            return ControlFlow::Continue(());
+        }
+        self.consecutive_spawn_failures = self.consecutive_spawn_failures.saturating_add(1);
+        if self.consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
+            let attempts = self.consecutive_spawn_failures;
+            let _ = send_notification(
+                self.shared,
+                self.notifications,
+                self.notification_wake,
+                Notification::Fatal(format!(
+                    "video encoder did not stay running: {attempts} consecutive starts \
+                     were spawn failures or exited within {CRASH_WINDOW:?}"
+                )),
+            );
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
     fn handle_spawn_failure(
         &mut self,
         slot: usize,
@@ -518,6 +607,7 @@ impl Worker<'_> {
         error: &io::Error,
     ) -> ControlFlow<()> {
         error!(%error, "could not start ffmpeg");
+        self.spawned_at = None;
         self.consecutive_spawn_failures = self.consecutive_spawn_failures.saturating_add(1);
         if self.consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
             release_slot(self.shared, slot, frame);
@@ -592,8 +682,27 @@ impl Worker<'_> {
                 error!(%error, ?frame_generation, "ffmpeg frame write failed");
             }
         }
+        // A pipe failure usually means the child already exited; count a
+        // confirmed exit like a crash so a rapid failure loop still reaches
+        // the fatal bound even when the write observes it first.
+        let child_exited = self.process.as_mut().is_some_and(child_has_exited);
+        let crash_runtime = if child_exited {
+            Some(
+                self.spawned_at
+                    .take()
+                    .map_or(Duration::ZERO, |at| at.elapsed()),
+            )
+        } else {
+            self.spawned_at = None;
+            None
+        };
         stop_process(self.shared, self.process.take());
         release_slot(self.shared, slot, frame);
+        if let Some(runtime) = crash_runtime
+            && self.account_process_exit(runtime).is_break()
+        {
+            return ControlFlow::Break(());
+        }
         if is_stopping(self.shared) {
             return ControlFlow::Break(());
         }
@@ -680,7 +789,10 @@ impl Worker<'_> {
                             .unwrap_or_else(PoisonError::into_inner)
                             .child_pid = Some(started.child.id());
                         self.process = Some(started);
-                        self.consecutive_spawn_failures = 0;
+                        // A successful spawn no longer resets the failure
+                        // count by itself; only a process that outlives
+                        // CRASH_WINDOW proves the encoder has recovered.
+                        self.spawned_at = Some(Instant::now());
                     }
                     Err(error) => match self.handle_spawn_failure(slot, frame, &error) {
                         ControlFlow::Break(()) => return,
@@ -719,6 +831,14 @@ impl Worker<'_> {
                 return;
             }
             self.restart.reset();
+            // Deliberate replacements never report an exit, so a healthy run
+            // must clear the count itself or scattered crashes would add up.
+            if self
+                .spawned_at
+                .is_some_and(|at| at.elapsed() >= CRASH_WINDOW)
+            {
+                self.consecutive_spawn_failures = 0;
+            }
             release_slot(self.shared, slot, frame);
         }
     }
