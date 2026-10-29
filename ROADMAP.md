@@ -78,47 +78,67 @@ already use before building new ones, and do it in two passes.
 ### Pass 1: on the box, with standard tools
 
 Agents and their harnesses run inside the box. Make existing tools work by
-supporting the standard protocols they speak.
+supporting the standard protocols and portals they speak.
 
 The bar is the versions distributions actually ship. A tool that has to be
 built from source, or a patched Xwayland, does not count as "existing". Pick
 protocols by what installed tools speak, not by what Smithay makes cheap.
 
-| Protocol                        | Installed tools that use it                           | Status                                                       |
-| ------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------ |
-| XTest through EIS               | xdotool click, key, type                              | Works only with an Xwayland that has libei (see below)       |
-| Pointer constraints + relative  | Xwayland's warp emulator (`xdotool mousemove`), games | Done; warps reach the seat only while the X cursor is hidden |
-| wlr-screencopy                  | packaged grim (1.4), wf-recorder, wayvnc              | Missing; not in Smithay, port niri's implementation          |
-| ext-image-copy-capture          | grim 1.5 and newer                                    | Done                                                         |
-| xdg-desktop-portal Screenshot   | desktop apps, portal-based agent drivers              | Missing; check which drivers need it                         |
-| virtual-keyboard                | wtype                                                 | Missing; Smithay has `virtual_keyboard`                      |
-| ext-foreign-toplevel-list       | lswt                                                  | Missing; Smithay has `foreign_toplevel_list`                 |
-| wlr-foreign-toplevel-management | wlrctl window actions                                 | Missing; not in Smithay, implement it                        |
+Agent input on Wayland goes through the xdg-desktop-portal RemoteDesktop
+interface, which current Linux drivers (trycua's cua-driver, computer-use-linux)
+use. Its `ConnectToEIS` call hands a driver a connection to the EIS server
+waywire already runs, so the backend is a thin D-Bus service, not a new input
+stack. xdg-desktop-portal-wlr provides no RemoteDesktop, so waywire implements
+that backend and the Screenshot backend itself. The wlr virtual-pointer and
+virtual-keyboard protocols cover drivers that synthesize input directly.
 
-Open problems against that bar:
+| Protocol or interface           | Installed tools that use it                                    | Status                                               |
+| ------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
+| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Missing; implement the backend on our EIS server     |
+| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Missing; implement the backend                       |
+| wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | In progress; port niri's implementation              |
+| ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
+| wlr-virtual-pointer             | cua-driver                                                     | Missing; not in Smithay                              |
+| virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | In progress                                          |
+| ext-foreign-toplevel-list       | lswt                                                           | In progress                                          |
+| wlr-foreign-toplevel-management | wlrctl window actions                                          | Missing; not in Smithay, implement it                |
+| Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done                                                 |
+| XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below) |
 
-- **Xwayland versions.** XTest reaching the seat needs an Xwayland built with
-  libei, and plain `xdotool mousemove` with a visible X cursor never reaches the
-  seat in stock Xwayland 24.1: its warp emulator only runs while the cursor is
-  hidden. Record which distribution releases ship a libei Xwayland, and decide
-  whether to support older ones another way.
-- **Agent drivers.** Check which input and capture paths real drivers use
-  (Anthropic's demo, trycua, computer-use-linux, mss and pyautogui) before
-  adding more protocols.
+### X11-only drivers
 
-ydotool (uinput needs libinput) and X11 screenshot tools (rootless Xwayland
-cannot see Wayland windows) cannot work on this desktop.
+Anthropic's computer-use demo (xdotool and scrot), OpenAI's Python sample
+(pyautogui) and mss work only through X11:
 
-Waywire-specific work in this pass:
+- Their input reaches Wayland windows only through an Xwayland built with
+  libei. Fedora 41 and 42 and Arch ship one; Debian 12 and 13, Ubuntu 22.04,
+  24.04 and 25.10, and Alpine do not. Nothing in the compositor can change this.
+- Their screenshots read the X11 root window, which cannot see Wayland windows
+  on any distribution.
 
-- **Input arbitration.** EIS and virtual-keyboard input bypass the browser's
-  control lease today (`crates/compositor/src/eis.rs`). Agents and humans share
+The supported workaround is to run the agent's applications as X11 clients,
+for example Chrome with `--ozone-platform=x11`. Then xdotool and pyautogui
+input works on every distribution, because it stays inside Xwayland, and
+screenshots can use grim. Document this; build nothing for it. Plain
+`xdotool mousemove` moves the seat pointer only while the X cursor is hidden,
+because Xwayland 24.1 emulates warps only then, and no released Xwayland
+supports the newer pointer-warp protocol.
+
+ydotool (uinput needs libinput) cannot work on this desktop.
+
+### Waywire-specific work
+
+- **Input arbitration.** EIS, portal, virtual-pointer and virtual-keyboard
+  input bypass the browser's control lease today
+  (`crates/compositor/src/eis.rs`). Agents and humans share
   one ownership model with explicit takeover and handback, shown in the
   desktop chrome.
 - **Window actions shared with the desktop.** Foreign-toplevel requests,
   titlebar clicks and the taskbar all go through the same `WindowAction`.
-- **Acceptance test.** Anthropic's computer-use demo loop (xdotool plus grim)
-  drives a real application while a browser watches and takes over.
+- **Acceptance tests,** on packaged tools from Debian 13 and Fedora 42:
+  computer-use-linux or cua-driver drives a Wayland application through the
+  portals, and Anthropic's demo loop drives an X11 application with xdotool
+  and grim. In both, a browser watches and takes over.
 
 Add a settled-frame signal or a custom endpoint only when a measured gap in
 these tools calls for one. No vendor offers a settled signal; they use fixed
