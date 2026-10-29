@@ -5,6 +5,33 @@ follows the goal in the README: a real, headless desktop that agents drive and a
 person watches or takes over from a browser. The phases are in order. Work in a
 later phase can start early when it doesn't depend on an earlier one.
 
+## Scope and bar
+
+waywire is a headless, remote-only desktop: the best lightweight desktop to run
+on a server, VM or microVM, used from a browser by people and agents. It aims
+for the feel and weight of XFCE. A local hardware backend (DRM/KMS, libinput,
+GPU rendering) is out of scope, but the code should not rule one out.
+
+It has to be measurably better than Waymote, its inspiration, not only a port.
+Every phase keeps the comparison below passing or improving.
+
+### Waymote comparison benchmark
+
+Run both desktops in the same orb with the same application, resolution, frame
+rate and bitrate. Waymote (labwc, `waymote-streamd` and `waymote-gateway`) is
+installed in Amp orbs under `/opt/amp-wayland`. Measure:
+
+- Idle CPU and resident memory across all desktop processes.
+- CPU and bitrate while typing in a terminal and scrolling a browser page.
+- Input-to-screen latency in the browser viewer.
+- Time from launch to the first decoded frame.
+- Whether an unmodified XTest agent (xdotool, and Anthropic's computer-use
+  demo loop with `grim` for screenshots) can drive the desktop.
+
+Record results in a table in the README with the date, commits and hardware.
+The benchmark is a repeatable script and a regression check, not a one-off
+measurement.
+
 Severity labels come from the review: **high** breaks common use, **medium**
 breaks specific apps or recovery paths, **low** is a rough edge. Items marked
 _(hypothesis)_ were traced in code but not reproduced against a real client.
@@ -45,24 +72,49 @@ Each fix here is small and independent.
 
 ## 2. Agent control plane
 
-This is the reason the project owns the compositor, and none of it exists yet.
+This is the reason the project owns the compositor. Reuse the tools agents
+already use before building new ones, and do it in two passes.
 
-- **Input arbitration.** EIS input goes straight to the seat as a separate
-  source and bypasses the browser's control lease
-  (`crates/compositor/src/eis.rs`). Agents and humans need one ownership model
-  with explicit takeover and handback, visible in the viewer.
-- **Agent queries as pipe record kinds:** window list with stable IDs, geometry,
-  focus and state; a settled-frame signal; screenshots on demand at a requested
-  size; per-window capture.
-- **Window actions shared with the desktop.** Focus, move, resize, minimize,
-  maximize and close go through the same operations as titlebar clicks and the
-  window list.
-- **A screenshot backend** so X11-based drivers see native Wayland windows.
-- **Agent-facing endpoint.** The gateway serves a local Unix socket with JSON
-  requests. Drivers and harnesses run inside the box and own their network
-  connection and its authentication; filesystem permissions protect the socket.
-  EIS stays available for XTest and libei drivers under the same ownership
-  model. An HTTP listener can be added later on the same handlers.
+### Pass 1: on the box, with standard tools
+
+Agents and their harnesses run inside the box. Make existing tools work by
+supporting the standard protocols they speak:
+
+| Tool                     | Needs                           | Status                                              |
+| ------------------------ | ------------------------------- | --------------------------------------------------- |
+| xdotool click, key, type | XTest through EIS               | Works with the libei Xwayland from `.agents/setup`  |
+| `xdotool mousemove`      | XWarpPointer reaching the seat  | Broken; check Smithay `pointer_warp` _(hypothesis)_ |
+| grim (1.5 or newer)      | ext-image-copy-capture          | Missing; Smithay has `image_copy_capture`           |
+| wtype                    | virtual-keyboard                | Missing; Smithay has `virtual_keyboard`             |
+| lswt                     | ext-foreign-toplevel-list       | Missing; Smithay has `foreign_toplevel_list`        |
+| wlrctl window actions    | wlr-foreign-toplevel-management | Missing; not in Smithay, implement it               |
+
+ydotool (uinput needs libinput) and X11 screenshot tools (rootless Xwayland
+cannot see Wayland windows) are out of scope; use grim instead.
+
+Waywire-specific work in this pass:
+
+- **Input arbitration.** EIS and virtual-keyboard input bypass the browser's
+  control lease today (`crates/compositor/src/eis.rs`). Agents and humans share
+  one ownership model with explicit takeover and handback, shown in the
+  desktop chrome.
+- **Window actions shared with the desktop.** Foreign-toplevel requests,
+  titlebar clicks and the taskbar all go through the same `WindowAction`.
+- **Acceptance test.** Anthropic's computer-use demo loop (xdotool plus grim)
+  drives a real application while a browser watches and takes over.
+
+Add a settled-frame signal or a custom endpoint only when a measured gap in
+these tools calls for one. No vendor offers a settled signal; they use fixed
+sleeps.
+
+### Pass 2: remote
+
+Design with what pass 1 teaches. Following the WPRS idea in the original spec,
+the remote side should understand windows and surfaces, not just receive
+pictures and inject coordinates. Candidates: a network agent endpoint with its
+own authentication, window-aware or per-window streaming, and agent
+observations taken from the rendered scene without an encode and decode round
+trip.
 
 ## 3. Window-management policy
 
@@ -210,7 +262,10 @@ Add these alongside the phases above:
 
 ## Decisions
 
+- **Scope.** Headless and remote only; no local hardware backend for now.
 - **Authentication.** The browser viewer stays behind an authenticating proxy.
-  The agent API is a local Unix socket, so it needs no built-in token.
-- **Agent endpoint.** A gateway-owned Unix socket with JSON (see phase 2).
+  Pass 1 agents run inside the box and use local Wayland and EIS sockets, so
+  they need no built-in token. A pass 2 network endpoint brings its own.
+- **Agent interface.** Standard protocols and existing tools first (see phase
+  2). A custom endpoint is added only for a measured gap.
 - **Theme.** Chrome and apps follow the viewer's light or dark preference.
