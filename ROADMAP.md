@@ -284,6 +284,25 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 Layer-shell, idle-inhibit and keyboard-shortcuts-inhibit can wait.
 
+## Dependency currency
+
+Bumping dependencies is part of the work, not a risk to avoid. Prefer
+upstream code to local copies of it.
+
+- **Smithay.** The pinned revision `d33a9c9` (2026-09-21) is 60 commits behind
+  upstream as of 2026-10-29. Upstream now has `wayland::virtual_pointer`, which
+  `crates/compositor/src/virtual_pointer.rs` ports by hand, and a Xwayland
+  spawn variant. Bump once the compositor threads in flight have merged, then
+  replace local ports with the upstream modules.
+- **Crates.** `cargo update` has about 60 compatible updates pending, including
+  tokio, hyper and calloop. `nix` is pinned exactly (`=0.31.3`); re-check it
+  against newer releases deliberately.
+- **Xwayland.** `.agents/setup` builds 24.1.13; 24.1.14 is current. Track the
+  26.1 release for pointer-warp and libei changes.
+- **Check.** Add a periodic job or `just` recipe that reports how far the
+  Smithay revision, the crates and the Xwayland build are behind, so drift is
+  visible before it becomes a large migration.
+
 ## Tests
 
 Add these alongside the phases above:
