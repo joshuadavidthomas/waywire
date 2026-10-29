@@ -58,8 +58,11 @@ This is the reason the project owns the compositor, and none of it exists yet.
   maximize and close go through the same operations as titlebar clicks and the
   window list.
 - **A screenshot backend** so X11-based drivers see native Wayland windows.
-- **Agent-facing endpoint.** Decide how drivers reach these queries and actions
-  locally (see Open decisions).
+- **Agent-facing endpoint.** The gateway serves a local Unix socket with JSON
+  requests. Drivers and harnesses run inside the box and own their network
+  connection and its authentication; filesystem permissions protect the socket.
+  EIS stays available for XTest and libei drivers under the same ownership
+  model. An HTTP listener can be added later on the same handlers.
 
 ## 3. Window-management policy
 
@@ -205,11 +208,9 @@ Add these alongside the phases above:
 - Clipboard auto-sync and macOS key handling in the viewer.
 - Input and scale conversion in the compositor.
 
-## Open decisions
+## Decisions
 
-- **Authentication.** The gateway expects an authenticating proxy. A
-  self-hosted product with an agent API may need a token built in.
-- **Agent endpoint shape.** Drivers could use a local socket, an HTTP API, or
-  the existing EIS socket plus new query records.
-- **Light theme default.** Decide whether sessions start dark or follow the
-  viewer's preference.
+- **Authentication.** The browser viewer stays behind an authenticating proxy.
+  The agent API is a local Unix socket, so it needs no built-in token.
+- **Agent endpoint.** A gateway-owned Unix socket with JSON (see phase 2).
+- **Theme.** Chrome and apps follow the viewer's light or dark preference.
