@@ -600,6 +600,18 @@ impl Worker<'_> {
         ControlFlow::Continue(())
     }
 
+    /// Deliberate replacements never report an exit, so a process that is still
+    /// writing frames after `CRASH_WINDOW` clears the count; otherwise crashes
+    /// scattered across a long session would add up to the fatal bound.
+    fn clear_failures_after_healthy_run(&mut self) {
+        if self
+            .spawned_at
+            .is_some_and(|at| at.elapsed() >= CRASH_WINDOW)
+        {
+            self.consecutive_spawn_failures = 0;
+        }
+    }
+
     fn handle_spawn_failure(
         &mut self,
         slot: usize,
@@ -831,14 +843,7 @@ impl Worker<'_> {
                 return;
             }
             self.restart.reset();
-            // Deliberate replacements never report an exit, so a healthy run
-            // must clear the count itself or scattered crashes would add up.
-            if self
-                .spawned_at
-                .is_some_and(|at| at.elapsed() >= CRASH_WINDOW)
-            {
-                self.consecutive_spawn_failures = 0;
-            }
+            self.clear_failures_after_healthy_run();
             release_slot(self.shared, slot, frame);
         }
     }
