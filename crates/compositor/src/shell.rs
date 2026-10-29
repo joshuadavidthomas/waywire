@@ -29,7 +29,6 @@ use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
 use smithay::wayland::fractional_scale::with_fractional_scale;
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::DataDeviceHandler;
@@ -137,7 +136,6 @@ impl ShmHandler for State {
     }
 }
 impl OutputHandler for State {}
-impl PointerConstraintsHandler for State {}
 impl smithay::input::tablet::TabletSeatHandler for State {
     type ToolFocus = WlSurface;
 }

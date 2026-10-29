@@ -114,7 +114,10 @@ pub(crate) fn listen(
                         }
                         InputEvent::PointerMotion { event } => {
                             if let Some(pointer) = state.seat.get_pointer() {
-                                state.pointer_motion(pointer.current_location() + event.delta());
+                                state.pointer_motion_with_delta(
+                                    pointer.current_location() + event.delta(),
+                                    Some(event.delta()),
+                                );
                             }
                         }
                         InputEvent::PointerMotionAbsolute { event } => {

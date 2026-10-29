@@ -7,6 +7,7 @@ mod eis;
 mod event_writer;
 mod focus;
 mod grabs;
+mod pointer_warp;
 mod shell;
 mod video;
 mod xwayland;
@@ -59,6 +60,7 @@ use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::MotionEvent;
+use smithay::input::pointer::RelativeMotionEvent;
 use smithay::output::Output;
 use smithay::output::PhysicalProperties;
 use smithay::output::Scale;
@@ -165,6 +167,7 @@ impl State {
     ) -> Result<Self> {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+        pointer_warp::install(&display_handle);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(&display_handle, [
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Maximize,
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Fullscreen,
@@ -323,6 +326,18 @@ impl State {
     }
 
     pub(crate) fn pointer_motion(&mut self, location: Point<f64, Logical>) {
+        self.pointer_motion_with_delta(location, None);
+    }
+
+    /// Relative input also reaches clients as relative motion, unclamped, so
+    /// locked-pointer clients keep receiving movement at the output edge. It
+    /// shares the absolute motion's frame: Xwayland's warp emulator then
+    /// applies only the relative delta instead of moving twice.
+    pub(crate) fn pointer_motion_with_delta(
+        &mut self,
+        location: Point<f64, Logical>,
+        delta: Option<Point<f64, Logical>>,
+    ) {
         let scale = self.output.current_scale().fractional_scale();
         let location = Point::from((
             location
@@ -342,6 +357,17 @@ impl State {
                     time: InputTime::now(),
                 },
             );
+            if let Some(delta) = delta {
+                pointer.relative_motion(
+                    self,
+                    self.surface_under(location),
+                    &RelativeMotionEvent {
+                        delta,
+                        delta_unaccel: delta,
+                        time: InputTime::now(),
+                    },
+                );
+            }
             pointer.frame(self);
         }
         if self.decoration_press.as_ref().is_some_and(|(_, window)| {
@@ -532,13 +558,9 @@ impl State {
             Command::PointerRelative(p) => {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let scale = self.output.current_scale().fractional_scale();
-                    self.pointer_motion(
-                        pointer.current_location()
-                            + Point::from((
-                                f64::from(p.dx.get()) / scale,
-                                f64::from(p.dy.get()) / scale,
-                            )),
-                    );
+                    let delta =
+                        Point::from((f64::from(p.dx.get()) / scale, f64::from(p.dy.get()) / scale));
+                    self.pointer_motion_with_delta(pointer.current_location() + delta, Some(delta));
                 }
             }
             Command::PointerButton(p) => self.pointer_button(
