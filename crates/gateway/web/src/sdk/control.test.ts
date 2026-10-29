@@ -566,3 +566,227 @@ test("a native resolution selection sends scale 120 after releasing ownership wi
     await session.dispose();
   }
 });
+
+function keyEvent(options: {
+  code: string;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+  shiftKey?: boolean;
+}): object {
+  return {
+    code: options.code,
+    key: "a",
+    repeat: false,
+    isComposing: false,
+    keyCode: 0,
+    ctrlKey: options.ctrlKey ?? false,
+    metaKey: options.metaKey ?? false,
+    shiftKey: options.shiftKey ?? false,
+    altKey: false,
+    preventDefault() {},
+    stopPropagation() {},
+  };
+}
+
+function keyboardRecords(
+  control: FakeWebSocket,
+): Array<{ key: number; state: number }> {
+  return control.sent
+    .filter(
+      (value): value is ArrayBuffer =>
+        value instanceof ArrayBuffer && new DataView(value).getUint8(1) === 4,
+    )
+    .map((record) => {
+      const view = new DataView(record);
+      return { key: view.getUint32(8, true), state: view.getUint8(12) };
+    });
+}
+
+async function keyboardFixture(
+  options: { clipboardAutoSync?: boolean } = {},
+): Promise<{
+  canvas: FakeTarget;
+  document: FakeTarget;
+  session: WaywireSession;
+  control: FakeWebSocket;
+}> {
+  const browser = installBrowser();
+  installGlobal("WheelEvent", { DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+  const control = new FakeWebSocket();
+  const canvas = new FakeTarget();
+  const session = new WaywireSession({
+    endpoint: "https://desktop.example.com",
+    createWebSocket: (path) =>
+      socket(path === "/control" ? control : new FakeWebSocket()),
+  });
+  session.attachSurface({
+    ...surfaceOptions(canvas),
+    ...(options.clipboardAutoSync ? { clipboardAutoSync: true } : {}),
+  });
+  session.input.acquire();
+  session.connect();
+  await flush();
+  control.readyState = FakeWebSocket.OPEN;
+  control.dispatch("open", {});
+  control.dispatch("message", {
+    data: JSON.stringify({ type: "control-state", state: "active" }),
+  });
+  return { ...browser, canvas, session, control };
+}
+
+test("releasing Meta releases keys whose keyup macOS never delivered", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  try {
+    canvas.dispatch("keydown", keyEvent({ code: "KeyA" }));
+    canvas.dispatch("keydown", keyEvent({ code: "MetaLeft" }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyX", metaKey: true }));
+    assert.deepEqual(keyboardRecords(control), [
+      { key: 30, state: 1 },
+      { key: 125, state: 1 },
+      { key: 45, state: 1 },
+    ]);
+
+    canvas.dispatch("keyup", keyEvent({ code: "MetaLeft" }));
+    assert.deepEqual(keyboardRecords(control), [
+      { key: 30, state: 1 },
+      { key: 125, state: 1 },
+      { key: 45, state: 1 },
+      { key: 125, state: 0 },
+      { key: 30, state: 0 },
+      { key: 45, state: 0 },
+    ]);
+
+    // A late keyup for an already released key sends nothing.
+    canvas.dispatch("keyup", keyEvent({ code: "KeyX" }));
+    assert.equal(keyboardRecords(control).length, 6);
+
+    // Modifier keys stay held until the browser releases them itself.
+    canvas.dispatch("keydown", keyEvent({ code: "ShiftLeft" }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyZ", metaKey: true }));
+    canvas.dispatch("keyup", keyEvent({ code: "MetaRight" }));
+    assert.deepEqual(keyboardRecords(control).slice(-3), [
+      { key: 42, state: 1 },
+      { key: 44, state: 1 },
+      { key: 44, state: 0 },
+    ]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("Cmd+Shift+C taps Ctrl instead of Super and lifts the held Meta", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  try {
+    canvas.dispatch("keydown", keyEvent({ code: "MetaLeft" }));
+    canvas.dispatch(
+      "keydown",
+      keyEvent({ code: "KeyC", metaKey: true, shiftKey: true }),
+    );
+    assert.deepEqual(keyboardRecords(control), [
+      { key: 125, state: 1 },
+      { key: 125, state: 0 },
+      { key: 42, state: 1 },
+      { key: 29, state: 1 },
+      { key: 46, state: 1 },
+      { key: 46, state: 0 },
+      { key: 42, state: 0 },
+      { key: 29, state: 0 },
+      { key: 125, state: 1 },
+    ]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("Cmd+V taps Ctrl instead of Super after sending the local clipboard", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  installGlobal("navigator", {
+    clipboard: { readText: () => Promise.resolve("local text") },
+  });
+  try {
+    canvas.dispatch("keydown", keyEvent({ code: "MetaLeft" }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyV", metaKey: true }));
+    await flush();
+    const management = new Set([
+      JSON.stringify({ type: "acquire" }),
+      JSON.stringify({ type: "set-quality", preset: "automatic" }),
+    ]);
+    assert.deepEqual(
+      control.sent.filter(
+        (value) => typeof value === "string" && !management.has(value),
+      ),
+      [JSON.stringify({ type: "clipboard-write", text: "local text" })],
+    );
+    assert.deepEqual(keyboardRecords(control), [
+      { key: 125, state: 1 },
+      { key: 125, state: 0 },
+      { key: 29, state: 1 },
+      { key: 47, state: 1 },
+      { key: 47, state: 0 },
+      { key: 29, state: 0 },
+      { key: 125, state: 1 },
+    ]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("a shortcut tap never re-presses a modifier the user already holds", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  installGlobal("navigator", {
+    clipboard: { readText: () => Promise.resolve("") },
+  });
+  try {
+    canvas.dispatch("keydown", keyEvent({ code: "ControlLeft" }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyV", ctrlKey: true }));
+    await flush();
+    assert.deepEqual(keyboardRecords(control), [
+      { key: 29, state: 1 },
+      { key: 47, state: 1 },
+      { key: 47, state: 0 },
+    ]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("acquiring control does not auto-write the clipboard snapshot", async () => {
+  const { canvas, session, control } = await keyboardFixture({
+    clipboardAutoSync: true,
+  });
+  const writes: string[] = [];
+  installGlobal("navigator", {
+    clipboard: {
+      writeText: (text: string) => {
+        writes.push(text);
+        return Promise.resolve();
+      },
+    },
+  });
+  const statuses: string[] = [];
+  session.on("clipboard", (event) => statuses.push(event.status));
+  try {
+    // The fixture's control-state active already marked the next clipboard as
+    // the acquisition snapshot the gateway sends with ownership.
+    control.dispatch("message", {
+      data: JSON.stringify({ type: "clipboard", text: "snapshot" }),
+    });
+    assert.deepEqual(writes, []);
+    assert.equal(session.clipboard.latestRemoteText, "snapshot");
+    assert.deepEqual(statuses, ["Remote clipboard ready"]);
+
+    // Only a later change syncs into the local clipboard.
+    control.dispatch("message", {
+      data: JSON.stringify({ type: "clipboard", text: "changed" }),
+    });
+    assert.deepEqual(writes, ["changed"]);
+    await flush();
+    assert.deepEqual(statuses, [
+      "Remote clipboard ready",
+      "Remote clipboard ready",
+      "Clipboard synced",
+    ]);
+  } finally {
+    await session.dispose();
+  }
+});

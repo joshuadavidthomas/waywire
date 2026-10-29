@@ -31,7 +31,10 @@ const minimumOutputWidth = 320;
 const maximumOutputWidth = 6000;
 const minimumOutputHeight = 180;
 const maximumOutputHeight = 6000;
-const maximumOutputPixels = maximumOutputWidth * maximumOutputHeight;
+// The compositor rejects any frame above 3840×2160 total pixels
+// (MAX_RAW_PIXELS in crates/protocol/src/pipe.rs), and a rejected resize
+// closes the input socket.
+const maximumOutputPixels = 3840 * 2160;
 const defaultAutomaticOutputPixels = 3840 * 2160;
 
 export function fitObservedResize(
@@ -94,7 +97,7 @@ export function normalizeResizeDimensions(
   width: number,
   height: number,
 ): Readonly<{ width: number; height: number }> {
-  return Object.freeze({
+  let normalized = {
     width: Math.max(
       minimumOutputWidth,
       Math.min(maximumOutputWidth, Math.round(width / 2) * 2),
@@ -103,7 +106,30 @@ export function normalizeResizeDimensions(
       minimumOutputHeight,
       Math.min(maximumOutputHeight, Math.round(height / 2) * 2),
     ),
-  });
+  };
+  const pixels = normalized.width * normalized.height;
+  if (pixels > maximumOutputPixels) {
+    // Scale both sides proportionally so the total stays within the
+    // compositor's pixel cap; flooring to even sides never exceeds it.
+    const downscale = Math.sqrt(maximumOutputPixels / pixels);
+    normalized = {
+      width: Math.max(
+        minimumOutputWidth,
+        Math.min(
+          maximumOutputWidth,
+          Math.floor((normalized.width * downscale) / 2) * 2,
+        ),
+      ),
+      height: Math.max(
+        minimumOutputHeight,
+        Math.min(
+          maximumOutputHeight,
+          Math.floor((normalized.height * downscale) / 2) * 2,
+        ),
+      ),
+    };
+  }
+  return Object.freeze(normalized);
 }
 
 function positiveNumber(value: unknown, name: string): number {

@@ -337,3 +337,52 @@ test("decode queue overflow drops stale data and waits for a keyframe", async (t
     },
   ]);
 });
+
+test("video reconnect backoff resets only after a stable connection", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  t.mock.method(console, "warn", () => {});
+  const fixture = await videoFixture();
+  const videoSocket = fixture.videoSocket;
+  const attempts = () =>
+    fixture.socketAttempts.filter((attempt) => attempt.path === "/stream")
+      .length;
+  try {
+    // The first connection opens briefly and flaps: the retry after it keeps
+    // the doubled backoff instead of restarting at 250 ms.
+    videoSocket.readyState = FakeWebSocket.OPEN;
+    videoSocket.dispatch("open", {});
+    videoSocket.dispatch("close", { code: 1006, reason: "" });
+    t.mock.timers.tick(250);
+    await flush();
+    assert.equal(attempts(), 2, "first retry after the initial delay");
+    const second = fixture.socketAttempts
+      .filter((attempt) => attempt.path === "/stream")
+      .at(-1)?.socket;
+    if (!second) throw new Error("second socket was not created");
+    second.readyState = FakeWebSocket.OPEN;
+    second.dispatch("open", {});
+    second.dispatch("close", { code: 1006, reason: "" });
+    t.mock.timers.tick(250);
+    await flush();
+    assert.equal(attempts(), 2, "the doubled delay has not elapsed yet");
+    t.mock.timers.tick(250);
+    await flush();
+    assert.equal(attempts(), 3, "second retry waits the doubled delay");
+
+    // A connection that stays open for 5 seconds restarts the backoff.
+    const third = fixture.socketAttempts
+      .filter((attempt) => attempt.path === "/stream")
+      .at(-1)?.socket;
+    if (!third) throw new Error("third socket was not created");
+    third.readyState = FakeWebSocket.OPEN;
+    third.dispatch("open", {});
+    t.mock.timers.tick(5000);
+    await flush();
+    third.dispatch("close", { code: 1006, reason: "" });
+    t.mock.timers.tick(250);
+    await flush();
+    assert.equal(attempts(), 4, "retry after a stable connection is immediate");
+  } finally {
+    await fixture.session.dispose();
+  }
+});

@@ -235,6 +235,10 @@ export class ControlRuntime {
   private qualityBitrate = 0;
   private qualityScale = 100;
   private remoteClipboard: string | null = null;
+  // The gateway sends the remote's latest clipboard with control acquisition;
+  // that snapshot must not overwrite the user's local clipboard. Only later
+  // clipboard changes auto-write.
+  private clipboardSnapshotPending = false;
   private pendingClipboardCopy: PendingClipboardCopy | null = null;
   private shortcutClipboardCopy: ShortcutClipboardCopy | null = null;
   private inputSequence = 0;
@@ -525,6 +529,10 @@ export class ControlRuntime {
   }
 
   private receiveRemoteClipboard(text: string): void {
+    // Only the first clipboard after acquiring control is the acquisition
+    // snapshot; later ones are real changes the user wants synced locally.
+    const snapshot = this.clipboardSnapshotPending;
+    this.clipboardSnapshotPending = false;
     this.remoteClipboard = text;
     this.setClipboardStatus(
       text.length === 0 ? "Remote clipboard empty" : "Remote clipboard ready",
@@ -540,7 +548,7 @@ export class ControlRuntime {
       transaction.resolve(text);
       return;
     }
-    if (text.length === 0) {
+    if (text.length === 0 || snapshot) {
       return;
     }
     if (
@@ -972,6 +980,8 @@ export class ControlRuntime {
       }
       const wasControlActive = this.controlActive;
       this.controlActive = message.state === "active";
+      if (this.controlActive && !wasControlActive)
+        this.clipboardSnapshotPending = true;
       this.localCursor?.setActive(
         this.controlActive && this.controlIntent === "wanted",
       );
@@ -988,12 +998,14 @@ export class ControlRuntime {
         // The reply can arrive after blur released ownership. Remember the
         // denial anyway so refocusing cannot create a new automatic claim.
         this.lastResizeRequest = null;
+        this.clipboardSnapshotPending = false;
         this.inputRuntime.resetPressed();
         this.controlAcquisition = "waiting";
         this.setControlStatus("Input in use");
         return;
       } else if (message.state === "ready") {
         this.lastResizeRequest = null;
+        this.clipboardSnapshotPending = false;
         if (this.controlAcquisition === "waiting")
           this.controlAcquisition = "automatic";
         // Readiness is an opportunity for a present viewer, not a queued claim.
@@ -1018,6 +1030,7 @@ export class ControlRuntime {
       this.localCursor?.clear();
       this.controlActive = false;
       this.lastResizeRequest = null;
+      this.clipboardSnapshotPending = false;
       this.pendingControlRecords = [];
       this.inputRuntime.resetPressed();
       if (this.controlAcquisition === "requesting")

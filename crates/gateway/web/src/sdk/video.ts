@@ -11,6 +11,9 @@ export const maximumVideoDecodeQueueSize = 24;
 const busyDecodeQueueSize = 5;
 const initialReconnectDelayMilliseconds = 250;
 const maximumReconnectDelayMilliseconds = 5000;
+// A connection must stay open this long before the backoff restarts; a socket
+// that flaps immediately after opening should not reset the delay.
+const reconnectStabilityMilliseconds = 5000;
 const presentationLeadMilliseconds = 8;
 const presentationWakeMarginMilliseconds = 4;
 const maximumPresentationTimerMilliseconds = 1000;
@@ -131,6 +134,7 @@ export class VideoRuntime {
   private decodedFrames = 0;
   private reconnectDelay = initialReconnectDelayMilliseconds;
   private reconnectTimer: Timer | null = null;
+  private reconnectStableTimer: Timer | null = null;
   private connectAttempt: ConnectionAttempt | null = null;
   private decoderConfiguration: VideoDecoderConfig | null = null;
   private waitingForKeyframe = true;
@@ -285,8 +289,17 @@ export class VideoRuntime {
     socket.binaryType = "arraybuffer";
     socket.addEventListener("open", () => {
       if (this.socket !== socket) return;
-      this.reconnectDelay = initialReconnectDelayMilliseconds;
       this.owner.setStatus("Connected", true);
+      // Restart the backoff only once the connection has proven stable, like
+      // the control socket does.
+      if (this.reconnectStableTimer !== null)
+        clearTimeout(this.reconnectStableTimer);
+      this.reconnectStableTimer = setTimeout(() => {
+        this.reconnectStableTimer = null;
+        if (this.socket === socket && socket.readyState === WebSocket.OPEN) {
+          this.reconnectDelay = initialReconnectDelayMilliseconds;
+        }
+      }, reconnectStabilityMilliseconds);
     });
     socket.addEventListener("message", (event) => {
       if (this.socket !== socket) return;
@@ -346,6 +359,10 @@ export class VideoRuntime {
     this.socket = null;
     const reason = event.reason || `WebSocket code ${event.code}`;
     console.warn("video WebSocket closed", event.code, event.reason);
+    if (this.reconnectStableTimer !== null) {
+      clearTimeout(this.reconnectStableTimer);
+      this.reconnectStableTimer = null;
+    }
     this.owner.setStatus(
       this.owner.shouldRun() ? `Reconnecting · ${event.code}` : "Disconnected",
     );
@@ -377,6 +394,9 @@ export class VideoRuntime {
     this.connectAttempt = null;
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    if (this.reconnectStableTimer !== null)
+      clearTimeout(this.reconnectStableTimer);
+    this.reconnectStableTimer = null;
     this.socket?.close(1000, "client disconnect");
     this.socket = null;
     this.decoderGeneration += 1;

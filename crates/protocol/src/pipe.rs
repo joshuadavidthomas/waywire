@@ -1881,6 +1881,39 @@ mod tests {
     }
 
     #[test]
+    fn frame_size_accepts_the_viewer_normalized_resizes() {
+        // Sizes the viewer's normalizeResizeDimensions produces, including the
+        // proportional scaling that fits the pixel cap.
+        for (width, height) in [
+            (2880, 2880),
+            (4988, 1662),
+            (6000, 1382),
+            (1920, 1080),
+            (3840, 2160),
+            (320, 180),
+        ] {
+            assert!(
+                FrameSize::new(width, height).is_ok(),
+                "{width}x{height} should be accepted"
+            );
+        }
+        for (width, height) in [
+            (5000, 5000),
+            (6000, 2000),
+            (3840, 2162),
+            (3842, 2160),
+            (318, 1080),
+            (1920, 178),
+            (1000, 1001),
+        ] {
+            assert!(
+                FrameSize::new(width, height).is_err(),
+                "{width}x{height} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn record_with_trailing_byte_is_an_invalid_header() {
         let mut record = event_cases()[1].2.clone();
         record.push(0);

@@ -33,6 +33,10 @@ const maximumPointerDelta = 4096;
 const keyReleased = 0;
 const keyPressed = 1;
 const keyRepeated = 2;
+// Linux key codes for the modifier keys.
+const controlKeyCodes = new Set([29, 97]);
+const metaKeyCodes = new Set([125, 126]);
+const modifierKeyCodes = new Set([29, 42, 54, 56, 97, 100, 125, 126]);
 const linuxPointerButtons: readonly Button[] = [
   0x110, 0x112, 0x111, 0x113, 0x114,
 ];
@@ -447,10 +451,13 @@ export class InputRuntime {
   }
 
   private tap(key: number, modifiers: readonly number[]): void {
+    // A modifier the user physically holds is already down remotely; tapping
+    // it again would make apps see a double press.
     for (const modifier of modifiers)
-      this.owner.sendRecord(
-        keyboardKey(modifier, keyPressed, this.owner.nextSequence()),
-      );
+      if (!this.pressedKeys.has(modifier))
+        this.owner.sendRecord(
+          keyboardKey(modifier, keyPressed, this.owner.nextSequence()),
+        );
     this.owner.sendRecord(
       keyboardKey(key, keyPressed, this.owner.nextSequence()),
     );
@@ -464,6 +471,31 @@ export class InputRuntime {
         );
   }
 
+  // The remote is Linux: a Cmd-triggered clipboard shortcut must tap Ctrl
+  // (plus Shift when held) instead of Super, or Linux apps never paste or
+  // copy. Lift the held Meta around the tap so the shortcut reaches the
+  // remote without synthesizing a second Meta press.
+  private tapClipboardShortcut(key: number, event: KeyboardEvent): void {
+    let modifiers = this.modifiers(event);
+    const heldMeta = event.metaKey
+      ? [...this.pressedKeys].filter((held) => metaKeyCodes.has(held))
+      : [];
+    if (event.metaKey) {
+      modifiers = modifiers.filter((modifier) => !metaKeyCodes.has(modifier));
+      if (!modifiers.some((modifier) => controlKeyCodes.has(modifier)))
+        modifiers.push(29);
+      for (const meta of heldMeta)
+        this.owner.sendRecord(
+          keyboardKey(meta, keyReleased, this.owner.nextSequence()),
+        );
+    }
+    this.tap(key, modifiers);
+    for (const meta of heldMeta)
+      this.owner.sendRecord(
+        keyboardKey(meta, keyPressed, this.owner.nextSequence()),
+      );
+  }
+
   private handleKeyDown = (event: KeyboardEvent): void => {
     if (!event.repeat) this.owner.requestControlOnInteraction();
     if (event.isComposing || event.keyCode === 229) return;
@@ -472,7 +504,6 @@ export class InputRuntime {
     if ((event.ctrlKey || event.metaKey) && event.code === "KeyV") {
       if (!event.repeat && !this.clipboardPastePending) {
         this.clipboardPastePending = true;
-        const modifiers = this.modifiers(event);
         this.owner
           .sendLocalClipboard()
           .catch((error) => {
@@ -480,7 +511,7 @@ export class InputRuntime {
               this.owner.setClipboardUnavailable(error);
           })
           .finally(() => {
-            if (!this.owner.disposed()) this.tap(key, modifiers);
+            if (!this.owner.disposed()) this.tapClipboardShortcut(key, event);
             this.clipboardPastePending = false;
           });
       }
@@ -495,7 +526,7 @@ export class InputRuntime {
     ) {
       if (!event.repeat) {
         this.owner.armRemoteCopy();
-        this.tap(key, this.modifiers(event));
+        this.tapClipboardShortcut(key, event);
       }
       event.preventDefault();
       event.stopPropagation();
@@ -536,6 +567,16 @@ export class InputRuntime {
       this.owner.sendRecord(
         keyboardKey(key, keyReleased, this.owner.nextSequence()),
       );
+    // macOS never delivers keyup for keys pressed while Cmd is held, so a
+    // Meta keyup is the last chance to release them on the remote.
+    if (metaKeyCodes.has(key))
+      for (const held of [...this.pressedKeys])
+        if (!modifierKeyCodes.has(held)) {
+          this.pressedKeys.delete(held);
+          this.owner.sendRecord(
+            keyboardKey(held, keyReleased, this.owner.nextSequence()),
+          );
+        }
     this.physicalTextPending = false;
     event.preventDefault();
     event.stopPropagation();
