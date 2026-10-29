@@ -1,5 +1,6 @@
 //! Headless Wayland compositor streaming H.264 RTP.
 
+mod capture;
 mod clipboard;
 mod decorations;
 mod eis;
@@ -136,6 +137,7 @@ pub(crate) struct State {
     pub(crate) xdisplay: Option<u32>,
     pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
+    capture: capture::Capture,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     decoration_press: Option<(KeyboardSource, Window)>,
@@ -216,6 +218,7 @@ impl State {
         output.set_preferred(mode);
         let mut space = Space::default();
         space.map_output(&output, (0, 0));
+        let capture = capture::Capture::new(&display_handle);
         Ok(Self {
             display_handle,
             space,
@@ -231,6 +234,7 @@ impl State {
             xdisplay: None,
             xwayland_shell_state,
             eis_seats: HashMap::new(),
+            capture,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
             decoration_press: None,
@@ -584,6 +588,7 @@ impl State {
                 self.output.set_preferred(mode);
                 self.space.map_output(&self.output, (0, 0));
                 self.output_resized();
+                self.capture.output_resized();
                 crate::eis::refresh_regions(self);
                 self.advance_generation()?;
                 self.emit(Event::ResizeApplied(pipe::ResizeApplied {
@@ -742,6 +747,7 @@ impl State {
                 video.submit(CapturedFrame::new(pixels, metadata, config))?;
             }
         }
+        capture::serve_pending(self, image);
         self.dirty = false;
         for window in self.space.elements() {
             window.send_frame(
