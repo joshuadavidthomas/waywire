@@ -7,6 +7,29 @@ relays video, input, and clipboard messages to a browser using WebCodecs.
 No wlroots compositor, desktop environment, GPU, or physical display is required.
 The project began as a port of [waymote](https://github.com/rockorager/waymote).
 
+## Why own the compositor
+
+The goal is a real, headless desktop for agents on your own machines, VMs, or
+microVMs. Agents drive it through computer-use drivers, and a person watches or
+takes over from a browser tab. It should feel like the sandbox computers in
+hosted agent products: a minimal desktop with overlapping windows, not a
+single-app stream.
+
+Waymote pairs labwc with a separate streaming process. They negotiate frames,
+cursor, clipboard, output size, and input through Wayland protocols. Everything
+the gateway needs belongs to the compositor, so waywire owns it directly:
+
+- Frames render straight into the encoder, and the cursor is reported by name
+  and position instead of being captured.
+- One seat serves the browser and agent drivers. XTest- and libei-based drivers
+  arrive through the EIS socket instead of stopping inside Xwayland.
+- Agent operations and desktop controls should share one implementation. A
+  titlebar click and an automation command perform the same window operation.
+
+Agent queries are planned but not built: a window list, a settled-frame signal,
+per-window capture, and screenshots on demand. Arbitration between the browser's
+control lease and agent input is planned too. See [ROADMAP.md](ROADMAP.md).
+
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while
 observers and pointer-locked clients show a positioned arrow. Cursor positions
