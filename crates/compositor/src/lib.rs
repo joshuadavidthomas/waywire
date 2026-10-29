@@ -10,6 +10,7 @@ mod grabs;
 mod pointer_warp;
 mod shell;
 mod video;
+mod virtual_pointer;
 mod xwayland;
 
 use std::collections::HashMap;
@@ -168,6 +169,7 @@ impl State {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         pointer_warp::install(&display_handle);
+        virtual_pointer::install(&display_handle);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(&display_handle, [
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Maximize,
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Fullscreen,
