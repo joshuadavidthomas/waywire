@@ -78,19 +78,36 @@ already use before building new ones, and do it in two passes.
 ### Pass 1: on the box, with standard tools
 
 Agents and their harnesses run inside the box. Make existing tools work by
-supporting the standard protocols they speak:
+supporting the standard protocols they speak.
 
-| Tool                     | Needs                           | Status                                              |
-| ------------------------ | ------------------------------- | --------------------------------------------------- |
-| xdotool click, key, type | XTest through EIS               | Works with the libei Xwayland from `.agents/setup`  |
-| `xdotool mousemove`      | XWarpPointer reaching the seat  | Broken; check Smithay `pointer_warp` _(hypothesis)_ |
-| grim (1.5 or newer)      | ext-image-copy-capture          | Missing; Smithay has `image_copy_capture`           |
-| wtype                    | virtual-keyboard                | Missing; Smithay has `virtual_keyboard`             |
-| lswt                     | ext-foreign-toplevel-list       | Missing; Smithay has `foreign_toplevel_list`        |
-| wlrctl window actions    | wlr-foreign-toplevel-management | Missing; not in Smithay, implement it               |
+The bar is the versions distributions actually ship. A tool that has to be
+built from source, or a patched Xwayland, does not count as "existing". Pick
+protocols by what installed tools speak, not by what Smithay makes cheap.
+
+| Protocol                        | Installed tools that use it                           | Status                                                       |
+| ------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------ |
+| XTest through EIS               | xdotool click, key, type                              | Works only with an Xwayland that has libei (see below)       |
+| Pointer constraints + relative  | Xwayland's warp emulator (`xdotool mousemove`), games | Done; warps reach the seat only while the X cursor is hidden |
+| wlr-screencopy                  | packaged grim (1.4), wf-recorder, wayvnc              | Missing; not in Smithay, port niri's implementation          |
+| ext-image-copy-capture          | grim 1.5 and newer                                    | Done                                                         |
+| xdg-desktop-portal Screenshot   | desktop apps, portal-based agent drivers              | Missing; check which drivers need it                         |
+| virtual-keyboard                | wtype                                                 | Missing; Smithay has `virtual_keyboard`                      |
+| ext-foreign-toplevel-list       | lswt                                                  | Missing; Smithay has `foreign_toplevel_list`                 |
+| wlr-foreign-toplevel-management | wlrctl window actions                                 | Missing; not in Smithay, implement it                        |
+
+Open problems against that bar:
+
+- **Xwayland versions.** XTest reaching the seat needs an Xwayland built with
+  libei, and plain `xdotool mousemove` with a visible X cursor never reaches the
+  seat in stock Xwayland 24.1: its warp emulator only runs while the cursor is
+  hidden. Record which distribution releases ship a libei Xwayland, and decide
+  whether to support older ones another way.
+- **Agent drivers.** Check which input and capture paths real drivers use
+  (Anthropic's demo, trycua, computer-use-linux, mss and pyautogui) before
+  adding more protocols.
 
 ydotool (uinput needs libinput) and X11 screenshot tools (rootless Xwayland
-cannot see Wayland windows) are out of scope; use grim instead.
+cannot see Wayland windows) cannot work on this desktop.
 
 Waywire-specific work in this pass:
 
