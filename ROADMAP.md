@@ -149,6 +149,15 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   computer-use-linux or cua-driver drives a Wayland application through the
   portals, and Anthropic's demo loop drives an X11 application with xdotool
   and grim. In both, a browser watches and takes over.
+  The rerunnable scenarios and prerequisites are in `tools/acceptance`.
+  Results: Debian 13 computer-use-linux **fail** (window discovery), Debian 13
+  cua-driver **fail** (missing paused notice), Fedora 42 X11 **pass**.
+  A Debian 13 rerun of cua-driver 0.38.0 showed `AGENT_BEFORE` and
+  `AGENT_AFTER` in Foot, with `AGENT_DURING` absent during browser control.
+  The viewer did not show the required paused notice in the captured frame:
+  the driver's virtual input devices were transient, so no agent remained
+  registered by the time the screenshot was taken. The complete screenshot
+  acceptance criterion remains unmet.
   On Debian 13, the published cua-driver 0.38.0 Linux binary captured Foot
   with wlr-screencopy and used virtual pointer plus `wtype` for desktop input.
   Browser takeover dropped that input, and handback restored it. With `wtype`
@@ -165,11 +174,16 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   `ConnectToEIS`; its click did not reach Foot. Outside COSMIC it sends
   input only through the RemoteDesktop Notify methods and reads stream
   metadata, never PipeWire video. waywire now serves those methods and one
-  metadata-only stream; the scenario has not been rerun yet. On Fedora 42, Anthropic's
-  computer tool and packaged xdotool typed a command into xterm, and grim
-  captured it. The packaged `ffmpeg-free` lacks libx264, but the OpenH264
-  fallback no longer blocks streaming; the X11 takeover and handback scenario
-  remains unverified. Neither complete acceptance scenario has passed.
+  metadata-only stream. On a rerun against Debian 13, screenshot and portal
+  click succeeded after installing xrandr, but computer-use-linux 0.7.32
+  refused `type_text`: it requires a supported focused-window discovery
+  backend before sending portal keyboard input, and none recognizes a native
+  waywire Foot window. A compatible focused-window backend or upstream driver
+  support is needed; the takeover scenario did not complete. On Fedora 42,
+  Anthropic's ComputerTool with packaged xdotool and grim passed the X11
+  takeover scenario: xterm displayed `AGENT_BEFORE` and `AGENT_AFTER`, but
+  not `AGENT_DURING`, and the paused notice appeared during browser control.
+  Fedora's packaged `ffmpeg-free` used the Cisco OpenH264 encoder.
 
 Add a settled-frame signal or a custom endpoint only when a measured gap in
 these tools calls for one. No vendor offers a settled signal; they use fixed

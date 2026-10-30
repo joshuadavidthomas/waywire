@@ -6,6 +6,10 @@ set unstable
 default:
     @just --list
 
+# Run one packaged-driver takeover scenario after `just build`.
+acceptance SCENARIO:
+    python3 tools/acceptance/scenario.py {{ SCENARIO }}
+
 build-web:
     pnpm --filter @waywire/web build
 
