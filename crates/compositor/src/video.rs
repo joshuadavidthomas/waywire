@@ -770,10 +770,12 @@ impl Worker<'_> {
                 error!(%error, ?frame_generation, "ffmpeg frame write failed");
             }
         }
-        // A pipe failure usually means the child already exited; count a
-        // confirmed exit like a crash so a rapid failure loop still reaches
-        // the fatal bound even when the write observes it first.
-        let child_exited = self.process.as_mut().is_some_and(child_has_exited);
+        // A pipe failure means the child stopped reading, which usually means it
+        // is exiting. The kernel closes its pipes before the exit becomes
+        // visible to try_wait, so count a pipe failure like a crash too;
+        // otherwise a rapid failure loop can respawn without reaching the bound.
+        let child_exited = matches!(error, FrameWriteError::Io(_))
+            || self.process.as_mut().is_some_and(child_has_exited);
         let crash_runtime = if child_exited {
             Some(
                 self.spawned_at

@@ -735,6 +735,74 @@ fn a_crash_loop_publishes_fatal_at_the_attempt_bound() {
 }
 
 #[test]
+fn an_encoder_that_closes_its_input_counts_toward_the_attempt_bound() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let spawn_attempts = Arc::clone(&attempts);
+    let encoder =
+        encoder_with_spawner(Duration::from_millis(5), move |_, _, config, generation| {
+            // An uncounted failure respawns forever; end it with a fatal panic.
+            assert!(
+                spawn_attempts.fetch_add(1, Ordering::SeqCst) < 20,
+                "pipe failures were not counted toward the attempt bound"
+            );
+            // Stops reading frames but outlives the write, so no exit is observed
+            // when the pipe breaks.
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec 0<&- sleep 5"]);
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            reset_signal_mask_before_exec(&mut command);
+            let mut child = command.spawn()?;
+            let input = child
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("test crasher stdin unavailable"))?;
+            Ok(EncoderProcess {
+                child,
+                input,
+                config,
+                generation,
+            })
+        });
+
+    let mut generation_value = 1_u32;
+    submit_frame(&encoder, &frame(1, generation_value))
+        .expect("test frame should be accepted by the encoder");
+    let error = loop {
+        match wait_for_notification(&encoder) {
+            // Keep writing so the closed pipe is observed.
+            Notification::Submitted(_) => {
+                submit_frame(
+                    &encoder,
+                    &frame(u64::from(generation_value), generation_value),
+                )
+                .expect("test frame should be accepted by the encoder");
+            }
+            Notification::RestartRequired { .. } => {
+                generation_value += 1;
+                encoder
+                    .set_generation(generation(generation_value))
+                    .expect("test generation should advance");
+                submit_frame(
+                    &encoder,
+                    &frame(u64::from(generation_value), generation_value),
+                )
+                .expect("test frame should be accepted by the encoder");
+            }
+            Notification::Fatal(error) => break error,
+        }
+    };
+    assert!(error.contains("did not stay running"), "{error}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        usize::from(MAX_CONSECUTIVE_SPAWN_FAILURES)
+    );
+    encoder.stop();
+}
+
+#[test]
 fn a_worker_panic_publishes_a_fatal_notification() {
     let encoder = encoder_with_spawner(Duration::from_millis(1), |_, _, _, _| {
         panic!("injected worker panic");
