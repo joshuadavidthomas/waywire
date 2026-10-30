@@ -159,14 +159,17 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   listing returned Foot with no PID or geometry. These probes are not yet a
   repeatable portal takeover acceptance test.
   On Debian 13, computer-use-linux 0.7.32 (installed from crates.io) captured
-  Foot through the Screenshot portal, but its click failed: it called
-  RemoteDesktop `CreateSession` and `SelectDevices`, then ScreenCast
-  `SelectSources`, which waywire does not implement. It did not call
-  `ConnectToEIS`. On Fedora 42, Anthropic's computer tool
-  and packaged xdotool typed a command into xterm, and grim captured it. The
-  packaged `ffmpeg-free` lacks libx264, but the OpenH264 fallback no longer
-  blocks streaming; the X11 takeover and handback scenario remains unverified.
-  Neither complete acceptance scenario has passed.
+  Foot through the Screenshot portal. With the ScreenCast stub, it called
+  RemoteDesktop `CreateSession` and `SelectDevices`, ScreenCast `SelectSources`,
+  then RemoteDesktop `Start`, but rejected the empty streams and never called
+  `ConnectToEIS`; its click did not reach Foot. Outside COSMIC it sends
+  input only through the RemoteDesktop Notify methods and reads stream
+  metadata, never PipeWire video. waywire now serves those methods and one
+  metadata-only stream; the scenario has not been rerun yet. On Fedora 42, Anthropic's
+  computer tool and packaged xdotool typed a command into xterm, and grim
+  captured it. The packaged `ffmpeg-free` lacks libx264, but the OpenH264
+  fallback no longer blocks streaming; the X11 takeover and handback scenario
+  remains unverified. Neither complete acceptance scenario has passed.
 
 Add a settled-frame signal or a custom endpoint only when a measured gap in
 these tools calls for one. No vendor offers a settled signal; they use fixed

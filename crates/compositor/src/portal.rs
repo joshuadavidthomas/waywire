@@ -4,9 +4,9 @@
 //!
 //! zbus serves the backends on the private bus as
 //! `org.freedesktop.impl.portal.desktop.waywire`, implementing `RemoteDesktop`
-//! (with `ConnectToEIS`) and Screenshot; method calls that need the seat or the
-//! rendered frame travel over a channel into the calloop loop and are answered
-//! when the loop gets to them.
+//! (with `ConnectToEIS`), a `ScreenCast` stub, and Screenshot; method calls that
+//! need the seat or the rendered frame travel over a channel into the calloop
+//! loop and are answered when the loop gets to them.
 //!
 //! Discovery: the frontend finds backends through `*.portal` files in
 //! `xdg-desktop-portal/portals` data directories and selects them through
@@ -20,6 +20,7 @@
 //! exported to the session program.
 
 mod remote_desktop;
+mod screencast;
 mod screenshot;
 
 use std::cell::RefCell;
@@ -32,6 +33,7 @@ use anyhow::Result;
 use calloop::LoopHandle;
 use calloop::channel::Event;
 use calloop::channel::Sender;
+use smithay::input::keyboard::KeyboardSource;
 use smithay::reexports::pixman::Image;
 use tokio::sync::oneshot;
 use zbus::blocking::Connection;
@@ -39,6 +41,7 @@ use zbus::zvariant::ObjectPath;
 
 use crate::State;
 use crate::portal::remote_desktop::RemoteDesktop;
+use crate::portal::screencast::ScreenCast;
 use crate::portal::screenshot::Access;
 use crate::portal::screenshot::Screenshot;
 
@@ -49,11 +52,26 @@ pub(crate) const PORTAL_NAME: &str = "org.freedesktop.impl.portal.desktop.waywir
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 
 /// Interfaces waywire implements, in the `.portal` file's semicolon list form.
-const PORTAL_INTERFACES: &str = "org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Access;";
+const PORTAL_INTERFACES: &str = "org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Access;";
 
 /// Requests the D-Bus thread routes into the calloop loop, which owns the
 /// seat, the keyboard layout, and the rendered frame.
 pub(crate) enum PortalRequest {
+    RegisterSource {
+        source: KeyboardSource,
+    },
+    DisconnectSource {
+        source: KeyboardSource,
+    },
+    Input(remote_desktop::PortalInput),
+    Keysym {
+        input: remote_desktop::PortalInput,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Read the current output's logical dimensions.
+    OutputSize {
+        reply: oneshot::Sender<Option<(i32, i32)>>,
+    },
     /// Hand out a new EI connection for a `ConnectToEIS` call.
     ConnectToEis {
         reply: oneshot::Sender<std::io::Result<(OwnedFd, std::os::unix::net::UnixStream)>>,
@@ -92,6 +110,7 @@ fn portals_conf_contents(default_portal: Option<&str>) -> String {
         "[preferred]\n\
          default={default_portal}\n\
          org.freedesktop.impl.portal.RemoteDesktop=waywire\n\
+         org.freedesktop.impl.portal.ScreenCast=waywire\n\
          org.freedesktop.impl.portal.Screenshot=waywire\n\
          org.freedesktop.impl.portal.Access=waywire\n"
     )
@@ -219,8 +238,32 @@ pub(crate) fn start(
     let screenshots_dir = runtime_path.join("screenshots");
     let (requests, incoming) = calloop::channel::channel::<PortalRequest>();
     let loop_handle = handle.clone();
-    if let Err(error) = handle.insert_source(incoming, move |request, (), _state| match request {
+    if let Err(error) = handle.insert_source(incoming, move |request, (), state| match request {
         Event::Msg(request) => match request {
+            PortalRequest::RegisterSource { source } => state.register_agent_source(source),
+            PortalRequest::DisconnectSource { source } => state.disconnect_input_source(source),
+            PortalRequest::Input(input) => {
+                if let Err(error) = remote_desktop::apply_portal_input(state, input) {
+                    tracing::warn!(%error, "portal input failed");
+                }
+            }
+            PortalRequest::Keysym { input, reply } => {
+                if reply
+                    .send(remote_desktop::apply_portal_input(state, input))
+                    .is_err()
+                {
+                    tracing::debug!("portal requester hung up");
+                }
+            }
+            PortalRequest::OutputSize { reply } => {
+                let size = state
+                    .space
+                    .output_geometry(&state.output)
+                    .map(|rect| (rect.size.w, rect.size.h));
+                if reply.send(size).is_err() {
+                    tracing::debug!("portal requester hung up");
+                }
+            }
             PortalRequest::ConnectToEis { reply } => {
                 if let Err(error) =
                     reply.send(remote_desktop::connect_to_eis(&loop_handle, &layout))
@@ -280,6 +323,10 @@ fn build_connection(requests: Sender<PortalRequest>, bus_address: &str) -> Resul
         .serve_at(ObjectPath::try_from(OBJECT_PATH)?, remote_desktop)?
         .serve_at(
             ObjectPath::try_from(OBJECT_PATH)?,
+            ScreenCast::new(requests.clone()),
+        )?
+        .serve_at(
+            ObjectPath::try_from(OBJECT_PATH)?,
             Screenshot::new(requests),
         )?
         .serve_at(ObjectPath::try_from(OBJECT_PATH)?, Access)?
@@ -319,7 +366,7 @@ mod tests {
             portal_file_contents(),
             "[portal]\n\
              DBusName=org.freedesktop.impl.portal.desktop.waywire\n\
-             Interfaces=org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Access;\n\
+             Interfaces=org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Access;\n\
              UseIn=waywire;\n"
         );
     }
@@ -331,6 +378,7 @@ mod tests {
             "[preferred]\n\
              default=gtk\n\
              org.freedesktop.impl.portal.RemoteDesktop=waywire\n\
+             org.freedesktop.impl.portal.ScreenCast=waywire\n\
              org.freedesktop.impl.portal.Screenshot=waywire\n\
              org.freedesktop.impl.portal.Access=waywire\n"
         );
@@ -339,9 +387,151 @@ mod tests {
             "[preferred]\n\
              default=none\n\
              org.freedesktop.impl.portal.RemoteDesktop=waywire\n\
+             org.freedesktop.impl.portal.ScreenCast=waywire\n\
              org.freedesktop.impl.portal.Screenshot=waywire\n\
              org.freedesktop.impl.portal.Access=waywire\n"
         );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one private-bus test covers both shared interfaces"
+    )]
+    #[test]
+    fn screencast_serves_metadata_streams_on_the_shared_backend() {
+        use std::collections::HashMap;
+
+        use zbus::zvariant::OwnedValue;
+
+        let runtime = tempfile::tempdir().expect("temporary runtime directory");
+        let Some(bus) = crate::session_bus::SessionBus::start(runtime.path()) else {
+            return;
+        };
+        let (requests, incoming) = calloop::channel::channel();
+        let worker = std::thread::spawn(move || {
+            let mut event_loop = calloop::EventLoop::<usize>::try_new().expect("event loop");
+            event_loop
+                .handle()
+                .insert_source(incoming, |event, (), count| {
+                    if let Event::Msg(PortalRequest::OutputSize { reply }) = event {
+                        reply.send(Some((1920, 1080))).expect("size reply");
+                        *count += 1;
+                    }
+                })
+                .expect("request source");
+            let mut count = 0;
+            while count < 2 {
+                event_loop
+                    .dispatch(std::time::Duration::from_secs(1), &mut count)
+                    .expect("dispatch");
+            }
+        });
+        let _backend = build_connection(requests, bus.address()).expect("portal backend");
+        let client = zbus::blocking::connection::Builder::address(bus.address())
+            .expect("bus address")
+            .build()
+            .expect("portal client");
+        let screen = zbus::blocking::Proxy::new(
+            &client,
+            PORTAL_NAME,
+            OBJECT_PATH,
+            "org.freedesktop.impl.portal.ScreenCast",
+        )
+        .expect("ScreenCast proxy");
+        assert_eq!(
+            screen
+                .get_property::<u32>("AvailableSourceTypes")
+                .expect("source types"),
+            1
+        );
+        assert_eq!(
+            screen
+                .get_property::<u32>("AvailableCursorModes")
+                .expect("cursor modes"),
+            1
+        );
+        assert_eq!(screen.get_property::<u32>("version").expect("version"), 2);
+
+        let handle = ObjectPath::try_from("/org/freedesktop/portal/desktop/request/test")
+            .expect("request path");
+        let session = ObjectPath::try_from("/org/freedesktop/portal/desktop/session/test")
+            .expect("session path");
+        let options: HashMap<String, OwnedValue> = HashMap::new();
+        let (status, values): (u32, HashMap<String, OwnedValue>) = screen
+            .call("SelectSources", &(&handle, &session, "", &options))
+            .expect("select sources");
+        assert_eq!(status, 0);
+        assert!(values.is_empty());
+        let (status, mut values): (u32, HashMap<String, OwnedValue>) = screen
+            .call("Start", &(&handle, &session, "", "", &options))
+            .expect("start ScreenCast");
+        assert_eq!(status, 0);
+        let streams: Vec<(u32, HashMap<String, OwnedValue>)> = values
+            .remove("streams")
+            .expect("streams result")
+            .try_into()
+            .expect("stream array type");
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].0, screencast::STREAM_ID);
+        let size: zbus::zvariant::Value<'_> = streams[0]
+            .1
+            .get("size")
+            .expect("size")
+            .try_clone()
+            .expect("clone size")
+            .into();
+        assert_eq!(
+            <(i32, i32)>::try_from(size).expect("size type"),
+            (1920, 1080)
+        );
+
+        let remote = zbus::blocking::Proxy::new(
+            &client,
+            PORTAL_NAME,
+            OBJECT_PATH,
+            "org.freedesktop.impl.portal.RemoteDesktop",
+        )
+        .expect("RemoteDesktop proxy");
+        let (status, _): (u32, HashMap<String, OwnedValue>) = remote
+            .call("CreateSession", &(&handle, &session, "", &options))
+            .expect("create remote session");
+        assert_eq!(status, 0);
+        let (status, mut values): (u32, HashMap<String, OwnedValue>) = remote
+            .call("Start", &(&handle, &session, "", "", &options))
+            .expect("start shared session");
+        assert_eq!(status, 0);
+        let streams: Vec<(u32, HashMap<String, OwnedValue>)> = values
+            .remove("streams")
+            .expect("shared streams result")
+            .try_into()
+            .expect("stream array type");
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].0, screencast::STREAM_ID);
+        let size: zbus::zvariant::Value<'_> = streams[0]
+            .1
+            .get("size")
+            .expect("size")
+            .try_clone()
+            .expect("clone size")
+            .into();
+        assert_eq!(
+            <(i32, i32)>::try_from(size).expect("size type"),
+            (1920, 1080)
+        );
+        assert_eq!(
+            u32::try_from(values.remove("devices").expect("devices result")).expect("device types"),
+            3
+        );
+        let error = remote
+            .call::<_, _, ()>(
+                "NotifyPointerMotionAbsolute",
+                &(&session, &options, 2u32, 1.0f64, 1.0f64),
+            )
+            .expect_err("unknown stream must be rejected");
+        assert!(
+            matches!(error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs")
+        );
+        worker.join().expect("request worker");
     }
 
     #[test]
@@ -414,5 +604,6 @@ mod tests {
         .expect("waywire-portals.conf readable");
         assert!(conf.starts_with("[preferred]\ndefault="));
         assert!(conf.contains("org.freedesktop.impl.portal.RemoteDesktop=waywire\n"));
+        assert!(conf.contains("org.freedesktop.impl.portal.ScreenCast=waywire\n"));
     }
 }

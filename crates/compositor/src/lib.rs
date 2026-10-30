@@ -1306,6 +1306,22 @@ mod tests {
     }
 
     #[test]
+    fn disconnecting_an_agent_releases_its_button() {
+        let (_display, mut state) = test_state();
+        let source = KeyboardSource::new_auxiliary();
+        state.register_agent_source(source);
+        state.pointer_button(source, 0x110, ButtonState::Pressed);
+        assert!(
+            state
+                .buttons
+                .get(&source)
+                .is_some_and(|buttons| buttons.contains(&0x110))
+        );
+        state.disconnect_input_source(source);
+        assert!(state.buttons.get(&source).is_none_or(HashSet::is_empty));
+    }
+
+    #[test]
     fn a_browser_takeover_releases_held_agent_input_and_drops_later_events() {
         let (_display, mut state) = test_state();
         let agent = KeyboardSource::new_auxiliary();
