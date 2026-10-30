@@ -550,7 +550,8 @@ export class InputRuntime {
 
   private handleKeyDown = (event: KeyboardEvent): void => {
     if (!event.repeat) this.owner.requestControlOnInteraction();
-    if (event.isComposing || event.keyCode === 229) return;
+    if (event.isComposing || event.keyCode === 229 || event.key === "Dead")
+      return;
     const key = linuxKeyCodes.get(event.code);
     if (key === undefined) return;
     if ((event.ctrlKey || event.metaKey) && event.code === "KeyV") {
@@ -610,7 +611,8 @@ export class InputRuntime {
   };
 
   private handleKeyUp = (event: KeyboardEvent): void => {
-    if (event.isComposing || event.keyCode === 229) return;
+    if (event.isComposing || event.keyCode === 229 || event.key === "Dead")
+      return;
     const key = linuxKeyCodes.get(event.code);
     if (key === undefined) return;
     if (

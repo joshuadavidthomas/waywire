@@ -569,15 +569,17 @@ test("a native resolution selection sends scale 120 after releasing ownership wi
 
 function keyEvent(options: {
   code: string;
+  key?: string;
+  isComposing?: boolean;
   metaKey?: boolean;
   ctrlKey?: boolean;
   shiftKey?: boolean;
 }): object {
   return {
     code: options.code,
-    key: "a",
+    key: options.key ?? "a",
     repeat: false,
-    isComposing: false,
+    isComposing: options.isComposing ?? false,
     keyCode: 0,
     ctrlKey: options.ctrlKey ?? false,
     metaKey: options.metaKey ?? false,
@@ -606,6 +608,7 @@ async function keyboardFixture(
   options: { clipboardAutoSync?: boolean } = {},
 ): Promise<{
   canvas: FakeTarget;
+  ime: FakeTarget;
   document: FakeTarget;
   session: WaywireSession;
   control: FakeWebSocket;
@@ -614,13 +617,14 @@ async function keyboardFixture(
   installGlobal("WheelEvent", { DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
   const control = new FakeWebSocket();
   const canvas = new FakeTarget();
+  const ime = new FakeTarget();
   const session = new WaywireSession({
     endpoint: "https://desktop.example.com",
     createWebSocket: (path) =>
       socket(path === "/control" ? control : new FakeWebSocket()),
   });
   session.attachSurface({
-    ...surfaceOptions(canvas),
+    ...surfaceOptions(canvas, ime),
     ...(options.clipboardAutoSync ? { clipboardAutoSync: true } : {}),
   });
   session.input.acquire();
@@ -631,8 +635,39 @@ async function keyboardFixture(
   control.dispatch("message", {
     data: JSON.stringify({ type: "control-state", state: "active" }),
   });
-  return { ...browser, canvas, session, control };
+  return { ...browser, canvas, ime, session, control };
 }
+
+test("dead key composition commits text without a physical accent", async () => {
+  const { ime, session, control } = await keyboardFixture();
+  try {
+    ime.dispatch("keydown", keyEvent({ code: "Quote", key: "Dead" }));
+    ime.dispatch("keyup", keyEvent({ code: "Quote", key: "Dead" }));
+    ime.dispatch(
+      "keydown",
+      keyEvent({ code: "KeyE", key: "e", isComposing: true }),
+    );
+    ime.dispatch("compositionend", { data: "é" });
+    ime.dispatch("beforeinput", {
+      inputType: "insertText",
+      data: "é",
+      isComposing: false,
+      preventDefault() {},
+    });
+    assert.deepEqual(keyboardRecords(control), []);
+    assert.deepEqual(
+      control.sent
+        .filter(
+          (value) =>
+            typeof value === "string" && value.includes('"type":"text"'),
+        )
+        .map((value) => JSON.parse(String(value))),
+      [{ type: "text", action: "commit", text: "é", sequence: 1 }],
+    );
+  } finally {
+    await session.dispose();
+  }
+});
 
 test("releasing Meta releases keys whose keyup macOS never delivered", async () => {
   const { canvas, session, control } = await keyboardFixture();

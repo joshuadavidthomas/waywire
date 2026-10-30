@@ -13,6 +13,7 @@ mod portal;
 mod screencopy;
 mod session_bus;
 mod shell;
+mod text_keyboard;
 mod toplevel_list;
 mod video;
 mod virtual_keyboard;
@@ -172,6 +173,7 @@ pub(crate) struct State {
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
     pub(crate) virtual_pointers: HashMap<VirtualPointerDevice, KeyboardSource>,
     pub(crate) virtual_keyboards: virtual_keyboard::VirtualKeyboards,
+    text_keyboard: text_keyboard::TextKeyboard,
     capture: capture::Capture,
     screencopy: screencopy::Screencopy,
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
@@ -296,6 +298,7 @@ impl State {
             eis_seats: HashMap::new(),
             virtual_pointers: HashMap::new(),
             virtual_keyboards: virtual_keyboard::VirtualKeyboards::default(),
+            text_keyboard: text_keyboard::TextKeyboard::default(),
             capture,
             screencopy,
             toplevel_list,
@@ -468,6 +471,9 @@ impl State {
                 InputTime::now(),
                 |_, _, _| FilterResult::Forward,
             );
+            if state == KeyState::Released && keyboard.pressed_keys().is_empty() {
+                self.flush_text_keyboard();
+            }
         }
     }
 
@@ -740,6 +746,9 @@ impl State {
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.release_source(self, source);
+            if keyboard.pressed_keys().is_empty() {
+                self.flush_text_keyboard();
+            }
         }
         let buttons = self.buttons.get(&source).cloned().unwrap_or_default();
         for button in buttons {
@@ -1044,16 +1053,26 @@ impl State {
             Command::Text(p) => {
                 let cursor = i32::try_from(p.text.as_str().len())?;
                 let text_input = self.seat.text_input();
-                text_input.with_active_text_input(|text, _| match p.action {
-                    pipe::TextAction::Commit => {
-                        text.preedit_string(None, 0, 0);
-                        text.commit_string(Some(p.text.as_str().into()));
-                    }
-                    pipe::TextAction::Preedit => {
-                        text.preedit_string(Some(p.text.as_str().into()), cursor, cursor);
+                let mut active = false;
+                text_input.with_active_text_input(|text, _| {
+                    active = true;
+                    match p.action {
+                        pipe::TextAction::Commit => {
+                            text.preedit_string(None, 0, 0);
+                            text.commit_string(Some(p.text.as_str().into()));
+                        }
+                        pipe::TextAction::Preedit => {
+                            text.preedit_string(Some(p.text.as_str().into()), cursor, cursor);
+                        }
                     }
                 });
                 text_input.done(false);
+                if !active && matches!(p.action, pipe::TextAction::Commit) {
+                    self.text_keyboard
+                        .pending
+                        .push_back(p.text.as_str().to_owned());
+                    self.flush_text_keyboard();
+                }
             }
             Command::Clipboard(text) => self.clipboard_set(&text),
         }

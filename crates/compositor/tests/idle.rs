@@ -4,6 +4,7 @@ use std::io::Write;
 use std::io::{
     self,
 };
+use std::os::unix::fs::PermissionsExt;
 use std::process::Child;
 use std::process::Command as ProcessCommand;
 use std::process::Stdio;
@@ -19,11 +20,18 @@ use waywire_protocol::Record;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::FrameSize;
+use waywire_protocol::pipe::InputSequence;
+use waywire_protocol::pipe::InputText;
+use waywire_protocol::pipe::KeyCode;
+use waywire_protocol::pipe::KeyState;
+use waywire_protocol::pipe::KeyboardKey;
 use waywire_protocol::pipe::KeyframeReadiness;
 use waywire_protocol::pipe::KeyframeState;
 use waywire_protocol::pipe::RequestId;
 use waywire_protocol::pipe::Resize;
 use waywire_protocol::pipe::ScaleV120;
+use waywire_protocol::pipe::Text;
+use waywire_protocol::pipe::TextAction;
 
 struct Compositor(Child);
 
@@ -281,4 +289,147 @@ fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
             "GTK3 buffer moved or shrank after output resize {i}"
         );
     }
+}
+
+fn text_client_script(wayland: bool, output: &std::path::Path) -> String {
+    if wayland {
+        format!(
+            r"#!/usr/bin/python3
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+window = Gtk.Window()
+entry = Gtk.Entry()
+window.add(entry)
+entry.connect('changed', lambda entry: open('{0}', 'w').write(entry.get_text()))
+window.connect('destroy', Gtk.main_quit)
+window.show_all()
+entry.grab_focus()
+open('{0}', 'w').close()
+Gtk.main()
+",
+            output.display()
+        )
+    } else {
+        format!(
+            "#!/bin/sh\nstty raw -echo; exec cat > {}\n",
+            output.display()
+        )
+    }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "integration test requires a running client"
+)]
+fn text_reaches_terminal(wayland: bool) {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let output = runtime.path().join("received");
+    let shell = runtime.path().join("shell");
+    let script = text_client_script(wayland, &output);
+    fs::write(&shell, script).expect("write client script");
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).expect("make shell executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"));
+    cmd.args(["--rtp-port", &port, "--resolution", "800x600", "--"]);
+    if wayland {
+        cmd.env("GDK_BACKEND", "wayland")
+            .env("GTK_IM_MODULE", "xim")
+            .arg(&shell);
+    } else {
+        cmd.args(["xterm", "-u8", "-e"]).arg(&shell);
+    }
+    let mut compositor = Compositor(
+        cmd.env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !output.exists() {
+        assert!(Instant::now() < deadline, "terminal did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_secs(1));
+    let stdin = compositor.0.stdin.as_mut().expect("command pipe");
+    for (state, sequence) in [(KeyState::Pressed, 1), (KeyState::Released, 2)] {
+        stdin
+            .write_all(
+                &Command::KeyboardKey(KeyboardKey {
+                    key: KeyCode::new(30).expect("key"),
+                    state,
+                    sequence: InputSequence::new(sequence).expect("sequence"),
+                })
+                .encode(),
+            )
+            .expect("send control key");
+    }
+    let mut expected = String::from("a");
+    let texts = std::iter::once(format!("😀é{}", "😀".repeat(20)))
+        .chain("αβγδεζηθικλμνξοπρστυφχψω😀".chars().map(|c| c.to_string()))
+        .chain(wayland.then(|| (0x4e00..0x4e28).filter_map(char::from_u32).collect()));
+    for text in texts {
+        stdin
+            .write_all(
+                &Command::Text(Text {
+                    action: TextAction::Commit,
+                    sequence: InputSequence::new(3).expect("sequence"),
+                    text: InputText::new(text.clone()).expect("text"),
+                })
+                .encode(),
+            )
+            .expect("send text");
+        expected.push_str(&text);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while fs::read(&output).expect("read client input") != expected.as_bytes() {
+            assert!(
+                Instant::now() < deadline,
+                "client did not receive {expected}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for (state, sequence) in [(KeyState::Pressed, 4), (KeyState::Released, 5)] {
+        stdin
+            .write_all(
+                &Command::KeyboardKey(KeyboardKey {
+                    key: KeyCode::new(48).expect("key"),
+                    state,
+                    sequence: InputSequence::new(sequence).expect("sequence"),
+                })
+                .encode(),
+            )
+            .expect("send trailing control key");
+    }
+    expected.push('b');
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let received = fs::read(&output).expect("read terminal input");
+        if received == expected.as_bytes() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal received {:?}, expected {expected}",
+            String::from_utf8_lossy(&received)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland and GTK3 Python bindings"]
+fn composed_text_reaches_wayland_client_without_text_input() {
+    text_reaches_terminal(true);
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland and xterm"]
+fn composed_text_reaches_x11_client() {
+    text_reaches_terminal(false);
 }
