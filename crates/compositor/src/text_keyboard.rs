@@ -125,11 +125,14 @@ impl State {
                         .any(|level| !keymap.key_get_syms_by_level(key, layout, level).is_empty())
                 });
                 if !used {
-                    let name = keymap.key_get_name(key).map(str::to_owned);
+                    let (name, new_name) = match keymap.key_get_name(key) {
+                        Some(name) => (name.to_owned(), false),
+                        None => (format!("W{code:03}"), true),
+                    };
                     slots.push(Slot {
                         code,
-                        new_name: name.is_none(),
-                        name: name.unwrap_or_else(|| format!("W{code:03}")),
+                        new_name,
+                        name,
                         character: None,
                         last_used: 0,
                     });
