@@ -414,22 +414,7 @@ impl State {
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
         if focused.is_some() && focused == super::focus::KeyboardFocus::window(window) {
-            let next = self
-                .space
-                .elements()
-                .rev()
-                .find(|candidate| {
-                    *candidate != window
-                        && self
-                            .windows
-                            .get(*candidate)
-                            .is_some_and(|state| state.mapped)
-                        && !candidate
-                            .x11_surface()
-                            .is_some_and(smithay::xwayland::X11Surface::is_override_redirect)
-                })
-                .cloned();
-            self.focus_window(next);
+            self.focus_window(self.topmost_focusable(Some(window)));
         }
     }
 

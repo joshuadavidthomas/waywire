@@ -130,7 +130,11 @@ continues working during takeover. XSendEvent can inject input into X11 windows
 on any build and cannot be blocked by the compositor. Plain
 `xdotool mousemove` moves the seat pointer only while the X cursor is hidden,
 because Xwayland 24.1 emulates warps only then, and no released Xwayland
-supports the newer pointer-warp protocol.
+supports the newer pointer-warp protocol. A click after an absolute
+`xdotool mousemove` therefore lands at the compositor's stale pointer
+position; over the background it also clears keyboard focus (see the
+background-click item in section 3), so typing after the click is lost.
+`xdotool mousemove_relative` does reach the compositor, through EIS.
 
 ydotool (uinput needs libinput) cannot work on this desktop.
 
@@ -245,11 +249,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **High:** X11 pop-ups take keyboard focus when they first draw. The commit
-  handler focuses override-redirect windows such as tooltips, menus and
-  dropdowns (`crates/compositor/src/shell.rs`). Chromium and Electron dropdowns
-  close as they open. Skip override-redirect windows here and in the
-  dead-focus fallback in `render`.
 - **High:** GTK3 X11 windows with client-drawn shadows shrink on each commit
   and are drawn offset. `constrain_window` configures X11 windows with
   `geometry()`, which excludes `_GTK_FRAME_EXTENTS`. _(Traced, not
@@ -349,6 +348,10 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
   may produce double input. _(hypothesis)_
 - **Medium:** relative motion and pointer constraints never reach apps. The
   constraints handler exists but its global is never created.
+- **Medium:** XTest relative motion moves the pointer twice as far.
+  `xdotool mousemove_relative 200 141` from the origin lands at 400,282.
+  Whether Xwayland's pointer acceleration or the compositor doubles it is not
+  traced.
 - **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
   keys are missing from the key map. The EI keycode subtraction can underflow.
 

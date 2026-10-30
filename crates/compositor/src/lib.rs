@@ -714,6 +714,19 @@ impl State {
         self.buttons.remove(&source);
     }
 
+    /// The topmost mapped window that can take keyboard focus, skipping `except`.
+    pub(crate) fn topmost_focusable(&self, except: Option<&Window>) -> Option<Window> {
+        self.space
+            .elements()
+            .rev()
+            .find(|window| {
+                Some(*window) != except
+                    && !is_override_redirect(window)
+                    && self.windows.get(*window).is_some_and(|state| state.mapped)
+            })
+            .cloned()
+    }
+
     #[expect(
         clippy::needless_pass_by_value,
         reason = "owned target avoids borrowing the mutable Space across focus changes"
@@ -732,6 +745,12 @@ impl State {
                 && let Err(error) = xwm.raise_window(surface)
             {
                 tracing::warn!(%error, "raise X11 window");
+            }
+            // X11 menus, dropdowns and tooltips draw above their app but expect
+            // keyboard focus to stay with it; taking focus closes them.
+            if is_override_redirect(window) {
+                self.dirty = true;
+                return;
             }
         }
         for current in self.space.elements() {
@@ -919,13 +938,7 @@ impl State {
             .and_then(|keyboard| keyboard.current_focus())
             .is_some_and(|focus| !smithay::utils::IsAlive::alive(&focus))
         {
-            let next = self
-                .space
-                .elements()
-                .rev()
-                .find(|window| self.windows.get(*window).is_some_and(|state| state.mapped))
-                .cloned();
-            self.focus_window(next);
+            self.focus_window(self.topmost_focusable(None));
         }
         let elements = self.scene_elements(renderer);
         let forced = self.dirty || self.acknowledged != Some(self.generation);
@@ -1267,6 +1280,12 @@ fn normalized_coordinate(pixel: f64, extent: u32) -> pipe::PointerCoordinate {
             .clamp(0.0, 65535.0) as u32,
     )
     .expect("clamped cursor coordinate")
+}
+
+fn is_override_redirect(window: &Window) -> bool {
+    window
+        .x11_surface()
+        .is_some_and(smithay::xwayland::X11Surface::is_override_redirect)
 }
 
 /// Open a pidfd, which becomes readable when the process exits.
