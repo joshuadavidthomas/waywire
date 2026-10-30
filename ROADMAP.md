@@ -132,9 +132,7 @@ on any build and cannot be blocked by the compositor. Plain
 because Xwayland 24.1 emulates warps only then, and no released Xwayland
 supports the newer pointer-warp protocol. A click after an absolute
 `xdotool mousemove` therefore lands at the compositor's stale pointer
-position; over the background it also clears keyboard focus (see the
-background-click item in section 3), so typing after the click is lost.
-`xdotool mousemove_relative` does reach the compositor, through EIS.
+position. `xdotool mousemove_relative` does reach the compositor, through EIS.
 
 ydotool (uinput needs libinput) cannot work on this desktop.
 
@@ -249,10 +247,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **High:** GTK3 X11 windows with client-drawn shadows shrink on each commit
-  and are drawn offset. `constrain_window` configures X11 windows with
-  `geometry()`, which excludes `_GTK_FRAME_EXTENTS`. _(Traced, not
-  reproduced.)_
 - **Medium:** maximized windows can be dragged and resized. Unmaximize on
   titlebar drag and refuse resize while maximized or fullscreen.
 - **Medium:** configures can be sent before a client's initial commit (from

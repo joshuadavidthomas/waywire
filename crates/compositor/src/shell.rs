@@ -450,7 +450,10 @@ impl State {
         );
         self.space.map_element(window.clone(), location, false);
         if let Some(x11) = window.x11_surface()
-            && let Err(error) = x11.configure(smithay::utils::Rectangle::new(location.into(), size))
+            && let Err(error) = x11.configure(smithay::utils::Rectangle::new(
+                smithay::utils::Point::from(location) - window.geometry().loc,
+                window.bbox().size,
+            ))
         {
             tracing::warn!(%error, "place X11 window");
         }
@@ -492,7 +495,7 @@ impl State {
                 expanded
             } else if let Some(x11) = window.x11_surface() {
                 let expanded = x11.is_maximized() || x11.is_fullscreen();
-                if expanded && let Err(error) = x11.configure(geometry) {
+                if expanded && let Err(error) = x11.configure(geometry + x11.frame_extents()) {
                     tracing::warn!(%error, "resize expanded X11 window");
                 }
                 expanded

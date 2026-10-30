@@ -161,7 +161,8 @@ impl State {
             return;
         }
         if let Some(window) = self.x11_window(surface) {
-            self.space.map_element(window, geometry.loc, false);
+            let location = geometry.loc + window.geometry().loc;
+            self.space.map_element(window, location, false);
         }
         self.refresh_pointer_focus();
         self.dirty = true;
@@ -212,7 +213,7 @@ impl State {
                 .x11_window(surface)
                 .and_then(|window| self.window_output_geometry(&window))
             {
-                self.x11_geometry(surface, geometry);
+                self.x11_geometry(surface, geometry + surface.frame_extents());
             }
         } else if let Some(geometry) = saved.0.borrow_mut().take() {
             self.x11_geometry(surface, geometry);
@@ -248,16 +249,17 @@ impl XwmHandler for State {
         let mut geometry = surface.last_configure();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Modulo 8.
         let offset = (self.space.elements().count() % 8) as i32 * 48;
-        geometry.loc = (32 + offset, 32 + offset).into();
         let window = Window::new_x11_window(surface.clone());
-        self.space.map_element(window.clone(), geometry.loc, true);
+        let location = smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset));
+        geometry.loc = location - window.geometry().loc;
+        self.space.map_element(window.clone(), location, true);
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
         self.center_dialog(&window);
     }
 
     fn mapped_override_redirect_window(&mut self, _: XwmId, surface: X11Surface) {
-        let location = surface.last_configure().loc;
+        let location = surface.last_configure().loc + surface.geometry().loc;
         self.space
             .map_element(Window::new_x11_window(surface), location, false);
         self.refresh_pointer_focus();
@@ -317,7 +319,8 @@ impl XwmHandler for State {
         above: Option<u32>,
     ) {
         if let Some(window) = self.x11_window(&surface) {
-            self.space.map_element(window.clone(), geometry.loc, false);
+            let location = geometry.loc + window.geometry().loc;
+            self.space.map_element(window.clone(), location, false);
             if let Some(reference) = above.and_then(|id| {
                 self.space
                     .elements()

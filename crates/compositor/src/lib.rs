@@ -824,7 +824,7 @@ impl State {
         };
         let parent_geometry = parent.geometry();
         let child_geometry = window.geometry();
-        let location = parent_location + parent_geometry.loc - child_geometry.loc
+        let location = parent_location
             + Point::from((
                 (parent_geometry.size.w - child_geometry.size.w) / 2,
                 (parent_geometry.size.h - child_geometry.size.h) / 2,
@@ -832,7 +832,7 @@ impl State {
         self.space.map_element(window.clone(), location, false);
         if let Some(surface) = window.x11_surface() {
             let mut geometry = surface.last_configure();
-            geometry.loc = location;
+            geometry.loc = location - child_geometry.loc;
             if let Err(error) = surface.configure(geometry) {
                 tracing::warn!(%error, "center X11 dialog");
             }

@@ -236,7 +236,7 @@ impl PointerGrab<State> for WindowGrab {
                 if edges & 1 != 0 {
                     rect.loc.y += self.initial.size.h - size.h;
                 }
-                if let Err(error) = surface.configure(Some(rect)) {
+                if let Err(error) = surface.configure(Some(rect + surface.frame_extents())) {
                     tracing::warn!(%error, "configure X11 resize");
                 }
                 state
@@ -247,8 +247,9 @@ impl PointerGrab<State> for WindowGrab {
             let location = (self.initial.loc.to_f64() + delta).to_i32_round();
             state.space.map_element(self.window.clone(), location, true);
             if let Some(surface) = self.window.x11_surface()
-                && let Err(error) =
-                    surface.configure(Some(Rectangle::new(location, self.initial.size)))
+                && let Err(error) = surface.configure(Some(
+                    Rectangle::new(location, self.initial.size) + surface.frame_extents(),
+                ))
             {
                 tracing::warn!(%error, "configure X11 move");
             }
@@ -287,9 +288,10 @@ impl PointerGrab<State> for WindowGrab {
             // X11 has no xdg configure acknowledgment to retire the resize anchor.
             // Keep the final configured position even if an older buffer commits later.
             state.windows.entry(self.window.clone()).or_default().resize = None;
+            let location = surface.last_configure().loc + surface.geometry().loc;
             state
                 .space
-                .map_element(self.window.clone(), surface.last_configure().loc, false);
+                .map_element(self.window.clone(), location, false);
         }
     }
     fn start_data(&self) -> &GrabStartData<State> {

@@ -18,8 +18,12 @@ use waywire_protocol::Decoder;
 use waywire_protocol::Record;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
+use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::KeyframeReadiness;
 use waywire_protocol::pipe::KeyframeState;
+use waywire_protocol::pipe::RequestId;
+use waywire_protocol::pipe::Resize;
+use waywire_protocol::pipe::ScaleV120;
 
 struct Compositor(Child);
 
@@ -184,5 +188,97 @@ fn compositor_exits_promptly_when_the_session_program_exits() {
             exited.elapsed()
         );
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, distro gtk3-demo and xdotool"]
+fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let marker = runtime.path().join("gtk-window");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "1280x720", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"
+                GDK_BACKEND=x11 GTK_CSD=1 gtk3-demo &
+                app=$!
+                trap 'kill "$app" 2>/dev/null' EXIT
+                while :; do
+                    id=$(xdotool search --pid "$app" --onlyvisible 2>/dev/null | head -n 1)
+                    [ -n "$id" ] && break
+                    sleep 0.05
+                done
+                sleep 0.3
+                xdotool windowsize "$id" 1100 680
+                sleep 0.3
+                printf '%s %s' "$DISPLAY" "$id" > "$0"
+                wait "$app"
+            "#,
+            ])
+            .arg(&marker)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "GTK3 window did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let target = fs::read_to_string(&marker).expect("GTK3 window target");
+    let (display, id) = target.split_once(' ').expect("display and window id");
+    let geometry = || {
+        let output = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(["getwindowgeometry", "--shell", id])
+            .output()
+            .expect("query GTK3 geometry");
+        assert!(output.status.success(), "xdotool geometry failed");
+        let text = String::from_utf8(output.stdout).expect("geometry UTF-8");
+        let dimension = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .expect("geometry dimension")
+                .parse::<i32>()
+                .expect("integer dimension")
+        };
+        (
+            dimension("X="),
+            dimension("Y="),
+            dimension("WIDTH="),
+            dimension("HEIGHT="),
+        )
+    };
+    let original = geometry();
+    assert_eq!((original.2, original.3), (1100, 680));
+    for i in 0..6 {
+        let resize = Command::Resize(Resize {
+            size: FrameSize::new(if i % 2 == 0 { 1282 } else { 1280 }, 720).expect("size"),
+            scale_v120: ScaleV120::new(120).expect("scale"),
+            request_id: RequestId::new(i + 1).expect("request id"),
+        });
+        compositor
+            .0
+            .stdin
+            .as_mut()
+            .expect("command pipe")
+            .write_all(&resize.encode())
+            .expect("resize output");
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            geometry(),
+            original,
+            "GTK3 buffer moved or shrank after output resize {i}"
+        );
     }
 }
