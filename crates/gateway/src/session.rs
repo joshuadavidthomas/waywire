@@ -225,15 +225,16 @@ impl Sessions {
             return Ok(SetQualityOutcome::NotInputOwner);
         }
 
-        let (change, levels) = {
+        let (previous, change, levels) = {
             let mut quality = self.quality_ladder();
+            let previous = quality.clone();
             let change = quality.select_preset(preset);
-            (change, quality.levels())
+            (previous, change, quality.levels())
         };
         let Some(change) = change else {
             return Ok(SetQualityOutcome::Unchanged(levels));
         };
-        self.write_quality_change(socket, change).await?;
+        self.write_quality_change(socket, previous, change).await?;
         Ok(SetQualityOutcome::Changed(levels))
     }
 
@@ -250,21 +251,25 @@ impl Sessions {
             return Ok(FeedbackOutcome::NotInputOwner);
         }
 
-        let (change, levels) = {
+        let (previous, change, levels) = {
             let mut quality = self.quality_ladder();
+            let previous = quality.clone();
             let change = quality.update(&feedback, Instant::now());
-            (change, quality.levels())
+            (previous, change, quality.levels())
         };
         if let Some(change) = change {
-            self.write_quality_change(socket, change).await?;
+            self.write_quality_change(socket, previous, change).await?;
         }
 
         Ok(FeedbackOutcome::Applied(levels))
     }
 
+    /// Sends a quality change, restoring `previous` when the send fails so
+    /// the ladder keeps matching the encoder's actual settings.
     async fn write_quality_change(
         &self,
         socket: SocketId,
+        previous: Quality,
         change: quality::QualityChange,
     ) -> Result<()> {
         info!(
@@ -280,16 +285,21 @@ impl Sessions {
         // Quality is daemon state, not user input. Callers hold the input ownership
         // lock, which puts this command before a release and any later acquisition.
         // The lock can be held for at worst two PIPE_DEADLINEs during the send.
-        self.commands
-            .system(Command::Quality(QualityCommand {
+        // A send failure ends only the requesting browser socket.
+        let sent = self
+            .commands
+            .browser_system(Command::Quality(QualityCommand {
                 bitrate_kbps: change.new.bitrate,
                 fps: change.new.fps,
                 scale_percent: change.new.scale,
                 crf: change.new_crf,
                 chroma: change.new_chroma,
             }))
-            .await?;
-        Ok(())
+            .await;
+        if sent.is_err() {
+            *self.quality_ladder() = previous;
+        }
+        Ok(sent?)
     }
 }
 
@@ -666,6 +676,21 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_quality_send_keeps_the_previous_levels() {
+        let (sessions, mut commands) = test_sessions();
+        let owner = SocketId::new(1);
+        acquire_ownership_and_drain(&sessions, &mut commands, owner).await;
+        let before = sessions.quality();
+        drop(commands);
+
+        sessions
+            .set_quality(owner, QualityPreset::Low)
+            .await
+            .expect_err("a stopped command writer should reject the quality change");
+        assert_eq!(sessions.quality(), before);
     }
 
     #[tokio::test]

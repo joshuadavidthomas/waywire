@@ -57,7 +57,7 @@ enum Streak {
     Good(u8),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EncoderPressure {
     previous: Option<(Generation, u64, u64)>,
     warmup_until: u64,
@@ -150,6 +150,7 @@ impl QualityBounds {
 
 /// Bad samples move down one ladder level; good samples move up one. Changes
 /// are rate-limited, and the first change may happen immediately.
+#[derive(Clone)]
 pub(super) struct Quality {
     levels: QualityLevels,
     max_bitrate: Kbps,
