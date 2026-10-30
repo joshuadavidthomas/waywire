@@ -885,6 +885,13 @@ test("the notice shows agent driving and the takeover that pauses it", () => {
     );
     assert.equal(harness.elements.notice.dataset["state"], "takeover");
 
+    harness.emitState(sessionState(false, true));
+    assert.equal(
+      harness.elements.notice.textContent,
+      "You have control · agent paused",
+    );
+    assert.equal(harness.elements.notice.dataset["state"], "takeover");
+
     harness.emitState(sessionState(false, false));
     assert.equal(harness.elements.notice.hidden, true);
 

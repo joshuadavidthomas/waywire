@@ -151,13 +151,12 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   and grim. In both, a browser watches and takes over.
   The rerunnable scenarios and prerequisites are in `tools/acceptance`.
   Results: Debian 13 computer-use-linux **fail** (window discovery), Debian 13
-  cua-driver **fail** (missing paused notice), Fedora 42 X11 **pass**.
+  cua-driver **pass**, Fedora 42 X11 **pass**.
   A Debian 13 rerun of cua-driver 0.38.0 showed `AGENT_BEFORE` and
   `AGENT_AFTER` in Foot, with `AGENT_DURING` absent during browser control.
-  The viewer did not show the required paused notice in the captured frame:
-  the driver's virtual input devices were transient, so no agent remained
-  registered by the time the screenshot was taken. The complete screenshot
-  acceptance criterion remains unmet.
+  The paused notice remained visible after the driver's transient virtual
+  input devices disconnected. A Fedora X11 rerun passed after an initial run
+  acquired browser control before `AGENT_BEFORE` and failed that check.
   On Debian 13, the published cua-driver 0.38.0 Linux binary captured Foot
   with wlr-screencopy and used virtual pointer plus `wtype` for desktop input.
   Browser takeover dropped that input, and handback restored it. With `wtype`

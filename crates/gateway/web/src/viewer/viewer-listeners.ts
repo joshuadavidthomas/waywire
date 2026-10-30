@@ -358,7 +358,7 @@ export function installViewerListeners(
       elements.notice.textContent = "Another viewer has control";
       elements.notice.dataset["state"] = "busy";
       elements.notice.hidden = false;
-    } else if (agent.connected && agent.dropped) {
+    } else if (agent.dropped) {
       elements.notice.textContent = "You have control · agent paused";
       elements.notice.dataset["state"] = "takeover";
       elements.notice.hidden = false;

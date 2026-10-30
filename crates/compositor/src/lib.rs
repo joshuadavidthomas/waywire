@@ -396,7 +396,7 @@ impl State {
         let connected = !self.agent_sources.is_empty();
         let state = pipe::AgentInput {
             connected,
-            dropped: connected && self.browser_holds_input,
+            dropped: self.browser_holds_input && (connected || self.agent_input.dropped),
         };
         if state != self.agent_input {
             self.agent_input = state;
@@ -1319,6 +1319,37 @@ mod tests {
         );
         state.disconnect_input_source(source);
         assert!(state.buttons.get(&source).is_none_or(HashSet::is_empty));
+    }
+
+    #[test]
+    fn transient_agent_remains_paused_until_handback() {
+        let (_display, mut state) = test_state();
+        let source = KeyboardSource::new_auxiliary();
+        lease(&mut state, true);
+        state.keyboard_key(source, 30, KeyState::Pressed);
+        state.disconnect_input_source(source);
+        assert!(
+            state
+                .event_sink
+                .take_events()
+                .contains(&Event::AgentInput(pipe::AgentInput {
+                    connected: false,
+                    dropped: true
+                }))
+        );
+
+        lease(&mut state, false);
+        assert!(
+            state
+                .event_sink
+                .take_events()
+                .contains(&Event::AgentInput(pipe::AgentInput {
+                    connected: false,
+                    dropped: false
+                }))
+        );
+        lease(&mut state, true);
+        assert!(state.event_sink.take_events().is_empty());
     }
 
     #[test]
