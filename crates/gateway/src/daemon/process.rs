@@ -1,4 +1,6 @@
 use std::ffi::OsString;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::Duration;
@@ -14,6 +16,7 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitid;
 use nix::unistd::Pid;
+use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
 use tokio::process::Command as ProcessCommand;
 use tokio::time::Instant;
@@ -82,12 +85,23 @@ fn daemon_args(config: &Config, rtp_port: u16) -> Vec<OsString> {
 }
 
 pub(super) async fn wait_for_leader_exit(pid: Pid) -> Result<WaitStatus> {
+    // SAFETY: pidfd_open takes an integer PID and flags, and returns a new file descriptor.
+    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid.as_raw(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open daemon pidfd");
+    }
+    let fd = i32::try_from(fd).context("pidfd exceeds descriptor range")?;
+    // SAFETY: a successful pidfd_open returns a uniquely owned file descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: the pidfd remains open and its descriptor is not reused while registered.
+    let fd = unsafe { AsyncFd::register(fd) }.context("register daemon pidfd")?;
     loop {
+        let mut ready = fd.readable().await.context("wait for daemon pidfd")?;
         match waitid(
             Id::Pid(pid),
             WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
         )? {
-            WaitStatus::StillAlive => sleep(Duration::from_millis(25)).await,
+            WaitStatus::StillAlive => ready.clear_ready(),
             status @ (WaitStatus::Exited(..)
             | WaitStatus::Signaled(..)
             | WaitStatus::Stopped(..)
