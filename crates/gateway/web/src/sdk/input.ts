@@ -222,6 +222,9 @@ export class InputRuntime {
   private suppressCompositionText: string | null = null;
   private compositionTimer: ReturnType<typeof setTimeout> | null = null;
   private clipboardPastePending = false;
+  private scrollTimer: ReturnType<typeof setTimeout> | null = null;
+  private scrollX = false;
+  private scrollY = false;
 
   constructor(private readonly owner: InputOwner) {}
 
@@ -295,6 +298,7 @@ export class InputRuntime {
   }
 
   resetPressed(): void {
+    this.stopScroll();
     this.pendingPointerPosition = null;
     this.pressedKeys.clear();
     this.pressedButtons.clear();
@@ -416,23 +420,72 @@ export class InputRuntime {
   private handleWheel = (event: WheelEvent): void => {
     this.owner.requestControlOnInteraction();
     this.owner.inputElement()?.focus({ preventScroll: true });
-    const scale =
-      event.deltaMode === WheelEvent.DOM_DELTA_LINE
-        ? 16
-        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-          ? (this.owner.display()?.clientHeight ?? 1)
-          : 1;
+    // DOM does not identify the device. Line deltas and exact 100- or
+    // 120-pixel multiples are common wheel notches; smaller pixel deltas
+    // are treated as smooth. Some touchpad gestures may match this heuristic.
+    const deltas = [event.deltaX, event.deltaY];
+    const pixelNotch = [100, 120].find(
+      (step) =>
+        deltas.some((value) => value !== 0) &&
+        deltas.every((value) => value % step === 0),
+    );
+    const wheel = event.deltaMode !== 0 || pixelNotch !== undefined;
+    if (wheel) {
+      this.stopScroll();
+      const notch = (value: number): number =>
+        Math.max(
+          -4080,
+          Math.min(
+            4080,
+            pixelNotch !== undefined && event.deltaMode === 0
+              ? (value / pixelNotch) * 120
+              : Math.sign(value) *
+                  Math.max(1, Math.round(Math.abs(value) / 3)) *
+                  120,
+          ),
+        );
+      this.owner.sendRecord(
+        pointerScroll(
+          notch(event.deltaX),
+          notch(event.deltaY),
+          this.owner.nextSequence(),
+          14,
+        ),
+      );
+      event.preventDefault();
+      return;
+    }
     const dx = Math.max(
       -maximumPointerDelta,
-      Math.min(maximumPointerDelta, event.deltaX * scale),
+      Math.min(maximumPointerDelta, event.deltaX),
     );
     const dy = Math.max(
       -maximumPointerDelta,
-      Math.min(maximumPointerDelta, event.deltaY * scale),
+      Math.min(maximumPointerDelta, event.deltaY),
     );
     this.owner.sendRecord(pointerScroll(dx, dy, this.owner.nextSequence()));
+    this.scrollX ||= dx !== 0;
+    this.scrollY ||= dy !== 0;
+    if (this.scrollTimer !== null) clearTimeout(this.scrollTimer);
+    this.scrollTimer = setTimeout(() => this.stopScroll(), 120);
     event.preventDefault();
   };
+
+  private stopScroll(): void {
+    if (this.scrollTimer !== null) clearTimeout(this.scrollTimer);
+    this.scrollTimer = null;
+    if (this.scrollX || this.scrollY)
+      this.owner.sendRecord(
+        pointerScroll(
+          Number(this.scrollX),
+          Number(this.scrollY),
+          this.owner.nextSequence(),
+          15,
+        ),
+      );
+    this.scrollX = false;
+    this.scrollY = false;
+  }
 
   private modifiers(event: KeyboardEvent): number[] {
     const modifiers = [...this.pressedKeys].filter((key) =>

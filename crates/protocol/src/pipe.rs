@@ -1157,6 +1157,8 @@ pub enum CommandKind {
     KeyframeReadiness = 11,
     ResetVideo = 12,
     InputLease = 13,
+    PointerWheel = 14,
+    PointerScrollStop = 15,
 }
 
 impl CommandKind {
@@ -1166,6 +1168,8 @@ impl CommandKind {
             Self::PointerAbsolute
                 | Self::PointerButton
                 | Self::PointerScroll
+                | Self::PointerWheel
+                | Self::PointerScrollStop
                 | Self::KeyboardKey
                 | Self::ReleaseAll
                 | Self::Resize
@@ -1191,6 +1195,8 @@ impl RecordKind for CommandKind {
             Self::KeyframeReadiness => 11,
             Self::ResetVideo => 12,
             Self::InputLease => 13,
+            Self::PointerWheel => 14,
+            Self::PointerScrollStop => 15,
         }
     }
 
@@ -1209,15 +1215,20 @@ impl RecordKind for CommandKind {
             11 => Some(Self::KeyframeReadiness),
             12 => Some(Self::ResetVideo),
             13 => Some(Self::InputLease),
+            14 => Some(Self::PointerWheel),
+            15 => Some(Self::PointerScrollStop),
             _ => None,
         }
     }
 
     fn max_payload(self) -> usize {
         match self {
-            Self::PointerAbsolute | Self::PointerScroll | Self::Resize | Self::PointerRelative => {
-                12
-            }
+            Self::PointerAbsolute
+            | Self::PointerScroll
+            | Self::PointerWheel
+            | Self::PointerScrollStop
+            | Self::Resize
+            | Self::PointerRelative => 12,
             Self::Quality => 14,
             Self::PointerButton | Self::KeyboardKey => 9,
             Self::ReleaseAll | Self::ResetVideo => 0,
@@ -1234,6 +1245,8 @@ pub enum Command {
     PointerAbsolute(PointerAbsolute),
     PointerButton(PointerButton),
     PointerScroll(PointerScroll),
+    PointerWheel(PointerScroll),
+    PointerScrollStop(PointerScroll),
     KeyboardKey(KeyboardKey),
     ReleaseAll(ReleaseAll),
     Resize(Resize),
@@ -1253,6 +1266,9 @@ impl Command {
             Self::PointerAbsolute(payload) => Some(payload.sequence),
             Self::PointerButton(payload) => Some(payload.sequence),
             Self::PointerScroll(payload) => Some(payload.sequence),
+            Self::PointerWheel(payload) | Self::PointerScrollStop(payload) => {
+                Some(payload.sequence)
+            }
             Self::KeyboardKey(payload) => Some(payload.sequence),
             Self::PointerRelative(payload) => Some(payload.sequence),
             Self::Text(payload) => Some(payload.sequence),
@@ -1272,6 +1288,8 @@ impl Command {
             Self::PointerAbsolute(_) => CommandKind::PointerAbsolute,
             Self::PointerButton(_) => CommandKind::PointerButton,
             Self::PointerScroll(_) => CommandKind::PointerScroll,
+            Self::PointerWheel(_) => CommandKind::PointerWheel,
+            Self::PointerScrollStop(_) => CommandKind::PointerScrollStop,
             Self::KeyboardKey(_) => CommandKind::KeyboardKey,
             Self::ReleaseAll(_) => CommandKind::ReleaseAll,
             Self::Resize(_) => CommandKind::Resize,
@@ -1297,7 +1315,9 @@ impl Record for Command {
         match self {
             Self::PointerAbsolute(payload) => out.put(payload),
             Self::PointerButton(payload) => out.put(payload),
-            Self::PointerScroll(payload) => out.put(payload),
+            Self::PointerScroll(payload)
+            | Self::PointerWheel(payload)
+            | Self::PointerScrollStop(payload) => out.put(payload),
             Self::KeyboardKey(payload) => out.put(payload),
             Self::ReleaseAll(payload) => out.put(payload),
             Self::Resize(payload) => out.put(payload),
@@ -1316,6 +1336,8 @@ impl Record for Command {
             CommandKind::PointerAbsolute => Ok(Self::PointerAbsolute(input.get()?)),
             CommandKind::PointerButton => Ok(Self::PointerButton(input.get()?)),
             CommandKind::PointerScroll => Ok(Self::PointerScroll(input.get()?)),
+            CommandKind::PointerWheel => Ok(Self::PointerWheel(input.get()?)),
+            CommandKind::PointerScrollStop => Ok(Self::PointerScrollStop(input.get()?)),
             CommandKind::KeyboardKey => Ok(Self::KeyboardKey(input.get()?)),
             CommandKind::ReleaseAll => Ok(Self::ReleaseAll(input.get()?)),
             CommandKind::Resize => Ok(Self::Resize(input.get()?)),
@@ -1581,6 +1603,28 @@ mod tests {
                 }),
                 vec![
                     10, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                ],
+            ),
+            (
+                "pointer wheel",
+                Command::PointerWheel(PointerScroll {
+                    dx: value(PointerDelta::new(0.0)),
+                    dy: value(PointerDelta::new(120.0)),
+                    sequence,
+                }),
+                vec![
+                    10, 14, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 66, 7, 0, 0, 0,
+                ],
+            ),
+            (
+                "pointer scroll stop",
+                Command::PointerScrollStop(PointerScroll {
+                    dx: value(PointerDelta::new(0.0)),
+                    dy: value(PointerDelta::new(1.0)),
+                    sequence,
+                }),
+                vec![
+                    10, 15, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 7, 0, 0, 0,
                 ],
             ),
             (

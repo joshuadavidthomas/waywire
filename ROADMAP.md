@@ -317,9 +317,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 ## 5. Input fidelity
 
-- **High:** wheel input is sent as continuous touchpad scroll, without
-  `axis_value120` or `axis_stop` (`crates/compositor/src/lib.rs`). Wheel zoom
-  may pan and Xwayland may over-scroll. _(Client effects are hypotheses.)_
 - **Medium:** Cmd+V on macOS sends Super+V. IME, emoji and mobile-keyboard text
   is dropped in apps without text-input-v3, including all X11 apps. Dead keys
   may produce double input. _(hypothesis)_

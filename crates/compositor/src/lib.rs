@@ -964,9 +964,34 @@ impl State {
             Command::InputLease(p) => self.set_browser_lease(p.held),
             Command::PointerScroll(p) => {
                 let frame = AxisFrame::new(InputTime::now())
-                    .source(AxisSource::Continuous)
+                    .source(AxisSource::Finger)
                     .value(Axis::Horizontal, f64::from(p.dx.get()))
                     .value(Axis::Vertical, f64::from(p.dy.get()));
+                self.pointer_axis(source, frame);
+            }
+            Command::PointerWheel(p) => {
+                let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
+                for (axis, value) in [(Axis::Horizontal, p.dx.get()), (Axis::Vertical, p.dy.get())]
+                {
+                    if value != 0.0 {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "wheel v120 is bounded by PointerDelta"
+                        )]
+                        let v120 = value.round() as i32;
+                        frame = frame.v120(axis, v120).value(axis, f64::from(v120) / 8.0);
+                    }
+                }
+                self.pointer_axis(source, frame);
+            }
+            Command::PointerScrollStop(p) => {
+                let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Finger);
+                if p.dx.get() != 0.0 {
+                    frame = frame.stop(Axis::Horizontal);
+                }
+                if p.dy.get() != 0.0 {
+                    frame = frame.stop(Axis::Vertical);
+                }
                 self.pointer_axis(source, frame);
             }
             Command::Resize(p) => {

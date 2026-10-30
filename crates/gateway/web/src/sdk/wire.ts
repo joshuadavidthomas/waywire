@@ -223,8 +223,9 @@ export function pointerScroll(
   dx: number,
   dy: number,
   sequence: number,
+  kind: 3 | 14 | 15 = 3,
 ): ArrayBuffer {
-  return encodeRecord(3, (payload) => {
+  return encodeRecord(kind, (payload) => {
     payload.f32(dx);
     payload.f32(dy);
     payload.u32(sequence);

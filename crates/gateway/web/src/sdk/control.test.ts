@@ -695,6 +695,36 @@ test("releasing Meta on other platforms does not release held keys", async () =>
   }
 });
 
+test("wheel notches and smooth scroll use distinct records", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  const wheel = (deltaY: number, deltaMode: number) => ({
+    deltaX: 0,
+    deltaY,
+    deltaMode,
+    preventDefault() {},
+  });
+  try {
+    canvas.dispatch("wheel", wheel(120, 0));
+    canvas.dispatch("wheel", wheel(100, 0));
+    canvas.dispatch("wheel", wheel(-3, 1));
+    canvas.dispatch("wheel", wheel(3, 0));
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    const records = control.sent.filter(
+      (value): value is ArrayBuffer => value instanceof ArrayBuffer,
+    );
+    assert.deepEqual(
+      records.map((record) => new DataView(record).getUint8(1)),
+      [14, 14, 14, 3, 15],
+    );
+    assert.deepEqual(
+      records.map((record) => new DataView(record).getFloat32(12, true)),
+      [120, 120, -120, 3, 1],
+    );
+  } finally {
+    await session.dispose();
+  }
+});
+
 test("Cmd+Shift+C taps Ctrl instead of Super and lifts the held Meta", async () => {
   const { canvas, session, control } = await keyboardFixture();
   try {
