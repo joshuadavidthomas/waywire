@@ -121,8 +121,13 @@ Anthropic's computer-use demo (xdotool and scrot), OpenAI's Python sample
 
 The supported workaround is to run the agent's applications as X11 clients,
 for example Chrome with `--ozone-platform=x11`. Then xdotool and pyautogui
-input works on every distribution, because it stays inside Xwayland, and
-screenshots can use grim. Document this; build nothing for it. Plain
+input works on every distribution, and screenshots can use grim. Browser
+takeover pauses Wayland portal, virtual-pointer and virtual-keyboard agents
+on every distribution. It also pauses XTest agents when Xwayland has libei
+(Fedora, Arch). Without libei (Debian, Ubuntu, Alpine), XTest input to X11
+windows stays inside Xwayland and cannot be blocked by the compositor: xdotool
+continues working during takeover. XSendEvent can inject input into X11 windows
+on any build and cannot be blocked by the compositor. Plain
 `xdotool mousemove` moves the seat pointer only while the X cursor is hidden,
 because Xwayland 24.1 emulates warps only then, and no released Xwayland
 supports the newer pointer-warp protocol.
@@ -144,6 +149,16 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   computer-use-linux or cua-driver drives a Wayland application through the
   portals, and Anthropic's demo loop drives an X11 application with xdotool
   and grim. In both, a browser watches and takes over.
+  On Debian 13, computer-use-linux 0.7.32 (installed from crates.io) captured
+  Foot through the Screenshot portal, but its click failed: it called
+  RemoteDesktop `CreateSession` and `SelectDevices`, then ScreenCast
+  `SelectSources`, which waywire does not implement. It did not call
+  `ConnectToEIS`. `tools/portal-driver-probe.py` repeats this diagnostic; it
+  is not a takeover acceptance test. On Fedora 42, Anthropic's computer tool
+  and packaged xdotool typed a command into xterm, and grim captured it. The
+  packaged `ffmpeg-free` lacks libx264, so the gateway could not stream and
+  restarted; the X11 takeover and handback scenario remains unverified.
+  Neither complete acceptance scenario has passed.
 
 Add a settled-frame signal or a custom endpoint only when a measured gap in
 these tools calls for one. No vendor offers a settled signal; they use fixed
