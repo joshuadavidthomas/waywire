@@ -147,6 +147,7 @@ pub(crate) enum FrameRequest {
 enum PointerMotionKind {
     Input,
     RefreshGrabFocus,
+    WarpHint,
 }
 
 #[expect(
@@ -531,7 +532,7 @@ impl State {
             return;
         }
         let scale = self.output.current_scale().fractional_scale();
-        let location = Point::from((
+        let mut location = Point::from((
             location
                 .x
                 .clamp(0.0, (f64::from(self.size.width()) - 1.0) / scale),
@@ -540,15 +541,21 @@ impl State {
                 .clamp(0.0, (f64::from(self.size.height()) - 1.0) / scale),
         ));
         if let Some(pointer) = self.seat.get_pointer() {
-            pointer.motion(
-                self,
-                self.surface_under(location),
-                &MotionEvent {
-                    location,
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: InputTime::now(),
-                },
-            );
+            let mut locked = false;
+            if self.pointer_motion_kind == PointerMotionKind::Input {
+                (location, locked) = self.constrain_pointer_motion(&pointer, location);
+            }
+            if !locked {
+                pointer.motion(
+                    self,
+                    self.surface_under(location),
+                    &MotionEvent {
+                        location,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: InputTime::now(),
+                    },
+                );
+            }
             if let Some(delta) = delta {
                 pointer.relative_motion(
                     self,
@@ -560,6 +567,7 @@ impl State {
                     },
                 );
             }
+            self.activate_focused_constraint(&pointer);
             pointer.frame(self);
         }
         if self.decoration_press.as_ref().is_some_and(|(_, window)| {

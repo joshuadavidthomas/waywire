@@ -188,6 +188,23 @@ mod tests {
     use wayland_client::protocol::wl_surface::WlSurface;
     use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
     use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
+    use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_confined_pointer_v1::ZwpConfinedPointerV1;
+    use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_confined_pointer_v1::{
+        self as confined,
+    };
+    use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
+    use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::{
+        self as locked,
+    };
+    use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+    use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::{
+        self as constraints,
+    };
+    use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
+    use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
+    use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{
+        self as relative,
+    };
     use wayland_protocols::xdg::shell::client::xdg_surface::XdgSurface;
     use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
     use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
@@ -220,6 +237,12 @@ mod tests {
         keys: Vec<u32>,
         pointer_focus: Option<WlSurface>,
         button_targets: Vec<WlSurface>,
+        pointer_motions: usize,
+        constraints: Option<ZwpPointerConstraintsV1>,
+        relative_manager: Option<ZwpRelativePointerManagerV1>,
+        locked: bool,
+        confined: bool,
+        relative: Vec<(f64, f64)>,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -273,6 +296,12 @@ mod tests {
                     }
                     "wl_seat" => {
                         state.seat = Some(registry.bind(name, version.min(1), qh, ()));
+                    }
+                    "zwp_pointer_constraints_v1" => {
+                        state.constraints = Some(registry.bind(name, 1, qh, ()));
+                    }
+                    "zwp_relative_pointer_manager_v1" => {
+                        state.relative_manager = Some(registry.bind(name, 1, qh, ()));
                     }
                     "zwlr_foreign_toplevel_manager_v1" => {
                         state.manager = Some(registry.bind(name, version.min(3), qh, ()));
@@ -344,6 +373,56 @@ mod tests {
     }
 
     wayland_client::delegate_noop!(App: ignore WlSeat);
+    wayland_client::delegate_noop!(App: ignore ZwpPointerConstraintsV1);
+    wayland_client::delegate_noop!(App: ignore ZwpRelativePointerManagerV1);
+    wayland_client::delegate_noop!(App: ignore wayland_client::protocol::wl_region::WlRegion);
+
+    impl Dispatch<ZwpLockedPointerV1, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &ZwpLockedPointerV1,
+            event: locked::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                locked::Event::Locked => state.locked = true,
+                locked::Event::Unlocked => state.locked = false,
+                _ => {}
+            }
+        }
+    }
+    impl Dispatch<ZwpConfinedPointerV1, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &ZwpConfinedPointerV1,
+            event: confined::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                confined::Event::Confined => state.confined = true,
+                confined::Event::Unconfined => state.confined = false,
+                _ => {}
+            }
+        }
+    }
+    impl Dispatch<ZwpRelativePointerV1, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &ZwpRelativePointerV1,
+            event: relative::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let relative::Event::RelativeMotion { dx, dy, .. } = event {
+                state.relative.push((dx, dy));
+            }
+        }
+    }
 
     impl Dispatch<wayland_client::protocol::wl_keyboard::WlKeyboard, ()> for App {
         fn event(
@@ -381,8 +460,10 @@ mod tests {
                         state.button_targets.push(surface.clone());
                     }
                 }
-                wayland_client::protocol::wl_pointer::Event::Motion { .. }
-                | wayland_client::protocol::wl_pointer::Event::Axis { .. }
+                wayland_client::protocol::wl_pointer::Event::Motion { .. } => {
+                    state.pointer_motions += 1;
+                }
+                wayland_client::protocol::wl_pointer::Event::Axis { .. }
                 | wayland_client::protocol::wl_pointer::Event::Frame
                 | wayland_client::protocol::wl_pointer::Event::AxisSource { .. }
                 | wayland_client::protocol::wl_pointer::Event::AxisStop { .. }
@@ -681,6 +762,164 @@ mod tests {
             .find(|events| events.title == title)
             .expect("managed toplevel")
             .states
+    }
+
+    fn attach_constraint_buffer(surface: &WlSurface, app: &App, qh: &QueueHandle<App>) {
+        let fd: OwnedFd =
+            nix::sys::memfd::memfd_create("constraint-test", nix::sys::memfd::MFdFlags::empty())
+                .expect("memfd");
+        nix::unistd::ftruncate(&fd, 40000).expect("ftruncate");
+        let pool = app
+            .shm
+            .as_ref()
+            .expect("shm")
+            .create_pool(fd.as_fd(), 40000, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            100,
+            100,
+            400,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the protocol scenario keeps setup and assertions together"
+    )]
+    fn constraint_client(mode: &str) {
+        use smithay::input::keyboard::KeyboardSource;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let pointer_client = app.seat.as_ref().expect("seat").get_pointer(&qh, ());
+        let relative_manager = app
+            .relative_manager
+            .as_ref()
+            .expect("relative pointer manager");
+        let _relative = relative_manager.get_relative_pointer(&pointer_client, &qh, ());
+        state.pointer_motion(KeyboardSource::MAIN, (1700.0, 900.0).into());
+        let (surface, _xdg, _top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Constraint",
+            "constraint",
+        );
+        attach_constraint_buffer(&surface, &app, &qh);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        state.space.map_element(window, (100, 100), true);
+        state.pointer_motion(KeyboardSource::MAIN, (1700.0, 900.0).into());
+        if mode != "pending" {
+            state.pointer_motion(KeyboardSource::MAIN, (120.0, 120.0).into());
+        }
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let manager = app.constraints.as_ref().expect("constraints manager");
+        let region = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_region(&qh, ());
+        region.add(10, 10, 30, 30);
+        if mode == "confine" {
+            region.subtract(25, 10, 5, 30);
+            let _constraint = manager.confine_pointer(
+                &surface,
+                &pointer_client,
+                Some(&region),
+                constraints::Lifetime::Persistent,
+                &qh,
+                (),
+            );
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert!(app.confined, "confine did not activate");
+            state.pointer_motion_with_delta(
+                KeyboardSource::MAIN,
+                (190.0, 120.0).into(),
+                Some((70.0, 0.0).into()),
+            );
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let pos = state
+                .seat
+                .get_pointer()
+                .expect("pointer")
+                .current_location();
+            assert!(
+                pos.x < 125.0 && pos.x >= 120.0,
+                "confine crossed a hole: {pos:?}"
+            );
+        } else {
+            let constraint = manager.lock_pointer(
+                &surface,
+                &pointer_client,
+                Some(&region),
+                constraints::Lifetime::Persistent,
+                &qh,
+                (),
+            );
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            if mode == "pending" {
+                assert!(!app.locked, "lock activated outside surface");
+                state.pointer_motion(KeyboardSource::MAIN, (120.0, 120.0).into());
+                sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            }
+            assert!(app.locked, "lock did not activate");
+            let pointer = state.seat.get_pointer().expect("pointer");
+            let before = pointer.current_location();
+            constraint.set_cursor_position_hint(80.0, 80.0);
+            surface.commit();
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert_eq!(
+                pointer.current_location(),
+                before,
+                "Wayland hint moved a locked pointer"
+            );
+            let motions = app.pointer_motions;
+            state.pointer_motion_with_delta(
+                KeyboardSource::MAIN,
+                (before.x + 70.0, before.y).into(),
+                Some((70.0, 0.0).into()),
+            );
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert_eq!(pointer.current_location(), before, "locked pointer moved");
+            assert_eq!(
+                app.pointer_motions, motions,
+                "locked pointer sent absolute motion"
+            );
+            assert_eq!(
+                app.relative.last(),
+                Some(&(70.0, 0.0)),
+                "relative motion lost"
+            );
+            surface.attach(None, 0, 0);
+            surface.commit();
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            state.refresh_pointer_focus();
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert!(!app.locked, "lock remains active after focus leaves");
+        }
+    }
+
+    #[test]
+    fn pointer_lock_keeps_position_and_sends_relative_motion() {
+        constraint_client("lock");
+    }
+    #[test]
+    fn pointer_constraint_created_before_focus_activates_on_entry() {
+        constraint_client("pending");
+    }
+    #[test]
+    fn pointer_confine_keeps_position_in_region() {
+        constraint_client("confine");
     }
 
     #[test]

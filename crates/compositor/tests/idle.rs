@@ -27,6 +27,8 @@ use waywire_protocol::pipe::KeyState;
 use waywire_protocol::pipe::KeyboardKey;
 use waywire_protocol::pipe::KeyframeReadiness;
 use waywire_protocol::pipe::KeyframeState;
+use waywire_protocol::pipe::PointerAbsolute;
+use waywire_protocol::pipe::PointerCoordinate;
 use waywire_protocol::pipe::RequestId;
 use waywire_protocol::pipe::Resize;
 use waywire_protocol::pipe::ScaleV120;
@@ -432,4 +434,131 @@ fn composed_text_reaches_wayland_client_without_text_input() {
 #[ignore = "requires FFmpeg, Xwayland and xterm"]
 fn composed_text_reaches_x11_client() {
     text_reaches_terminal(false);
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the X11 session and pointer assertions form one integration scenario"
+)]
+fn xwayland_relative_warp_moves_the_compositor_pointer() {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("client.py");
+    let ready = runtime.path().join("ready");
+    fs::write(
+        &script,
+        format!(
+            r"#!/usr/bin/python3
+import ctypes, tkinter as tk
+root = tk.Tk()
+root.title('waywire-warp-test')
+root.geometry('400x300')
+root.update()
+x11 = ctypes.CDLL('libX11.so.6')
+fixes = ctypes.CDLL('libXfixes.so.3')
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XFlush.argtypes = [ctypes.c_void_p]
+fixes.XFixesHideCursor.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+d = x11.XOpenDisplay(None)
+fixes.XFixesHideCursor(d, root.winfo_id())
+x11.XFlush(d)
+open('{}', 'w').write(str(__import__('os').getpid()))
+root.mainloop()
+",
+            ready.display()
+        ),
+    )
+    .expect("write client");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable client");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "client did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("client pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("client environment");
+    let display = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"DISPLAY="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .expect("DISPLAY");
+    let xdotool = |args: &[&str]| {
+        ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(args)
+            .output()
+            .expect("xdotool")
+    };
+    let search = xdotool(&["search", "--name", "waywire-warp-test"]);
+    let window = String::from_utf8(search.stdout).expect("window id");
+    let window = window.lines().next().expect("window");
+    let geometry = xdotool(&["getwindowgeometry", "--shell", window]);
+    let geometry = String::from_utf8(geometry.stdout).expect("geometry");
+    let value = |name: &str| {
+        geometry
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .expect("coordinate")
+            .parse::<u32>()
+            .expect("number")
+    };
+    let (x, y) = (value("X=") + 100, value("Y=") + 100);
+    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
+    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
+    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
+    let mut decoder = Decoder::<Event>::new();
+    let command = Command::PointerAbsolute(PointerAbsolute {
+        x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
+        y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
+        sequence: InputSequence::new(1).expect("sequence"),
+    });
+    compositor
+        .0
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(&command.encode())
+        .expect("move pointer");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if events(&mut compositor.0, &mut decoder)
+            .iter()
+            .any(|event| matches!(event, Event::CursorPosition(_)))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no initial cursor position");
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(300));
+    events(&mut compositor.0, &mut decoder);
+    let moved = xdotool(&["mousemove_relative", "--", "20", "0"]);
+    assert!(moved.status.success(), "xdotool failed");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let updates = events(&mut compositor.0, &mut decoder);
+        if updates.iter().any(|event| matches!(event, Event::CursorPosition(pos) if pos.x.get() > x * 65535 / 800 + 1000)) { break }
+        assert!(
+            Instant::now() < deadline,
+            "relative warp did not reach compositor"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }

@@ -322,13 +322,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
   text-input-v3. The X11 pool is limited to keycodes at or below 255. X11
   clients that have not consumed earlier keyboard events may decode them using
   a newer mapping after a spare keycode is reused.
-- **Medium:** pointer locks and confines are not enforced. Both globals exist
-  and relative motion reaches clients (EIS and the viewer's pointer lock), but
-  `pointer_motion_with_delta` (`crates/compositor/src/lib.rs`) moves the
-  pointer through a locked or confined surface, and a constraint only activates
-  if its surface already has pointer focus when it is created
-  (`crates/compositor/src/pointer_warp.rs`). Games that lock the pointer may
-  see it leave the window. _(Client effects are hypotheses.)_
 - **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
   keys are missing from the key map. The EI keycode subtraction can underflow.
 
