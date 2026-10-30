@@ -131,11 +131,12 @@ ydotool (uinput needs libinput) cannot work on this desktop.
 
 ### Waywire-specific work
 
-- **Input arbitration.** EIS, portal, virtual-pointer and virtual-keyboard
-  input bypass the browser's control lease today
-  (`crates/compositor/src/eis.rs`). Agents and humans share
-  one ownership model with explicit takeover and handback, shown in the
-  desktop chrome.
+- **Input arbitration.** Done. Every EIS connection, virtual pointer and
+  virtual keyboard shares the browser's ownership model with explicit
+  takeover and handback: a takeover releases held agent keys and buttons,
+  drops later agent input, and gives browser keys the seat's own keymap; the
+  viewer shows agent driving versus the takeover. Agent input resumes when
+  the browser releases control.
 - **Window actions shared with the desktop.** Foreign-toplevel requests,
   titlebar clicks and the taskbar all go through the same `WindowAction`.
 - **Acceptance tests,** on packaged tools from Debian 13 and Fedora 42:
@@ -298,9 +299,9 @@ upstream code to local copies of it.
   `wayland::virtual_pointer` events to the seat's input entry points instead of
   porting the protocol by hand. Virtual keyboards likewise route through
   upstream's `VirtualKeyboardHandler`; the newest virtual keyboard's keymap is
-  active on the seat, and the seat's own keymap returns when the last one goes
-  away. While one is connected, its keymap also applies to browser keys; input
-  arbitration should settle that. Upstream's
+  active on the seat, the seat's own keymap is used for browser keys while a
+  browser holds the input lease, and the newest virtual keyboard's keymap
+  returns on handback if it is still connected. Upstream's
   new Xwayland spawn variant, `spawn_with_inherited_env`, only controls
   environment inheritance and still has no pre-exec hook, so the signal-mask
   workaround around `XWayland::spawn` stays. `KeymapFile` still seals the

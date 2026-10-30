@@ -46,9 +46,15 @@ export interface InputState {
   readonly pointerLocked: boolean;
 }
 
+export interface AgentInputState {
+  readonly connected: boolean;
+  readonly dropped: boolean;
+}
+
 export interface WaywireSessionState {
   readonly video: VideoState;
   readonly input: InputState;
+  readonly agent: AgentInputState;
 }
 
 export interface WaywireStats {
@@ -191,6 +197,10 @@ export class WaywireSession {
         message: "Input idle",
         connected: false,
         pointerLocked: false,
+      }),
+      agent: Object.freeze({
+        connected: false,
+        dropped: false,
       }),
     });
     this.#runtime = new ControlRuntime(

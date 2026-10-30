@@ -7,6 +7,7 @@ import type {
   RemoteDisplayPolicy,
   SurfaceHandle,
   WaywireSession,
+  WaywireSessionState,
   WaywireStats,
 } from "../sdk/waywire.ts";
 import {
@@ -275,6 +276,7 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
   readonly qualitySelect: FakeSelect;
   readonly storage: FakeStorage;
   readonly emitStats: (stats: WaywireStats) => void;
+  readonly emitState: (state: WaywireSessionState) => void;
   readonly calls: {
     acquired: number;
     released: number;
@@ -298,6 +300,7 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
     targets: [] as number[],
   };
   const statsListeners = new Set<(stats: WaywireStats) => void>();
+  const stateListeners = new Set<(state: WaywireSessionState) => void>();
   const session = {
     input: {
       acquire: () => {
@@ -317,9 +320,15 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
         calls.policies.push(policy);
       },
     },
-    on: (type: string, listener: (stats: WaywireStats) => void) => {
-      if (type === "stats") statsListeners.add(listener);
-      return () => statsListeners.delete(listener);
+    on: (type: string, listener: (value: never) => void) => {
+      if (type === "stats")
+        statsListeners.add(listener as (stats: WaywireStats) => void);
+      if (type === "state")
+        stateListeners.add(listener as (state: WaywireSessionState) => void);
+      return () => {
+        statsListeners.delete(listener as (stats: WaywireStats) => void);
+        stateListeners.delete(listener as (state: WaywireSessionState) => void);
+      };
     },
   } as unknown as WaywireSession;
   const surface = {
@@ -345,7 +354,26 @@ function setup(stored: Readonly<Record<string, string>> = {}): {
     emitStats: (stats) => {
       for (const listener of statsListeners) listener(stats);
     },
+    emitState: (state) => {
+      for (const listener of stateListeners) listener(state);
+    },
     calls,
+  };
+}
+
+function sessionState(
+  connected: boolean,
+  dropped: boolean,
+): WaywireSessionState {
+  return {
+    video: { state: "connected", message: "", codec: "avc1.640034" },
+    input: {
+      state: "active",
+      message: "Input active",
+      connected: true,
+      pointerLocked: false,
+    },
+    agent: { connected, dropped },
   };
 }
 
@@ -837,6 +865,37 @@ test("turning Remote input back on restores the keyboard", () => {
     assert.equal(harness.calls.acquired, 2);
     assert.equal(harness.calls.focused, 1);
     assert.equal(harness.calls.textFocused, 1);
+  } finally {
+    harness.controls.dispose();
+  }
+});
+
+test("the notice shows agent driving and the takeover that pauses it", () => {
+  const harness = setup();
+  try {
+    harness.emitState(sessionState(true, false));
+    assert.equal(harness.elements.notice.hidden, false);
+    assert.equal(harness.elements.notice.textContent, "Agent driving");
+    assert.equal(harness.elements.notice.dataset["state"], "agent");
+
+    harness.emitState(sessionState(true, true));
+    assert.equal(
+      harness.elements.notice.textContent,
+      "You have control · agent paused",
+    );
+    assert.equal(harness.elements.notice.dataset["state"], "takeover");
+
+    harness.emitState(sessionState(false, false));
+    assert.equal(harness.elements.notice.hidden, true);
+
+    harness.controlToggle.checked = false;
+    harness.controlToggle.dispatch("change");
+    harness.emitState(sessionState(true, false));
+    assert.equal(
+      harness.elements.notice.textContent,
+      "View only · agent driving",
+    );
+    assert.equal(harness.elements.notice.dataset["state"], "view-only");
   } finally {
     harness.controls.dispose();
   }

@@ -14,6 +14,7 @@
 //! cursor is hidden (`xwl_seat->x_cursor == NULL`) and warps only reach it when
 //! the target position lies in the window that already has pointer focus, so
 //! unadorned `xdotool mousemove` stays an X11-only sprite move.
+use smithay::input::keyboard::KeyboardSource;
 use smithay::input::pointer::PointerHandle;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -79,6 +80,6 @@ impl PointerConstraintsHandler for State {
         // The surface sits inside the outer window geometry, whose origin the
         // space element location tracks (see `decorations::DecorationLayout`).
         let origin = (element - window.geometry().loc).to_f64();
-        self.pointer_motion(origin + location);
+        self.pointer_motion(KeyboardSource::MAIN, origin + location);
     }
 }

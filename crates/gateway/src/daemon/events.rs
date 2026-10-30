@@ -18,6 +18,7 @@ use waywire_protocol::Decoder;
 use waywire_protocol::ProtocolError as DecodeError;
 use waywire_protocol::browser::ClientEvent;
 use waywire_protocol::browser::CursorState;
+use waywire_protocol::pipe::AgentInput;
 use waywire_protocol::pipe::ClipboardText;
 use waywire_protocol::pipe::CursorPosition;
 use waywire_protocol::pipe::Event;
@@ -83,6 +84,7 @@ pub(crate) struct AppEvents {
     tx: broadcast::Sender<ClientEvent>,
     latest_clipboard: Arc<Mutex<Option<ClipboardText>>>,
     latest_cursor: Arc<Mutex<CursorState>>,
+    latest_agent: Arc<Mutex<Option<AgentInput>>>,
 }
 
 impl AppEvents {
@@ -92,6 +94,7 @@ impl AppEvents {
             tx,
             latest_clipboard: Arc::new(Mutex::new(None)),
             latest_cursor: Arc::new(Mutex::new(CursorState::default())),
+            latest_agent: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -106,9 +109,19 @@ impl AppEvents {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        let agent = *self
+            .latest_agent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut values = vec![ClientEvent::Cursor(cursor)];
         if let Some(text) = clipboard {
             values.push(ClientEvent::Clipboard { text });
+        }
+        if let Some(agent) = agent {
+            values.push(ClientEvent::AgentInput {
+                connected: agent.connected,
+                dropped: agent.dropped,
+            });
         }
         values
     }
@@ -176,6 +189,16 @@ pub(super) async fn read_events(
                         if let Some(position) = position_gate.push(position, Instant::now()) {
                             publish_cursor(&events, |cursor| cursor.position = Some(position));
                         }
+                    }
+                    Event::AgentInput(agent) => {
+                        *events
+                            .latest_agent
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(agent);
+                        events.publish(ClientEvent::AgentInput {
+                            connected: agent.connected,
+                            dropped: agent.dropped,
+                        });
                     }
                 }
             }

@@ -76,6 +76,7 @@ impl ClientEventAudience for ClientEvent {
             | ClientEvent::ResizeApplied(_)
             | ClientEvent::VideoConfig { .. }
             | ClientEvent::ControlState { .. }
+            | ClientEvent::AgentInput { .. }
             | ClientEvent::Pong { .. }
             | ClientEvent::Quality(_) => Audience::Everyone,
         }
@@ -599,6 +600,7 @@ mod tests {
     use waywire_protocol::pipe::Fps;
     use waywire_protocol::pipe::FrameSize;
     use waywire_protocol::pipe::Generation;
+    use waywire_protocol::pipe::InputLease;
     use waywire_protocol::pipe::InputSequence;
     use waywire_protocol::pipe::InputText;
     use waywire_protocol::pipe::Kbps;
@@ -690,11 +692,11 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: true }))
         ));
     }
     #[tokio::test]
-    async fn acquire_message_enqueues_active_state_and_reset_command() {
+    async fn acquire_message_enqueues_active_state_and_lease_command() {
         let (state, mut commands) = test_state();
         let (outbound, mut events) = outbound();
         let mut ownership = InputOwnership::NotHeld;
@@ -719,11 +721,11 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: true }))
         ));
     }
     #[tokio::test]
-    async fn release_message_enqueues_ready_state_and_reset_command() {
+    async fn release_message_enqueues_ready_state_and_handback_command() {
         let (state, mut commands) = test_state();
         let socket = SocketId::new(1);
         acquire(&state, &mut commands, socket).await;
@@ -750,7 +752,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: false }))
         ));
     }
     #[tokio::test]
@@ -809,7 +811,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: false }))
         ));
         first_changes
             .changed()
@@ -905,7 +907,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: false }))
         ));
 
         handle_text(
@@ -1331,7 +1333,7 @@ mod tests {
         send_client_text(&mut client, r#"{"type":"acquire"}"#).await;
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: true }))
         ));
 
         // A ping halfway to the read deadline must reset it: the socket then
@@ -1364,7 +1366,7 @@ mod tests {
         }
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: false }))
         ));
         server.abort();
     }

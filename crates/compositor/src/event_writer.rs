@@ -37,6 +37,7 @@ enum Replacement {
     Visibility,
     Position,
     Clipboard,
+    AgentInput,
 }
 
 impl Replacement {
@@ -49,6 +50,9 @@ impl Replacement {
             // replacement, 1 MiB clipboards would fill the 4 MiB queue.
             Event::Clipboard(_) => Some(Self::Clipboard),
             Event::Frame(_) | Event::ResizeApplied(_) | Event::ResetVideoRefused(_) => None,
+            // The newest agent state is the only one that matters, so it
+            // replaces an older queued update like clipboard contents do.
+            Event::AgentInput(_) => Some(Self::AgentInput),
         }
     }
 }

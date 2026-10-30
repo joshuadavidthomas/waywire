@@ -9,6 +9,7 @@ use smithay::input::SeatState;
 use smithay::input::dnd::DndGrabHandler;
 use smithay::input::dnd::GrabType;
 use smithay::input::dnd::Source;
+use smithay::input::keyboard::KeyboardSource;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Client;
@@ -510,7 +511,7 @@ impl State {
             }
         }
         if let Some(pointer) = self.seat.get_pointer() {
-            self.pointer_motion(pointer.current_location());
+            self.pointer_motion(KeyboardSource::MAIN, pointer.current_location());
         }
     }
 

@@ -344,14 +344,27 @@ export function installViewerListeners(
       ? keyboardTitle
       : "Turn on Remote input first";
   };
-  // The page's one notice, for the two states that explain a screen which
-  // does not answer. It reports the situation; the switch names the action.
+  // The page's one notice, for the states that explain who is driving. It
+  // reports the situation; the switch names the action.
   const renderNotice = (state: WaywireSessionState): void => {
+    const agent = state.agent;
     if (wheel === "handsOff") {
-      elements.notice.textContent = "View only";
+      elements.notice.textContent = agent.connected
+        ? "View only · agent driving"
+        : "View only";
+      elements.notice.dataset["state"] = "view-only";
       elements.notice.hidden = false;
     } else if (state.input.state === "busy") {
       elements.notice.textContent = "Another viewer has control";
+      elements.notice.dataset["state"] = "busy";
+      elements.notice.hidden = false;
+    } else if (agent.connected && agent.dropped) {
+      elements.notice.textContent = "You have control · agent paused";
+      elements.notice.dataset["state"] = "takeover";
+      elements.notice.hidden = false;
+    } else if (agent.connected) {
+      elements.notice.textContent = "Agent driving";
+      elements.notice.dataset["state"] = "agent";
       elements.notice.hidden = false;
     } else {
       elements.notice.hidden = true;

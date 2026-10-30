@@ -566,6 +566,7 @@ mod tests {
     async fn submitted_gaps_adapt_only_for_the_owner_before_rtp_correlation() {
         use waywire_protocol::browser::Feedback;
         use waywire_protocol::browser::FeedbackValues;
+        use waywire_protocol::pipe::InputLease;
         use waywire_protocol::pipe::Kbps;
         use waywire_protocol::pipe::ScalePercent;
 
@@ -583,7 +584,7 @@ mod tests {
             sessions.acquire(owner).await.expect("acquire");
             assert!(matches!(
                 command_events.recv().await,
-                Some(Command::ReleaseAll(_))
+                Some(Command::InputLease(InputLease { held: true }))
             ));
             let (pipeline, mut worker) =
                 VideoPipeline::new(video_hub(), commands, Readiness::new(), sessions.clone());

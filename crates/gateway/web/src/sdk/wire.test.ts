@@ -17,37 +17,37 @@ function bytes(record: ArrayBuffer): number[] {
   return [...new Uint8Array(record)];
 }
 
-test("browser command encoders match the Rust v9 vectors", () => {
+test("browser command encoders match the Rust v10 vectors", () => {
   assert.deepEqual(
     bytes(pointerAbsolute(12, 34, 7)),
-    [9, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0],
+    [10, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0],
   );
   assert.deepEqual(
     bytes(pointerButton(0x110, 1, 7)),
-    [9, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
+    [10, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
   );
   assert.deepEqual(
     bytes(pointerScroll(1.5, -2.25, 7)),
-    [9, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0],
+    [10, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0],
   );
   assert.deepEqual(
     bytes(keyboardKey(30, 2, 7)),
-    [9, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
+    [10, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
   );
-  assert.deepEqual(bytes(releaseAll()), [9, 5, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(bytes(releaseAll()), [10, 5, 0, 0, 0, 0, 0, 0]);
   assert.deepEqual(
     bytes(resize(1280, 720, 180, 9)),
-    [9, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0],
+    [10, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0],
   );
   assert.deepEqual(
     bytes(pointerRelative(1.5, -2.25, 7)),
-    [9, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0],
+    [10, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0],
   );
 });
 
-test("video parser decodes the Rust v9 frame vector", () => {
+test("video parser decodes the Rust v10 frame vector", () => {
   const record = new Uint8Array([
-    9, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0,
+    10, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0,
     0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
   ]).buffer;
 
@@ -64,7 +64,7 @@ test("video parser decodes the Rust v9 frame vector", () => {
   assert.deepEqual([...packet.data], [1, 2]);
 });
 
-test("video parser accepts every v9 format and rejects unknown chroma and v8", () => {
+test("video parser accepts every v10 format and rejects unknown chroma and v9", () => {
   const record = videoFrame(
     1,
     0,
@@ -87,6 +87,6 @@ test("video parser accepts every v9 format and rejects unknown chroma and v8", (
   new Uint8Array(record)[42] = 3;
   assert.equal(parseVideoPacket(record), null);
   new Uint8Array(record)[42] = 0;
-  new Uint8Array(record)[0] = 8;
+  new Uint8Array(record)[0] = 9;
   assert.equal(parseVideoPacket(record), null);
 });

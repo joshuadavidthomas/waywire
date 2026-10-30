@@ -1,4 +1,4 @@
-//! EI senders feed the same seat as browser input, with independent ownership.
+//! EI senders feed the same seat as browser input, under one ownership model.
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -49,7 +49,8 @@ pub(crate) fn listen(
 
 /// Serve one EI connection, whether accepted from the listening socket or
 /// handed out over D-Bus by the `RemoteDesktop` portal's `ConnectToEIS`. Both
-/// feed the same seat as browser input, with independent ownership.
+/// feed the same seat as browser input, and every device is an agent source
+/// that a browser takeover releases and then bypasses.
 #[expect(
     clippy::too_many_lines,
     reason = "one function owns the EI event pump for a single connection"
@@ -97,18 +98,19 @@ pub(crate) fn serve_connection(
                     tracing::debug!("EI sender disconnected");
                     state.eis_seats.remove(&connection_id);
                     for (_, source) in sources.drain() {
-                        state.release_input(source);
+                        state.disconnect_input_source(source);
                     }
                 }
                 EiInputEvent::Event(event) => match event {
                     InputEvent::DeviceAdded { device } => {
-                        sources
+                        let source = *sources
                             .entry(device.id())
                             .or_insert_with(KeyboardSource::new_auxiliary);
+                        state.register_agent_source(source);
                     }
                     InputEvent::DeviceRemoved { device } => {
                         if let Some(source) = sources.remove(&device.id()) {
-                            state.release_input(source);
+                            state.disconnect_input_source(source);
                         }
                     }
                     InputEvent::Keyboard { event } => {
@@ -134,37 +136,47 @@ pub(crate) fn serve_connection(
                         state.pointer_button(source, event.button_code(), event.state());
                     }
                     InputEvent::PointerMotion { event } => {
+                        let source = *sources
+                            .entry(event.device().id())
+                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        state.register_agent_source(source);
                         if let Some(pointer) = state.seat.get_pointer() {
                             state.pointer_motion_with_delta(
+                                source,
                                 pointer.current_location() + event.delta(),
                                 Some(event.delta()),
                             );
                         }
                     }
                     InputEvent::PointerMotionAbsolute { event } => {
+                        let source = *sources
+                            .entry(event.device().id())
+                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        state.register_agent_source(source);
                         // EI absolute coordinates are logical already, not normalized pixels.
-                        state.pointer_motion((event.x(), event.y()).into());
+                        state.pointer_motion(source, (event.x(), event.y()).into());
                     }
                     InputEvent::PointerAxis { event } => {
-                        if let Some(pointer) = state.seat.get_pointer() {
-                            let mut frame = AxisFrame::new(event.time()).source(event.source());
-                            for axis in [Axis::Horizontal, Axis::Vertical] {
-                                if let Some(v120) = event.amount_v120(axis) {
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    // Wheel notch counts are small integers in v120 units.
-                                    let (notches, scroll) = (v120 as i32, v120 * 15.0 / 120.0);
-                                    frame = frame.v120(axis, notches).value(axis, scroll);
-                                } else if let Some(amount) = event.amount(axis) {
-                                    frame = if amount == 0.0 {
-                                        frame.stop(axis)
-                                    } else {
-                                        frame.value(axis, amount)
-                                    };
-                                }
+                        let source = *sources
+                            .entry(event.device().id())
+                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        state.register_agent_source(source);
+                        let mut frame = AxisFrame::new(event.time()).source(event.source());
+                        for axis in [Axis::Horizontal, Axis::Vertical] {
+                            if let Some(v120) = event.amount_v120(axis) {
+                                #[allow(clippy::cast_possible_truncation)]
+                                // Wheel notch counts are small integers in v120 units.
+                                let (notches, scroll) = (v120 as i32, v120 * 15.0 / 120.0);
+                                frame = frame.v120(axis, notches).value(axis, scroll);
+                            } else if let Some(amount) = event.amount(axis) {
+                                frame = if amount == 0.0 {
+                                    frame.stop(axis)
+                                } else {
+                                    frame.value(axis, amount)
+                                };
                             }
-                            pointer.axis(state, frame);
-                            pointer.frame(state);
                         }
+                        state.pointer_axis(source, frame);
                     }
                     // Any other event kind this seat adapter does not produce.
                     InputEvent::GestureSwipeBegin { .. }

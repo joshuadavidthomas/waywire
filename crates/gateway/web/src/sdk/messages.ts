@@ -1,5 +1,5 @@
 // Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 export class ProtocolVersionMismatchError extends Error {
   constructor(
@@ -89,6 +89,11 @@ export type ControlMessage =
       readonly state: "active" | "busy" | "ready";
     }
   | {
+      readonly type: "agent-input";
+      readonly connected: boolean;
+      readonly dropped: boolean;
+    }
+  | {
       readonly type: "pong";
       readonly id: number;
       readonly serverNanos: string | number;
@@ -140,6 +145,15 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
         value.state === "busy" ||
         value.state === "ready"
         ? { type: value.type, state: value.state }
+        : null;
+    case "agent-input":
+      return typeof value.connected === "boolean" &&
+        typeof value.dropped === "boolean"
+        ? {
+            type: value.type,
+            connected: value.connected,
+            dropped: value.dropped,
+          }
         : null;
     case "pong":
       return typeof value.id === "number" &&

@@ -1,5 +1,6 @@
 export {
   WaywireSession,
+  type AgentInputState,
   type ClipboardController,
   type ClipboardUpdateEvent,
   type InputController,

@@ -8,10 +8,14 @@
 //! Smithay also hands the compositor the client's keymap. Activating it on the
 //! seat before routing keys is required, because the keycodes belong to that
 //! keymap. With several virtual keyboards the newest one's keymap is active,
-//! and the seat's own keymap returns when the last one goes away.
+//! and the seat's own keymap returns when the last one goes away. While a
+//! browser holds the input lease the seat keymap stays active, so browser keys
+//! are decoded with the browser's layout; the newest virtual keyboard's keymap
+//! returns on handback if that keyboard is still connected.
 //!
-//! Control-ownership arbitration for this input source is planned in
-//! ROADMAP.md phase 2 and is intentionally not part of this change.
+//! Key, modifier and keymap input from these devices shares the one ownership
+//! model: a browser takeover releases held keys and drops later virtual-keyboard
+//! input at the seat entry points in `lib.rs`.
 
 use smithay::backend::input::Event;
 use smithay::backend::input::InputEvent;
@@ -43,17 +47,23 @@ pub(crate) struct VirtualKeyboards {
 }
 
 impl State {
-    /// Make `device` the newest virtual keyboard and activate its keymap.
+    /// Make `device` the newest virtual keyboard. Its keymap is activated only
+    /// when no browser holds the input lease; during a lease the seat keymap
+    /// must stay in force for the browser's keys.
     fn activate_virtual_keymap(&mut self, device: VirtualKeyboardDevice) {
         let (Some(keymap), Some(keyboard)) = (device.keymap(), self.seat.get_keyboard()) else {
             return;
         };
+        let browser_holds_input = self.browser_holds_input;
         let keyboards = &mut self.virtual_keyboards;
         keyboards.devices.retain(|known| *known != device);
         keyboards.devices.push(device);
         keyboards
             .seat_keymap
             .get_or_insert_with(|| keyboard.keymap_file());
+        if browser_holds_input {
+            return;
+        }
         if let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap) {
             tracing::warn!(%error, "virtual keyboard keymap activation failed");
         }
@@ -62,13 +72,14 @@ impl State {
     /// Drop `device` and activate the keymap that applies without it: the
     /// next newest virtual keyboard's, or the seat's own after the last.
     fn remove_virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) {
+        let browser_holds_input = self.browser_holds_input;
         let keyboards = &mut self.virtual_keyboards;
         let Some(index) = keyboards.devices.iter().position(|known| known == device) else {
             return;
         };
         let was_active = index + 1 == keyboards.devices.len();
         keyboards.devices.remove(index);
-        if !was_active {
+        if !was_active || browser_holds_input {
             return;
         }
         let keymap = match keyboards.devices.last() {
@@ -81,18 +92,54 @@ impl State {
             tracing::warn!(%error, "virtual keyboard keymap restore failed");
         }
     }
+
+    /// Put the seat's own keymap back for the duration of a browser lease.
+    pub(crate) fn suspend_virtual_keymap(&mut self) {
+        if self.virtual_keyboards.devices.is_empty() {
+            return;
+        }
+        let Some(keymap) = self.virtual_keyboards.seat_keymap.clone() else {
+            return;
+        };
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap)
+        {
+            tracing::warn!(%error, "virtual keyboard keymap suspension failed");
+        }
+    }
+
+    /// Re-activate the newest connected virtual keyboard's keymap after a
+    /// browser handback.
+    pub(crate) fn resume_virtual_keymap(&mut self) {
+        let Some(keymap) = self
+            .virtual_keyboards
+            .devices
+            .last()
+            .and_then(VirtualKeyboardDevice::keymap)
+        else {
+            return;
+        };
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap)
+        {
+            tracing::warn!(%error, "virtual keyboard keymap resumption failed");
+        }
+    }
 }
 
 impl VirtualKeyboardHandler for State {
     fn process_virtual_keyboard_event(&mut self, event: InputEvent<VirtualKeyboardBackend>) {
         match event {
-            InputEvent::DeviceAdded { device }
-            | InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
+            InputEvent::DeviceAdded { device } => {
+                self.register_agent_source(device.source());
+                self.activate_virtual_keymap(device);
+            }
+            InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
                 self.activate_virtual_keymap(device);
             }
             InputEvent::DeviceRemoved { device } => {
                 // Release held keys while the device's keymap is still active.
-                self.release_input(device.source());
+                self.disconnect_input_source(device.source());
                 self.remove_virtual_keyboard(&device);
             }
             InputEvent::Keyboard { event } => {
@@ -109,17 +156,20 @@ impl VirtualKeyboardHandler for State {
                 self.keyboard_key(event.device().source(), key, event.state());
             }
             InputEvent::Special(VirtualKeyboardSpecialEvent::Modifiers {
+                device,
                 mods_depressed,
                 mods_latched,
                 mods_locked,
                 group,
                 ..
             }) => {
-                if let Some(keyboard) = self.seat.get_keyboard() {
-                    keyboard.with_xkb_state(self, |mut context| {
-                        context.set_modifier_mask(mods_depressed, mods_latched, mods_locked, group);
-                    });
-                }
+                self.keyboard_modifiers(
+                    device.source(),
+                    mods_depressed,
+                    mods_latched,
+                    mods_locked,
+                    group,
+                );
             }
             // This backend only produces keyboard events.
             InputEvent::PointerMotion { .. }
@@ -254,6 +304,62 @@ mod tests {
             u32::try_from(text.len()).expect("keymap length fits"),
         );
         keyboard
+    }
+
+    #[test]
+    fn a_browser_lease_swaps_the_virtual_keymap_out_and_back() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (client_socket, server_socket) =
+            std::os::unix::net::UnixStream::pair().expect("socket pair");
+        display
+            .handle()
+            .insert_client(
+                server_socket,
+                std::sync::Arc::new(crate::shell::ClientState::default()),
+            )
+            .expect("insert client");
+        let connection = Connection::from_socket(client_socket).expect("client connection");
+        let mut queue: EventQueue<App> = connection.new_event_queue();
+        let qh = queue.handle();
+        let mut app = App::default();
+        connection.display().get_registry(&qh, ());
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let keymap_id = |state: &State| {
+            state
+                .seat
+                .get_keyboard()
+                .expect("seat keyboard")
+                .keymap_file()
+                .id()
+        };
+        let seat_keymap = keymap_id(&state);
+        let keyboard = keyboard_with_keymap(&app, &qh, "de");
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let virtual_keymap = keymap_id(&state);
+        assert_ne!(virtual_keymap, seat_keymap);
+
+        state.set_browser_lease(true);
+        assert_eq!(
+            keymap_id(&state),
+            seat_keymap,
+            "a browser lease uses the seat's own keymap"
+        );
+
+        state.set_browser_lease(false);
+        assert_eq!(
+            keymap_id(&state),
+            virtual_keymap,
+            "handback restores the connected virtual keyboard's keymap"
+        );
+
+        keyboard.destroy();
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            keymap_id(&state),
+            seat_keymap,
+            "the seat keymap still returns after the keyboard leaves"
+        );
     }
 
     #[test]

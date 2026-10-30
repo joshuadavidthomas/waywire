@@ -168,6 +168,14 @@ pub(crate) struct State {
     sequence: u64,
     latest_input_sequence: Option<InputSequence>,
     buttons: HashMap<KeyboardSource, HashSet<u32>>,
+    /// Every connected agent source: EIS devices, virtual pointers and
+    /// virtual keyboards. `KeyboardSource::MAIN` is the browser and never
+    /// belongs here.
+    agent_sources: HashSet<KeyboardSource>,
+    /// Sources already logged as dropped during the current browser lease.
+    dropped_agent_sources: HashSet<KeyboardSource>,
+    agent_input: pipe::AgentInput,
+    browser_holds_input: bool,
     pub(crate) dirty: bool,
 }
 
@@ -285,6 +293,10 @@ impl State {
             sequence: 0,
             latest_input_sequence: None,
             buttons: HashMap::new(),
+            agent_sources: HashSet::new(),
+            dropped_agent_sources: HashSet::new(),
+            agent_input: pipe::AgentInput::default(),
+            browser_holds_input: false,
             dirty: true,
         })
     }
@@ -337,7 +349,85 @@ impl State {
             })
     }
 
+    /// Gate every seat input entry point. Browser input always passes. Agent
+    /// sources are registered on first use so a takeover can release them;
+    /// while a browser holds the lease their events are dropped, with one
+    /// debug line per source per lease rather than one per event.
+    fn accepts_input(&mut self, source: KeyboardSource) -> bool {
+        if source == KeyboardSource::MAIN {
+            return true;
+        }
+        self.register_agent_source(source);
+        if !self.browser_holds_input {
+            return true;
+        }
+        if self.dropped_agent_sources.insert(source) {
+            tracing::debug!(
+                ?source,
+                "dropped agent input while a browser holds input control"
+            );
+        }
+        false
+    }
+
+    pub(crate) fn register_agent_source(&mut self, source: KeyboardSource) {
+        if source == KeyboardSource::MAIN {
+            return;
+        }
+        if self.agent_sources.insert(source) {
+            self.publish_agent_input();
+        }
+    }
+
+    /// An adapter's device is gone. Release its held input and stop counting
+    /// it as connected.
+    pub(crate) fn disconnect_input_source(&mut self, source: KeyboardSource) {
+        self.release_input(source);
+        self.dropped_agent_sources.remove(&source);
+        if self.agent_sources.remove(&source) {
+            self.publish_agent_input();
+        }
+    }
+
+    fn publish_agent_input(&mut self) {
+        let connected = !self.agent_sources.is_empty();
+        let state = pipe::AgentInput {
+            connected,
+            dropped: connected && self.browser_holds_input,
+        };
+        if state != self.agent_input {
+            self.agent_input = state;
+            self.emit(Event::AgentInput(state));
+        }
+    }
+
+    /// Apply a browser takeover or handback. On takeover, every agent source
+    /// releases what it holds before its future input is dropped. On handback,
+    /// the browser's own keys are released and agent input resumes.
+    pub(crate) fn set_browser_lease(&mut self, held: bool) {
+        if self.browser_holds_input == held {
+            return;
+        }
+        self.browser_holds_input = held;
+        if held {
+            let sources: Vec<_> = self.agent_sources.iter().copied().collect();
+            for source in sources {
+                self.release_input(source);
+            }
+            self.release_input(KeyboardSource::MAIN);
+            self.suspend_virtual_keymap();
+        } else {
+            self.release_input(KeyboardSource::MAIN);
+            self.resume_virtual_keymap();
+        }
+        self.dropped_agent_sources.clear();
+        self.publish_agent_input();
+    }
+
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
+        if !self.accepts_input(source) {
+            return;
+        }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.input_from_source::<(), _>(
                 source,
@@ -351,8 +441,28 @@ impl State {
         }
     }
 
-    pub(crate) fn pointer_motion(&mut self, location: Point<f64, Logical>) {
-        self.pointer_motion_with_delta(location, None);
+    /// Apply a virtual keyboard's modifier state through the same gate as its
+    /// keys, so a browser lease drops it too.
+    pub(crate) fn keyboard_modifiers(
+        &mut self,
+        source: KeyboardSource,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    ) {
+        if !self.accepts_input(source) {
+            return;
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.with_xkb_state(self, |mut context| {
+                context.set_modifier_mask(depressed, latched, locked, group);
+            });
+        }
+    }
+
+    pub(crate) fn pointer_motion(&mut self, source: KeyboardSource, location: Point<f64, Logical>) {
+        self.pointer_motion_with_delta(source, location, None);
     }
 
     /// Relative input also reaches clients as relative motion, unclamped, so
@@ -361,9 +471,13 @@ impl State {
     /// applies only the relative delta instead of moving twice.
     pub(crate) fn pointer_motion_with_delta(
         &mut self,
+        source: KeyboardSource,
         location: Point<f64, Logical>,
         delta: Option<Point<f64, Logical>>,
     ) {
+        if !self.accepts_input(source) {
+            return;
+        }
         let scale = self.output.current_scale().fractional_scale();
         let location = Point::from((
             location
@@ -414,6 +528,23 @@ impl State {
         button: u32,
         state: ButtonState,
     ) {
+        if !self.accepts_input(source) {
+            return;
+        }
+        self.pointer_button_inner(source, button, state);
+    }
+
+    pub(crate) fn pointer_axis(&mut self, source: KeyboardSource, frame: AxisFrame) {
+        if !self.accepts_input(source) {
+            return;
+        }
+        if let Some(pointer) = self.seat.get_pointer() {
+            pointer.axis(self, frame);
+            pointer.frame(self);
+        }
+    }
+
+    fn pointer_button_inner(&mut self, source: KeyboardSource, button: u32, state: ButtonState) {
         let before = self.buttons.values().any(|keys| keys.contains(&button));
         let keys = self.buttons.entry(source).or_default();
         match state {
@@ -521,7 +652,7 @@ impl State {
         }
         let buttons = self.buttons.get(&source).cloned().unwrap_or_default();
         for button in buttons {
-            self.pointer_button(source, button, ButtonState::Released);
+            self.pointer_button_inner(source, button, ButtonState::Released);
         }
         self.buttons.remove(&source);
     }
@@ -573,6 +704,7 @@ impl State {
         let source = KeyboardSource::MAIN;
         match command {
             Command::PointerAbsolute(p) => self.pointer_motion(
+                source,
                 (
                     f64::from(p.x.get()) / 65535.0 * f64::from(self.size.width())
                         / self.output.current_scale().fractional_scale(),
@@ -586,7 +718,11 @@ impl State {
                     let scale = self.output.current_scale().fractional_scale();
                     let delta =
                         Point::from((f64::from(p.dx.get()) / scale, f64::from(p.dy.get()) / scale));
-                    self.pointer_motion_with_delta(pointer.current_location() + delta, Some(delta));
+                    self.pointer_motion_with_delta(
+                        source,
+                        pointer.current_location() + delta,
+                        Some(delta),
+                    );
                 }
             }
             Command::PointerButton(p) => self.pointer_button(
@@ -607,15 +743,13 @@ impl State {
                 pipe::KeyState::Repeated => {}
             },
             Command::ReleaseAll(_) => self.release_input(source),
+            Command::InputLease(p) => self.set_browser_lease(p.held),
             Command::PointerScroll(p) => {
-                if let Some(pointer) = self.seat.get_pointer() {
-                    let frame = AxisFrame::new(InputTime::now())
-                        .source(AxisSource::Continuous)
-                        .value(Axis::Horizontal, f64::from(p.dx.get()))
-                        .value(Axis::Vertical, f64::from(p.dy.get()));
-                    pointer.axis(self, frame);
-                    pointer.frame(self);
-                }
+                let frame = AxisFrame::new(InputTime::now())
+                    .source(AxisSource::Continuous)
+                    .value(Axis::Horizontal, f64::from(p.dx.get()))
+                    .value(Axis::Vertical, f64::from(p.dy.get()));
+                self.pointer_axis(source, frame);
             }
             Command::Resize(p) => {
                 self.size = p.size;
@@ -1082,6 +1216,136 @@ mod tests {
             .expect("test compositor");
         state.video.take().expect("new encoder").stop();
         (display, state)
+    }
+
+    fn pressed(state: &State, key: u32) -> bool {
+        state
+            .seat
+            .get_keyboard()
+            .expect("seat keyboard")
+            .pressed_keys()
+            .contains(&(key + 8).into())
+    }
+
+    fn lease(state: &mut State, held: bool) {
+        state
+            .apply_command(Command::InputLease(waywire_protocol::pipe::InputLease {
+                held,
+            }))
+            .expect("lease command");
+    }
+
+    #[test]
+    fn agent_input_reaches_the_seat_without_a_browser_lease() {
+        let (_display, mut state) = test_state();
+        let agent = KeyboardSource::new_auxiliary();
+
+        state.keyboard_key(agent, 30, KeyState::Pressed);
+        state.pointer_button(agent, 0x110, ButtonState::Pressed);
+
+        assert!(pressed(&state, 30), "the agent's key must reach the seat");
+        assert!(
+            state
+                .buttons
+                .get(&agent)
+                .is_some_and(|buttons| buttons.contains(&0x110)),
+            "the agent's button must reach the seat"
+        );
+        assert_eq!(
+            state.agent_input,
+            pipe::AgentInput {
+                connected: true,
+                dropped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_browser_takeover_releases_held_agent_input_and_drops_later_events() {
+        let (_display, mut state) = test_state();
+        let agent = KeyboardSource::new_auxiliary();
+        state.keyboard_key(agent, 30, KeyState::Pressed);
+        state.keyboard_key(agent, 42, KeyState::Pressed);
+        state.pointer_button(agent, 0x110, ButtonState::Pressed);
+        state.pointer_button(agent, 0x113, ButtonState::Pressed);
+        assert!(pressed(&state, 30) && pressed(&state, 42));
+
+        lease(&mut state, true);
+
+        assert!(
+            state
+                .seat
+                .get_keyboard()
+                .expect("seat keyboard")
+                .pressed_keys()
+                .is_empty(),
+            "a key held across the takeover must be released"
+        );
+        assert!(
+            state.buttons.get(&agent).is_none_or(HashSet::is_empty),
+            "a button held across the takeover must be released"
+        );
+
+        // Later agent events are dropped rather than queued or forwarded.
+        state.event_sink.take_events();
+        state.keyboard_key(agent, 31, KeyState::Pressed);
+        state.pointer_button(agent, 0x111, ButtonState::Pressed);
+        state.pointer_motion(agent, (12.0, 34.0).into());
+        assert!(!pressed(&state, 31));
+        assert!(state.buttons.get(&agent).is_none_or(HashSet::is_empty));
+        assert!(
+            state.event_sink.take_events().is_empty(),
+            "dropped agent motion must not move the cursor or emit an event"
+        );
+        assert_eq!(
+            state.agent_input,
+            pipe::AgentInput {
+                connected: true,
+                dropped: true,
+            }
+        );
+
+        // Browser input still reaches the seat during its lease.
+        state.keyboard_key(KeyboardSource::MAIN, 32, KeyState::Pressed);
+        assert!(pressed(&state, 32));
+    }
+
+    #[test]
+    fn agent_input_resumes_after_the_browser_hands_back() {
+        let (_display, mut state) = test_state();
+        let agent = KeyboardSource::new_auxiliary();
+        lease(&mut state, true);
+        state.keyboard_key(agent, 31, KeyState::Pressed);
+        state.pointer_button(agent, 0x111, ButtonState::Pressed);
+        state.keyboard_key(KeyboardSource::MAIN, 32, KeyState::Pressed);
+        assert!(!pressed(&state, 31));
+        assert!(state.buttons.get(&agent).is_none_or(HashSet::is_empty));
+        assert!(pressed(&state, 32));
+
+        lease(&mut state, false);
+
+        assert!(!pressed(&state, 32), "the browser's held key is released");
+        assert!(
+            !pressed(&state, 31),
+            "input dropped during the lease must not appear on handback"
+        );
+        state.keyboard_key(agent, 31, KeyState::Pressed);
+        state.pointer_button(agent, 0x111, ButtonState::Pressed);
+        assert!(pressed(&state, 31), "agent keys resume after handback");
+        assert!(
+            state
+                .buttons
+                .get(&agent)
+                .is_some_and(|buttons| buttons.contains(&0x111)),
+            "agent buttons resume after handback"
+        );
+        assert_eq!(
+            state.agent_input,
+            pipe::AgentInput {
+                connected: true,
+                dropped: false,
+            }
+        );
     }
 
     #[test]

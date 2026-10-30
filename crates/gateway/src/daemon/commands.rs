@@ -239,7 +239,7 @@ impl CommandSink {
     }
 
     pub(crate) fn clear_active_ownership(&self) {
-        // Release invalidates the epoch after ReleaseAll enters the FIFO. A reader that
+        // Handback invalidates the epoch after its command enters the FIFO. A reader that
         // observes the clear can only drop late input-owner commands; system commands
         // remain ordered by the channel.
         self.active_ownership.store(0, Ordering::Release);
@@ -287,6 +287,7 @@ mod tests {
     use waywire_protocol::browser::FeedbackValues;
     use waywire_protocol::pipe::Fps;
     use waywire_protocol::pipe::Generation;
+    use waywire_protocol::pipe::InputLease;
     use waywire_protocol::pipe::Kbps;
     use waywire_protocol::pipe::KeyframeReadiness;
     use waywire_protocol::pipe::KeyframeState;
@@ -442,10 +443,10 @@ mod tests {
         let initial_release = command_reader
             .recv()
             .await
-            .expect("initial release should queue");
+            .expect("initial lease should queue");
         assert!(matches!(
             Command::decode(&initial_release.encoded),
-            Ok(Command::ReleaseAll(_))
+            Ok(Command::InputLease(InputLease { held: true }))
         ));
 
         sessions
@@ -504,10 +505,10 @@ mod tests {
         let final_release = command_reader
             .recv()
             .await
-            .expect("final release should queue");
+            .expect("final handback should queue");
         assert!(matches!(
             Command::decode(&final_release.encoded),
-            Ok(Command::ReleaseAll(_))
+            Ok(Command::InputLease(InputLease { held: false }))
         ));
         assert_eq!(
             sessions

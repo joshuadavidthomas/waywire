@@ -964,6 +964,12 @@ export class ControlRuntime {
         }
         if (message.type === "clipboard")
           this.receiveRemoteClipboard(message.text);
+        if (message.type === "agent-input") {
+          this.owner.updateState("agent", {
+            connected: message.connected,
+            dropped: message.dropped,
+          });
+        }
         if (message.type === "quality") {
           this.qualityBitrate = message.bitrate;
           this.qualityScale = message.scale;

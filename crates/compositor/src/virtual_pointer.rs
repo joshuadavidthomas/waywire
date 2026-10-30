@@ -6,10 +6,9 @@
 //! those events to the same seat entry points the browser's input uses. Focus,
 //! decorations and cursor events then behave exactly like browser input.
 //!
-//! Control-ownership arbitration for this input source is planned in
-//! ROADMAP.md (pass 1, input arbitration) and is not part of this change:
-//! virtual-pointer input bypasses the browser's control lease today, exactly
-//! like EIS input.
+//! Control ownership is shared with every other agent source: while a browser
+//! holds the input lease, a virtual pointer's events are dropped at the seat
+//! entry points in `lib.rs`, and its held buttons are released on takeover.
 use smithay::backend::input::AbsolutePositionEvent;
 use smithay::backend::input::Axis;
 use smithay::backend::input::Event;
@@ -40,28 +39,42 @@ impl VirtualPointerHandler for State {
                 // One source per virtual pointer, like one per EI device, so its
                 // held buttons are tracked and released independently of other
                 // input sources.
-                self.virtual_pointers
-                    .insert(device, KeyboardSource::new_auxiliary());
+                let source = KeyboardSource::new_auxiliary();
+                self.virtual_pointers.insert(device, source);
+                self.register_agent_source(source);
             }
             InputEvent::DeviceRemoved { device } => {
                 // A client may destroy the pointer, or die, with buttons still
                 // down. Releasing the source's input clears Close arming, held
                 // buttons and keyboard state together, like an unplugged mouse.
                 if let Some(source) = self.virtual_pointers.remove(&device) {
-                    self.release_input(source);
+                    self.disconnect_input_source(source);
                 }
             }
             InputEvent::PointerMotion { event } => {
+                let source = *self
+                    .virtual_pointers
+                    .entry(event.device())
+                    .or_insert_with(KeyboardSource::new_auxiliary);
                 if let Some(pointer) = self.seat.get_pointer() {
                     let delta = event.delta();
-                    self.pointer_motion_with_delta(pointer.current_location() + delta, Some(delta));
+                    self.pointer_motion_with_delta(
+                        source,
+                        pointer.current_location() + delta,
+                        Some(delta),
+                    );
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
+                let source = *self
+                    .virtual_pointers
+                    .entry(event.device())
+                    .or_insert_with(KeyboardSource::new_auxiliary);
                 // The event is a fraction of the client's extents, already
                 // clamped to 0..=1. Map it onto the output's logical size.
                 let scale = self.output.current_scale().fractional_scale();
                 self.pointer_motion(
+                    source,
                     (
                         absolute_position(event.x(), self.size.width(), scale),
                         absolute_position(event.y(), self.size.height(), scale),
@@ -77,27 +90,28 @@ impl VirtualPointerHandler for State {
                 self.pointer_button(source, event.button_code(), event.state());
             }
             InputEvent::PointerAxis { event } => {
-                if let Some(pointer) = self.seat.get_pointer() {
-                    // One frame per `frame` request, timestamped with the
-                    // scroll event's own time.
-                    let mut frame = AxisFrame::new(event.time()).source(event.source());
-                    for axis in [Axis::Horizontal, Axis::Vertical] {
-                        match axis_event(event.amount(axis), event.amount_v120(axis)) {
-                            Some(AxisEvent::Value(value)) => {
-                                frame = frame.value(axis, value);
-                            }
-                            Some(AxisEvent::Steps { value, v120 }) => {
-                                frame = frame.v120(axis, v120).value(axis, value);
-                            }
-                            Some(AxisEvent::Stop) => {
-                                frame = frame.stop(axis);
-                            }
-                            None => {}
+                let source = *self
+                    .virtual_pointers
+                    .entry(event.device())
+                    .or_insert_with(KeyboardSource::new_auxiliary);
+                // One frame per `frame` request, timestamped with the
+                // scroll event's own time.
+                let mut frame = AxisFrame::new(event.time()).source(event.source());
+                for axis in [Axis::Horizontal, Axis::Vertical] {
+                    match axis_event(event.amount(axis), event.amount_v120(axis)) {
+                        Some(AxisEvent::Value(value)) => {
+                            frame = frame.value(axis, value);
                         }
+                        Some(AxisEvent::Steps { value, v120 }) => {
+                            frame = frame.v120(axis, v120).value(axis, value);
+                        }
+                        Some(AxisEvent::Stop) => {
+                            frame = frame.stop(axis);
+                        }
+                        None => {}
                     }
-                    pointer.axis(self, frame);
-                    pointer.frame(self);
                 }
+                self.pointer_axis(source, frame);
             }
             // This backend only produces pointer events.
             InputEvent::Keyboard { .. }

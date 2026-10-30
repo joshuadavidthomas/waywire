@@ -54,6 +54,11 @@ pub enum ClientEvent {
         state: ControlState,
     },
     #[serde(rename_all = "camelCase")]
+    AgentInput {
+        connected: bool,
+        dropped: bool,
+    },
+    #[serde(rename_all = "camelCase")]
     Pong {
         id: u64,
         server_nanos: String,
@@ -426,7 +431,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![9, kind, 0, 0];
+        let mut bytes = vec![10, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -446,7 +451,7 @@ mod tests {
             let event = ClientEvent::video_config(chroma.h264_profile().codec());
             assert_eq!(
                 json(&event),
-                format!(r#"{{"type":"video-config","version":9,"codec":"{codec}"}}"#)
+                format!(r#"{{"type":"video-config","version":10,"codec":"{codec}"}}"#)
             );
         }
     }
@@ -529,6 +534,17 @@ mod tests {
                 state: ControlState::Active
             }),
             r#"{"type":"control-state","state":"active"}"#
+        );
+    }
+
+    #[test]
+    fn agent_input_json_is_exact() {
+        assert_eq!(
+            json(&ClientEvent::AgentInput {
+                connected: true,
+                dropped: false,
+            }),
+            r#"{"type":"agent-input","connected":true,"dropped":false}"#
         );
     }
 
@@ -753,7 +769,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            9, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            10, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

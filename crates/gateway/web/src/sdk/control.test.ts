@@ -790,3 +790,35 @@ test("acquiring control does not auto-write the clipboard snapshot", async () =>
     await session.dispose();
   }
 });
+
+test("agent input state from the control socket reaches the session", async () => {
+  installBrowser();
+  const sockets = new Map<string, FakeWebSocket>();
+  const session = new WaywireSession({
+    endpoint: "https://desktop.example.com",
+    createWebSocket(path) {
+      const created = new FakeWebSocket();
+      sockets.set(path, created);
+      return socket(created);
+    },
+  });
+  session.attachSurface(surfaceOptions());
+  try {
+    session.connect();
+    await flush();
+    const control = sockets.get("/control");
+    if (!control) throw new Error("control socket was not created");
+    control.readyState = FakeWebSocket.OPEN;
+    control.dispatch("open", {});
+    control.dispatch("message", {
+      data: JSON.stringify({
+        type: "agent-input",
+        connected: true,
+        dropped: true,
+      }),
+    });
+    assert.deepEqual(session.state.agent, { connected: true, dropped: true });
+  } finally {
+    await session.dispose();
+  }
+});

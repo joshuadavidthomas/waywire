@@ -121,6 +121,10 @@ canvas {
   background: var(--lamp-wait);
 }
 
+.notice[data-state="agent"]::before {
+  background: var(--lamp-live);
+}
+
 /* No picture: the screen says so, over whatever frame it last held. */
 
 .signal {

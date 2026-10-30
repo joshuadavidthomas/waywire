@@ -27,8 +27,9 @@ the gateway needs belongs to the compositor, so waywire owns it directly:
   titlebar click and an automation command perform the same window operation.
 
 Agent queries are planned but not built: a window list, a settled-frame signal,
-per-window capture, and screenshots on demand. Arbitration between the browser's
-control lease and agent input is planned too. See [ROADMAP.md](ROADMAP.md).
+per-window capture, and screenshots on demand. Input arbitration is shared with
+agent sources: a browser takeover releases and pauses agent input, and handback
+resumes it. See [ROADMAP.md](ROADMAP.md).
 
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while

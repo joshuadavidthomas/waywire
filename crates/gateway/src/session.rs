@@ -16,9 +16,9 @@ use waywire_protocol::browser::QualityPreset;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameMetadata;
+use waywire_protocol::pipe::InputLease;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality as QualityCommand;
-use waywire_protocol::pipe::ReleaseAll;
 use waywire_protocol::pipe::Resize;
 
 use self::quality::Quality;
@@ -112,11 +112,11 @@ impl Sessions {
             });
         }
 
-        // ReleaseAll enters the FIFO before the new epoch becomes valid, so
-        // no command from the new input owner can overtake the reset. The input ownership
+        // The lease enters the FIFO before the new epoch becomes valid, so
+        // no command from the new input owner can overtake it. The input ownership
         // lock can be held for at worst two PIPE_DEADLINEs while that write enters the FIFO.
         self.commands
-            .system(Command::ReleaseAll(ReleaseAll))
+            .system(Command::InputLease(InputLease { held: true }))
             .await?;
         let epoch = book.next_epoch;
         book.next_epoch = epoch.next();
@@ -138,11 +138,11 @@ impl Sessions {
             return Ok(ReleaseOutcome::NotInputOwner);
         }
 
-        // The reset follows every command already queued by this epoch. Once
+        // The handback follows every command already queued by this epoch. Once
         // the authority is cleared, the writer drops any late stale command.
         // The input ownership lock can be held for at worst two PIPE_DEADLINEs during the send.
         self.commands
-            .system(Command::ReleaseAll(ReleaseAll))
+            .system(Command::InputLease(InputLease { held: false }))
             .await?;
         self.commands.clear_active_ownership();
         book.input_owner = None;
@@ -348,6 +348,7 @@ mod tests {
     use waywire_protocol::InvalidValue;
     use waywire_protocol::browser::FeedbackValues;
     use waywire_protocol::pipe::FrameSize;
+    use waywire_protocol::pipe::ReleaseAll;
     use waywire_protocol::pipe::RequestId;
     use waywire_protocol::pipe::ScaleV120;
 
@@ -377,7 +378,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: true }))
         ));
     }
 
@@ -513,7 +514,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: false }))
         ));
         first_waiter
             .changed()
@@ -575,7 +576,7 @@ mod tests {
         assert_eq!(commands.recv().await, Some(Command::Resize(resize)));
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: true }))
         ));
     }
 
@@ -753,7 +754,7 @@ mod tests {
         sessions.release(first).await.expect("release");
         assert!(matches!(
             commands.recv().await,
-            Some(Command::ReleaseAll(_))
+            Some(Command::InputLease(InputLease { held: false }))
         ));
         acquire_ownership_and_drain(&sessions, &mut commands, second).await;
         sessions
