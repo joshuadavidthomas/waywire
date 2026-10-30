@@ -98,7 +98,7 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Missing; implement the backend                       |
 | wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                 |
 | ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
-| wlr-virtual-pointer             | cua-driver                                                     | Missing; not in Smithay                              |
+| wlr-virtual-pointer             | cua-driver                                                     | Done; ported from upstream Smithay                   |
 | virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                 |
 | ext-foreign-toplevel-list       | lswt                                                           | Done                                                 |
 | wlr-foreign-toplevel-management | wlrctl window actions                                          | Missing; not in Smithay, implement it                |
