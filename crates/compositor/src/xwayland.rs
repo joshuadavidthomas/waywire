@@ -41,11 +41,26 @@ use crate::clipboard::SelectionData;
 // requests issued by Wayland callbacks (notably new_selection, which does not
 // flush its SetSelectionOwner request in the pinned Smithay revision).
 pub(crate) fn sync_stacking(state: &mut State) {
-    if let Some(xwm) = &mut state.xwm
-        && let Err(error) = xwm
-            .update_stacking_order_upwards(state.space.elements().filter_map(Window::x11_surface))
+    let Some(xwm) = &mut state.xwm else {
+        return;
+    };
+    // Smithay grabs and ungrabs the X server on every call, which woke
+    // Xwayland on every loop iteration. Map, unmap and raise_window keep its
+    // stacking list in step with the space, so only a reorder or an unflushed
+    // request needs a sync.
+    let order: Vec<u32> = state
+        .space
+        .elements()
+        .filter_map(Window::x11_surface)
+        .map(X11Surface::window_id)
+        .collect();
+    if state.x11_stacking.as_ref() == Some(&order) {
+        return;
+    }
+    match xwm.update_stacking_order_upwards(state.space.elements().filter_map(Window::x11_surface))
     {
-        tracing::warn!(%error, "X11 stacking synchronization failed");
+        Ok(()) => state.x11_stacking = Some(order),
+        Err(error) => tracing::warn!(%error, "X11 stacking synchronization failed"),
     }
 }
 

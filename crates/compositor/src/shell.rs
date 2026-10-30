@@ -210,6 +210,7 @@ impl SelectionHandler for State {
             {
                 tracing::warn!(%error, "forward clipboard ownership to X11");
             }
+            self.x11_stacking = None;
             self.clipboard_changed(source);
         }
     }

@@ -54,6 +54,7 @@ impl State {
         {
             tracing::warn!(%error, "forward clipboard ownership to X11");
         }
+        self.x11_stacking = None;
         self.emit(Event::Clipboard(text.clone()));
     }
 
