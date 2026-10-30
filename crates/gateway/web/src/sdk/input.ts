@@ -36,7 +36,6 @@ const keyRepeated = 2;
 // Linux key codes for the modifier keys.
 const controlKeyCodes = new Set([29, 97]);
 const metaKeyCodes = new Set([125, 126]);
-const modifierKeyCodes = new Set([29, 42, 54, 56, 97, 100, 125, 126]);
 const linuxPointerButtons: readonly Button[] = [
   0x110, 0x112, 0x111, 0x113, 0x114,
 ];
@@ -567,16 +566,14 @@ export class InputRuntime {
       this.owner.sendRecord(
         keyboardKey(key, keyReleased, this.owner.nextSequence()),
       );
-    // macOS never delivers keyup for keys pressed while Cmd is held, so a
-    // Meta keyup is the last chance to release them on the remote.
-    if (metaKeyCodes.has(key))
-      for (const held of [...this.pressedKeys])
-        if (!modifierKeyCodes.has(held)) {
-          this.pressedKeys.delete(held);
-          this.owner.sendRecord(
-            keyboardKey(held, keyReleased, this.owner.nextSequence()),
-          );
-        }
+    // macOS may omit keyup while Cmd is held. Other platforms deliver it.
+    if (metaKeyCodes.has(key) && navigator.platform.startsWith("Mac"))
+      for (const held of this.pressedKeys) {
+        this.pressedKeys.delete(held);
+        this.owner.sendRecord(
+          keyboardKey(held, keyReleased, this.owner.nextSequence()),
+        );
+      }
     this.physicalTextPending = false;
     event.preventDefault();
     event.stopPropagation();

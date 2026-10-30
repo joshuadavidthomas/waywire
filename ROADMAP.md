@@ -317,9 +317,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 ## 5. Input fidelity
 
-- **High:** macOS keys pressed while Cmd is held stay down on the remote,
-  because only `keyup` releases them (`crates/gateway/web/src/sdk/input.ts`).
-  Release other held keys when Meta is released.
 - **High:** acquiring control writes the remote clipboard over the user's local
   clipboard (`crates/gateway/web/src/sdk/control.ts`). Don't auto-write the
   snapshot sent with control acquisition.
