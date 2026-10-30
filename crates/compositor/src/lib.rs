@@ -8,6 +8,7 @@ mod event_writer;
 mod focus;
 mod grabs;
 mod pointer_warp;
+mod portal;
 mod screencopy;
 mod shell;
 mod toplevel_list;
@@ -16,6 +17,7 @@ mod virtual_keyboard;
 mod virtual_pointer;
 mod xwayland;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -25,6 +27,7 @@ use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::Child;
 use std::process::Stdio;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -900,13 +903,23 @@ pub fn run(mut options: Config) -> Result<()> {
     }
     let mut child = Session(None);
     let mut renderer = PixmanRenderer::new()?;
-    let mut image = renderer.create_buffer(
-        Fourcc::Argb8888,
-        (
-            i32::try_from(state.size.width())?,
-            i32::try_from(state.size.height())?,
-        )
-            .into(),
+    // The portal backends read the most recently rendered frame from the
+    // calloop loop, which is the only writer.
+    let image = Rc::new(RefCell::new(
+        renderer.create_buffer(
+            Fourcc::Argb8888,
+            (
+                i32::try_from(state.size.width())?,
+                i32::try_from(state.size.height())?,
+            )
+                .into(),
+        )?,
+    ));
+    let portal_dirs = crate::portal::start(
+        &handle,
+        runtime.path(),
+        Rc::clone(&image),
+        options.xkb_layout.clone(),
     )?;
     let mut tracker = OutputDamageTracker::from_output(&state.output);
     let mut next_frame = Instant::now();
@@ -923,7 +936,15 @@ pub fn run(mut options: Config) -> Result<()> {
                 .env("XDG_RUNTIME_DIR", runtime.path())
                 .env("DISPLAY", format!(":{display}"))
                 .env("LIBEI_SOCKET", &eis_path)
-                .env_remove("WAYLAND_SOCKET")
+                .env_remove("WAYLAND_SOCKET");
+            // The session program and its portal clients discover the desktop
+            // the same way the bus-activated frontend does.
+            if let Some(dirs) = &portal_dirs {
+                for (key, value) in crate::portal::portal_environment(dirs) {
+                    command.env(key, value);
+                }
+            }
+            command
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
                 .stderr(Stdio::inherit());
@@ -953,7 +974,7 @@ pub fn run(mut options: Config) -> Result<()> {
         state.space.refresh();
         crate::xwayland::sync_stacking(&mut state);
         if Instant::now() >= next_frame {
-            if let Err(error) = state.render(&mut renderer, &mut image, &mut tracker) {
+            if let Err(error) = state.render(&mut renderer, &mut image.borrow_mut(), &mut tracker) {
                 state.fail(error);
             }
             next_frame = frame_deadline(

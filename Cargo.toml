@@ -37,6 +37,8 @@ waywire-protocol = { path = "crates/protocol" }
 
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
+# Screenshot portal PNGs; Cairo already backs the decorations through pangocairo.
+cairo-rs = { version = "0.22.9", default-features = false, features = ["png", "use_glib"] }
 calloop = { version = "0.14.5", features = ["signals"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = "0.3.34"
@@ -56,6 +58,8 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5.8"
+# The portal backends serve D-Bus from their own thread.
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 # Smithay provides no server state for wlr-screencopy; the compositor implements
 # that protocol directly over these generated bindings.
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }

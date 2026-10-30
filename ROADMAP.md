@@ -94,8 +94,8 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 
 | Protocol or interface           | Installed tools that use it                                    | Status                                               |
 | ------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
-| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Missing; implement the backend on our EIS server     |
-| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Missing; implement the backend                       |
+| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Done; needs a session bus                            |
+| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; needs a session bus                            |
 | wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                 |
 | ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
 | wlr-virtual-pointer             | cua-driver                                                     | Done; ported from upstream Smithay                   |
@@ -293,10 +293,15 @@ upstream code to local copies of it.
   upstream as of 2026-10-29. Upstream now has `wayland::virtual_pointer`, which
   `crates/compositor/src/virtual_pointer.rs` ports by hand, and a Xwayland
   spawn variant. Bump once the compositor threads in flight have merged, then
-  replace local ports with the upstream modules.
-- **Crates.** `cargo update` has about 60 compatible updates pending, including
-  tokio, hyper and calloop. `nix` is pinned exactly (`=0.31.3`); re-check it
-  against newer releases deliberately.
+  replace local ports with the upstream modules. The pinned `KeymapFile` seals
+  the keymap as a C string, so the EIS keymap event's length counts a trailing
+  NUL that libxkbcommon before 1.6 rejects; check the bump fixes it, or fix it
+  upstream.
+- **Crates.** Compatible updates landed on 2026-10-30; re-run `cargo update`
+  with the drift check below. `nix` is pinned exactly (`=0.31.3`); re-check it
+  against newer releases deliberately. `zbus` stays on 5.x: 6.0 drops the
+  `blocking-api` feature and reworks runtime selection, so moving the portal
+  thread to it is a port, not a bump.
 - **Xwayland.** `.agents/setup` builds 24.1.13; 24.1.14 is current. Track the
   26.1 release for pointer-warp and libei changes.
 - **Check.** Add a periodic job or `just` recipe that reports how far the

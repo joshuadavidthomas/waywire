@@ -40,119 +40,158 @@ pub(crate) fn listen(
     let listener = eis::Listener::bind(path)?;
     let handle_clone = handle.clone();
     handle.insert_source(EisListenerSource::new(listener), move |context, (), _| {
-        // Device ids are unique within a connection, not across connections.
-        let connection_id = KeyboardSource::new_auxiliary();
-        let mut sources = HashMap::<String, KeyboardSource>::new();
-        let layout = layout.clone();
-        handle_clone
-            .insert_source(EiInput::new(context), move |event, connection, state| {
-                match event {
-                    EiInputEvent::Connected => {
-                        tracing::debug!("EI sender connected");
-                        let seat = connection.add_seat("waywire");
-                        if let Err(error) = seat.add_keyboard(
-                            "keyboard",
-                            XkbConfig {
-                                layout: &layout,
-                                ..Default::default()
-                            },
-                        ) {
-                            tracing::error!(%error, "EI keyboard creation failed");
-                        }
-                        seat.add_pointer("pointer");
-                        if let Some(rect) = state.space.output_geometry(&state.output) {
-                            seat.add_pointer_absolute(
-                                "absolute pointer",
-                                &[EiRegion {
-                                    rect,
-                                    scale: state.output.current_scale().fractional_scale() as f32,
-                                    mapping_id: Some(state.output.name()),
-                                }],
-                            );
-                        }
-                        state.eis_seats.insert(connection_id, seat);
-                    }
-                    EiInputEvent::Disconnected => {
-                        tracing::debug!("EI sender disconnected");
-                        state.eis_seats.remove(&connection_id);
-                        for (_, source) in sources.drain() {
-                            state.release_input(source);
-                        }
-                    }
-                    EiInputEvent::Event(event) => match event {
-                        InputEvent::DeviceAdded { device } => {
-                            sources
-                                .entry(device.id())
-                                .or_insert_with(KeyboardSource::new_auxiliary);
-                        }
-                        InputEvent::DeviceRemoved { device } => {
-                            if let Some(source) = sources.remove(&device.id()) {
-                                state.release_input(source);
-                            }
-                        }
-                        InputEvent::Keyboard { event } => {
-                            let source = *sources
-                                .entry(event.device().id())
-                                .or_insert_with(KeyboardSource::new_auxiliary);
-                            // Smithay's adapter converts evdev to XKB; our shared entry point accepts evdev.
-                            // Evdev key codes below KEY_ESC (9) are not key events;
-                            // subtracting the 8-code XKB offset would underflow.
-                            let Some(key) = u32::from(event.key_code()).checked_sub(8) else {
-                                tracing::debug!(
-                                    key_code = u32::from(event.key_code()),
-                                    "dropped EI key code below the evdev key range"
-                                );
-                                return;
-                            };
-                            state.keyboard_key(source, key, event.state());
-                        }
-                        InputEvent::PointerButton { event } => {
-                            let source = *sources
-                                .entry(event.device().id())
-                                .or_insert_with(KeyboardSource::new_auxiliary);
-                            state.pointer_button(source, event.button_code(), event.state());
-                        }
-                        InputEvent::PointerMotion { event } => {
-                            if let Some(pointer) = state.seat.get_pointer() {
-                                state.pointer_motion_with_delta(
-                                    pointer.current_location() + event.delta(),
-                                    Some(event.delta()),
-                                );
-                            }
-                        }
-                        InputEvent::PointerMotionAbsolute { event } => {
-                            // EI absolute coordinates are logical already, not normalized pixels.
-                            state.pointer_motion((event.x(), event.y()).into());
-                        }
-                        InputEvent::PointerAxis { event } => {
-                            if let Some(pointer) = state.seat.get_pointer() {
-                                let mut frame = AxisFrame::new(event.time()).source(event.source());
-                                for axis in [Axis::Horizontal, Axis::Vertical] {
-                                    if let Some(v120) = event.amount_v120(axis) {
-                                        frame = frame
-                                            .v120(axis, v120 as i32)
-                                            .value(axis, v120 * 15.0 / 120.0);
-                                    } else if let Some(amount) = event.amount(axis) {
-                                        frame = if amount == 0.0 {
-                                            frame.stop(axis)
-                                        } else {
-                                            frame.value(axis, amount)
-                                        };
-                                    }
-                                }
-                                pointer.axis(state, frame);
-                                pointer.frame(state);
-                            }
-                        }
-                        _ => {}
-                    },
-                    // No text or touch device is advertised by this seat adapter.
-                    EiInputEvent::TextKeysym { .. } | EiInputEvent::TextUtf8 { .. } => {}
-                }
-            })
+        serve_connection(&handle_clone, context, layout.clone())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(PostAction::Continue)
     })?;
+    Ok(())
+}
+
+/// Serve one EI connection, whether accepted from the listening socket or
+/// handed out over D-Bus by the `RemoteDesktop` portal's `ConnectToEIS`. Both
+/// feed the same seat as browser input, with independent ownership.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one function owns the EI event pump for a single connection"
+)]
+pub(crate) fn serve_connection(
+    handle: &LoopHandle<'static, State>,
+    context: eis::Context,
+    layout: String,
+) -> Result<()> {
+    // Device ids are unique within a connection, not across connections.
+    let connection_id = KeyboardSource::new_auxiliary();
+    let mut sources = HashMap::<String, KeyboardSource>::new();
+    handle
+        .insert_source(EiInput::new(context), move |event, connection, state| {
+            match event {
+                EiInputEvent::Connected => {
+                    tracing::debug!("EI sender connected");
+                    let seat = connection.add_seat("waywire");
+                    if let Err(error) = seat.add_keyboard(
+                        "keyboard",
+                        XkbConfig {
+                            layout: &layout,
+                            ..Default::default()
+                        },
+                    ) {
+                        tracing::error!(%error, "EI keyboard creation failed");
+                    }
+                    seat.add_pointer("pointer");
+                    if let Some(rect) = state.space.output_geometry(&state.output) {
+                        #[allow(clippy::cast_possible_truncation)]
+                        // EI represents output scale as f32.
+                        let scale = state.output.current_scale().fractional_scale() as f32;
+                        seat.add_pointer_absolute(
+                            "absolute pointer",
+                            &[EiRegion {
+                                rect,
+                                scale,
+                                mapping_id: Some(state.output.name()),
+                            }],
+                        );
+                    }
+                    state.eis_seats.insert(connection_id, seat);
+                }
+                EiInputEvent::Disconnected => {
+                    tracing::debug!("EI sender disconnected");
+                    state.eis_seats.remove(&connection_id);
+                    for (_, source) in sources.drain() {
+                        state.release_input(source);
+                    }
+                }
+                EiInputEvent::Event(event) => match event {
+                    InputEvent::DeviceAdded { device } => {
+                        sources
+                            .entry(device.id())
+                            .or_insert_with(KeyboardSource::new_auxiliary);
+                    }
+                    InputEvent::DeviceRemoved { device } => {
+                        if let Some(source) = sources.remove(&device.id()) {
+                            state.release_input(source);
+                        }
+                    }
+                    InputEvent::Keyboard { event } => {
+                        let source = *sources
+                            .entry(event.device().id())
+                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        // Smithay's adapter converts evdev to XKB; our shared entry point accepts evdev.
+                        // Evdev key codes below KEY_ESC (9) are not key events;
+                        // subtracting the 8-code XKB offset would underflow.
+                        let Some(key) = u32::from(event.key_code()).checked_sub(8) else {
+                            tracing::debug!(
+                                key_code = u32::from(event.key_code()),
+                                "dropped EI key code below the evdev key range"
+                            );
+                            return;
+                        };
+                        state.keyboard_key(source, key, event.state());
+                    }
+                    InputEvent::PointerButton { event } => {
+                        let source = *sources
+                            .entry(event.device().id())
+                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        state.pointer_button(source, event.button_code(), event.state());
+                    }
+                    InputEvent::PointerMotion { event } => {
+                        if let Some(pointer) = state.seat.get_pointer() {
+                            state.pointer_motion_with_delta(
+                                pointer.current_location() + event.delta(),
+                                Some(event.delta()),
+                            );
+                        }
+                    }
+                    InputEvent::PointerMotionAbsolute { event } => {
+                        // EI absolute coordinates are logical already, not normalized pixels.
+                        state.pointer_motion((event.x(), event.y()).into());
+                    }
+                    InputEvent::PointerAxis { event } => {
+                        if let Some(pointer) = state.seat.get_pointer() {
+                            let mut frame = AxisFrame::new(event.time()).source(event.source());
+                            for axis in [Axis::Horizontal, Axis::Vertical] {
+                                if let Some(v120) = event.amount_v120(axis) {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    // Wheel notch counts are small integers in v120 units.
+                                    let (notches, scroll) = (v120 as i32, v120 * 15.0 / 120.0);
+                                    frame = frame.v120(axis, notches).value(axis, scroll);
+                                } else if let Some(amount) = event.amount(axis) {
+                                    frame = if amount == 0.0 {
+                                        frame.stop(axis)
+                                    } else {
+                                        frame.value(axis, amount)
+                                    };
+                                }
+                            }
+                            pointer.axis(state, frame);
+                            pointer.frame(state);
+                        }
+                    }
+                    // Any other event kind this seat adapter does not produce.
+                    InputEvent::GestureSwipeBegin { .. }
+                    | InputEvent::GestureSwipeUpdate { .. }
+                    | InputEvent::GestureSwipeEnd { .. }
+                    | InputEvent::GesturePinchBegin { .. }
+                    | InputEvent::GesturePinchUpdate { .. }
+                    | InputEvent::GesturePinchEnd { .. }
+                    | InputEvent::GestureHoldBegin { .. }
+                    | InputEvent::GestureHoldEnd { .. }
+                    | InputEvent::TouchDown { .. }
+                    | InputEvent::TouchMotion { .. }
+                    | InputEvent::TouchUp { .. }
+                    | InputEvent::TouchCancel { .. }
+                    | InputEvent::TouchFrame { .. }
+                    | InputEvent::TabletToolAxis { .. }
+                    | InputEvent::TabletToolProximity { .. }
+                    | InputEvent::TabletToolTip { .. }
+                    | InputEvent::TabletToolButton { .. }
+                    | InputEvent::SwitchToggle { .. }
+                    | InputEvent::Special(_) => {}
+                },
+                // No text or touch device is advertised by this seat adapter.
+                EiInputEvent::TextKeysym { .. } | EiInputEvent::TextUtf8 { .. } => {}
+            }
+        })
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(())
 }
 
