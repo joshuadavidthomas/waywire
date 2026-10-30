@@ -37,6 +37,12 @@ pub(super) struct Clipboard {
 }
 
 impl State {
+    pub(super) fn clipboard_active(&self) -> bool {
+        self.clipboard.pending_offer.is_some()
+            || self.clipboard.read.is_some()
+            || !self.clipboard.writes.is_empty()
+    }
+
     pub(super) fn clipboard_set(&mut self, text: &ClipboardText) {
         self.clipboard.pending_offer = None;
         self.clipboard.read = None;

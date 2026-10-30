@@ -77,6 +77,7 @@ impl CompositorHandler for State {
     }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.frame_pending = crate::FrameRequest::Pending;
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {

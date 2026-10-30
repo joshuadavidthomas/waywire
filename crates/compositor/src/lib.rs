@@ -132,6 +132,12 @@ pub struct Config {
     pub session: Vec<OsString>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameRequest {
+    Idle,
+    Pending,
+}
+
 #[expect(
     clippy::struct_field_names,
     reason = "Smithay protocol state names match their handler methods"
@@ -183,6 +189,7 @@ pub(crate) struct State {
     agent_input: pipe::AgentInput,
     browser_holds_input: bool,
     pub(crate) dirty: bool,
+    pub(crate) frame_pending: FrameRequest,
 }
 
 /// Advertise the globals whose server state `State` never needs to reach.
@@ -306,6 +313,7 @@ impl State {
             agent_input: pipe::AgentInput::default(),
             browser_holds_input: false,
             dirty: true,
+            frame_pending: FrameRequest::Pending,
         })
     }
 
@@ -841,7 +849,10 @@ impl State {
                 if p.generation == self.generation {
                     self.acknowledged = match p.state {
                         pipe::KeyframeState::Cached => Some(p.generation),
-                        pipe::KeyframeState::Missing => None,
+                        pipe::KeyframeState::Missing => {
+                            self.frame_pending = FrameRequest::Pending;
+                            None
+                        }
                     };
                 }
             }
@@ -983,6 +994,7 @@ impl State {
         capture::serve_pending(self, image);
         screencopy::serve_pending(self, image);
         self.dirty = false;
+        self.frame_pending = FrameRequest::Idle;
         for window in self.space.elements() {
             window.send_frame(
                 &self.output,
@@ -1124,6 +1136,7 @@ pub fn run(mut options: Config) -> Result<()> {
     };
     let mut tracker = OutputDamageTracker::from_output(&state.output);
     let mut next_frame = Instant::now();
+    let mut next_housekeeping = Instant::now() + Duration::from_secs(2);
     tracing::info!(socket = %socket_path.display(), "Wayland compositor ready");
     while state.running {
         if child.0.is_none()
@@ -1167,23 +1180,38 @@ pub fn run(mut options: Config) -> Result<()> {
             }
         }
         state.clipboard_tick();
-        if let Err(error) = event_loop.dispatch(
-            next_frame.saturating_duration_since(Instant::now()),
-            &mut state,
-        ) {
+        let now = Instant::now();
+        let mut deadline = next_housekeeping;
+        if state.dirty || state.frame_pending == FrameRequest::Pending {
+            deadline = deadline.min(next_frame);
+        }
+        if state.clipboard_active() {
+            deadline = deadline.min(now + Duration::from_millis(20));
+        }
+        if let Err(error) = event_loop.dispatch(deadline.saturating_duration_since(now), &mut state)
+        {
             state.fail(error.into());
         }
         state.space.refresh();
         crate::xwayland::sync_stacking(&mut state);
-        if Instant::now() >= next_frame {
+        if (state.dirty || state.frame_pending == FrameRequest::Pending)
+            && Instant::now() >= next_frame
+        {
+            let started = Instant::now();
             if let Err(error) = state.render(&mut renderer, &mut image.borrow_mut(), &mut tracker) {
                 state.fail(error);
             }
             next_frame = frame_deadline(
-                next_frame,
+                next_frame.max(started),
                 Instant::now(),
                 Duration::from_secs_f64(1.0 / f64::from(state.quality.fps.get())),
             );
+        }
+        if Instant::now() >= next_housekeeping {
+            next_housekeeping = Instant::now() + Duration::from_secs(2);
+            if state.acknowledged != Some(state.generation) {
+                state.frame_pending = FrameRequest::Pending;
+            }
         }
         if let Err(error) = state.display_handle.flush_clients() {
             state.fail(error.into());

@@ -129,7 +129,9 @@ pub(crate) fn start(
                     monitor_handle.remove(token);
                     state.fail(anyhow!("Xwayland disconnected"));
                     TimeoutAction::Drop
-                } else if state.xdisplay.is_none() && Instant::now() >= deadline {
+                } else if state.xdisplay.is_some() {
+                    TimeoutAction::Drop
+                } else if Instant::now() >= deadline {
                     monitor_handle.remove(token);
                     state.fail(anyhow!("Xwayland did not become ready within 10 seconds"));
                     TimeoutAction::Drop
