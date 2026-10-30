@@ -760,6 +760,7 @@ fn generation_change_and_stop_discard_spawn_retry_frame() {
             notifications: mpsc::sync_channel(1).1,
             notification_source: None,
             worker: None,
+            encoder: Encoder::X264,
         };
         submit_frame(&encoder, &frame(1, 1)).expect("test frame should be accepted by the encoder");
         let (slot, encoding) =
@@ -799,6 +800,7 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
         notifications: mpsc::sync_channel(1).1,
         notification_source: None,
         worker: None,
+        encoder: Encoder::X264,
     };
 
     let first = frame(1, 1);
@@ -897,6 +899,7 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
         notifications: mpsc::sync_channel(1).1,
         notification_source: None,
         worker: None,
+        encoder: Encoder::X264,
     };
 
     let current = frame(1, 1);
@@ -965,6 +968,7 @@ fn generation_changes_are_positive_checked_increments() {
         notifications: mpsc::sync_channel(1).1,
         notification_source: None,
         worker: None,
+        encoder: Encoder::X264,
     };
 
     assert!(matches!(
@@ -1018,6 +1022,7 @@ fn two_slot_storage_reallocates_for_a_larger_frame_then_stays_stable() {
         notifications: mpsc::sync_channel(1).1,
         notification_source: None,
         worker: None,
+        encoder: Encoder::X264,
     };
 
     for sequence in 1..=SLOT_COUNT as u64 {
@@ -1377,7 +1382,7 @@ fn worker_inherits_blocked_signal_and_child_resets_mask_before_exec() {
 
 #[test]
 fn ffmpeg_flags_match_the_rtp_contract() {
-    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
+    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17), Encoder::X264);
     assert!(args.windows(2).any(|pair| pair == ["-payload_type", "96"]));
     assert!(args.windows(2).any(|pair| pair == ["-ssrc", "17"]));
     assert!(args.windows(2).any(|pair| {
@@ -1396,7 +1401,7 @@ fn ffmpeg_flags_match_the_rtp_contract() {
 
 #[test]
 fn ffmpeg_uses_capped_crf_without_a_target_bitrate() {
-    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17));
+    let args = ffmpeg_args(5000, frame(1, 1).config, generation(17), Encoder::X264);
 
     assert!(args.windows(2).any(|pair| pair == ["-crf", "23"]));
     assert!(args.windows(2).any(|pair| pair == ["-maxrate", "8000k"]));
@@ -1405,11 +1410,104 @@ fn ffmpeg_uses_capped_crf_without_a_target_bitrate() {
 }
 
 #[test]
+fn openh264_arguments_use_bitrate_control_and_rtp_contract() {
+    let mut config = frame(1, 1).config;
+    config.chroma = Chroma::Yuv420;
+    let args = ffmpeg_args(5000, config, generation(17), Encoder::OpenH264);
+    assert_eq!(
+        args,
+        [
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-nostdin",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "bgra",
+            "-video_size",
+            "2x2",
+            "-framerate",
+            "60",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libopenh264",
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            "8000k",
+            "-maxrate",
+            "8000k",
+            "-rc_mode",
+            "bitrate",
+            "-allow_skip_frames",
+            "1",
+            "-g",
+            "15",
+            "-bf",
+            "0",
+            "-bsf:v",
+            "h264_metadata=aud=insert:video_full_range_flag=1:colour_primaries=1:transfer_characteristics=13:matrix_coefficients=1:level=5.2",
+            "-vf",
+            "scale=2:2:out_color_matrix=bt709:out_range=pc",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "iec61966-2-1",
+            "-color_range",
+            "pc",
+            "-payload_type",
+            "96",
+            "-ssrc",
+            "17",
+            "-rtpflags",
+            "skip_rtcp",
+            "-f",
+            "rtp",
+            "rtp://127.0.0.1:5000?pkt_size=60000",
+        ]
+    );
+}
+
+#[test]
+fn encoder_reports_the_chroma_it_can_encode() {
+    for (selected, requested, expected) in [
+        (Encoder::OpenH264, Chroma::Yuv444, Chroma::Yuv420),
+        (Encoder::OpenH264, Chroma::Rgb, Chroma::Yuv420),
+        (Encoder::X264WithoutRgb, Chroma::Rgb, Chroma::Yuv444),
+        (Encoder::X264, Chroma::Rgb, Chroma::Rgb),
+    ] {
+        let shared = shared();
+        let encoder = VideoEncoder {
+            shared: Arc::clone(&shared),
+            notifications: mpsc::sync_channel(1).1,
+            notification_source: None,
+            worker: None,
+            encoder: selected,
+        };
+        let mut input = frame(1, 1);
+        input.config.chroma = requested;
+        input.metadata.chroma = requested;
+        submit_frame(&encoder, &input).expect("frame accepted");
+        let (slot, queued) = take_pending_frame(&shared).expect("frame queued");
+        assert_eq!(queued.config.chroma, expected);
+        assert_eq!(queued.metadata.chroma, expected);
+        release_slot(&shared, slot, queued);
+    }
+}
+
+#[test]
 fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
     for (rate, interval) in [(60, 15), (30, 8), (10, 3)] {
         let mut config = frame(1, 1).config;
         config.fps = fps(rate);
-        let args = ffmpeg_args(5000, config, generation(17));
+        let args = ffmpeg_args(5000, config, generation(17), Encoder::X264);
         for (flag, value) in [
             ("-framerate", rate),
             ("-g", interval),
@@ -1429,7 +1527,7 @@ fn ffmpeg_converts_and_tags_desktop_srgb_for_each_chroma_choice() {
     for chroma in [Chroma::Yuv444, Chroma::Yuv420] {
         let mut config = frame(1, 1).config;
         config.chroma = chroma;
-        let args = ffmpeg_args(5000, config, generation(17));
+        let args = ffmpeg_args(5000, config, generation(17), Encoder::X264);
         for pair in [
             ["-profile:v", chroma.h264_profile().ffmpeg_profile()],
             ["-pix_fmt", chroma.ffmpeg_pixel_format()],
@@ -1450,7 +1548,7 @@ fn ffmpeg_rgb_preserves_components_at_full_and_reduced_size() {
         let mut config = real_frame(1, 1).config;
         config.chroma = Chroma::Rgb;
         config.encoded_width = dimension(width);
-        let args = ffmpeg_args(5000, config, generation(17));
+        let args = ffmpeg_args(5000, config, generation(17), Encoder::X264);
         for pair in [
             ["-pixel_format", "bgr0"],
             ["-c:v", "libx264rgb"],
@@ -1662,6 +1760,7 @@ fn ffmpeg_stdin_has_one_mib_capacity() {
             .port(),
         real_frame(1, 1).config,
         generation(1),
+        Encoder::X264,
     )
     .expect("FFmpeg test process should start");
     let capacity = fcntl(&process.input, FcntlArg::F_GETPIPE_SZ)

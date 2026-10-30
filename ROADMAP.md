@@ -156,8 +156,8 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   `ConnectToEIS`. `tools/portal-driver-probe.py` repeats this diagnostic; it
   is not a takeover acceptance test. On Fedora 42, Anthropic's computer tool
   and packaged xdotool typed a command into xterm, and grim captured it. The
-  packaged `ffmpeg-free` lacks libx264, so the gateway could not stream and
-  restarted; the X11 takeover and handback scenario remains unverified.
+  packaged `ffmpeg-free` lacks libx264, but the OpenH264 fallback no longer
+  blocks streaming; the X11 takeover and handback scenario remains unverified.
   Neither complete acceptance scenario has passed.
 
 Add a settled-frame signal or a custom endpoint only when a measured gap in

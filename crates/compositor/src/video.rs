@@ -30,7 +30,9 @@ use nix::sys::signal::SigSet;
 use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
 use thiserror::Error;
+use tracing::debug;
 use tracing::error;
+use tracing::info;
 use waywire_protocol::pipe::Chroma;
 use waywire_protocol::pipe::Crf;
 use waywire_protocol::pipe::Fps;
@@ -58,6 +60,48 @@ const MAX_CONSECUTIVE_SPAWN_FAILURES: u8 = 6;
 // consecutive-failure bound, alongside failed spawns, so an FFmpeg crash loop
 // becomes fatal instead of restarting forever.
 const CRASH_WINDOW: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encoder {
+    X264,
+    X264WithoutRgb,
+    OpenH264,
+}
+
+fn probe_encoder(ffmpeg: &str) -> Result<Encoder, VideoError> {
+    let mut command = Command::new(ffmpeg);
+    command.args(["-hide_banner", "-encoders"]);
+    reset_signal_mask_before_exec(&mut command);
+    let output = command.output().map_err(VideoError::Probe)?;
+    if !output.status.success() {
+        return Err(VideoError::Probe(io::Error::other(format!(
+            "ffmpeg encoder probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))));
+    }
+    let encoders = String::from_utf8_lossy(&output.stdout);
+    let has = |name| {
+        encoders
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(name))
+    };
+    let encoder = if has("libx264") {
+        if has("libx264rgb") {
+            Encoder::X264
+        } else {
+            Encoder::X264WithoutRgb
+        }
+    } else if has("libopenh264") {
+        Encoder::OpenH264
+    } else {
+        return Err(VideoError::NoEncoder);
+    };
+    info!(?encoder, "selected video encoder");
+    if encoder == Encoder::OpenH264 {
+        debug!("libopenh264 ignores CRF and x264 presets; bitrate controls quality");
+    }
+    Ok(encoder)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EncoderConfig {
@@ -160,6 +204,10 @@ pub(crate) enum VideoError {
     Stopped,
     #[error("video frame pool exhausted")]
     PoolExhausted,
+    #[error("could not probe FFmpeg encoders: {0}")]
+    Probe(#[source] io::Error),
+    #[error("FFmpeg provides neither libx264 nor libopenh264")]
+    NoEncoder,
     #[error("could not start video worker: {0}")]
     SpawnThread(#[from] io::Error),
 }
@@ -191,17 +239,34 @@ pub(crate) struct VideoEncoder {
     notifications: mpsc::Receiver<Notification>,
     notification_source: Option<PingSource>,
     worker: Option<thread::JoinHandle<()>>,
+    encoder: Encoder,
 }
 
 impl VideoEncoder {
-    pub(crate) fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Result<Self, VideoError> {
         Self::start_with_spawner(
+            String::new(),
+            0,
+            RESTART_DELAY_MIN,
+            RESTART_DELAY_MAX,
+            |_, _, _, _| Err(io::Error::other("idle test encoder")),
+        )
+    }
+
+    pub(crate) fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
+        let encoder = probe_encoder(&ffmpeg)?;
+        let mut video = Self::start_with_spawner(
             ffmpeg,
             rtp_port,
             RESTART_DELAY_MIN,
             RESTART_DELAY_MAX,
-            spawn_ffmpeg,
-        )
+            move |ffmpeg, port, config, generation| {
+                spawn_ffmpeg(ffmpeg, port, config, generation, encoder)
+            },
+        )?;
+        video.encoder = encoder;
+        Ok(video)
     }
 
     fn start_with_spawner<F>(
@@ -264,11 +329,19 @@ impl VideoEncoder {
             notifications,
             notification_source: Some(notification_source),
             worker: Some(worker),
+            encoder: Encoder::X264,
         })
     }
 
-    pub(crate) fn submit(&self, frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
+    pub(crate) fn submit(&self, mut frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
         frame.validate()?;
+        if self.encoder == Encoder::OpenH264 {
+            frame.config.chroma = Chroma::Yuv420;
+            frame.metadata.chroma = Chroma::Yuv420;
+        } else if self.encoder == Encoder::X264WithoutRgb && frame.config.chroma == Chroma::Rgb {
+            frame.config.chroma = Chroma::Yuv444;
+            frame.metadata.chroma = Chroma::Yuv444;
+        }
         let mut pool = self
             .shared
             .pool
@@ -1026,10 +1099,11 @@ fn spawn_ffmpeg(
     rtp_port: u16,
     config: EncoderConfig,
     generation: Generation,
+    encoder: Encoder,
 ) -> io::Result<EncoderProcess> {
     // The local RTP contract uses SSRC as the frame generation. The gateway
     // can correlate reordered replacement traffic by identity.
-    let args = ffmpeg_args(rtp_port, config, generation);
+    let args = ffmpeg_args(rtp_port, config, generation, encoder);
     let mut command = Command::new(ffmpeg);
     command
         .args(args)
@@ -1079,7 +1153,16 @@ fn reset_signal_mask_before_exec(command: &mut Command) {
     }
 }
 
-fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> Vec<String> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "both encoder variants share the same input and RTP output"
+)]
+fn ffmpeg_args(
+    rtp_port: u16,
+    config: EncoderConfig,
+    generation: Generation,
+    encoder: Encoder,
+) -> Vec<String> {
     let rate = config.fps.get().to_string();
     let keyframe_interval = config.fps.keyframe_interval().to_string();
     let bitrate_ceiling = format!("{}k", config.bitrate_kbps.get());
@@ -1087,7 +1170,7 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
     let profile = config.chroma.h264_profile();
     let rgb = config.chroma == Chroma::Rgb;
     let matrix = if rgb { "gbr" } else { "bt709" };
-    vec![
+    let mut args = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "warning".into(),
@@ -1104,38 +1187,57 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "-i".into(),
         "pipe:0".into(),
         "-an".into(),
-        "-c:v".into(),
-        if rgb { "libx264rgb" } else { "libx264" }.into(),
-        "-preset".into(),
-        if rgb { "ultrafast" } else { "superfast" }.into(),
-        "-tune".into(),
-        "zerolatency".into(),
-        "-profile:v".into(),
-        profile.ffmpeg_profile().into(),
-        "-level:v".into(),
-        profile.ffmpeg_level(),
-        "-pix_fmt".into(),
-        config.chroma.ffmpeg_pixel_format().into(),
-        "-crf".into(),
-        config.crf.get().to_string(),
-        "-maxrate".into(),
-        bitrate_ceiling,
-        "-bufsize".into(),
-        buffer,
-        "-g".into(),
-        keyframe_interval.clone(),
-        "-keyint_min".into(),
-        keyframe_interval,
-        "-sc_threshold".into(),
-        "0".into(),
-        "-bf".into(),
-        "0".into(),
-        "-x264-params".into(),
-        // Write the desktop color contract into the H.264 VUI explicitly;
-        // FFmpeg's frame metadata alone does not reach the SPS in every build.
-        format!(
-            "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
-        ),
+    ];
+    if matches!(encoder, Encoder::X264 | Encoder::X264WithoutRgb) {
+        args.extend([
+            "-c:v".into(),
+            if rgb { "libx264rgb" } else { "libx264" }.into(),
+            "-preset".into(),
+            if rgb { "ultrafast" } else { "superfast" }.into(),
+            "-tune".into(),
+            "zerolatency".into(),
+            "-profile:v".into(),
+            profile.ffmpeg_profile().into(),
+            "-level:v".into(),
+            profile.ffmpeg_level(),
+            "-pix_fmt".into(),
+            config.chroma.ffmpeg_pixel_format().into(),
+            "-crf".into(),
+            config.crf.get().to_string(),
+            "-maxrate".into(),
+            bitrate_ceiling,
+            "-bufsize".into(),
+            buffer,
+            "-g".into(),
+            keyframe_interval.clone(),
+            "-keyint_min".into(),
+            keyframe_interval,
+            "-sc_threshold".into(),
+            "0".into(),
+            "-bf".into(),
+            "0".into(),
+            "-x264-params".into(),
+            // Write the desktop color contract into the H.264 VUI explicitly;
+            // FFmpeg's frame metadata alone does not reach the SPS in every build.
+            format!(
+                "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
+            ),
+        ]);
+    } else {
+        args.extend([
+            "-c:v".into(), "libopenh264".into(),
+            "-profile:v".into(), "high".into(),
+            "-pix_fmt".into(), "yuv420p".into(),
+            "-b:v".into(), bitrate_ceiling.clone(),
+            "-maxrate".into(), bitrate_ceiling,
+            "-rc_mode".into(), "bitrate".into(),
+            "-allow_skip_frames".into(), "1".into(),
+            "-g".into(), keyframe_interval,
+            "-bf".into(), "0".into(),
+            "-bsf:v".into(), "h264_metadata=aud=insert:video_full_range_flag=1:colour_primaries=1:transfer_characteristics=13:matrix_coefficients=1:level=5.2".into(),
+        ]);
+    }
+    args.extend([
         "-vf".into(),
         // Equal-size RGB is a no-op; reduced output still uses packed RGB scaling.
         if rgb {
@@ -1169,7 +1271,8 @@ fn ffmpeg_args(rtp_port: u16, config: EncoderConfig, generation: Generation) -> 
         "-f".into(),
         "rtp".into(),
         format!("rtp://127.0.0.1:{rtp_port}?pkt_size=60000"),
-    ]
+    ]);
+    args
 }
 
 #[derive(Debug, Error)]

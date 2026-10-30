@@ -1256,7 +1256,7 @@ mod tests {
             resolution: FrameSize::new(1920, 1080).expect("test resolution"),
             session: Vec::new(),
         };
-        let video = VideoEncoder::start(String::new(), 0).expect("idle encoder");
+        let video = VideoEncoder::idle_for_test().expect("idle encoder");
         let mut state = State::new(display.handle(), &options, EventSink::for_test(), video)
             .expect("test compositor");
         state.video.take().expect("new encoder").stop();
