@@ -640,36 +640,36 @@ test("releasing Meta releases keys whose keyup macOS never delivered", async () 
   try {
     canvas.dispatch("keydown", keyEvent({ code: "KeyA" }));
     canvas.dispatch("keydown", keyEvent({ code: "MetaLeft" }));
-    canvas.dispatch("keydown", keyEvent({ code: "KeyC", metaKey: true }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyB", metaKey: true }));
     assert.deepEqual(keyboardRecords(control), [
       { key: 30, state: 1 },
       { key: 125, state: 1 },
-      { key: 46, state: 1 },
+      { key: 48, state: 1 },
     ]);
 
     canvas.dispatch("keyup", keyEvent({ code: "MetaLeft" }));
     assert.deepEqual(keyboardRecords(control), [
       { key: 30, state: 1 },
       { key: 125, state: 1 },
-      { key: 46, state: 1 },
+      { key: 48, state: 1 },
       { key: 125, state: 0 },
       { key: 30, state: 0 },
-      { key: 46, state: 0 },
+      { key: 48, state: 0 },
     ]);
 
     // A late keyup for an already released key sends nothing.
-    canvas.dispatch("keyup", keyEvent({ code: "KeyC" }));
+    canvas.dispatch("keyup", keyEvent({ code: "KeyB" }));
     assert.equal(keyboardRecords(control).length, 6);
 
     // Modifier keyup events may also be lost while Meta is held.
     canvas.dispatch("keydown", keyEvent({ code: "ShiftLeft" }));
-    canvas.dispatch("keydown", keyEvent({ code: "KeyZ", metaKey: true }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyB", metaKey: true }));
     canvas.dispatch("keyup", keyEvent({ code: "MetaRight" }));
     assert.deepEqual(keyboardRecords(control).slice(-4), [
       { key: 42, state: 1 },
-      { key: 44, state: 1 },
+      { key: 48, state: 1 },
       { key: 42, state: 0 },
-      { key: 44, state: 0 },
+      { key: 48, state: 0 },
     ]);
   } finally {
     await session.dispose();
@@ -690,6 +690,33 @@ test("releasing Meta on other platforms does not release held keys", async () =>
     ]);
     canvas.dispatch("keyup", keyEvent({ code: "KeyC" }));
     assert.deepEqual(keyboardRecords(control).at(-1), { key: 46, state: 0 });
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("macOS editing shortcuts use Ctrl while other Cmd shortcuts use Super", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  installGlobal("navigator", { platform: "MacIntel" });
+  try {
+    canvas.dispatch("keydown", keyEvent({ code: "MetaLeft" }));
+    canvas.dispatch("keydown", keyEvent({ code: "KeyA", metaKey: true }));
+    canvas.dispatch("keyup", keyEvent({ code: "KeyA", metaKey: true }));
+    canvas.dispatch("keydown", keyEvent({ code: "Tab", metaKey: true }));
+    canvas.dispatch("keyup", keyEvent({ code: "Tab", metaKey: true }));
+    canvas.dispatch("keyup", keyEvent({ code: "MetaLeft" }));
+    assert.deepEqual(keyboardRecords(control), [
+      { key: 125, state: 1 },
+      { key: 125, state: 0 },
+      { key: 29, state: 1 },
+      { key: 30, state: 1 },
+      { key: 30, state: 0 },
+      { key: 29, state: 0 },
+      { key: 125, state: 1 },
+      { key: 15, state: 1 },
+      { key: 15, state: 0 },
+      { key: 125, state: 0 },
+    ]);
   } finally {
     await session.dispose();
   }
@@ -752,6 +779,7 @@ test("Cmd+Shift+C taps Ctrl instead of Super and lifts the held Meta", async () 
 test("Cmd+V taps Ctrl instead of Super after sending the local clipboard", async () => {
   const { canvas, session, control } = await keyboardFixture();
   installGlobal("navigator", {
+    platform: "MacIntel",
     clipboard: { readText: () => Promise.resolve("local text") },
   });
   try {

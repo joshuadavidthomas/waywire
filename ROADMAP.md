@@ -317,9 +317,9 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 ## 5. Input fidelity
 
-- **Medium:** Cmd+V on macOS sends Super+V. IME, emoji and mobile-keyboard text
-  is dropped in apps without text-input-v3, including all X11 apps. Dead keys
-  may produce double input. _(hypothesis)_
+- **Medium:** IME, emoji and mobile-keyboard text is dropped in apps without
+  text-input-v3, including all X11 apps. Dead keys may produce double input.
+  _(hypothesis)_
 - **Medium:** pointer locks and confines are not enforced. Both globals exist
   and relative motion reaches clients (EIS and the viewer's pointer lock), but
   `pointer_motion_with_delta` (`crates/compositor/src/lib.rs`) moves the

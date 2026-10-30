@@ -584,6 +584,16 @@ export class InputRuntime {
       event.stopPropagation();
       return;
     }
+    if (
+      navigator.platform?.startsWith("Mac") &&
+      event.metaKey &&
+      ["KeyC", "KeyX", "KeyA", "KeyZ"].includes(event.code)
+    ) {
+      this.tapClipboardShortcut(key, event);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (!this.pressedKeys.has(key)) {
       this.pressedKeys.add(key);
       this.owner.sendRecord(
