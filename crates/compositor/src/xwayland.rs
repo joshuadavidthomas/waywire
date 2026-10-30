@@ -1,5 +1,6 @@
 //! Rootless software Xwayland and its small floating-window manager.
 use std::cell::RefCell;
+use std::fmt::Write;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::process::Stdio;
@@ -16,6 +17,11 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::calloop::timer::TimeoutAction;
 use smithay::reexports::calloop::timer::Timer;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::x11rb;
+use smithay::reexports::x11rb::connection::Connection;
+use smithay::reexports::x11rb::protocol::xproto::AtomEnum;
+use smithay::reexports::x11rb::protocol::xproto::ConnectionExt;
+use smithay::reexports::x11rb::protocol::xproto::PropMode;
 use smithay::utils::Logical;
 use smithay::utils::Rectangle;
 use smithay::wayland::selection::SelectionTarget;
@@ -94,6 +100,7 @@ pub(crate) fn start(
         tracing::warn!(%error, "could not restore signals after Xwayland spawn");
     }
     let (xwayland, client) = spawned?;
+    state.xwayland_client = Some(client.clone());
     let ready_handle = handle.clone();
     let ready_client = client.clone();
     let token = handle.insert_source(xwayland, move |event, (), state| match event {
@@ -110,6 +117,9 @@ pub(crate) fn start(
                 Ok(wm) => {
                     state.xwm = Some(wm);
                     state.xdisplay = Some(display_number);
+                    if let Err(error) = update_scale(state) {
+                        state.fail(error.context("configure Xwayland scale"));
+                    }
                     tracing::info!(display_number, "Xwayland ready");
                 }
                 Err(error) => state.fail(anyhow!("Xwayland WM startup: {error}")),
@@ -141,6 +151,88 @@ pub(crate) fn start(
             },
         )
         .map_err(|error| anyhow!(error.to_string()))?;
+    Ok(())
+}
+
+fn update_resources(display: u32, scale: f64) -> Result<()> {
+    let (connection, screen) = x11rb::connect(Some(&format!(":{display}")))?;
+    let root = connection.setup().roots[screen].root;
+    let property = AtomEnum::RESOURCE_MANAGER;
+    let reply = connection
+        .get_property(false, root, property, AtomEnum::STRING, 0, u32::MAX)?
+        .reply()?;
+    let old = String::from_utf8_lossy(&reply.value);
+    let mut resources = old
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("Xft.dpi:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !resources.is_empty() {
+        resources.push('\n');
+    }
+    writeln!(resources, "Xft.dpi:\t{}", 96.0 * scale)?;
+    connection
+        .change_property(
+            PropMode::REPLACE,
+            root,
+            property,
+            AtomEnum::STRING,
+            8,
+            resources.len().try_into()?,
+            resources.as_bytes(),
+        )?
+        .check()?;
+    connection.flush()?;
+    Ok(())
+}
+
+pub(crate) fn update_scale(state: &mut State) -> Result<()> {
+    let (Some(client), Some(display), Some(xwm)) =
+        (&state.xwayland_client, state.xdisplay, &mut state.xwm)
+    else {
+        return Ok(());
+    };
+    // Match cosmic-comp's fractional descaling: retain 1.5 rather than rounding
+    // Xwayland to 2, so X11 coordinates and toolkit DPI use the output scale.
+    let scale = state.output.current_scale().fractional_scale().max(1.0);
+    let geometries = state
+        .space
+        .elements()
+        .filter_map(Window::x11_surface)
+        .map(|surface| (surface.clone(), surface.last_configure()))
+        .collect::<Vec<_>>();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "output scale and DPI are bounded"
+    )]
+    let settings = [
+        ("Xft/DPI".into(), (scale * 96.0 * 1024.0).round() as i32),
+        ("Gdk/WindowScalingFactor".into(), scale.floor() as i32),
+        (
+            "Gdk/UnscaledDPI".into(),
+            (96.0 * 1024.0 * (1.0 + scale.fract() / scale.floor())).round() as i32,
+        ),
+    ];
+    xwm.set_xsettings(
+        settings
+            .into_iter()
+            .map(|(name, value)| (name, value.into())),
+    )?;
+    update_resources(display, scale)?;
+    let data = client
+        .get_data::<smithay::xwayland::XWaylandClientData>()
+        .ok_or_else(|| anyhow!("missing Xwayland client data"))?;
+    if data.compositor_state.client_scale().to_bits() == scale.to_bits() {
+        return Ok(());
+    }
+    data.compositor_state.set_client_scale(scale);
+    state.output.change_current_state(None, None, None, None);
+    for (surface, geometry) in geometries {
+        if !surface.is_override_redirect() {
+            surface.configure(geometry)?;
+        }
+    }
+    state.x11_stacking = None;
     Ok(())
 }
 

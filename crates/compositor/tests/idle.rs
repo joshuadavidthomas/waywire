@@ -17,6 +17,8 @@ use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use waywire_protocol::Decoder;
 use waywire_protocol::Record;
+use waywire_protocol::pipe::Button;
+use waywire_protocol::pipe::ButtonState;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::FrameSize;
@@ -28,6 +30,7 @@ use waywire_protocol::pipe::KeyboardKey;
 use waywire_protocol::pipe::KeyframeReadiness;
 use waywire_protocol::pipe::KeyframeState;
 use waywire_protocol::pipe::PointerAbsolute;
+use waywire_protocol::pipe::PointerButton;
 use waywire_protocol::pipe::PointerCoordinate;
 use waywire_protocol::pipe::RequestId;
 use waywire_protocol::pipe::Resize;
@@ -438,14 +441,29 @@ fn composed_text_reaches_x11_client() {
 
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn xwayland_relative_warp_moves_the_compositor_pointer() {
+    xwayland_pointer_at_scale(120);
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn xwayland_click_and_relative_warp_match_at_double_scale() {
+    xwayland_pointer_at_scale(240);
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the X11 session and pointer assertions form one integration scenario"
 )]
-fn xwayland_relative_warp_moves_the_compositor_pointer() {
+#[expect(
+    clippy::expect_used,
+    reason = "integration test helper requires live clients"
+)]
+fn xwayland_pointer_at_scale(scale: u16) {
     let runtime = tempfile::tempdir().expect("runtime");
     let script = runtime.path().join("client.py");
     let ready = runtime.path().join("ready");
+    let click = runtime.path().join("click");
     fs::write(
         &script,
         format!(
@@ -454,6 +472,7 @@ import ctypes, tkinter as tk
 root = tk.Tk()
 root.title('waywire-warp-test')
 root.geometry('400x300')
+root.bind('<Button-1>', lambda e: open('{}', 'w').write(str(e.x) + ' ' + str(e.y)))
 root.update()
 x11 = ctypes.CDLL('libX11.so.6')
 fixes = ctypes.CDLL('libXfixes.so.3')
@@ -467,6 +486,7 @@ x11.XFlush(d)
 open('{}', 'w').write(str(__import__('os').getpid()))
 root.mainloop()
 ",
+            click.display(),
             ready.display()
         ),
     )
@@ -492,6 +512,31 @@ root.mainloop()
         assert!(Instant::now() < deadline, "client did not start");
         thread::sleep(Duration::from_millis(20));
     }
+    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
+    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
+    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
+    let mut decoder = Decoder::<Event>::new();
+    let resize = Command::Resize(Resize {
+        size: FrameSize::new(800, 600).expect("size"),
+        scale_v120: ScaleV120::new(scale).expect("scale"),
+        request_id: RequestId::new(1).expect("request"),
+    });
+    compositor
+        .0
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(&resize.encode())
+        .expect("resize");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !events(&mut compositor.0, &mut decoder)
+        .iter()
+        .any(|event| matches!(event, Event::ResizeApplied(_)))
+    {
+        assert!(Instant::now() < deadline, "resize not applied");
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(300));
     let pid = fs::read_to_string(&ready).expect("client pid");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("client environment");
     let display = environ
@@ -520,10 +565,6 @@ root.mainloop()
             .expect("number")
     };
     let (x, y) = (value("X=") + 100, value("Y=") + 100);
-    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
-    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
-    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
-    let mut decoder = Decoder::<Event>::new();
     let command = Command::PointerAbsolute(PointerAbsolute {
         x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
         y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
@@ -548,6 +589,35 @@ root.mainloop()
         thread::sleep(Duration::from_millis(10));
     }
     thread::sleep(Duration::from_millis(300));
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        let command = Command::PointerButton(PointerButton {
+            button: Button::Left,
+            state,
+            sequence: InputSequence::new(2).expect("sequence"),
+        });
+        compositor
+            .0
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(&command.encode())
+            .expect("click");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !click.exists() {
+        assert!(Instant::now() < deadline, "click did not reach X11 client");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let coordinates = fs::read_to_string(&click).expect("click coordinates");
+    let coordinates: Vec<i32> = coordinates
+        .split_whitespace()
+        .map(|v| v.parse().expect("coordinate"))
+        .collect();
+    assert_eq!(coordinates.len(), 2);
+    assert!(
+        (95..=105).contains(&coordinates[0]) && (95..=105).contains(&coordinates[1]),
+        "wrong click coordinates: {coordinates:?}"
+    );
     events(&mut compositor.0, &mut decoder);
     let moved = xdotool(&["mousemove_relative", "--", "20", "0"]);
     assert!(moved.status.success(), "xdotool failed");
@@ -561,4 +631,74 @@ root.mainloop()
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland and xprop"]
+fn xwayland_resource_dpi_tracks_output_scale() {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let ready = runtime.path().join("display");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                "printf '%s' \"$DISPLAY\" > \"$0\"; exec sleep 30",
+            ])
+            .arg(&ready)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "session did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let display = fs::read_to_string(ready).expect("display");
+    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
+    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
+    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
+    let mut decoder = Decoder::<Event>::new();
+    let resize = Command::Resize(Resize {
+        size: FrameSize::new(800, 600).expect("size"),
+        scale_v120: ScaleV120::new(240).expect("scale"),
+        request_id: RequestId::new(1).expect("request"),
+    });
+    compositor
+        .0
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(&resize.encode())
+        .expect("resize");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if events(&mut compositor.0, &mut decoder)
+            .iter()
+            .any(|event| matches!(event, Event::ResizeApplied(_)))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "resize not applied");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = ProcessCommand::new("xprop")
+        .env("DISPLAY", display)
+        .args(["-root", "RESOURCE_MANAGER"])
+        .output()
+        .expect("xprop");
+    let resources = String::from_utf8(output.stdout).expect("resource text");
+    assert!(
+        resources.contains("Xft.dpi:\\t192"),
+        "missing 2x DPI: {resources}"
+    );
 }

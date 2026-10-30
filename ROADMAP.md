@@ -336,8 +336,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 ## 6. Sharpness and scale
 
-- **Medium:** Xwayland never gets a client scale or XSETTINGS, so every X11 app
-  is drawn at 1× and stretched.
 - **Medium:** custom cursor surfaces, used by all X11 and SDL apps, fall back to
   a plain arrow.
 - **Low:** the output keeps advertising the old refresh rate after an FPS

@@ -171,6 +171,7 @@ pub(crate) struct State {
     /// which also flushes requests such as `new_selection` that do not flush.
     pub(crate) x11_stacking: Option<Vec<u32>>,
     pub(crate) xdisplay: Option<u32>,
+    pub(crate) xwayland_client: Option<smithay::reexports::wayland_server::Client>,
     pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
     pub(crate) virtual_pointers: HashMap<VirtualPointerDevice, KeyboardSource>,
@@ -297,6 +298,7 @@ impl State {
             xwm: None,
             x11_stacking: None,
             xdisplay: None,
+            xwayland_client: None,
             xwayland_shell_state,
             eis_seats: HashMap::new(),
             virtual_pointers: HashMap::new(),
@@ -1031,6 +1033,7 @@ impl State {
                 );
                 self.output.set_preferred(mode);
                 self.space.map_output(&self.output, (0, 0));
+                crate::xwayland::update_scale(self)?;
                 self.output_resized();
                 self.capture.output_resized();
                 crate::eis::refresh_regions(self);
