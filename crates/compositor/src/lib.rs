@@ -1107,6 +1107,9 @@ pub fn run(mut options: Config) -> Result<()> {
             .extend(std::env::var_os("WAYWIRE_SESSION").filter(|v| !v.is_empty()));
     }
     let mut child = Session(None);
+    if let Some(pid) = bus.as_ref().and_then(session_bus::SessionBus::pid) {
+        wake_on_exit(&handle, pid)?;
+    }
     let mut renderer = PixmanRenderer::new()?;
     // The portal backends read the most recently rendered frame from the
     // calloop loop, which is the only writer.
@@ -1175,7 +1178,12 @@ pub fn run(mut options: Config) -> Result<()> {
                 });
             }
             match command.spawn() {
-                Ok(process) => child.0 = Some(process),
+                Ok(process) => {
+                    if let Err(error) = wake_on_exit(&handle, process.id()) {
+                        state.fail(error);
+                    }
+                    child.0 = Some(process);
+                }
                 Err(error) => state.fail(error.into()),
             }
         }
@@ -1259,6 +1267,30 @@ fn normalized_coordinate(pixel: f64, extent: u32) -> pipe::PointerCoordinate {
             .clamp(0.0, 65535.0) as u32,
     )
     .expect("clamped cursor coordinate")
+}
+
+/// Open a pidfd, which becomes readable when the process exits.
+pub(crate) fn pidfd(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
+    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = i32::try_from(fd).map_err(std::io::Error::other)?;
+    // SAFETY: the successful syscall returned a new descriptor we now own.
+    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+}
+
+/// Wake the event loop once `pid` exits so the checks after dispatch see it
+/// immediately instead of at the next housekeeping deadline.
+fn wake_on_exit(handle: &calloop::LoopHandle<'static, State>, pid: u32) -> Result<()> {
+    handle
+        .insert_source(
+            Generic::new(pidfd(pid)?, Interest::READ, Mode::Level),
+            |_, _, _| Ok(PostAction::Remove),
+        )
+        .map_err(|error| anyhow!("watch child exit: {error}"))?;
+    Ok(())
 }
 
 struct Session(Option<Child>);

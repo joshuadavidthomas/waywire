@@ -2,8 +2,6 @@ use std::io;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
-use std::os::fd::FromRawFd;
-use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::process::Child;
 use std::process::ChildStdin;
@@ -1114,14 +1112,7 @@ fn watch_process(
 }
 
 fn watch_child(shared: Arc<Shared>, wake: Ping, pid: u32) -> io::Result<()> {
-    // SAFETY: pidfd_open accepts a PID and flags and returns a new descriptor.
-    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = i32::try_from(fd).map_err(io::Error::other)?;
-    // SAFETY: the successful syscall returned a new owned descriptor.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = crate::pidfd(pid)?;
     thread::Builder::new()
         .name("ffmpeg-exit".into())
         .spawn(move || {

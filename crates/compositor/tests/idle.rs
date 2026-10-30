@@ -144,3 +144,45 @@ fn idle_compositor_stops_rendering_and_emitting_frames() {
         "idle compositor emitted a frame"
     );
 }
+
+#[test]
+#[ignore = "requires FFmpeg and a working Xwayland on PATH"]
+fn compositor_exits_promptly_when_the_session_program_exits() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let marker = runtime.path().join("exited");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "640x360", "--"])
+            .args(["sh", "-c", "sleep 0.5; touch \"$0\""])
+            .arg(&marker)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "session program did not run");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let exited = Instant::now();
+    while compositor
+        .0
+        .try_wait()
+        .expect("compositor status")
+        .is_none()
+    {
+        assert!(
+            exited.elapsed() < Duration::from_millis(500),
+            "compositor still running {:?} after its session program exited",
+            exited.elapsed()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}

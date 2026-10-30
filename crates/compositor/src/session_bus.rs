@@ -79,6 +79,11 @@ impl SessionBus {
         })
     }
 
+    /// The daemon's PID while it is running.
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     /// Address portal clients and activated services must connect to.
     pub(crate) fn address(&self) -> &str {
         &self.address
