@@ -8,6 +8,7 @@ mod event_writer;
 mod focus;
 mod grabs;
 mod pointer_warp;
+mod screencopy;
 mod shell;
 mod video;
 mod virtual_pointer;
@@ -141,6 +142,7 @@ pub(crate) struct State {
     pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
     capture: capture::Capture,
+    screencopy: screencopy::Screencopy,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     decoration_press: Option<(KeyboardSource, Window)>,
@@ -224,6 +226,7 @@ impl State {
         let mut space = Space::default();
         space.map_output(&output, (0, 0));
         let capture = capture::Capture::new(&display_handle);
+        let screencopy = screencopy::Screencopy::new(&display_handle);
         Ok(Self {
             display_handle,
             space,
@@ -240,6 +243,7 @@ impl State {
             xwayland_shell_state,
             eis_seats: HashMap::new(),
             capture,
+            screencopy,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
             decoration_press: None,
@@ -772,6 +776,7 @@ impl State {
             }
         }
         capture::serve_pending(self, image);
+        screencopy::serve_pending(self, image);
         self.dirty = false;
         for window in self.space.elements() {
             window.send_frame(

@@ -145,78 +145,97 @@ pub(crate) fn serve_pending(state: &mut State, image: &Image<'static, 'static>) 
     if state.capture.pending.is_empty() {
         return;
     }
-    let width = image.width();
-    let height = image.height();
-    let stride = image.stride();
-    // SAFETY: create_buffer owns and initializes the complete image storage;
-    // the renderer's exclusive target borrow has ended before this read.
-    let data = unsafe { image.data() };
-    // SAFETY: stride * height covers this live image's allocation.
-    let pixels = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), stride * height) };
+    let pixels = image_pixels(image);
     let presented = monotonic();
+    let region = (0, 0, image.width(), image.height());
     for frame in std::mem::take(&mut state.capture.pending) {
         let buffer = frame.buffer();
         let copied = with_buffer_contents_mut(&buffer, |pool, pool_len, shm| {
-            copy_pixels(pool, pool_len, shm, pixels, width, height, stride)
+            copy_pixels(pool, pool_len, shm, pixels, image.stride(), region)
         });
         match copied {
             Ok(Ok(())) => {
                 // Without damage regions the client assumes a full redraw.
                 frame.success(Transform::Normal, None, presented);
             }
-            Ok(Err(reason)) => frame.fail(reason),
+            Ok(Err(())) => frame.fail(CaptureFailureReason::BufferConstraints),
             // A bad pool was already reported to the client by Smithay.
             Err(_) => frame.fail(CaptureFailureReason::Unknown),
         }
     }
 }
 
-fn copy_pixels(
+/// Borrow the complete pixel storage of a rendered image as bytes. Callers copy
+/// regions out of it into client buffers; the renderer's exclusive target borrow
+/// must have ended before this read.
+pub(crate) fn image_pixels<'a>(image: &'a Image<'static, 'static>) -> &'a [u8] {
+    // SAFETY: create_buffer owns and initializes the complete image storage;
+    // the renderer's exclusive target borrow has ended before this read.
+    let data = unsafe { image.data() };
+    // SAFETY: stride * height covers this live image's allocation.
+    unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image.stride() * image.height()) }
+}
+
+/// Copy a region of an already-rendered BGRA image into a client's `wl_shm`
+/// buffer. `region` is `(x, y, width, height)` in image pixels. Shared by the
+/// ext-image-copy-capture and wlr-screencopy capture paths, which differ only in
+/// how they report success to the client.
+pub(crate) fn copy_pixels(
     pool: *mut u8,
     pool_len: usize,
     shm: BufferData,
     pixels: &[u8],
-    width: usize,
-    height: usize,
     src_stride: usize,
-) -> Result<(), CaptureFailureReason> {
-    let row_bytes = width * 4;
+    region: (usize, usize, usize, usize),
+) -> Result<(), ()> {
+    let (region_x, region_y, width, height) = region;
+    // A region negotiated before an output resize can exceed the new image's
+    // rows; reading past a row end would copy wrapped pixels, so fail instead.
+    if width == 0 || height == 0 || region_x.checked_add(width).ok_or(())? > src_stride / 4 {
+        return Err(());
+    }
     if !matches!(
         shm.format,
         wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
     ) {
-        return Err(CaptureFailureReason::BufferConstraints);
+        return Err(());
     }
     let dimensions = shm_dimensions(&shm);
     let Some((shm_width, shm_height, shm_stride, offset)) = dimensions else {
-        return Err(CaptureFailureReason::BufferConstraints);
+        return Err(());
     };
     if shm_width < width || shm_height < height {
-        return Err(CaptureFailureReason::BufferConstraints);
+        return Err(());
     }
-    let end = offset
-        .checked_add(
-            shm_stride
-                .checked_mul(height - 1)
-                .ok_or(CaptureFailureReason::BufferConstraints)?,
-        )
-        .and_then(|last_row| last_row.checked_add(row_bytes))
-        .ok_or(CaptureFailureReason::BufferConstraints)?;
-    if end > pool_len {
-        return Err(CaptureFailureReason::BufferConstraints);
+    // The last source row read is region_y + height - 1, up to region_x*4 + width*4.
+    let src_end = region_y
+        .checked_add(height - 1)
+        .and_then(|last_row| last_row.checked_mul(src_stride))
+        .and_then(|last_row| last_row.checked_add(region_x * 4))
+        .and_then(|last_row| last_row.checked_add(width * 4))
+        .ok_or(())?;
+    if src_end > pixels.len() {
+        return Err(());
+    }
+    let dst_end = offset
+        .checked_add(shm_stride.checked_mul(height - 1).ok_or(())?)
+        .and_then(|last_row| last_row.checked_add(width * 4))
+        .ok_or(())?;
+    if dst_end > pool_len {
+        return Err(());
     }
     // SAFETY: the pool pointer maps pool_len bytes of client memory for the
-    // duration of this callback, and offset..end stays inside it.
+    // duration of this callback, and offset..dst_end stays inside it.
     let pool = unsafe { std::slice::from_raw_parts_mut(pool, pool_len) };
     for row in 0..height {
-        let src = &pixels[row * src_stride..row * src_stride + row_bytes];
+        let src = &pixels[(region_y + row) * src_stride + region_x * 4..][..width * 4];
         let dst = offset + row * shm_stride;
-        pool[dst..dst + row_bytes].copy_from_slice(src);
+        pool[dst..dst + width * 4].copy_from_slice(src);
     }
     Ok(())
 }
 
-fn monotonic() -> Duration {
+pub(crate) fn monotonic() -> Duration {
     nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map_or(
         Duration::ZERO,
         |timestamp| {
@@ -250,6 +269,121 @@ mod tests {
             state
                 .capture_constraints(&ImageCaptureSource::new())
                 .is_none()
+        );
+    }
+
+    /// A 4x3 BGRA image whose pixel at column x, row y carries the value
+    /// y * 10 + x in its blue channel, with fixed marker bytes elsewhere.
+    fn image_pixels_4x3() -> Vec<u8> {
+        let stride = 16;
+        let mut pixels = vec![0u8; stride * 3];
+        for row in 0..3u8 {
+            for col in 0..4u8 {
+                let offset = usize::from(row) * stride + usize::from(col) * 4;
+                pixels[offset] = row * 10 + col;
+                pixels[offset + 1] = 0x11;
+                pixels[offset + 2] = 0x22;
+                pixels[offset + 3] = 0xFF;
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn copy_pixels_writes_only_the_requested_region() {
+        let pixels = image_pixels_4x3();
+        // A 2x2 client buffer at offset 8 with 8-byte rows.
+        let shm = BufferData {
+            offset: 8,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: wl_shm::Format::Xrgb8888,
+        };
+        let mut pool = vec![0u8; 8 + 16];
+        copy_pixels(
+            pool.as_mut_ptr(),
+            pool.len(),
+            shm,
+            &pixels,
+            16,
+            (2, 1, 2, 2),
+        )
+        .expect("region copy succeeds");
+        // The copied rows are image rows 1 and 2, columns 2 and 3: pixel
+        // values 12, 13, 22, 23, each followed by the marker bytes.
+        let expected: Vec<u8> = pixels[24..32]
+            .iter()
+            .chain(&pixels[40..48])
+            .copied()
+            .collect();
+        assert_eq!(&pool[8..], &expected[..]);
+        // Nothing outside the client buffer region was touched.
+        assert!(pool[..8].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn copy_pixels_rejects_impossible_regions() {
+        let pixels = image_pixels_4x3();
+        let shm = BufferData {
+            offset: 0,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: wl_shm::Format::Xrgb8888,
+        };
+        let mut pool = vec![0u8; 16];
+        // A region taller than the rendered image would read past its pixels.
+        assert!(
+            copy_pixels(
+                pool.as_mut_ptr(),
+                pool.len(),
+                shm,
+                &pixels,
+                16,
+                (0, 0, 2, 10)
+            )
+            .is_err()
+        );
+        // A region wider than the image likewise overruns its rows.
+        assert!(
+            copy_pixels(
+                pool.as_mut_ptr(),
+                pool.len(),
+                shm,
+                &pixels,
+                16,
+                (3, 0, 4, 2)
+            )
+            .is_err()
+        );
+        // Empty regions have nothing to copy.
+        assert!(
+            copy_pixels(
+                pool.as_mut_ptr(),
+                pool.len(),
+                shm,
+                &pixels,
+                16,
+                (0, 0, 2, 0)
+            )
+            .is_err()
+        );
+        // A client buffer too small for the region would overflow its pool.
+        assert!(copy_pixels(pool.as_mut_ptr(), 12, shm, &pixels, 16, (0, 0, 2, 2)).is_err());
+        // Only the BGRA formats matching the rendered image are accepted.
+        let mut wrong_format = shm;
+        wrong_format.format = wl_shm::Format::Abgr2101010;
+        assert!(
+            copy_pixels(
+                pool.as_mut_ptr(),
+                pool.len(),
+                wrong_format,
+                &pixels,
+                16,
+                (0, 0, 2, 2)
+            )
+            .is_err()
         );
     }
 }
