@@ -115,7 +115,7 @@ impl AppEvents {
             .unwrap_or_else(PoisonError::into_inner);
         let mut values = vec![ClientEvent::Cursor(cursor)];
         if let Some(text) = clipboard {
-            values.push(ClientEvent::Clipboard { text });
+            values.push(ClientEvent::ClipboardSnapshot { text });
         }
         if let Some(agent) = agent {
             values.push(ClientEvent::AgentInput {

@@ -118,6 +118,7 @@ export type ControlMessage =
         | "output-unavailable";
     }
   | { readonly type: "clipboard"; readonly text: string }
+  | { readonly type: "clipboard-snapshot"; readonly text: string }
   | {
       readonly type: "quality";
       readonly bitrate: number;
@@ -208,6 +209,7 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
         : null;
     }
     case "clipboard":
+    case "clipboard-snapshot":
       return typeof value.text === "string"
         ? { type: value.type, text: value.text }
         : null;

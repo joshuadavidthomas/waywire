@@ -69,9 +69,9 @@ trait ClientEventAudience {
 impl ClientEventAudience for ClientEvent {
     fn audience(&self) -> Audience {
         match self {
-            ClientEvent::Clipboard { .. } | ClientEvent::ResetVideoRefused { .. } => {
-                Audience::InputOwner
-            }
+            ClientEvent::Clipboard { .. }
+            | ClientEvent::ClipboardSnapshot { .. }
+            | ClientEvent::ResetVideoRefused { .. } => Audience::InputOwner,
             ClientEvent::Cursor(_)
             | ClientEvent::ResizeApplied(_)
             | ClientEvent::VideoConfig { .. }
@@ -451,7 +451,7 @@ async fn handle_text(
                 && let Some(text) = state.events.latest_clipboard()
             {
                 outbound
-                    .enqueue_event(&ClientEvent::Clipboard { text })
+                    .enqueue_event(&ClientEvent::ClipboardSnapshot { text })
                     .map_err(SocketEnd::from)?;
             }
             Ok(())

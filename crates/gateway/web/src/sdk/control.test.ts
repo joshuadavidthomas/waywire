@@ -787,10 +787,8 @@ test("acquiring control does not auto-write the clipboard snapshot", async () =>
   const statuses: string[] = [];
   session.on("clipboard", (event) => statuses.push(event.status));
   try {
-    // The fixture's control-state active already marked the next clipboard as
-    // the acquisition snapshot the gateway sends with ownership.
     control.dispatch("message", {
-      data: JSON.stringify({ type: "clipboard", text: "snapshot" }),
+      data: JSON.stringify({ type: "clipboard-snapshot", text: "snapshot" }),
     });
     assert.deepEqual(writes, []);
     assert.equal(session.clipboard.latestRemoteText, "snapshot");
@@ -807,6 +805,29 @@ test("acquiring control does not auto-write the clipboard snapshot", async () =>
       "Remote clipboard ready",
       "Clipboard synced",
     ]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("the first remote copy syncs when acquisition has no snapshot", async () => {
+  const { session, control } = await keyboardFixture({
+    clipboardAutoSync: true,
+  });
+  const writes: string[] = [];
+  installGlobal("navigator", {
+    clipboard: {
+      writeText: (text: string) => {
+        writes.push(text);
+        return Promise.resolve();
+      },
+    },
+  });
+  try {
+    control.dispatch("message", {
+      data: JSON.stringify({ type: "clipboard", text: "first copy" }),
+    });
+    assert.deepEqual(writes, ["first copy"]);
   } finally {
     await session.dispose();
   }

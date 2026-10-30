@@ -45,6 +45,9 @@ pub enum ClientEvent {
     Clipboard {
         text: ClipboardText,
     },
+    ClipboardSnapshot {
+        text: ClipboardText,
+    },
     ResizeApplied(pipe::ResizeApplied),
     ResetVideoRefused {
         reason: pipe::ResetVideoRefusal,
@@ -487,6 +490,12 @@ mod tests {
                 text: value(ClipboardText::new("hello".into()))
             }),
             r#"{"type":"clipboard","text":"hello"}"#
+        );
+        assert_eq!(
+            json(&ClientEvent::ClipboardSnapshot {
+                text: value(ClipboardText::new("hello".into()))
+            }),
+            r#"{"type":"clipboard-snapshot","text":"hello"}"#
         );
     }
 

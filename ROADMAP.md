@@ -317,9 +317,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 ## 5. Input fidelity
 
-- **High:** acquiring control writes the remote clipboard over the user's local
-  clipboard (`crates/gateway/web/src/sdk/control.ts`). Don't auto-write the
-  snapshot sent with control acquisition.
 - **High:** wheel input is sent as continuous touchpad scroll, without
   `axis_value120` or `axis_stop` (`crates/compositor/src/lib.rs`). Wheel zoom
   may pan and Xwayland may over-scroll. _(Client effects are hypotheses.)_
