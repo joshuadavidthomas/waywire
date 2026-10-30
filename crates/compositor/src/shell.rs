@@ -75,6 +75,23 @@ impl CompositorHandler for State {
             .expect("registered compositor client")
             .compositor_state
     }
+    fn new_surface(&mut self, surface: &WlSurface) {
+        if surface.version() >= 6 && self.output.current_scale().integer_scale() == 1 {
+            surface.preferred_buffer_scale(1);
+        }
+        smithay::wayland::compositor::with_states(surface, |states| {
+            smithay::wayland::compositor::send_surface_state(
+                surface,
+                states,
+                self.output.current_scale().integer_scale(),
+                self.output.current_transform(),
+            );
+        });
+        self.surfaces.push(surface.clone());
+    }
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.surfaces.retain(|item| item != surface);
+    }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.frame_pending = crate::FrameRequest::Pending;
@@ -474,6 +491,16 @@ impl State {
 
     pub(super) fn output_resized(&mut self) {
         let scale = self.output.current_scale().fractional_scale();
+        for surface in &self.surfaces {
+            smithay::wayland::compositor::with_states(surface, |states| {
+                smithay::wayland::compositor::send_surface_state(
+                    surface,
+                    states,
+                    self.output.current_scale().integer_scale(),
+                    self.output.current_transform(),
+                );
+            });
+        }
         for window in self.space.elements().cloned().collect::<Vec<_>>() {
             let Some(geometry) = self.window_output_geometry(&window) else {
                 continue;

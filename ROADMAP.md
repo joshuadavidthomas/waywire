@@ -336,8 +336,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 ## 6. Sharpness and scale
 
-- **Medium:** `preferred_buffer_scale` is never sent, so clients without
-  fractional-scale-v1 render at 2× at a 1.5× output and get downsampled.
 - **Medium:** Xwayland never gets a client scale or XSETTINGS, so every X11 app
   is drawn at 1× and stretched.
 - **Medium:** custom cursor surfaces, used by all X11 and SDL apps, fall back to

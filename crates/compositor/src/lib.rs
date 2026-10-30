@@ -160,6 +160,7 @@ pub(crate) struct State {
     pub(crate) seat: Seat<Self>,
     pub(crate) output: Output,
     pub(crate) compositor_state: CompositorState,
+    pub(crate) surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     pub(crate) shm_state: ShmState,
     pub(crate) xdg_shell_state: XdgShellState,
     pub(crate) seat_state: SeatState<Self>,
@@ -228,7 +229,7 @@ impl State {
         event_sink: EventSink,
         video: VideoEncoder,
     ) -> Result<Self> {
-        let compositor_state = CompositorState::new::<Self>(&display_handle);
+        let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(&display_handle, [
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Maximize,
@@ -287,6 +288,7 @@ impl State {
             seat,
             output,
             compositor_state,
+            surfaces: Vec::new(),
             shm_state,
             xdg_shell_state,
             seat_state,

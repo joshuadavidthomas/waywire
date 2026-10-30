@@ -243,6 +243,7 @@ mod tests {
         locked: bool,
         confined: bool,
         relative: Vec<(f64, f64)>,
+        preferred_scales: Vec<i32>,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -326,13 +327,18 @@ mod tests {
 
     impl Dispatch<WlSurface, ()> for App {
         fn event(
-            _: &mut Self,
+            state: &mut Self,
             _: &WlSurface,
-            _: wayland_client::protocol::wl_surface::Event,
+            event: wayland_client::protocol::wl_surface::Event,
             (): &(),
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
+            if let wayland_client::protocol::wl_surface::Event::PreferredBufferScale { factor } =
+                event
+            {
+                state.preferred_scales.push(factor);
+            }
         }
     }
 
@@ -1381,6 +1387,37 @@ mod tests {
             [WlrState::Activated as u32],
             "requests resume after handback"
         );
+    }
+
+    #[test]
+    fn surface_receives_preferred_buffer_scale_on_map_and_resize() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_surface, _xdg, _top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Scale",
+            "scale",
+        );
+        state.space.refresh();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.preferred_scales, [1]);
+        for (scale, expected) in [(1.5, 2), (2.0, 2), (1.0, 1)] {
+            state.output.change_current_state(
+                None,
+                None,
+                Some(smithay::output::Scale::Fractional(scale)),
+                None,
+            );
+            state.output_resized();
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert_eq!(app.preferred_scales.last(), Some(&expected));
+        }
     }
 
     #[test]
