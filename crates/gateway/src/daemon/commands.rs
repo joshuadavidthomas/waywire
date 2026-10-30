@@ -494,7 +494,7 @@ mod tests {
                 bitrate_kbps: Kbps::new(8_000).expect("expected bitrate should be valid"),
                 fps: Fps::new(60).expect("expected frame rate should be valid"),
                 scale_percent: ScalePercent::new(75).expect("expected scale should be valid"),
-                crf: waywire_protocol::pipe::Crf::new(23).expect("test CRF should be valid"),
+                crf: waywire_protocol::pipe::Crf::new(27).expect("test CRF should be valid"),
                 chroma: waywire_protocol::pipe::Chroma::Yuv420,
             })
         );

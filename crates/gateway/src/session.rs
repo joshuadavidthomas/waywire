@@ -661,7 +661,7 @@ mod tests {
                 bitrate_kbps: expected.bitrate,
                 fps: expected.fps,
                 scale_percent: expected.scale,
-                crf: value(waywire_protocol::pipe::Crf::new(28)),
+                crf: value(waywire_protocol::pipe::Crf::new(32)),
                 chroma: waywire_protocol::pipe::Chroma::Yuv420,
             }))
         );
@@ -714,7 +714,7 @@ mod tests {
                 bitrate_kbps: expected.bitrate,
                 fps: expected.fps,
                 scale_percent: expected.scale,
-                crf: value(waywire_protocol::pipe::Crf::new(18)),
+                crf: value(waywire_protocol::pipe::Crf::new(22)),
                 chroma: waywire_protocol::pipe::Chroma::Yuv420,
             }))
         );

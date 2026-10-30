@@ -638,7 +638,7 @@ mod tests {
                         bitrate_kbps: Kbps::new(8_000).expect("bitrate"),
                         fps: fps(60),
                         scale_percent: ScalePercent::new(75).expect("scale"),
-                        crf: waywire_protocol::pipe::Crf::new(23).expect("crf"),
+                        crf: waywire_protocol::pipe::Crf::new(27).expect("crf"),
                         chroma: Chroma::Yuv420,
                     }))
                 );

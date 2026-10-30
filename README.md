@@ -99,24 +99,25 @@ missing comparison.
 
 Both runs below used 1280×720 at 30 Hz and a 30 fps, 12,000 kbps encoder
 target, with xterm and Debian Chromium 156.0.8078.73 as the applications.
-Waywire was built from `9fc47ffcc3a4b6cfdd5b1efbc6d5a18d1c5e3167`
-(0.1.0-rc.1); Waymote gateway and streamd were 0.1.7 (protocol 2), with labwc
-0.9.8. The packaged Waymote binaries did not report a source commit. Hardware:
+Waywire (0.1.0-rc.1) was built from
+`ac32e682deb827e8f6f042f1ff6a91621f86110a` plus the ultrafast encoder change
+that added these runs. Waymote gateway and streamd were 0.1.7 (protocol 2),
+with labwc 0.9.8. The packaged Waymote binaries did not report a source commit. Hardware:
 2 vCPUs, Intel Xeon @ 2.60 GHz, 4,025,412 kB RAM. Date: 2026-10-30.
 
 | Metric                             | Run 1 waywire | Run 1 Waymote | Run 2 waywire | Run 2 Waymote |
 | ---------------------------------- | ------------: | ------------: | ------------: | ------------: |
-| Launch to first decoded frame (ms) |           523 |           301 |           557 |           305 |
-| Idle CPU (% of one core)           |           0.9 |           0.1 |           0.6 |           0.0 |
-| Idle RSS (MiB)                     |         149.1 |         154.6 |         149.3 |         153.9 |
-| Typing CPU (%)                     |          15.8 |          11.7 |          16.4 |          13.1 |
-| Typing RSS (MiB)                   |         150.5 |         154.8 |         150.0 |         154.6 |
-| Typing stream (kbps)               |         109.8 |         125.6 |         111.2 |         125.6 |
-| Scrolling CPU (%)                  |          44.7 |          36.4 |          46.5 |          34.6 |
-| Scrolling RSS (MiB)                |        1084.4 |        1083.0 |        1086.0 |        1081.1 |
-| Scrolling stream (kbps)            |        2094.8 |        2423.6 |        2122.8 |        2381.1 |
-| Input-to-screen median (ms)        |          75.6 |          65.6 |          80.7 |          66.1 |
-| Input-to-screen p95 (ms)           |          90.7 |         113.7 |          98.1 |         115.9 |
+| Launch to first decoded frame (ms) |           725 |           879 |           541 |           426 |
+| Idle CPU (% of one core)           |           1.0 |           0.0 |           1.0 |           0.0 |
+| Idle RSS (MiB)                     |         142.5 |         153.5 |         143.1 |         153.5 |
+| Typing CPU (%)                     |          16.9 |          15.3 |          15.7 |          14.2 |
+| Typing RSS (MiB)                   |         143.3 |         153.7 |         143.8 |         154.4 |
+| Typing stream (kbps)               |         132.9 |         124.7 |         135.4 |         125.9 |
+| Scrolling CPU (%)                  |          48.8 |          45.0 |          46.9 |          42.9 |
+| Scrolling RSS (MiB)                |        1050.9 |        1056.5 |        1064.9 |        1072.8 |
+| Scrolling stream (kbps)            |        2335.6 |        2142.6 |        2308.6 |        2175.5 |
+| Input-to-screen median (ms)        |          83.2 |          66.8 |          88.5 |          67.2 |
+| Input-to-screen p95 (ms)           |          96.6 |         116.0 |          97.8 |         116.7 |
 | xdotool XTest                      |          pass |          pass |          pass |          pass |
 | Anthropic ComputerTool + grim      |          pass |          pass |          pass |          pass |
 
@@ -135,7 +136,8 @@ adapted to use grim, as in the acceptance scenario.
 
 ## Video encoding
 
-The default is H.264 High with YUV 4:2:0 (`libx264`, superfast), including startup,
+The default is H.264 High with YUV 4:2:0 (`libx264` ultrafast with CABAC and
+the 8x8 transform re-enabled, CRF 27), including startup,
 quality presets, and automatic recovery. This works with browsers that reject
 High 4:4:4 Predictive, including the tested Amp macOS embedded viewer.
 The compositor still renders RGB pixels; FFmpeg converts them to YUV for encoding.

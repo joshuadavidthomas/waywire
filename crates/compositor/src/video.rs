@@ -1193,7 +1193,7 @@ fn ffmpeg_args(
             "-c:v".into(),
             if rgb { "libx264rgb" } else { "libx264" }.into(),
             "-preset".into(),
-            if rgb { "ultrafast" } else { "superfast" }.into(),
+            "ultrafast".into(),
             "-tune".into(),
             "zerolatency".into(),
             "-profile:v".into(),
@@ -1217,10 +1217,12 @@ fn ffmpeg_args(
             "-bf".into(),
             "0".into(),
             "-x264-params".into(),
+            // ultrafast disables CABAC and the 8x8 transform. Re-enable both: CABAC
+            // saves ~13% bitrate, and 8x8dct keeps the SPS at the advertised High profile.
             // Write the desktop color contract into the H.264 VUI explicitly;
             // FFmpeg's frame metadata alone does not reach the SPS in every build.
             format!(
-                "aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
+                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
             ),
         ]);
     } else {

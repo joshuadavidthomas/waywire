@@ -29,19 +29,21 @@ const FPS_FLOOR: Fps = match Fps::new(20) {
 };
 const SCALE_FLOOR: ScalePercent = ScalePercent::MINIMUM;
 const FULL_SCALE: ScalePercent = ScalePercent::MAXIMUM;
-const AUTOMATIC_CRF: Crf = match Crf::new(23) {
+// x264 ultrafast (with CABAC) needs about 4 more CRF than superfast for the
+// same bitrate and PSNR on desktop text; these values keep the old budgets.
+const AUTOMATIC_CRF: Crf = match Crf::new(27) {
     Ok(value) => value,
     Err(_) => panic!("AUTOMATIC_CRF is outside the CRF range"),
 };
-const HIGH_CRF: Crf = match Crf::new(18) {
+const HIGH_CRF: Crf = match Crf::new(22) {
     Ok(value) => value,
     Err(_) => panic!("HIGH_CRF is outside the CRF range"),
 };
-const MEDIUM_CRF: Crf = match Crf::new(28) {
+const MEDIUM_CRF: Crf = match Crf::new(32) {
     Ok(value) => value,
     Err(_) => panic!("MEDIUM_CRF is outside the CRF range"),
 };
-const LOW_CRF: Crf = match Crf::new(32) {
+const LOW_CRF: Crf = match Crf::new(36) {
     Ok(value) => value,
     Err(_) => panic!("LOW_CRF is outside the CRF range"),
 };
@@ -891,11 +893,11 @@ mod tests {
         let cases = [
             (
                 QualityPreset::Automatic,
-                (4_000, 8_000, 20, 60, 50, 100, 23),
+                (4_000, 8_000, 20, 60, 50, 100, 27),
             ),
-            (QualityPreset::High, (4_000, 8_000, 20, 60, 50, 100, 18)),
-            (QualityPreset::Medium, (2_000, 4_000, 20, 60, 50, 100, 28)),
-            (QualityPreset::Low, (1_000, 2_000, 20, 60, 50, 100, 32)),
+            (QualityPreset::High, (4_000, 8_000, 20, 60, 50, 100, 22)),
+            (QualityPreset::Medium, (2_000, 4_000, 20, 60, 50, 100, 32)),
+            (QualityPreset::Low, (1_000, 2_000, 20, 60, 50, 100, 36)),
         ];
 
         for (

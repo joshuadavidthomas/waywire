@@ -292,7 +292,7 @@ impl State {
                 fps: options.frame_rate,
                 bitrate_kbps: options.bitrate,
                 scale_percent: pipe::ScalePercent::new(100)?,
-                crf: pipe::Crf::new(23)?,
+                crf: pipe::Crf::new(27)?,
                 chroma: pipe::Chroma::Yuv420,
             },
             size: options.resolution,
