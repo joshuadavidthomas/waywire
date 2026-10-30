@@ -185,6 +185,49 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   not `AGENT_DURING`, and the paused notice appeared during browser control.
   Fedora's packaged `ffmpeg-free` used the Cisco OpenH264 encoder.
 
+  computer-use-linux 0.7.32 tries the first nonempty window list in
+  [registry.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/registry.rs#190-267),
+  with a COSMIC focused-window override
+  ([target.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/target.rs#14-32)).
+  Its options are:
+  - GNOME Shell's `org.gnome.Shell.Introspect.GetWindows` or its own verified
+    GNOME extension's `dev.avifenesh.ComputerUseLinux.WindowControl` D-Bus
+    service ([gnome.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/gnome.rs#16-111),
+    [identity.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/identity.rs#9-24)).
+  - The COSMIC helper, located by `COMPUTER_USE_LINUX_COSMIC_HELPER`, next to
+    the executable, or on PATH ([cosmic_helper.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/cosmic_helper.rs#38-75)).
+    It binds `ext_foreign_toplevel_list_v1` only when the COSMIC-specific
+    `zcosmic_toplevel_info_v1` exists and reads activation from COSMIC state
+    ([helper](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/bin/computer-use-linux-cosmic.rs#292-352),
+    [state](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/bin/computer-use-linux-cosmic.rs#847-878)).
+  - KWin's `org.kde.KWin` scripting D-Bus API
+    ([kwin.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/kwin.rs#24-55));
+    Hyprland's `hyprctl` and `HYPRLAND_INSTANCE_SIGNATURE` or runtime socket
+    discovery ([hyprland.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/hyprland.rs#268-315));
+    niri's `NIRI_SOCKET` or matching runtime socket and optional CLI
+    ([niri.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/niri.rs#260-304),
+    [socket](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/niri.rs#394-433));
+    i3's `i3-msg` and `I3SOCK` or runtime socket
+    ([i3.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/i3.rs#166-205));
+    or labwc's `labwc.sock`, verified against the Wayland peer. The labwc
+    backend uses wlr foreign-toplevel only for activation, not discovery
+    ([labwc.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/labwc.rs#111-180)).
+  - Native X11/EWMH with `wmctrl` and `xprop`, not a Wayland session's Xwayland
+    windows ([x11.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/windowing/backends/x11.rs#37-115)).
+
+  Registry selection tries these backends rather than dispatching on
+  `XDG_CURRENT_DESKTOP`; AT-SPI is not a window discovery fallback. waywire
+  already exposes the wlr foreign-toplevel activated state, but the driver
+  does not read it for discovery. Serving a desktop-specific API would pose
+  as that desktop, so the compositor should not do that. Upstream can add a
+  generic `zwlr_foreign_toplevel_manager_v1` backend that lists handles and
+  reads their activated state, preserving its focus verification across portal
+  consent ([server.rs](https://docs.rs/crate/computer-use-linux/0.7.32/source/src/server.rs#4174-4199)).
+  The October 30, 2026 Debian 13 rerun still failed at the first `type_text`
+  after screenshot and click succeeded. The MCP response reported all window
+  backends unavailable, including a missing COSMIC helper binary. No takeover
+  screenshots were captured because the failure preceded the first capture.
+
 Add a settled-frame signal or a custom endpoint only when a measured gap in
 these tools calls for one. No vendor offers a settled signal; they use fixed
 sleeps.
