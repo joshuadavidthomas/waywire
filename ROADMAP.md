@@ -149,12 +149,20 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   computer-use-linux or cua-driver drives a Wayland application through the
   portals, and Anthropic's demo loop drives an X11 application with xdotool
   and grim. In both, a browser watches and takes over.
+  On Debian 13, the published cua-driver 0.38.0 Linux binary captured Foot
+  with wlr-screencopy and used virtual pointer plus `wtype` for desktop input.
+  Browser takeover dropped that input, and handback restored it. With `wtype`
+  and `LIBEI_SOCKET` unavailable, its keyboard fallback used RemoteDesktop
+  `CreateSession`, `SelectDevices`, `Start` and `ConnectToEIS`, and typed into
+  xterm. In X11 mode it captured the xterm window and typed with XTest, but
+  full-desktop capture failed with X11 `GetImage` `Match`. Wayland window
+  listing returned Foot with no PID or geometry. These probes are not yet a
+  repeatable portal takeover acceptance test.
   On Debian 13, computer-use-linux 0.7.32 (installed from crates.io) captured
   Foot through the Screenshot portal, but its click failed: it called
   RemoteDesktop `CreateSession` and `SelectDevices`, then ScreenCast
   `SelectSources`, which waywire does not implement. It did not call
-  `ConnectToEIS`. `tools/portal-driver-probe.py` repeats this diagnostic; it
-  is not a takeover acceptance test. On Fedora 42, Anthropic's computer tool
+  `ConnectToEIS`. On Fedora 42, Anthropic's computer tool
   and packaged xdotool typed a command into xterm, and grim captured it. The
   packaged `ffmpeg-free` lacks libx264, but the OpenH264 fallback no longer
   blocks streaming; the X11 takeover and handback scenario remains unverified.
