@@ -108,6 +108,9 @@ impl CompositorHandler for State {
                     // whenever the client re-commits.
                     self.toplevel_list.publish(&window);
                 }
+                if mapped && !previous {
+                    self.center_dialog(&window);
+                }
                 if mapped && (!previous || old_size != window.bbox().size) && !resizing {
                     // Clients can grow after their first commit. Keep their
                     // geometry on output without disturbing resize-grab anchors.
@@ -386,6 +389,7 @@ impl XdgShellHandler for State {
         }
     }
 }
+impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for State {}
 impl State {
     fn update_toplevel_metadata(&mut self, surface: &ToplevelSurface) {
         if let Some(window) = self

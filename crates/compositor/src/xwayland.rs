@@ -253,6 +253,7 @@ impl XwmHandler for State {
         self.space.map_element(window.clone(), geometry.loc, true);
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
+        self.center_dialog(&window);
     }
 
     fn mapped_override_redirect_window(&mut self, _: XwmId, surface: X11Surface) {
@@ -335,6 +336,18 @@ impl XwmHandler for State {
             && let Some(window) = self.x11_window(&surface)
         {
             self.toplevel_list.update(&window);
+        }
+    }
+
+    fn modal_request(&mut self, _: XwmId, surface: X11Surface) {
+        if let Err(error) = surface.set_modal(true) {
+            tracing::warn!(%error, "set X11 modal state");
+        }
+    }
+
+    fn unmodal_request(&mut self, _: XwmId, surface: X11Surface) {
+        if let Err(error) = surface.set_modal(false) {
+            tracing::warn!(%error, "clear X11 modal state");
         }
     }
 

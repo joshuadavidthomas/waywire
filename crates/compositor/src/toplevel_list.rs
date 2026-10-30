@@ -828,6 +828,74 @@ mod tests {
     }
 
     #[test]
+    fn wayland_dialog_is_centered_and_stays_above_its_parent() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (parent_surface, _, parent_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Parent",
+            "parent",
+        );
+        attach_buffer(&parent_surface, &app, &queue.handle(), 50);
+        parent_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let parent = top_window(&state);
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let dialog = xdg.get_toplevel(&qh, ());
+        dialog.set_parent(Some(&parent_top));
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("configure"));
+        attach_buffer(&surface, &app, &qh, 1);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let child = top_window(&state);
+        let parent_location = state
+            .space
+            .element_location(&parent)
+            .expect("parent location");
+        let child_location = state
+            .space
+            .element_location(&child)
+            .expect("child location");
+        assert_eq!(
+            child_location.x,
+            parent_location.x + 24,
+            "dialog centered over parent"
+        );
+        state.pointer_motion(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            (f64::from(parent_location.x), f64::from(parent_location.y)).into(),
+        );
+        state.pointer_button(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            0x110,
+            smithay::backend::input::ButtonState::Pressed,
+        );
+        assert_eq!(top_window(&state), child, "dialog stays above parent");
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&child)
+        );
+    }
+
+    #[test]
     fn wlr_client_sees_one_handle_with_title_app_id_and_state() {
         let (mut display, mut state) = crate::tests::test_state();
         let (connection, mut queue, mut app) = connect_client(&mut display.handle());

@@ -86,11 +86,15 @@ use smithay::utils::Point;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::compositor::with_states;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
+use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::text_input::TextInputSeat;
@@ -202,6 +206,7 @@ pub(crate) struct State {
 /// Advertise the globals whose server state `State` never needs to reach.
 fn install_globals(display_handle: &DisplayHandle) {
     smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<State>(display_handle);
+    XdgDialogState::new::<State>(display_handle);
     OutputManagerState::new_with_xdg_output::<State>(display_handle);
     ViewporterState::new::<State>(display_handle);
     FractionalScaleManagerState::new::<State>(display_handle);
@@ -756,11 +761,122 @@ impl State {
             .cloned()
     }
 
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "owned target avoids borrowing the mutable Space across focus changes"
-    )]
+    fn parent_window(&self, window: &Window) -> Option<Window> {
+        if let Some(parent) = window
+            .toplevel()
+            .and_then(smithay::wayland::shell::xdg::ToplevelSurface::parent)
+        {
+            return self
+                .space
+                .elements()
+                .find(|candidate| {
+                    candidate
+                        .toplevel()
+                        .is_some_and(|top| top.wl_surface() == &parent)
+                })
+                .cloned();
+        }
+        let parent = window.x11_surface()?.is_transient_for()?;
+        self.space
+            .elements()
+            .find(|candidate| {
+                candidate
+                    .x11_surface()
+                    .is_some_and(|surface| surface.window_id() == parent)
+            })
+            .cloned()
+    }
+
+    fn modal_dialog(window: &Window) -> bool {
+        if let Some(top) = window.toplevel() {
+            return with_states(top.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|data| data.lock().ok())
+                    .is_none_or(|data| data.dialog_hint != ToplevelDialogHint::Dialog)
+            });
+        }
+        window
+            .x11_surface()
+            .is_some_and(smithay::xwayland::X11Surface::is_modal)
+    }
+
+    fn dialog_children(&self, parent: &Window) -> Vec<Window> {
+        self.space
+            .elements()
+            .filter(|candidate| {
+                self.windows
+                    .get(*candidate)
+                    .is_some_and(|state| state.mapped)
+                    && self.parent_window(candidate).as_ref() == Some(parent)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn center_dialog(&mut self, window: &Window) {
+        let Some(parent) = self.parent_window(window) else {
+            return;
+        };
+        let Some(parent_location) = self.space.element_location(&parent) else {
+            return;
+        };
+        let parent_geometry = parent.geometry();
+        let child_geometry = window.geometry();
+        let location = parent_location + parent_geometry.loc - child_geometry.loc
+            + Point::from((
+                (parent_geometry.size.w - child_geometry.size.w) / 2,
+                (parent_geometry.size.h - child_geometry.size.h) / 2,
+            ));
+        self.space.map_element(window.clone(), location, false);
+        if let Some(surface) = window.x11_surface() {
+            let mut geometry = surface.last_configure();
+            geometry.loc = location;
+            if let Err(error) = surface.configure(geometry) {
+                tracing::warn!(%error, "center X11 dialog");
+            }
+        }
+    }
+
     pub(crate) fn focus_window(&mut self, window: Option<Window>) {
+        let mut window = window;
+        if let Some(target) = &window {
+            let mut family = vec![target.clone()];
+            let mut index = 0;
+            while index < family.len() {
+                for child in self.dialog_children(&family[index]) {
+                    if !family.contains(&child) {
+                        family.push(child);
+                    }
+                }
+                index += 1;
+            }
+            for member in &family {
+                self.space.raise_element(member, true);
+                if let (Some(xwm), Some(surface)) = (&mut self.xwm, member.x11_surface())
+                    && let Err(error) = xwm.raise_window(surface)
+                {
+                    tracing::warn!(%error, "raise X11 window");
+                }
+            }
+            let mut visited = Vec::new();
+            while let Some(target) = &window {
+                if visited.contains(target) {
+                    break;
+                }
+                visited.push(target.clone());
+                let next = self
+                    .dialog_children(target)
+                    .into_iter()
+                    .rev()
+                    .find(Self::modal_dialog);
+                if next.is_none() {
+                    break;
+                }
+                window = next;
+            }
+        }
         if self
             .decoration_press
             .as_ref()
@@ -769,12 +885,6 @@ impl State {
             self.decoration_press = None;
         }
         if let Some(window) = &window {
-            self.space.raise_element(window, true);
-            if let (Some(xwm), Some(surface)) = (&mut self.xwm, window.x11_surface())
-                && let Err(error) = xwm.raise_window(surface)
-            {
-                tracing::warn!(%error, "raise X11 window");
-            }
             // X11 menus, dropdowns and tooltips draw above their app but expect
             // keyboard focus to stay with it; taking focus closes them.
             if is_override_redirect(window) {

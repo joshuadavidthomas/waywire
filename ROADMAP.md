@@ -253,10 +253,6 @@ mainstream apps work.
   and are drawn offset. `constrain_window` configures X11 windows with
   `geometry()`, which excludes `_GTK_FRAME_EXTENTS`. _(Traced, not
   reproduced.)_
-- **High:** dialogs ignore their parent. Nothing reads `xdg_toplevel` parent or
-  X11 transient-for, so clicking the main window hides its own modal dialog.
-  Keep children above their parent, redirect focus to a modal child, and
-  centre dialogs on their parent.
 - **Medium:** maximized windows can be dragged and resized. Unmaximize on
   titlebar drag and refuse resize while maximized or fullscreen.
 - **Medium:** configures can be sent before a client's initial commit (from
