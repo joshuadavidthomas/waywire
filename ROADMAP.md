@@ -89,13 +89,16 @@ interface, which current Linux drivers (trycua's cua-driver, computer-use-linux)
 use. Its `ConnectToEIS` call hands a driver a connection to the EIS server
 waywire already runs, so the backend is a thin D-Bus service, not a new input
 stack. xdg-desktop-portal-wlr provides no RemoteDesktop, so waywire implements
-that backend and the Screenshot backend itself. The wlr virtual-pointer and
+that backend and the Screenshot backend itself. The compositor starts its own
+`dbus-daemon` on a socket in its runtime directory and publishes the portal
+environment there, so portals work without an inherited session bus and never
+modify a host desktop's activation environment. The wlr virtual-pointer and
 virtual-keyboard protocols cover drivers that synthesize input directly.
 
 | Protocol or interface           | Installed tools that use it                                    | Status                                               |
 | ------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
-| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Done; needs a session bus                            |
-| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; needs a session bus                            |
+| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Done; compositor's private bus                       |
+| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; compositor's private bus                       |
 | wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                 |
 | ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
 | wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                        |

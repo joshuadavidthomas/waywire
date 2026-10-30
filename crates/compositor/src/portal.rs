@@ -1,8 +1,8 @@
-//! xdg-desktop-portal backends, served from the compositor's own session bus
-//! connection so packaged agent drivers work on distributions whose Xwayland
-//! lacks libei (Debian 13, Ubuntu 24.04).
+//! xdg-desktop-portal backends, served on the compositor's private session bus
+//! so packaged agent drivers work on distributions whose Xwayland lacks libei
+//! (Debian 13, Ubuntu 24.04).
 //!
-//! The D-Bus thread runs zbus on the session bus as
+//! zbus serves the backends on the private bus as
 //! `org.freedesktop.impl.portal.desktop.waywire`, implementing `RemoteDesktop`
 //! (with `ConnectToEIS`) and Screenshot; method calls that need the seat or the
 //! rendered frame travel over a channel into the calloop loop and are answered
@@ -15,9 +15,9 @@
 //! directory to `XDG_DATA_DIRS`, and sets `XDG_DESKTOP_PORTAL_DIR` to it:
 //! frontends through 1.18 look up `.portal` files only in that single
 //! variable's directory, so it also carries symlinks to the portals already
-//! installed on the system. Both variables are published with
-//! `org.freedesktop.DBus.UpdateActivationEnvironment` and exported to the
-//! session program.
+//! installed on the system. Those variables and the private bus address are
+//! published with `org.freedesktop.DBus.UpdateActivationEnvironment` and
+//! exported to the session program.
 
 mod remote_desktop;
 mod screenshot;
@@ -167,8 +167,12 @@ pub(crate) fn write_portal_files(runtime_path: &Path) -> Result<PortalDirs> {
 
 /// Environment a portal-using program needs on this desktop, in activation
 /// environment form.
-pub(crate) fn portal_environment(dirs: &PortalDirs) -> Vec<(String, String)> {
-    portal_environment_from(dirs, std::env::var_os("XDG_DATA_DIRS").as_deref())
+pub(crate) fn portal_environment(dirs: &PortalDirs, bus_address: &str) -> Vec<(String, String)> {
+    portal_environment_from(
+        dirs,
+        std::env::var_os("XDG_DATA_DIRS").as_deref(),
+        bus_address,
+    )
 }
 
 /// The environment from an `XDG_DATA_DIRS` value the compositor runs with.
@@ -179,6 +183,7 @@ pub(crate) fn portal_environment(dirs: &PortalDirs) -> Vec<(String, String)> {
 fn portal_environment_from(
     dirs: &PortalDirs,
     value: Option<&std::ffi::OsStr>,
+    bus_address: &str,
 ) -> Vec<(String, String)> {
     let mut data_dirs = data_dirs_from(value);
     data_dirs.insert(0, dirs.data_dir.clone());
@@ -187,6 +192,10 @@ fn portal_environment_from(
         .to_string_lossy()
         .into_owned();
     vec![
+        (
+            "DBUS_SESSION_BUS_ADDRESS".to_owned(),
+            bus_address.to_owned(),
+        ),
         ("XDG_DATA_DIRS".to_owned(), joined),
         ("XDG_CURRENT_DESKTOP".to_owned(), "waywire".to_owned()),
         (
@@ -196,19 +205,16 @@ fn portal_environment_from(
     ]
 }
 
-/// Serve the portal backends for the lifetime of the compositor. Returns the
-/// published directories, or `None` when there is no session bus to serve on.
+/// Serve the portal backends on `bus_address` for the lifetime of the
+/// compositor. Returns the published directories, or `None` when the backends
+/// could not be started; the desktop itself still runs.
 pub(crate) fn start(
     handle: &LoopHandle<'static, State>,
     runtime_path: &Path,
+    bus_address: &str,
     image: Rc<RefCell<Image<'static, 'static>>>,
     layout: String,
 ) -> Result<Option<PortalDirs>> {
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none_or(|value| value.is_empty()) {
-        // The portals require a session bus; the desktop must still start.
-        tracing::warn!("no DBUS_SESSION_BUS_ADDRESS, portal backends disabled");
-        return Ok(None);
-    }
     let dirs = write_portal_files(runtime_path)?;
     let screenshots_dir = runtime_path.join("screenshots");
     let (requests, incoming) = calloop::channel::channel::<PortalRequest>();
@@ -240,35 +246,36 @@ pub(crate) fn start(
         tracing::error!(?error, "portal request channel failed to install");
         return Ok(None);
     }
-    let serve_dirs = dirs.clone();
-    std::thread::Builder::new()
-        .name("waywire-portal".to_owned())
-        .spawn(move || serve_dbus(requests, &serve_dirs))?;
-    Ok(Some(dirs))
-}
-
-/// Run the zbus service on the portal thread until the compositor exits.
-fn serve_dbus(requests: Sender<PortalRequest>, dirs: &PortalDirs) {
-    let connection = match build_connection(requests) {
+    // Connect and publish before the session program starts: its first portal
+    // call may activate xdg-desktop-portal, which reads discovery variables
+    // from the activation environment.
+    let connection = match build_connection(requests, bus_address) {
         Ok(connection) => connection,
         Err(error) => {
             tracing::error!(%error, "portal D-Bus service failed to start");
-            return;
+            return Ok(None);
         }
     };
-    if let Err(error) = publish_environment(&connection, dirs) {
+    if let Err(error) = publish_environment(&connection, &dirs, bus_address) {
         tracing::error!(%error, "portal activation environment");
+        return Ok(None);
     }
-    // The connection serves requests on zbus's own executor; this thread just
-    // keeps it alive for the compositor's lifetime.
-    loop {
-        std::thread::park();
-    }
+    std::thread::Builder::new()
+        .name("waywire-portal".to_owned())
+        .spawn(move || {
+            // The connection serves requests on zbus's own executor; this
+            // thread just keeps it alive for the compositor's lifetime.
+            let _connection = connection;
+            loop {
+                std::thread::park();
+            }
+        })?;
+    Ok(Some(dirs))
 }
 
-fn build_connection(requests: Sender<PortalRequest>) -> Result<Connection> {
+fn build_connection(requests: Sender<PortalRequest>, bus_address: &str) -> Result<Connection> {
     let remote_desktop = RemoteDesktop::new(requests.clone());
-    let connection = zbus::blocking::connection::Builder::session()?
+    let connection = zbus::blocking::connection::Builder::address(bus_address)?
         .name(zbus::names::WellKnownName::try_from(PORTAL_NAME)?)?
         .serve_at(ObjectPath::try_from(OBJECT_PATH)?, remote_desktop)?
         .serve_at(
@@ -283,8 +290,12 @@ fn build_connection(requests: Sender<PortalRequest>) -> Result<Connection> {
 /// Make the frontend and portal clients inherit this desktop's discovery
 /// environment, both for services the bus activates and for programs the
 /// compositor spawns.
-fn publish_environment(connection: &Connection, dirs: &PortalDirs) -> Result<()> {
-    let environment = portal_environment(dirs);
+fn publish_environment(
+    connection: &Connection,
+    dirs: &PortalDirs,
+    bus_address: &str,
+) -> Result<()> {
+    let environment = portal_environment(dirs, bus_address);
     let settings: std::collections::HashMap<String, String> = environment.iter().cloned().collect();
     zbus::blocking::Proxy::new(
         connection,
@@ -342,10 +353,15 @@ mod tests {
         let environment = portal_environment_from(
             &dirs,
             Some(std::ffi::OsStr::new("/usr/local/share:/usr/share")),
+            "unix:path=/run/waywire/bus,guid=0123456789abcdef",
         );
         assert_eq!(
             environment,
             vec![
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".to_owned(),
+                    "unix:path=/run/waywire/bus,guid=0123456789abcdef".to_owned()
+                ),
                 (
                     "XDG_DATA_DIRS".to_owned(),
                     "/run/waywire/share:/usr/local/share:/usr/share".to_owned()

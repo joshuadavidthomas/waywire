@@ -10,6 +10,7 @@ mod grabs;
 mod pointer_warp;
 mod portal;
 mod screencopy;
+mod session_bus;
 mod shell;
 mod toplevel_list;
 mod video;
@@ -818,6 +819,9 @@ impl State {
 pub fn run(mut options: Config) -> Result<()> {
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
     let runtime = tempfile::Builder::new().prefix("waywire-").tempdir()?;
+    // Portals need a session bus, but it must be ours: an inherited bus may
+    // belong to the desktop that launched us. Without a daemon, portals are off.
+    let mut bus = session_bus::SessionBus::start(runtime.path());
     let socket_path = runtime.path().join("wayland-0");
     let socket = ListeningSocket::bind_absolute(socket_path.clone())?;
     let mut event_loop = EventLoop::<State>::try_new()?;
@@ -920,12 +924,20 @@ pub fn run(mut options: Config) -> Result<()> {
                 .into(),
         )?,
     ));
-    let portal_dirs = crate::portal::start(
-        &handle,
-        runtime.path(),
-        Rc::clone(&image),
-        options.xkb_layout.clone(),
-    )?;
+    let portal_dirs = match &bus {
+        Some(bus) => crate::portal::start(
+            &handle,
+            runtime.path(),
+            bus.address(),
+            Rc::clone(&image),
+            options.xkb_layout.clone(),
+        )?,
+        None => None,
+    };
+    let session_environment = match (&portal_dirs, &bus) {
+        (Some(dirs), Some(bus)) => Some(crate::portal::portal_environment(dirs, bus.address())),
+        _ => None,
+    };
     let mut tracker = OutputDamageTracker::from_output(&state.output);
     let mut next_frame = Instant::now();
     tracing::info!(socket = %socket_path.display(), "Wayland compositor ready");
@@ -941,11 +953,12 @@ pub fn run(mut options: Config) -> Result<()> {
                 .env("XDG_RUNTIME_DIR", runtime.path())
                 .env("DISPLAY", format!(":{display}"))
                 .env("LIBEI_SOCKET", &eis_path)
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
                 .env_remove("WAYLAND_SOCKET");
             // The session program and its portal clients discover the desktop
-            // the same way the bus-activated frontend does.
-            if let Some(dirs) = &portal_dirs {
-                for (key, value) in crate::portal::portal_environment(dirs) {
+            // and its private bus the same way the bus-activated frontend does.
+            if let Some(environment) = &session_environment {
+                for (key, value) in environment {
                     command.env(key, value);
                 }
             }
@@ -994,6 +1007,9 @@ pub fn run(mut options: Config) -> Result<()> {
         if let Some(error) = event_writer.failure() {
             state.fail(error.into());
         }
+        if let Some(bus) = bus.as_mut() {
+            bus.poll();
+        }
         if let Some(child) = child.0.as_mut() {
             match child.try_wait() {
                 Ok(Some(_)) => state.running = false,
@@ -1003,6 +1019,7 @@ pub fn run(mut options: Config) -> Result<()> {
         }
     }
     drop(child);
+    drop(bus);
     state.release_input(KeyboardSource::MAIN);
     if let Some(video) = state.video.take() {
         video.stop();
