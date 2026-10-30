@@ -10,6 +10,10 @@ default:
 acceptance SCENARIO:
     python3 tools/acceptance/scenario.py {{ SCENARIO }}
 
+# Compare the desktops using the installed Waymote and release binaries.
+benchmark *ARGS:
+    python3 tools/benchmark/benchmark.py {{ ARGS }}
+
 build-web:
     pnpm --filter @waywire/web build
 

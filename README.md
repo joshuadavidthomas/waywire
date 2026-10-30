@@ -88,6 +88,51 @@ just test-ffmpeg
 `just test-ffmpeg` separately exercises the encoder contract with real FFmpeg and
 requires libx264. It is excluded from the ordinary test command.
 
+## Waymote comparison benchmark
+
+After `just build`, run `just benchmark` in an Amp orb with Waymote installed
+under `/opt/amp-wayland`. The script header lists the other development-tool
+prerequisites. It downloads a pinned Anthropic demo and its Python dependency
+into a temporary directory. `just benchmark --check` compares both results
+against the tolerances in the script and exits nonzero for a regression or a
+missing comparison.
+
+Both runs below used 1280×720 at 30 Hz and a 30 fps, 12,000 kbps encoder
+target, with xterm and Debian Chromium 156.0.8078.73 as the applications.
+Waywire was built from `9fc47ffcc3a4b6cfdd5b1efbc6d5a18d1c5e3167`
+(0.1.0-rc.1); Waymote gateway and streamd were 0.1.7 (protocol 2), with labwc
+0.9.8. The packaged Waymote binaries did not report a source commit. Hardware:
+2 vCPUs, Intel Xeon @ 2.60 GHz, 4,025,412 kB RAM. Date: 2026-10-30.
+
+| Metric                             | Run 1 waywire | Run 1 Waymote | Run 2 waywire | Run 2 Waymote |
+| ---------------------------------- | ------------: | ------------: | ------------: | ------------: |
+| Launch to first decoded frame (ms) |           523 |           301 |           557 |           305 |
+| Idle CPU (% of one core)           |           0.9 |           0.1 |           0.6 |           0.0 |
+| Idle RSS (MiB)                     |         149.1 |         154.6 |         149.3 |         153.9 |
+| Typing CPU (%)                     |          15.8 |          11.7 |          16.4 |          13.1 |
+| Typing RSS (MiB)                   |         150.5 |         154.8 |         150.0 |         154.6 |
+| Typing stream (kbps)               |         109.8 |         125.6 |         111.2 |         125.6 |
+| Scrolling CPU (%)                  |          44.7 |          36.4 |          46.5 |          34.6 |
+| Scrolling RSS (MiB)                |        1084.4 |        1083.0 |        1086.0 |        1081.1 |
+| Scrolling stream (kbps)            |        2094.8 |        2423.6 |        2122.8 |        2381.1 |
+| Input-to-screen median (ms)        |          75.6 |          65.6 |          80.7 |          66.1 |
+| Input-to-screen p95 (ms)           |          90.7 |         113.7 |          98.1 |         115.9 |
+| xdotool XTest                      |          pass |          pass |          pass |          pass |
+| Anthropic ComputerTool + grim      |          pass |          pass |          pass |          pass |
+
+CPU and RSS are sampled across the desktop process trees, including the active
+application, but excluding the viewer and workload driver. RSS is summed per
+process, so shared pages may be counted more than once; short-lived processes
+between samples may be missed. Each workload lasts eight seconds. Bitrate is
+the viewer's `/stream` WebSocket payload rate, including protocol framing, not
+network-interface traffic. A lower bitrate does not establish equal visual
+quality: the two implementations use different x264 presets and rate controls.
+The 12 latency samples time a browser keydown to a changed pixel in the
+rendered video canvas, not physical display scanout. Launch includes waiting for
+the application window and navigating a prewarmed browser. Agent checks run
+after browser control is released; the Anthropic screenshot implementation is
+adapted to use grim, as in the acceptance scenario.
+
 ## Video encoding
 
 The default is H.264 High with YUV 4:2:0 (`libx264`, superfast), including startup,
