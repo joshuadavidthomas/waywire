@@ -105,7 +105,7 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                 |
 | ext-foreign-toplevel-list       | lswt                                                           | Done                                                 |
 | wlr-foreign-toplevel-management | wlrctl window actions                                          | Done; activate and close                             |
-| Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done                                                 |
+| Pointer constraints + relative  | Xwayland's warp emulator, games                                | Partial; locks and confines not enforced (see 5)     |
 | XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below) |
 
 ### X11-only drivers
@@ -346,8 +346,13 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 - **Medium:** Cmd+V on macOS sends Super+V. IME, emoji and mobile-keyboard text
   is dropped in apps without text-input-v3, including all X11 apps. Dead keys
   may produce double input. _(hypothesis)_
-- **Medium:** relative motion and pointer constraints never reach apps. The
-  constraints handler exists but its global is never created.
+- **Medium:** pointer locks and confines are not enforced. Both globals exist
+  and relative motion reaches clients (EIS and the viewer's pointer lock), but
+  `pointer_motion_with_delta` (`crates/compositor/src/lib.rs`) moves the
+  pointer through a locked or confined surface, and a constraint only activates
+  if its surface already has pointer focus when it is created
+  (`crates/compositor/src/pointer_warp.rs`). Games that lock the pointer may
+  see it leave the window. _(Client effects are hypotheses.)_
 - **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
   keys are missing from the key map. The EI keycode subtraction can underflow.
 
