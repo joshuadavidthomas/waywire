@@ -10,7 +10,9 @@ mod grabs;
 mod pointer_warp;
 mod screencopy;
 mod shell;
+mod toplevel_list;
 mod video;
+mod virtual_keyboard;
 mod virtual_pointer;
 mod xwayland;
 
@@ -143,6 +145,7 @@ pub(crate) struct State {
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
     capture: capture::Capture,
     screencopy: screencopy::Screencopy,
+    pub(crate) toplevel_list: toplevel_list::ToplevelList,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     decoration_press: Option<(KeyboardSource, Window)>,
@@ -161,6 +164,19 @@ pub(crate) struct State {
     pub(crate) dirty: bool,
 }
 
+/// Advertise the globals whose server state `State` never needs to reach.
+fn install_globals(display_handle: &DisplayHandle) {
+    smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<State>(display_handle);
+    OutputManagerState::new_with_xdg_output::<State>(display_handle);
+    ViewporterState::new::<State>(display_handle);
+    FractionalScaleManagerState::new::<State>(display_handle);
+    CursorShapeManagerState::new::<State>(display_handle);
+    TextInputManagerState::new::<State>(display_handle);
+    pointer_warp::install(display_handle);
+    virtual_pointer::install(display_handle);
+    virtual_keyboard::init(display_handle);
+}
+
 impl State {
     fn new(
         display_handle: DisplayHandle,
@@ -170,21 +186,15 @@ impl State {
     ) -> Result<Self> {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
-        pointer_warp::install(&display_handle);
-        virtual_pointer::install(&display_handle);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(&display_handle, [
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Maximize,
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Fullscreen,
         ]);
-        smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let xwayland_shell_state =
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&display_handle);
-        OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
-        ViewporterState::new::<Self>(&display_handle);
-        FractionalScaleManagerState::new::<Self>(&display_handle);
-        CursorShapeManagerState::new::<Self>(&display_handle);
-        TextInputManagerState::new::<Self>(&display_handle);
+        install_globals(&display_handle);
+        let toplevel_list = toplevel_list::ToplevelList::new(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "waywire");
         seat.add_keyboard(
@@ -244,6 +254,7 @@ impl State {
             eis_seats: HashMap::new(),
             capture,
             screencopy,
+            toplevel_list,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
             decoration_press: None,
@@ -696,6 +707,7 @@ impl State {
         self.space.refresh();
         self.windows
             .retain(|window, _| smithay::utils::IsAlive::alive(window));
+        self.toplevel_list.cleanup();
         self.popups.cleanup();
         if self
             .seat

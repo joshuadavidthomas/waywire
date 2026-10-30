@@ -99,8 +99,8 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                 |
 | ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
 | wlr-virtual-pointer             | cua-driver                                                     | Missing; not in Smithay                              |
-| virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | In progress                                          |
-| ext-foreign-toplevel-list       | lswt                                                           | In progress                                          |
+| virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                 |
+| ext-foreign-toplevel-list       | lswt                                                           | Done                                                 |
 | wlr-foreign-toplevel-management | wlrctl window actions                                          | Missing; not in Smithay, implement it                |
 | Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done                                                 |
 | XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below) |

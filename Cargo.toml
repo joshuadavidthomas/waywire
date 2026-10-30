@@ -42,7 +42,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = "0.3.34"
 # Pin the tested syscall wrappers: both binaries rely on their FD, polling,
 # signal and process-control behavior for backpressure and child cleanup.
-nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "time"] }
+nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "socket", "time"] }
 pangocairo = "0.22.9"
 rust-embed = { version = "8.13.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.229", features = ["derive"] }

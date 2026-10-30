@@ -101,6 +101,11 @@ impl CompositorHandler for State {
                 .unwrap_or(false);
                 let previous = self.windows.entry(window.clone()).or_default().mapped;
                 self.windows.entry(window.clone()).or_default().mapped = mapped;
+                if mapped {
+                    // Announce the handle on map and refresh title and app id
+                    // whenever the client re-commits.
+                    self.toplevel_list.publish(&window);
+                }
                 if mapped && (!previous || old_size != window.bbox().size) && !resizing {
                     // Clients can grow after their first commit. Keep their
                     // geometry on output without disturbing resize-grab anchors.
@@ -328,6 +333,12 @@ impl XdgShellHandler for State {
         self.unconstrain_popup(&surface);
         surface.send_repositioned(token);
     }
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        self.update_toplevel_metadata(&surface);
+    }
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.update_toplevel_metadata(&surface);
+    }
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
         use smithay::desktop::PopupKeyboardGrab;
         use smithay::desktop::PopupPointerGrab;
@@ -369,7 +380,19 @@ impl XdgShellHandler for State {
     }
 }
 impl State {
+    fn update_toplevel_metadata(&mut self, surface: &ToplevelSurface) {
+        if let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel() == Some(surface))
+            .cloned()
+        {
+            self.toplevel_list.update(&window);
+        }
+    }
+
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
+        self.toplevel_list.unpublish(window);
         if self
             .decoration_press
             .as_ref()

@@ -31,6 +31,7 @@ use smithay::xwayland::XWaylandEvent;
 use smithay::xwayland::XwmHandler;
 use smithay::xwayland::xwm::Reorder;
 use smithay::xwayland::xwm::ResizeEdge;
+use smithay::xwayland::xwm::WmWindowProperty;
 use smithay::xwayland::xwm::XwmId;
 
 use crate::State;
@@ -229,8 +230,9 @@ impl XwmHandler for State {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Modulo 8.
         let offset = (self.space.elements().count() % 8) as i32 * 48;
         geometry.loc = (32 + offset, 32 + offset).into();
-        self.space
-            .map_element(Window::new_x11_window(surface.clone()), geometry.loc, true);
+        let window = Window::new_x11_window(surface.clone());
+        self.space.map_element(window.clone(), geometry.loc, true);
+        self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
     }
 
@@ -304,6 +306,14 @@ impl XwmHandler for State {
             }
         }
         self.dirty = true;
+    }
+
+    fn property_notify(&mut self, _: XwmId, surface: X11Surface, property: WmWindowProperty) {
+        if matches!(property, WmWindowProperty::Title | WmWindowProperty::Class)
+            && let Some(window) = self.x11_window(&surface)
+        {
+            self.toplevel_list.update(&window);
+        }
     }
 
     fn maximize_request(&mut self, _: XwmId, surface: X11Surface) {
