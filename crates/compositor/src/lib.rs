@@ -620,12 +620,14 @@ impl State {
             pointer.frame(self);
             return;
         }
-        if state == ButtonState::Pressed && !pointer.is_grabbed() {
-            let window = self
+        if state == ButtonState::Pressed
+            && !pointer.is_grabbed()
+            && let Some(window) = self
                 .space
                 .element_under(pointer.current_location())
-                .map(|(window, _)| window.clone());
-            self.focus_window(window);
+                .map(|(window, _)| window.clone())
+        {
+            self.focus_window(Some(window));
         }
         pointer.button(
             self,

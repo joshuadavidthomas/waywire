@@ -216,6 +216,7 @@ mod tests {
         handles: Vec<ToplevelHandleEvents>,
         managed: Vec<ManagedToplevelEvents>,
         close_requests: usize,
+        keys: Vec<u32>,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -340,6 +341,21 @@ mod tests {
     }
 
     wayland_client::delegate_noop!(App: ignore WlSeat);
+
+    impl Dispatch<wayland_client::protocol::wl_keyboard::WlKeyboard, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+            event: wayland_client::protocol::wl_keyboard::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wayland_client::protocol::wl_keyboard::Event::Key { key, .. } = event {
+                state.keys.push(key);
+            }
+        }
+    }
 
     impl Dispatch<XdgWmBase, ()> for App {
         fn event(
@@ -627,6 +643,48 @@ mod tests {
             .find(|events| events.title == title)
             .expect("managed toplevel")
             .states
+    }
+
+    #[test]
+    fn background_click_preserves_keyboard_focus() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let _client_keyboard = app
+            .seat
+            .as_ref()
+            .expect("seat")
+            .get_keyboard(&queue.handle(), ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Focused",
+            "focused",
+        );
+        let keyboard = state.seat.get_keyboard().expect("keyboard");
+        let focused = keyboard.current_focus().expect("window focused on map");
+        state.pointer_motion(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            (1800.0, 1000.0).into(),
+        );
+        state.pointer_button(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            0x110,
+            smithay::backend::input::ButtonState::Pressed,
+        );
+        assert_eq!(keyboard.current_focus(), Some(focused));
+        state.keyboard_key(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            30,
+            smithay::backend::input::KeyState::Pressed,
+        );
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.keys, [30], "the focused client receives typing");
     }
 
     #[test]
