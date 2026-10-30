@@ -156,6 +156,11 @@ impl AssemblyResult {
 }
 
 impl Assembler {
+    /// Whether the assembler is waiting for the next keyframe after a drop.
+    pub(super) fn is_recovering(&self) -> bool {
+        matches!(self.keyframe, GopState::Recovering)
+    }
+
     fn drop_unit(&mut self, drops: &mut Option<DroppedPackets>, reason: AssemblyDrop) {
         if let Some(packets) = self.unit.discard() {
             DroppedPackets::record(drops, packets, reason);

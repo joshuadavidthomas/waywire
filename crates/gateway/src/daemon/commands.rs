@@ -9,7 +9,9 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::TryAcquireError;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::timeout;
 use tracing::debug;
 use waywire_protocol::Record;
@@ -159,7 +161,7 @@ impl CommandSink {
         }
     }
 
-    fn fail<T>(&self, error: CommandSinkError) -> Result<T, CommandSinkError> {
+    fn fail(&self, error: CommandSinkError) -> CommandSinkError {
         self.readiness.stop();
         // A full queue already holds a fatal error; a closed queue means the
         // supervisor is stopping. Neither needs another shutdown notification,
@@ -167,27 +169,65 @@ impl CommandSink {
         if let Err(notification_error) = self.fatal.try_send(error.clone()) {
             debug!(%notification_error, "fatal command notification no longer needed");
         }
-        Err(error)
+        error
     }
 
+    /// Sends a gateway-internal command.
+    ///
+    /// Send failures are fatal to the session: readiness stops and the fatal
+    /// error reaches the session supervisor.
     pub(crate) async fn system(&self, command: Command) -> Result<(), CommandSinkError> {
         match self.send(Authority::System, command).await {
             Ok(()) => Ok(()),
-            Err(error) => self.fail(error),
+            Err(error) => Err(self.fail(error)),
         }
     }
 
+    /// Sends an input-owner command from a browser socket.
+    ///
+    /// Send failures are returned to the caller so a stalled command pipe ends
+    /// only that socket instead of the whole session.
     pub(crate) async fn input(
         &self,
         ownership: OwnershipEpoch,
         command: Command,
     ) -> Result<(), CommandSinkError> {
-        match self
-            .send(Authority::InputOwnership(ownership), command)
+        self.send(Authority::InputOwnership(ownership), command)
             .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) => self.fail(error),
+    }
+
+    /// Sends a command with system authority on behalf of a browser socket.
+    ///
+    /// Send failures are returned to the caller so a stalled command pipe ends
+    /// only that socket instead of the whole session.
+    pub(crate) async fn browser_system(&self, command: Command) -> Result<(), CommandSinkError> {
+        self.send(Authority::System, command).await
+    }
+
+    /// Sends a gateway-internal command without blocking.
+    ///
+    /// Returns `Ok(false)` when backpressure dropped the command. Use this only
+    /// for idempotent state where losing an update under backpressure is fine.
+    pub(crate) fn try_system(&self, command: &Command) -> Result<bool, CommandSinkError> {
+        let encoded = command.encode();
+        let length = encoded.len();
+        let Ok(count) = u32::try_from(length) else {
+            return Err(CommandSinkError::LengthOverflow { length });
+        };
+        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(count) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::Closed) => return Err(CommandSinkError::ByteBudgetClosed),
+            Err(TryAcquireError::NoPermits) => return Ok(false),
+        };
+        let request = Request {
+            authority: Authority::System,
+            encoded,
+            permit,
+        };
+        match self.tx.try_send(request) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Closed(_)) => Err(CommandSinkError::WriterStopped),
         }
     }
 
@@ -344,6 +384,34 @@ mod tests {
             .expect_err("closed byte budget should reject a command");
         assert_eq!(error, CommandSinkError::ByteBudgetClosed);
         assert_eq!(commands.readiness.state(), ReadinessState::Stopped);
+        drop(request_guard);
+    }
+
+    #[tokio::test]
+    async fn browser_command_errors_return_without_a_fatal_shutdown() {
+        let (fatal, mut fatal_events) = mpsc::channel(1);
+        let (commands, request_guard) = CommandSink::new(1, COMMAND_BYTES, fatal, Readiness::new());
+        commands.budget.close();
+        let input_error = commands
+            .input(OwnershipEpoch::FIRST, Command::ReleaseAll(ReleaseAll))
+            .await
+            .expect_err("closed byte budget should reject a browser input command");
+        let resize_error = commands
+            .browser_system(Command::ReleaseAll(ReleaseAll))
+            .await
+            .expect_err("closed byte budget should reject a browser resize command");
+
+        assert_eq!(input_error, CommandSinkError::ByteBudgetClosed);
+        assert_eq!(resize_error, CommandSinkError::ByteBudgetClosed);
+        assert_eq!(
+            commands.readiness.state(),
+            ReadinessState::WaitingForFirstFrame
+        );
+        assert!(
+            timeout(Duration::from_millis(20), fatal_events.recv())
+                .await
+                .is_err()
+        );
         drop(request_guard);
     }
 

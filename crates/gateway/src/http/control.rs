@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use axum::extract::ws::Message;
@@ -12,6 +13,8 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep_until;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -50,6 +53,14 @@ enum Audience {
     Everyone,
     InputOwner,
 }
+
+// The browser client pings every second, so a socket that stays silent for the
+// read deadline is effectively dead (a closed laptop, a suspended tab) and
+// would otherwise hold input ownership indefinitely.
+#[cfg(not(test))]
+const READ_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const READ_DEADLINE: Duration = Duration::from_secs(1);
 
 trait ClientEventAudience {
     fn audience(&self) -> Audience;
@@ -111,6 +122,7 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
     let mut writer = tokio::spawn(control_writer(sink, receiver, cancellation.clone()));
     let mut writer_status = WriterStatus::Running;
     let mut ownership = InputOwnership::NotHeld;
+    let mut read_deadline = Instant::now() + READ_DEADLINE;
 
     let reason = 'connected: {
         if let Err(error) = enqueue_snapshot(
@@ -150,6 +162,9 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                         ),
                         None => break 'connected SocketEnd::Disconnected,
                     };
+                    // Any received message from the client proves it is alive
+                    // and restarts the read deadline.
+                    read_deadline = Instant::now() + READ_DEADLINE;
                     let result = match message {
                         Message::Text(text) => {
                             handle_text(
@@ -208,6 +223,11 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                     if let Err(error) = result {
                         break 'connected error;
                     }
+                }
+                () = sleep_until(read_deadline) => {
+                    // Silence for the read deadline means the client is gone;
+                    // release ownership the same way a disconnect does.
+                    break 'connected SocketEnd::Disconnected;
                 }
                 event_result = events.recv() => {
                     if let Err(error) = dispatch_control_event(
@@ -1191,5 +1211,161 @@ mod tests {
 
         assert!(rendered.contains("release failed"));
         assert!(rendered.contains("writer failed"));
+    }
+
+    // A minimal WebSocket client for the tests below: a fixed handshake and
+    // masked client frames, enough to drive the real control socket loop.
+    async fn control_websocket(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("test control client should connect");
+        let request = format!(
+            "GET /control HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Origin: https://x.test\r\n\
+             \r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("test control handshake request should write");
+        let mut response = vec![0u8; 1024];
+        let mut received = 0;
+        loop {
+            let read = stream
+                .read(&mut response[received..])
+                .await
+                .expect("test control handshake response should read");
+            assert!(read > 0, "test control handshake should not close early");
+            received += read;
+            if response[..received]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                break;
+            }
+        }
+        assert!(
+            response[..received].starts_with(b"HTTP/1.1 101"),
+            "test control handshake should upgrade: {:?}",
+            String::from_utf8_lossy(&response[..received])
+        );
+        stream
+    }
+
+    async fn send_client_text(stream: &mut tokio::net::TcpStream, text: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126, "test client frames should stay short");
+        let mut frame = vec![
+            0x81,
+            0x80 | u8::try_from(payload.len()).expect("test client frame length should fit"),
+        ];
+        // A zero mask leaves the payload unchanged, which is all the tests need.
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        frame.extend_from_slice(payload);
+        stream
+            .write_all(&frame)
+            .await
+            .expect("test client frame should write");
+    }
+
+    async fn next_server_pong(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+
+        loop {
+            let mut header = [0u8; 2];
+            stream
+                .read_exact(&mut header)
+                .await
+                .expect("test server frame header should read");
+            let length = match header[1] & 0x7f {
+                127 => panic!("test server frames should stay short"),
+                126 => {
+                    let mut bytes = [0u8; 2];
+                    stream
+                        .read_exact(&mut bytes)
+                        .await
+                        .expect("test server frame length should read");
+                    usize::from(u16::from_be_bytes(bytes))
+                }
+                length => usize::from(length),
+            };
+            let mut payload = vec![0u8; length];
+            stream
+                .read_exact(&mut payload)
+                .await
+                .expect("test server frame payload should read");
+            if (header[0] & 0x0f) == 0x1 && String::from_utf8_lossy(&payload).contains("pong") {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pings_keep_the_control_socket_alive_until_silence_ends_it() {
+        use tokio::io::AsyncReadExt;
+
+        let (state, mut commands) = test_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test HTTP listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::http::router(state))
+                .await
+                .expect("test HTTP server should not fail");
+        });
+
+        let mut client = control_websocket(address).await;
+        send_client_text(&mut client, r#"{"type":"acquire"}"#).await;
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+
+        // A ping halfway to the read deadline must reset it: the socket then
+        // stays open past the original deadline.
+        tokio::time::sleep(READ_DEADLINE / 2).await;
+        send_client_text(&mut client, r#"{"type":"ping","id":1}"#).await;
+        timeout(READ_DEADLINE, next_server_pong(&mut client))
+            .await
+            .expect("control socket should answer a ping before the read deadline");
+
+        // With the deadline reset, the socket must outlive the original
+        // deadline, then silence must end it and release input ownership
+        // exactly like a disconnect does.
+        let mut buffer = [0u8; 64];
+        assert!(
+            timeout(READ_DEADLINE * 3 / 4, client.read(&mut buffer))
+                .await
+                .is_err(),
+            "control socket should stay open right after a ping"
+        );
+        loop {
+            let Ok(read_result) = timeout(READ_DEADLINE * 3, client.read(&mut buffer)).await else {
+                panic!("control socket should end after the read deadline of silence");
+            };
+            match read_result {
+                Ok(0) => break,
+                Ok(_read) => {}
+                Err(error) => panic!("control socket read should not fail: {error}"),
+            }
+        }
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::ReleaseAll(_))
+        ));
+        server.abort();
     }
 }

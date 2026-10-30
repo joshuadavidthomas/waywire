@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
+use tracing::debug;
 use tracing::warn;
 #[cfg(test)]
 use waywire_protocol::browser::Continuity;
@@ -29,7 +30,6 @@ use waywire_protocol::pipe::Command;
 #[cfg(test)]
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameMetadata;
-#[cfg(test)]
 use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::KeyframeReadiness;
 use waywire_protocol::pipe::KeyframeState;
@@ -75,6 +75,9 @@ enum GopState {
 enum PipelineMessage {
     Metadata(FrameMetadata),
     Unit(PendingUnit),
+    /// The assembler dropped RTP and entered recovery: it awaits the next IDR
+    /// before the stream can resume.
+    Recovery,
 }
 
 enum WorkerWake {
@@ -277,9 +280,21 @@ impl VideoPipeline {
                     continue;
                 }
             };
+            let was_recovering = assembler.is_recovering();
             let result = assembler.consume(packet);
             if let Some(dropped) = result.drops {
                 summary.record(dropped.packets, PacketFailure::Drop(dropped.reason));
+            }
+            if !was_recovering && assembler.is_recovering() {
+                // RTP loss put the assembler into recovery, so the compositor
+                // must send a keyframe before the stream resumes. A packet that
+                // completes a keyframe in the same consume call never enters
+                // this branch, and later packets while still recovering do not
+                // repeat the signal.
+                self.tx
+                    .send(PipelineMessage::Recovery)
+                    .await
+                    .context("video pipeline stopped")?;
             }
             match result.outcome {
                 Ok(AssemblyOutcome::Complete(unit)) => self.unit(unit).await?,
@@ -291,6 +306,30 @@ impl VideoPipeline {
 }
 
 impl VideoWorker {
+    /// Sends one keyframe readiness update for `generation`, if any.
+    ///
+    /// The readiness state is idempotent, so the send is non-blocking and a
+    /// command dropped under command-pipe backpressure is fine.
+    fn send_keyframe_readiness(&self, generation: Option<Generation>, state: KeyframeState) {
+        let Some(generation) = generation else {
+            return;
+        };
+        match self
+            .commands
+            .try_system(&Command::KeyframeReadiness(KeyframeReadiness {
+                generation,
+                state,
+            })) {
+            Ok(true) => {}
+            Ok(false) => debug!(
+                generation = generation.get(),
+                state = ?state,
+                "keyframe readiness command dropped under command-pipe backpressure"
+            ),
+            Err(error) => warn!(reason = %error, "keyframe readiness command failed"),
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one worker loop keeps timer priority, resync recovery, and frame broadcasts ordered"
@@ -348,6 +387,17 @@ impl VideoWorker {
                     WorkerWake::Message(PipelineMessage::Unit(value)) => {
                         correlator.push_unit(value)
                     }
+                    WorkerWake::Message(PipelineMessage::Recovery) => {
+                        // The assembler lost RTP and awaits a fresh keyframe;
+                        // mirror the correlator resync notification so the
+                        // compositor sends an IDR.
+                        self.readiness.await_keyframe();
+                        self.send_keyframe_readiness(
+                            ready_generation.take(),
+                            KeyframeState::Missing,
+                        );
+                        continue;
+                    }
                     WorkerWake::PipelineClosed => {
                         return Err(anyhow!("video pipeline closed"));
                     }
@@ -365,49 +415,27 @@ impl VideoWorker {
                 CorrelationOutcome::Resync(reason) => {
                     warn!(reason = %reason, "video metadata/RTP correlation resynchronised");
                     self.readiness.await_keyframe();
-                    if let Some(generation) = ready_generation.take()
-                        && let Err(error) = self
-                            .commands
-                            .system(Command::KeyframeReadiness(KeyframeReadiness {
-                                generation,
-                                state: KeyframeState::Missing,
-                            }))
-                            .await
-                    {
-                        warn!(reason = %error, "keyframe readiness command failed");
-                    }
+                    self.send_keyframe_readiness(ready_generation.take(), KeyframeState::Missing);
                     continue;
                 }
             };
             for frame in frames {
                 let generation = frame.metadata.generation;
-                let transition = match self.hub.broadcast(&frame) {
+                match self.hub.broadcast(&frame) {
                     GopState::KeyframeCached => {
                         self.readiness.mark_video_ready();
-                        if ready_generation == Some(generation) {
-                            None
-                        } else {
+                        if ready_generation != Some(generation) {
                             ready_generation = Some(generation);
-                            Some((generation, KeyframeState::Cached))
+                            self.send_keyframe_readiness(Some(generation), KeyframeState::Cached);
                         }
                     }
                     GopState::Recovering => {
                         self.readiness.await_keyframe();
-                        ready_generation
-                            .take()
-                            .map(|generation| (generation, KeyframeState::Missing))
+                        self.send_keyframe_readiness(
+                            ready_generation.take(),
+                            KeyframeState::Missing,
+                        );
                     }
-                };
-                if let Some((generation, state)) = transition
-                    && let Err(error) = self
-                        .commands
-                        .system(Command::KeyframeReadiness(KeyframeReadiness {
-                            generation,
-                            state,
-                        }))
-                        .await
-                {
-                    warn!(reason = %error, "keyframe readiness command failed");
                 }
             }
         }
@@ -710,6 +738,94 @@ mod tests {
         assert_eq!(frame.continuity, Continuity::AfterGap);
 
         drop(pipeline);
+        assert!(worker_task.await.expect("worker task should run").is_err());
+    }
+
+    #[tokio::test]
+    async fn assembler_recovery_requests_one_keyframe_for_the_ready_generation() {
+        async fn send_rtp(
+            sender: &tokio::net::UdpSocket,
+            address: std::net::SocketAddr,
+            sequence: u16,
+            timestamp: u32,
+            generation: u32,
+            payload: &[u8],
+        ) {
+            // Version 2, marker bit set, dynamic payload type: one complete
+            // access unit per packet.
+            let mut bytes = vec![0x80, 0x80 | 0x60];
+            bytes.extend_from_slice(&sequence.to_be_bytes());
+            bytes.extend_from_slice(&timestamp.to_be_bytes());
+            bytes.extend_from_slice(&generation.to_be_bytes());
+            bytes.extend_from_slice(payload);
+            sender
+                .send_to(&bytes, address)
+                .await
+                .expect("test RTP packet should send");
+        }
+
+        let (commands, mut command_events) = test_command_sink();
+        let readiness = Readiness::new();
+        let hub = video_hub();
+        let sessions = Sessions::new(
+            commands.clone(),
+            waywire_protocol::pipe::Kbps::new(8_000).expect("valid bitrate"),
+            Fps::new(60).expect("valid fps"),
+        );
+        let (pipeline, worker) =
+            VideoPipeline::new(hub.clone(), commands, readiness.clone(), sessions);
+        let worker_task = tokio::spawn(worker.run());
+
+        let gateway = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("test RTP gateway socket should bind");
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("test RTP sender socket should bind");
+        let gateway_address = gateway
+            .local_addr()
+            .expect("test RTP gateway socket should have an address");
+
+        pipeline
+            .metadata(metadata(1, 1))
+            .await
+            .expect("first metadata should queue");
+        let receive_task = tokio::spawn(pipeline.receive(gateway));
+
+        // A complete keyframe starts the stream and caches the keyframe.
+        send_rtp(&sender, gateway_address, 1, 1, 1, &[0x65, 1]).await;
+        let command = tokio::time::timeout(Duration::from_secs(1), command_events.recv())
+            .await
+            .expect("cached keyframe readiness should queue");
+        let Some(Command::KeyframeReadiness(command)) = command else {
+            panic!("cached keyframe should queue a readiness command");
+        };
+        assert_eq!(command.generation.get(), 1);
+        assert_eq!(command.state, KeyframeState::Cached);
+        assert_eq!(readiness.state(), ReadinessState::Ready);
+
+        // A sequence jump drops the stream into recovery and must ask the
+        // compositor for a keyframe for the ready generation.
+        send_rtp(&sender, gateway_address, 3, 2, 1, &[0x41, 1]).await;
+        let command = tokio::time::timeout(Duration::from_secs(1), command_events.recv())
+            .await
+            .expect("assembler recovery readiness should queue");
+        let Some(Command::KeyframeReadiness(command)) = command else {
+            panic!("assembler recovery should queue a readiness command");
+        };
+        assert_eq!(command.generation.get(), 1);
+        assert_eq!(command.state, KeyframeState::Missing);
+        assert_eq!(readiness.state(), ReadinessState::WaitingForKeyframe);
+
+        // Packets that drop while already recovering must not repeat the ask.
+        send_rtp(&sender, gateway_address, 4, 3, 1, &[0x41, 1]).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), command_events.recv())
+                .await
+                .is_err()
+        );
+
+        receive_task.abort();
         assert!(worker_task.await.expect("worker task should run").is_err());
     }
 }

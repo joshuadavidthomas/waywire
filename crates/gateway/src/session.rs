@@ -184,8 +184,11 @@ impl Sessions {
 
         // Resize changes shared display state rather than injecting user input.
         // Holding the ownership lock orders an accepted resize before any later
-        // release or acquisition, and system authority keeps it valid in the queue.
-        self.commands.system(Command::Resize(resize)).await?;
+        // release or acquisition, and system authority keeps it valid in the
+        // queue. A send failure ends only this browser socket, not the session.
+        self.commands
+            .browser_system(Command::Resize(resize))
+            .await?;
         Ok(ResizeOutcome::Sent)
     }
 
