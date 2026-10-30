@@ -118,6 +118,9 @@ impl CompositorHandler for State {
                 } else if previous && !mapped {
                     self.window_unmapped(&window);
                 }
+                if mapped && old_size != window.bbox().size {
+                    self.refresh_pointer_focus();
+                }
                 if let Some(top) = window.toplevel()
                     && !top.is_initial_configure_sent()
                 {
@@ -416,6 +419,7 @@ impl State {
         if focused.is_some() && focused == super::focus::KeyboardFocus::window(window) {
             self.focus_window(self.topmost_focusable(Some(window)));
         }
+        self.refresh_pointer_focus();
     }
 
     fn constrain_window(&mut self, window: &Window) {
@@ -555,6 +559,7 @@ impl State {
         });
         surface.send_pending_configure();
         self.space.map_element(window, geometry.loc, true);
+        self.refresh_pointer_focus();
         self.refresh_toplevel_states();
         self.dirty = true;
     }

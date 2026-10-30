@@ -138,6 +138,12 @@ pub(crate) enum FrameRequest {
     Pending,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PointerMotionKind {
+    Input,
+    RefreshGrabFocus,
+}
+
 #[expect(
     clippy::struct_field_names,
     reason = "Smithay protocol state names match their handler methods"
@@ -168,6 +174,7 @@ pub(crate) struct State {
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     decoration_press: Option<(KeyboardSource, Window)>,
+    pointer_motion_kind: PointerMotionKind,
     start: Instant,
     running: bool,
     failure: Option<anyhow::Error>,
@@ -290,6 +297,7 @@ impl State {
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
             decoration_press: None,
+            pointer_motion_kind: PointerMotionKind::Input,
             start: Instant::now(),
             running: true,
             failure: None,
@@ -482,6 +490,22 @@ impl State {
         self.pointer_motion_with_delta(source, location, None);
     }
 
+    pub(crate) fn refresh_pointer_focus(&mut self) {
+        if let Some(pointer) = self.seat.get_pointer() {
+            let window_grab = pointer
+                .with_grab(|_, grab| grab.is::<grabs::WindowGrab>())
+                .unwrap_or(false);
+            if pointer.is_grabbed() && !window_grab {
+                return;
+            }
+            if window_grab {
+                self.pointer_motion_kind = PointerMotionKind::RefreshGrabFocus;
+            }
+            self.pointer_motion(KeyboardSource::MAIN, pointer.current_location());
+            self.pointer_motion_kind = PointerMotionKind::Input;
+        }
+    }
+
     /// Relative input also reaches clients as relative motion, unclamped, so
     /// locked-pointer clients keep receiving movement at the output edge. It
     /// shares the absolute motion's frame: Xwayland's warp emulator then
@@ -639,6 +663,9 @@ impl State {
             },
         );
         pointer.frame(self);
+        if state == ButtonState::Released {
+            self.refresh_pointer_focus();
+        }
         if state == ButtonState::Released
             && button == 0x110
             && let Some((owner, window)) = self.decoration_press.take()
@@ -751,10 +778,12 @@ impl State {
             // X11 menus, dropdowns and tooltips draw above their app but expect
             // keyboard focus to stay with it; taking focus closes them.
             if is_override_redirect(window) {
+                self.refresh_pointer_focus();
                 self.dirty = true;
                 return;
             }
         }
+        self.refresh_pointer_focus();
         for current in self.space.elements() {
             current.set_activated(window.as_ref() == Some(current));
             if let Some(top) = current.toplevel() {

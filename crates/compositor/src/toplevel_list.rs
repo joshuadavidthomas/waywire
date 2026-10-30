@@ -175,6 +175,7 @@ mod tests {
     use std::os::unix::io::OwnedFd;
 
     use smithay::desktop::Window;
+    use smithay::wayland::seat::WaylandFocus;
     use wayland_client::Connection;
     use wayland_client::Dispatch;
     use wayland_client::EventQueue;
@@ -217,6 +218,8 @@ mod tests {
         managed: Vec<ManagedToplevelEvents>,
         close_requests: usize,
         keys: Vec<u32>,
+        pointer_focus: Option<WlSurface>,
+        button_targets: Vec<WlSurface>,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -353,6 +356,41 @@ mod tests {
         ) {
             if let wayland_client::protocol::wl_keyboard::Event::Key { key, .. } = event {
                 state.keys.push(key);
+            }
+        }
+    }
+
+    impl Dispatch<wayland_client::protocol::wl_pointer::WlPointer, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &wayland_client::protocol::wl_pointer::WlPointer,
+            event: wayland_client::protocol::wl_pointer::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                wayland_client::protocol::wl_pointer::Event::Enter { surface, .. } => {
+                    state.pointer_focus = Some(surface);
+                }
+                wayland_client::protocol::wl_pointer::Event::Leave { .. } => {
+                    state.pointer_focus = None;
+                }
+                wayland_client::protocol::wl_pointer::Event::Button { .. } => {
+                    if let Some(surface) = &state.pointer_focus {
+                        state.button_targets.push(surface.clone());
+                    }
+                }
+                wayland_client::protocol::wl_pointer::Event::Motion { .. }
+                | wayland_client::protocol::wl_pointer::Event::Axis { .. }
+                | wayland_client::protocol::wl_pointer::Event::Frame
+                | wayland_client::protocol::wl_pointer::Event::AxisSource { .. }
+                | wayland_client::protocol::wl_pointer::Event::AxisStop { .. }
+                | wayland_client::protocol::wl_pointer::Event::AxisDiscrete { .. }
+                | wayland_client::protocol::wl_pointer::Event::AxisValue120 { .. }
+                | wayland_client::protocol::wl_pointer::Event::AxisRelativeDirection { .. }
+                | wayland_client::protocol::wl_pointer::Event::Warp { .. }
+                | _ => {}
             }
         }
     }
@@ -685,6 +723,108 @@ mod tests {
         );
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(app.keys, [30], "the focused client receives typing");
+    }
+
+    #[test]
+    fn stationary_pointer_tracks_newly_mapped_window() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let _client_pointer = app
+            .seat
+            .as_ref()
+            .expect("seat")
+            .get_pointer(&queue.handle(), ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "First",
+            "first",
+        );
+        let first = top_window(&state);
+        state.space.map_element(first.clone(), (80, 80), true);
+        state.pointer_motion(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            (80.0, 80.0).into(),
+        );
+        let pointer = state.seat.get_pointer().expect("pointer");
+        assert_eq!(
+            pointer.current_focus(),
+            first.wl_surface().map(std::borrow::Cow::into_owned)
+        );
+        state.start_decoration_grab(
+            first.clone(),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            false,
+        );
+        assert!(pointer.is_grabbed());
+        let (second_surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Second",
+            "second",
+        );
+        let second = top_window(&state);
+        assert_ne!(first, second);
+        pointer.unset_grab(
+            &mut state,
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            smithay::backend::input::InputTime::now(),
+        );
+        assert_eq!(
+            pointer.current_focus(),
+            second.wl_surface().map(std::borrow::Cow::into_owned)
+        );
+        state.pointer_button(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            0x110,
+            smithay::backend::input::ButtonState::Pressed,
+        );
+        state.pointer_button(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            0x110,
+            smithay::backend::input::ButtonState::Released,
+        );
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            app.button_targets,
+            [second_surface.clone(), second_surface.clone()]
+        );
+        state.start_decoration_grab(
+            second.clone(),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            true,
+        );
+        state.focus_window(Some(first.clone()));
+        pointer.unset_grab(
+            &mut state,
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            smithay::backend::input::InputTime::now(),
+        );
+        assert_eq!(
+            pointer.current_focus(),
+            first.wl_surface().map(std::borrow::Cow::into_owned)
+        );
+        state.focus_window(Some(second.clone()));
+        assert_eq!(
+            pointer.current_focus(),
+            second.wl_surface().map(std::borrow::Cow::into_owned)
+        );
+        second_surface.attach(None, 0, 0);
+        second_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            pointer.current_focus(),
+            first.wl_surface().map(std::borrow::Cow::into_owned)
+        );
     }
 
     #[test]

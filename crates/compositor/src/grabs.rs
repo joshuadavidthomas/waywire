@@ -204,6 +204,9 @@ impl PointerGrab<State> for WindowGrab {
         _: Option<(WlSurface, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
+        if state.pointer_motion_kind == super::PointerMotionKind::RefreshGrabFocus {
+            return;
+        }
         handle.motion(state, None, event);
         let delta = event.location - self.start.location;
         if let Some(edges) = self.edges {

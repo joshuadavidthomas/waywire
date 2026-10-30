@@ -163,6 +163,7 @@ impl State {
         if let Some(window) = self.x11_window(surface) {
             self.space.map_element(window, geometry.loc, false);
         }
+        self.refresh_pointer_focus();
         self.dirty = true;
     }
 
@@ -258,6 +259,7 @@ impl XwmHandler for State {
         let location = surface.last_configure().loc;
         self.space
             .map_element(Window::new_x11_window(surface), location, false);
+        self.refresh_pointer_focus();
         self.dirty = true;
     }
 
@@ -302,6 +304,7 @@ impl XwmHandler for State {
             && let Some(window) = self.x11_window(&surface)
         {
             self.space.raise_element(&window, false);
+            self.refresh_pointer_focus();
         }
     }
 
@@ -323,6 +326,7 @@ impl XwmHandler for State {
                 self.space.raise_element_above(&window, &reference, false);
             }
         }
+        self.refresh_pointer_focus();
         self.dirty = true;
     }
 

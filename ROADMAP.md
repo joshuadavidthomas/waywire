@@ -257,10 +257,6 @@ mainstream apps work.
   X11 transient-for, so clicking the main window hides its own modal dialog.
   Keep children above their parent, redirect focus to a modal child, and
   centre dialogs on their parent.
-- **High:** pointer focus is recomputed only on pointer motion. A click on a
-  dialog that opened under a still pointer goes to the window underneath.
-  Re-run motion at the current location after map, unmap, raise, maximize and
-  grab end.
 - **Medium:** maximized windows can be dragged and resized. Unmaximize on
   titlebar drag and refuse resize while maximized or fullscreen.
 - **Medium:** configures can be sent before a client's initial commit (from
