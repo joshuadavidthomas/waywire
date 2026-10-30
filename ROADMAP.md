@@ -348,10 +348,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
   may produce double input. _(hypothesis)_
 - **Medium:** relative motion and pointer constraints never reach apps. The
   constraints handler exists but its global is never created.
-- **Medium:** XTest relative motion moves the pointer twice as far.
-  `xdotool mousemove_relative 200 141` from the origin lands at 400,282.
-  Whether Xwayland's pointer acceleration or the compositor doubles it is not
-  traced.
 - **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
   keys are missing from the key map. The EI keycode subtraction can underflow.
 
