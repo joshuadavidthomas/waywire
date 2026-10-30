@@ -153,7 +153,7 @@ impl State {
         clippy::expect_used,
         reason = "user data is inserted immediately before access"
     )]
-    fn x11_zoom(&mut self, surface: &X11Surface, fullscreen: bool, enabled: bool) {
+    pub(crate) fn x11_zoom(&mut self, surface: &X11Surface, fullscreen: bool, enabled: bool) {
         surface
             .user_data()
             .insert_if_missing(RestoreGeometry::default);
@@ -199,6 +199,7 @@ impl State {
         } else if let Some(geometry) = saved.0.borrow_mut().take() {
             self.x11_geometry(surface, geometry);
         }
+        self.refresh_toplevel_states();
     }
 }
 

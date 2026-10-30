@@ -104,7 +104,7 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                        |
 | virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                 |
 | ext-foreign-toplevel-list       | lswt                                                           | Done                                                 |
-| wlr-foreign-toplevel-management | wlrctl window actions                                          | Missing; not in Smithay, implement it                |
+| wlr-foreign-toplevel-management | wlrctl window actions                                          | Done; activate and close                             |
 | Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done                                                 |
 | XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below) |
 
@@ -137,8 +137,9 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   drops later agent input, and gives browser keys the seat's own keymap; the
   viewer shows agent driving versus the takeover. Agent input resumes when
   the browser releases control.
-- **Window actions shared with the desktop.** Foreign-toplevel requests,
-  titlebar clicks and the taskbar all go through the same `WindowAction`.
+- **Window actions shared with the desktop.** Foreign-toplevel activate and
+  close share the titlebar's focus and close functions. The full `WindowAction`
+  type, minimize with restore, and a restore keybinding wait for the taskbar.
 - **Acceptance tests,** on packaged tools from Debian 13 and Fedora 42:
   computer-use-linux or cua-driver drives a Wayland application through the
   portals, and Anthropic's demo loop drives an X11 application with xdotool
@@ -234,7 +235,10 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 
 - One `WindowAction` type (focus, move, resize, minimize, maximize, restore,
   close, show menu). Titlebar buttons, the window menu, taskbar chips,
-  keybindings and the agent API all dispatch it.
+  keybindings and the agent API all dispatch it. Deferred until the taskbar
+  lands: minimize with restore through its chip, the restore keybinding, and
+  the full `WindowAction` type. Foreign-toplevel activate and close already
+  share the titlebar's focus and close paths.
 - Chrome is built from window state and the theme as a short list of nodes,
   each with a rectangle, a style and an optional action. Painting, hit testing
   and cursor shapes all read that list, replacing the separate `Layout` and

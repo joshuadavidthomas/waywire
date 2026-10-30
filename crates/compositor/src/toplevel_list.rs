@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 
 use smithay::desktop::Window;
+use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1;
+use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::IsAlive;
 use smithay::wayland::compositor::with_states;
@@ -19,10 +21,12 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::xwayland::X11Surface;
 
 use crate::State;
+use crate::foreign_toplevel::ForeignToplevels;
 
 pub(crate) struct ToplevelList {
     state: ForeignToplevelListState,
     handles: HashMap<Window, ForeignToplevelHandle>,
+    foreign: ForeignToplevels,
 }
 
 impl ToplevelList {
@@ -30,6 +34,7 @@ impl ToplevelList {
         Self {
             state: ForeignToplevelListState::new::<State>(display_handle),
             handles: HashMap::new(),
+            foreign: ForeignToplevels::new(display_handle),
         }
     }
 
@@ -47,25 +52,35 @@ impl ToplevelList {
         let Some((title, app_id)) = metadata(window) else {
             return;
         };
-        let handle = self.state.new_toplevel::<State>(title, app_id);
+        let handle = self
+            .state
+            .new_toplevel::<State>(title.clone(), app_id.clone());
         self.handles.insert(window.clone(), handle);
+        let states =
+            crate::foreign_toplevel::states(window, crate::foreign_toplevel::activated(window));
+        self.foreign.publish(window, title, app_id, states);
     }
 
     /// Refresh an announced window's title and app id, sending `done` only
     /// when one of them changed.
     pub(crate) fn update(&mut self, window: &Window) {
-        let Some(handle) = self.handles.get(window) else {
-            return;
-        };
         let Some((title, app_id)) = metadata(window) else {
             return;
         };
-        if handle.title() == title && handle.app_id() == app_id {
-            return;
+        if let Some(handle) = self.handles.get(window)
+            && (handle.title() != title || handle.app_id() != app_id)
+        {
+            handle.send_title(&title);
+            handle.send_app_id(&app_id);
+            handle.send_done();
         }
-        handle.send_title(&title);
-        handle.send_app_id(&app_id);
-        handle.send_done();
+        self.foreign.update_metadata(window, &title, &app_id);
+    }
+
+    /// Refresh the foreign-toplevel states of every window after a focus
+    /// change. Commits do not call this.
+    pub(crate) fn refresh_states(&mut self, focused: Option<&crate::focus::KeyboardFocus>) {
+        self.foreign.refresh(focused);
     }
 
     /// Close the window's handle; the entry is removed when the window unmaps
@@ -74,6 +89,7 @@ impl ToplevelList {
         if let Some(handle) = self.handles.remove(window) {
             self.state.remove_toplevel(&handle);
         }
+        self.foreign.unpublish(window);
     }
 
     /// Close handles of windows that were destroyed without an unmap, such as
@@ -88,6 +104,34 @@ impl ToplevelList {
         for window in dead {
             self.unpublish(&window);
         }
+    }
+
+    pub(crate) fn manager_bound(&mut self, manager: &ZwlrForeignToplevelManagerV1) {
+        self.foreign.manager_bound(manager);
+    }
+
+    pub(crate) fn manager_removed(&mut self, manager: &ZwlrForeignToplevelManagerV1) {
+        self.foreign.manager_removed(manager);
+    }
+
+    pub(crate) fn handle_destroyed(&mut self, handle: &ZwlrForeignToplevelHandleV1) {
+        self.foreign.handle_destroyed(handle);
+    }
+
+    pub(crate) fn holds_handle(
+        &self,
+        window: &Window,
+        handle: &ZwlrForeignToplevelHandleV1,
+    ) -> bool {
+        self.foreign.holds_handle(window, handle)
+    }
+
+    pub(crate) fn accepts_request(&mut self, browser_holds_input: bool) -> bool {
+        self.foreign.accepts_request(browser_holds_input)
+    }
+
+    pub(crate) fn lease_changed(&mut self) {
+        self.foreign.lease_changed();
     }
 }
 
@@ -130,12 +174,14 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::io::OwnedFd;
 
+    use smithay::desktop::Window;
     use wayland_client::Connection;
     use wayland_client::Dispatch;
     use wayland_client::EventQueue;
     use wayland_client::QueueHandle;
     use wayland_client::protocol::wl_compositor::WlCompositor;
     use wayland_client::protocol::wl_registry;
+    use wayland_client::protocol::wl_seat::WlSeat;
     use wayland_client::protocol::wl_shm::WlShm;
     use wayland_client::protocol::wl_shm_pool::WlShmPool;
     use wayland_client::protocol::wl_surface::WlSurface;
@@ -144,6 +190,17 @@ mod tests {
     use wayland_protocols::xdg::shell::client::xdg_surface::XdgSurface;
     use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
     use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::State as WlrState;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::{
+        self as wlr_handle,
+    };
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::{
+        self as wlr_manager,
+    };
+
+    use crate::focus::KeyboardFocus;
 
     /// A Wayland client that maps a minimal xdg toplevel and records the
     /// foreign toplevel events the compositor announces.
@@ -153,8 +210,12 @@ mod tests {
         shm: Option<WlShm>,
         wm_base: Option<XdgWmBase>,
         list: Option<ExtForeignToplevelListV1>,
+        seat: Option<WlSeat>,
+        manager: Option<ZwlrForeignToplevelManagerV1>,
         last_configure: Option<u32>,
         handles: Vec<ToplevelHandleEvents>,
+        managed: Vec<ManagedToplevelEvents>,
+        close_requests: usize,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -162,6 +223,16 @@ mod tests {
         identifier: String,
         title: String,
         app_id: String,
+        closed: bool,
+        done: usize,
+    }
+
+    #[derive(Default)]
+    struct ManagedToplevelEvents {
+        handle: Option<ZwlrForeignToplevelHandleV1>,
+        title: String,
+        app_id: String,
+        states: Vec<u32>,
         closed: bool,
         done: usize,
     }
@@ -195,6 +266,12 @@ mod tests {
                     }
                     "ext_foreign_toplevel_list_v1" => {
                         state.list = Some(registry.bind(name, version.min(1), qh, ()));
+                    }
+                    "wl_seat" => {
+                        state.seat = Some(registry.bind(name, version.min(1), qh, ()));
+                    }
+                    "zwlr_foreign_toplevel_manager_v1" => {
+                        state.manager = Some(registry.bind(name, version.min(3), qh, ()));
                     }
                     _ => {}
                 }
@@ -262,6 +339,8 @@ mod tests {
         }
     }
 
+    wayland_client::delegate_noop!(App: ignore WlSeat);
+
     impl Dispatch<XdgWmBase, ()> for App {
         fn event(
             _: &mut Self,
@@ -293,13 +372,16 @@ mod tests {
 
     impl Dispatch<XdgToplevel, ()> for App {
         fn event(
-            _: &mut Self,
+            state: &mut Self,
             _: &XdgToplevel,
-            _: wayland_protocols::xdg::shell::client::xdg_toplevel::Event,
+            event: wayland_protocols::xdg::shell::client::xdg_toplevel::Event,
             (): &(),
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
+            if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::Close = event {
+                state.close_requests += 1;
+            }
         }
     }
 
@@ -352,6 +434,64 @@ mod tests {
                     events.done += 1;
                 }
                 _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &ZwlrForeignToplevelManagerV1,
+            event: wlr_manager::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wlr_manager::Event::Toplevel { toplevel } = event {
+                state.managed.push(ManagedToplevelEvents {
+                    handle: Some(toplevel),
+                    ..Default::default()
+                });
+            }
+        }
+
+        wayland_client::event_created_child!(App, ZwlrForeignToplevelManagerV1, [
+            wlr_manager::EVT_TOPLEVEL_OPCODE =>
+                (ZwlrForeignToplevelHandleV1, ()),
+        ]);
+    }
+
+    impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for App {
+        fn event(
+            state: &mut Self,
+            handle: &ZwlrForeignToplevelHandleV1,
+            event: wlr_handle::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            let Some(events) = state
+                .managed
+                .iter_mut()
+                .find(|events| events.handle.as_ref() == Some(handle))
+            else {
+                return;
+            };
+            match event {
+                wlr_handle::Event::Title { title } => events.title = title,
+                wlr_handle::Event::AppId { app_id } => events.app_id = app_id,
+                wlr_handle::Event::State { state } => {
+                    events.states = state
+                        .chunks_exact(4)
+                        .map(|entry| u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]))
+                        .collect();
+                }
+                wlr_handle::Event::Done => events.done += 1,
+                wlr_handle::Event::Closed => events.closed = true,
+                wlr_handle::Event::OutputEnter { .. }
+                | wlr_handle::Event::OutputLeave { .. }
+                | wlr_handle::Event::Parent { .. }
+                | _ => {}
             }
         }
     }
@@ -462,6 +602,280 @@ mod tests {
         surface.commit();
         sync(display, state, connection, queue, app);
         (surface, xdg_surface, toplevel)
+    }
+
+    fn top_window(state: &crate::State) -> Window {
+        state
+            .space
+            .elements()
+            .last()
+            .cloned()
+            .expect("mapped window")
+    }
+
+    fn managed_handle(app: &App, title: &str) -> ZwlrForeignToplevelHandleV1 {
+        app.managed
+            .iter()
+            .find(|events| events.title == title)
+            .and_then(|events| events.handle.clone())
+            .expect("managed toplevel handle")
+    }
+
+    fn managed_states<'a>(app: &'a App, title: &str) -> &'a [u32] {
+        &app.managed
+            .iter()
+            .find(|events| events.title == title)
+            .expect("managed toplevel")
+            .states
+    }
+
+    #[test]
+    fn wlr_client_sees_one_handle_with_title_app_id_and_state() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(
+            app.manager.is_some(),
+            "zwlr_foreign_toplevel_manager_v1 global advertised"
+        );
+
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Foot",
+            "foot",
+        );
+        assert_eq!(app.managed.len(), 1, "one handle for the mapped window");
+        let toplevel = &app.managed[0];
+        assert_eq!(toplevel.title, "Foot");
+        assert_eq!(toplevel.app_id, "foot");
+        assert_eq!(toplevel.states, vec![WlrState::Activated as u32]);
+        assert!(!toplevel.closed);
+
+        let handle = toplevel.handle.clone().expect("handle announced");
+        let done = toplevel.done;
+        handle.set_maximized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            managed_states(&app, "Foot"),
+            [WlrState::Maximized as u32, WlrState::Activated as u32]
+        );
+        assert_eq!(app.managed[0].done, done + 1, "one done per state change");
+
+        handle.unset_maximized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(managed_states(&app, "Foot"), [WlrState::Activated as u32]);
+    }
+
+    #[test]
+    fn unchanged_commits_do_not_resend_wlr_done() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Foot",
+            "foot",
+        );
+        let done = app.managed[0].done;
+        surface.commit();
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            app.managed[0].done, done,
+            "a commit without a window change sends no done"
+        );
+    }
+
+    #[test]
+    fn close_request_closes_the_window_through_the_shared_path() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Foot",
+            "foot",
+        );
+        managed_handle(&app, "Foot").close();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.close_requests, 1, "the client receives xdg close");
+        assert!(!app.managed[0].closed, "the handle closes only on unmap");
+
+        surface.attach(None, 0, 0);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(app.managed[0].closed, "unmapping closes the wlr handle");
+        assert_eq!(state.toplevel_list.handles.len(), 0);
+    }
+
+    #[test]
+    fn activate_raises_and_focuses_a_window_behind_another() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let (_surface_a, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "A",
+            "a",
+        );
+        let window_a = top_window(&state);
+        let (_surface_b, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "B",
+            "b",
+        );
+        let window_b = top_window(&state);
+        assert_eq!(
+            state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus()),
+            KeyboardFocus::window(&window_b),
+            "the newer window starts focused"
+        );
+        assert_eq!(
+            state.space.elements().last(),
+            Some(&window_b),
+            "the newer window starts on top"
+        );
+        assert_eq!(managed_states(&app, "B"), [WlrState::Activated as u32]);
+
+        managed_handle(&app, "A").activate(app.seat.as_ref().expect("seat bound"));
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        assert_eq!(
+            state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus()),
+            KeyboardFocus::window(&window_a)
+        );
+        assert_eq!(
+            state.space.elements().last(),
+            Some(&window_a),
+            "activate raises the window"
+        );
+        assert_eq!(managed_states(&app, "A"), [WlrState::Activated as u32]);
+        assert!(
+            managed_states(&app, "B").is_empty(),
+            "the previously focused window is deactivated"
+        );
+    }
+
+    #[test]
+    fn foreign_toplevel_requests_are_dropped_during_a_browser_lease() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let (_surface_a, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "A",
+            "a",
+        );
+        let window_a = top_window(&state);
+        let (_surface_b, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "B",
+            "b",
+        );
+        let window_b = top_window(&state);
+        let handle_a = managed_handle(&app, "A");
+        let done = app
+            .managed
+            .iter()
+            .find(|events| events.title == "A")
+            .expect("managed A")
+            .done;
+
+        state.set_browser_lease(true);
+        handle_a.activate(app.seat.as_ref().expect("seat bound"));
+        handle_a.close();
+        handle_a.set_maximized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        assert_eq!(
+            state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus()),
+            KeyboardFocus::window(&window_b),
+            "a dropped activate leaves focus alone"
+        );
+        assert_eq!(app.close_requests, 0, "a dropped close does nothing");
+        assert!(
+            !managed_states(&app, "A").contains(&(WlrState::Maximized as u32)),
+            "a dropped maximize changes no state"
+        );
+        assert_eq!(
+            app.managed
+                .iter()
+                .find(|events| events.title == "A")
+                .expect("managed A")
+                .done,
+            done,
+            "dropping a request sends no done"
+        );
+
+        state.set_browser_lease(false);
+        assert_eq!(
+            state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus()),
+            KeyboardFocus::window(&window_b),
+            "handback leaves focus where it was"
+        );
+        handle_a.activate(app.seat.as_ref().expect("seat bound"));
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus()),
+            KeyboardFocus::window(&window_a)
+        );
+        assert_eq!(
+            managed_states(&app, "A"),
+            [WlrState::Activated as u32],
+            "requests resume after handback"
+        );
     }
 
     #[test]

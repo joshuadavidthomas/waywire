@@ -6,6 +6,7 @@ mod decorations;
 mod eis;
 mod event_writer;
 mod focus;
+mod foreign_toplevel;
 mod grabs;
 mod pointer_warp;
 mod portal;
@@ -74,9 +75,11 @@ use smithay::output::PhysicalProperties;
 use smithay::output::Scale;
 use smithay::output::Subpixel;
 use smithay::reexports::pixman::Image;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::ListeningSocket;
+use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Logical;
 use smithay::utils::Point;
@@ -421,6 +424,7 @@ impl State {
             self.resume_virtual_keymap();
         }
         self.dropped_agent_sources.clear();
+        self.toplevel_list.lease_changed();
         self.publish_agent_input();
     }
 
@@ -627,15 +631,55 @@ impl State {
             && self.decoration_under(pointer.current_location())
                 == Some((window.clone(), decorations::DecorationAction::Close))
         {
-            if let Some(top) = window.toplevel() {
-                top.send_close();
-            }
-            if let Some(x11) = window.x11_surface()
-                && let Err(error) = x11.close()
-            {
-                tracing::warn!(%error, "close X11 window");
-            }
+            Self::close_window(&window);
         }
+    }
+
+    /// Ask a window to close. The titlebar's Close button and the
+    /// wlr-foreign-toplevel-management close request both use this path.
+    pub(crate) fn close_window(window: &Window) {
+        if let Some(top) = window.toplevel() {
+            top.send_close();
+        }
+        if let Some(x11) = window.x11_surface()
+            && let Err(error) = x11.close()
+        {
+            tracing::warn!(%error, "close X11 window");
+        }
+    }
+
+    /// Activate a window from a foreign-toplevel request when the request's
+    /// seat belongs to this compositor.
+    pub(crate) fn activate_foreign_toplevel(&mut self, window: &Window, seat: &WlSeat) {
+        if Seat::<Self>::from_resource(seat).as_ref() != Some(&self.seat) {
+            return;
+        }
+        self.focus_window(Some(window.clone()));
+    }
+
+    /// Apply a maximize or fullscreen request to the window's native surface.
+    /// Both paths already exist for client requests; this only selects the
+    /// Wayland or X11 one.
+    pub(crate) fn set_window_expanded(
+        &mut self,
+        window: &Window,
+        mode: xdg_toplevel::State,
+        enabled: bool,
+    ) {
+        if let Some(top) = window.toplevel() {
+            self.set_expanded(top, mode, enabled);
+        } else if let Some(surface) = window.x11_surface() {
+            self.x11_zoom(surface, mode == xdg_toplevel::State::Fullscreen, enabled);
+        }
+    }
+
+    /// Recompute every foreign-toplevel's state from the seat's current focus.
+    pub(crate) fn refresh_toplevel_states(&mut self) {
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        self.toplevel_list.refresh_states(focused.as_ref());
     }
 
     pub(crate) fn release_input(&mut self, source: KeyboardSource) {
@@ -690,6 +734,7 @@ impl State {
                 SERIAL_COUNTER.next_serial(),
             );
         }
+        self.refresh_toplevel_states();
         self.dirty = true;
     }
 

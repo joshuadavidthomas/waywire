@@ -515,7 +515,7 @@ impl State {
         }
     }
 
-    fn set_expanded(
+    pub(crate) fn set_expanded(
         &mut self,
         surface: &ToplevelSurface,
         mode: xdg_toplevel::State,
@@ -568,6 +568,7 @@ impl State {
         });
         surface.send_pending_configure();
         self.space.map_element(window, geometry.loc, true);
+        self.refresh_toplevel_states();
         self.dirty = true;
     }
     fn unconstrain_popup(&self, popup: &PopupSurface) {
