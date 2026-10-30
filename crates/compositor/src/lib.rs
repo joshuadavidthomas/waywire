@@ -91,6 +91,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::virtual_pointer::VirtualPointerDevice;
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
@@ -146,6 +147,8 @@ pub(crate) struct State {
     pub(crate) xdisplay: Option<u32>,
     pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
+    pub(crate) virtual_pointers: HashMap<VirtualPointerDevice, KeyboardSource>,
+    pub(crate) virtual_keyboards: virtual_keyboard::VirtualKeyboards,
     capture: capture::Capture,
     screencopy: screencopy::Screencopy,
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
@@ -255,6 +258,8 @@ impl State {
             xdisplay: None,
             xwayland_shell_state,
             eis_seats: HashMap::new(),
+            virtual_pointers: HashMap::new(),
+            virtual_keyboards: virtual_keyboard::VirtualKeyboards::default(),
             capture,
             screencopy,
             toplevel_list,

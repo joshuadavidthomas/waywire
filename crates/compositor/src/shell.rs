@@ -189,6 +189,7 @@ impl SeatHandler for State {
         }
     }
 }
+impl smithay::wayland::text_input::TextInputActivation for State {}
 impl SelectionHandler for State {
     type SelectionUserData = super::clipboard::SelectionData;
     fn new_selection(

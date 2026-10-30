@@ -187,8 +187,6 @@ pub(crate) fn serve_connection(
                     | InputEvent::SwitchToggle { .. }
                     | InputEvent::Special(_) => {}
                 },
-                // No text or touch device is advertised by this seat adapter.
-                EiInputEvent::TextKeysym { .. } | EiInputEvent::TextUtf8 { .. } => {}
             }
         })
         .map_err(|error| std::io::Error::other(error.to_string()))?;

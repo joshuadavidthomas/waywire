@@ -30,7 +30,7 @@ system_dependencies() {
 # Keep build paths and cleanup scoped to Xwayland, not the rest of setup.
 xwayland() (
   prefix="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}"
-  if [[ -x "$prefix/bin/Xwayland" ]] && "$prefix/bin/Xwayland" -version 2>&1 | grep -Fq 'Xwayland Version 24.1.13'; then
+  if [[ -x "$prefix/bin/Xwayland" ]] && "$prefix/bin/Xwayland" -version 2>&1 | grep -Fq 'Xwayland Version 24.1.14'; then
     printf 'CPU-only Xwayland is already installed in %s\n' "$prefix"
     exit 0
   fi
@@ -48,7 +48,7 @@ xwayland() (
   fetch https://deb.debian.org/debian/pool/main/libe/libei/libei_1.5.0.orig.tar.bz2 libei.tar.bz2 da1fba92daccd0667bc46c3ee952d4ae8cfc6bdb4c0bb4d34df26528fb240618
   fetch https://deb.debian.org/debian/pool/main/w/wayland-protocols/wayland-protocols_1.47.orig.tar.xz protocols.tar.xz 5fd4349bcbc9bab9a46f8cf77d1f434296a7a052c87440a094f63fcf62a58e20
   fetch https://www.x.org/releases/individual/proto/xorgproto-2024.1.tar.xz xorgproto.tar.xz 372225fd40815b8423547f5d890c5debc72e88b91088fbfb13158c20495ccb59
-  fetch https://www.x.org/releases/individual/xserver/xwayland-24.1.13.tar.xz xwayland.tar.xz 173aea3d6f79609164c04528e1c8e4c9b60fcd59391c3c9dad4667297d727fb6
+  fetch https://www.x.org/releases/individual/xserver/xwayland-24.1.14.tar.xz xwayland.tar.xz 4eb6b98d678299a4b96138d886345b294130695760345ef84596225a8224078a
 
   build() {
     local source=$1
@@ -64,7 +64,7 @@ xwayland() (
   # Xwayland includes xf86drm.h even in the software-only build. No DRM device
   # or GL library is needed at runtime. Rpath survives Smithay's env_clear().
   export LDFLAGS="-Wl,-rpath,$prefix/lib"
-  build xwayland-24.1.13 -Dglamor=false -Dglx=false -Ddrm=false -Ddri3=false \
+  build xwayland-24.1.14 -Dglamor=false -Dglx=false -Ddrm=false -Ddri3=false \
     -Dxwayland_ei=socket -Dxvfb=false -Dlibdecor=false -Ddocs=false \
     -Ddevel-docs=false -Dxselinux=false -Dc_args=-I/usr/include/libdrm
   "$prefix/bin/Xwayland" -version

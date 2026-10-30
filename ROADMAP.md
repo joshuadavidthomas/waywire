@@ -98,7 +98,7 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; needs a session bus                            |
 | wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                 |
 | ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
-| wlr-virtual-pointer             | cua-driver                                                     | Done; ported from upstream Smithay                   |
+| wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                        |
 | virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                 |
 | ext-foreign-toplevel-list       | lswt                                                           | Done                                                 |
 | wlr-foreign-toplevel-management | wlrctl window actions                                          | Missing; not in Smithay, implement it                |
@@ -289,21 +289,28 @@ Layer-shell, idle-inhibit and keyboard-shortcuts-inhibit can wait.
 Bumping dependencies is part of the work, not a risk to avoid. Prefer
 upstream code to local copies of it.
 
-- **Smithay.** The pinned revision `d33a9c9` (2026-09-21) is 60 commits behind
-  upstream as of 2026-10-29. Upstream now has `wayland::virtual_pointer`, which
-  `crates/compositor/src/virtual_pointer.rs` ports by hand, and a Xwayland
-  spawn variant. Bump once the compositor threads in flight have merged, then
-  replace local ports with the upstream modules. The pinned `KeymapFile` seals
-  the keymap as a C string, so the EIS keymap event's length counts a trailing
-  NUL that libxkbcommon before 1.6 rejects; check the bump fixes it, or fix it
-  upstream.
+- **Smithay.** Pinned at `f581531` (2026-10-29), current upstream master at the
+  time of the bump, 60 commits past the previous `d33a9c9` pin.
+  `crates/compositor/src/virtual_pointer.rs` now adapts upstream
+  `wayland::virtual_pointer` events to the seat's input entry points instead of
+  porting the protocol by hand. Virtual keyboards likewise route through
+  upstream's `VirtualKeyboardHandler`; the newest virtual keyboard's keymap is
+  active on the seat, and the seat's own keymap returns when the last one goes
+  away. While one is connected, its keymap also applies to browser keys; input
+  arbitration should settle that. Upstream's
+  new Xwayland spawn variant, `spawn_with_inherited_env`, only controls
+  environment inheritance and still has no pre-exec hook, so the signal-mask
+  workaround around `XWayland::spawn` stays. `KeymapFile` still seals the
+  keymap as a C string, and the libei seat still passes the sealed file's size,
+  trailing NUL included, to the EIS keymap event. The bump does not fix the
+  length that libxkbcommon before 1.6 rejects; fix it upstream.
 - **Crates.** Compatible updates landed on 2026-10-30; re-run `cargo update`
   with the drift check below. `nix` is pinned exactly (`=0.31.3`); re-check it
   against newer releases deliberately. `zbus` stays on 5.x: 6.0 drops the
   `blocking-api` feature and reworks runtime selection, so moving the portal
   thread to it is a port, not a bump.
-- **Xwayland.** `.agents/setup` builds 24.1.13; 24.1.14 is current. Track the
-  26.1 release for pointer-warp and libei changes.
+- **Xwayland.** `.agents/setup` builds 24.1.14. Track the 26.1 release for
+  pointer-warp and libei changes.
 - **Check.** Add a periodic job or `just` recipe that reports how far the
   Smithay revision, the crates and the Xwayland build are behind, so drift is
   visible before it becomes a large migration.
