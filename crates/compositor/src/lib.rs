@@ -1047,6 +1047,14 @@ impl State {
             }
             Command::Quality(q) => {
                 if q != self.quality {
+                    if q.fps != self.quality.fps
+                        && let Some(mut mode) = self.output.current_mode()
+                    {
+                        mode.refresh = i32::try_from(q.fps.get())? * 1000;
+                        self.output.set_preferred(mode);
+                        self.output
+                            .change_current_state(Some(mode), None, None, None);
+                    }
                     self.quality = q;
                     self.advance_generation()?;
                 }

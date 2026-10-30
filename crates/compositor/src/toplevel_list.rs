@@ -181,6 +181,7 @@ mod tests {
     use wayland_client::EventQueue;
     use wayland_client::QueueHandle;
     use wayland_client::protocol::wl_compositor::WlCompositor;
+    use wayland_client::protocol::wl_output;
     use wayland_client::protocol::wl_registry;
     use wayland_client::protocol::wl_seat::WlSeat;
     use wayland_client::protocol::wl_shm::WlShm;
@@ -244,6 +245,7 @@ mod tests {
         confined: bool,
         relative: Vec<(f64, f64)>,
         preferred_scales: Vec<i32>,
+        refresh_rates: Vec<i32>,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -289,6 +291,9 @@ mod tests {
                     "wl_shm" => {
                         state.shm = Some(registry.bind(name, version.min(1), qh, ()));
                     }
+                    "wl_output" => {
+                        let _: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
+                    }
                     "xdg_wm_base" => {
                         state.wm_base = Some(registry.bind(name, version.min(1), qh, ()));
                     }
@@ -322,6 +327,21 @@ mod tests {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
+        }
+    }
+
+    impl Dispatch<wl_output::WlOutput, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &wl_output::WlOutput,
+            event: wl_output::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_output::Event::Mode { refresh, .. } = event {
+                state.refresh_rates.push(refresh);
+            }
         }
     }
 
@@ -1387,6 +1407,22 @@ mod tests {
             [WlrState::Activated as u32],
             "requests resume after handback"
         );
+    }
+
+    #[test]
+    fn output_reports_refresh_after_quality_change() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.refresh_rates.last(), Some(&60_000));
+        let mut quality = state.quality;
+        quality.fps = waywire_protocol::pipe::Fps::new(30).expect("valid fps");
+        state
+            .apply_command(waywire_protocol::pipe::Command::Quality(quality))
+            .expect("quality change");
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.refresh_rates.last(), Some(&30_000));
     }
 
     #[test]
