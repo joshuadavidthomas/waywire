@@ -170,6 +170,7 @@ fn shared() -> Arc<Shared> {
             stopping: false,
             notification_failure: None,
             child_pid: None,
+            child_exited: false,
         }),
         work: Condvar::new(),
     })

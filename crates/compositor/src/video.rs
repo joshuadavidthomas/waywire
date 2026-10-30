@@ -2,6 +2,8 @@ use std::io;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::process::Child;
 use std::process::ChildStdin;
@@ -49,7 +51,6 @@ const SLOT_COUNT: usize = 2;
 // FFmpeg 8's SSRC option accepts only a signed integer. Stop at this boundary
 // rather than changing the RTP identity or retrying an encoder that cannot start.
 const MAX_MEDIA_GENERATION: u32 = i32::MAX as u32;
-const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NOTIFICATION_STALL_LIMIT: Duration = Duration::from_secs(2);
 const PIPE_WRITE_STALL_LIMIT: Duration = Duration::from_secs(5);
 const PIPE_WRITE_POLL_INTERVAL_MS: u16 = 20;
@@ -227,6 +228,7 @@ struct Pool {
     stopping: bool,
     notification_failure: Option<String>,
     child_pid: Option<u32>,
+    child_exited: bool,
 }
 
 struct Shared {
@@ -293,6 +295,7 @@ impl VideoEncoder {
                 stopping: false,
                 notification_failure: None,
                 child_pid: None,
+                child_exited: false,
             }),
             work: Condvar::new(),
         });
@@ -612,7 +615,7 @@ fn child_has_exited(active: &mut EncoderProcess) -> bool {
 }
 
 struct Worker<'a> {
-    shared: &'a Shared,
+    shared: &'a Arc<Shared>,
     notifications: &'a mpsc::SyncSender<Notification>,
     notification_wake: &'a Ping,
     ffmpeg: &'a str,
@@ -866,13 +869,10 @@ impl Worker<'_> {
                     self.rtp_port,
                     frame.config,
                     frame.metadata.generation,
-                ) {
+                )
+                .and_then(|started| watch_process(self.shared, self.notification_wake, started))
+                {
                     Ok(started) => {
-                        self.shared
-                            .pool
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .child_pid = Some(started.child.id());
                         self.process = Some(started);
                         // A successful spawn no longer resets the failure
                         // count by itself; only a process that outlives
@@ -924,14 +924,13 @@ impl Worker<'_> {
 
 fn take_pending_frame(shared: &Shared) -> Option<(usize, RawFrame)> {
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-    if pool.pending.is_none() && !pool.stopping {
+    while pool.pending.is_none() && !pool.stopping && !pool.child_exited {
         pool = shared
             .work
-            .wait_timeout(pool, CHILD_POLL_INTERVAL)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0;
+            .wait(pool)
+            .unwrap_or_else(PoisonError::into_inner);
     }
-    if pool.stopping {
+    if pool.stopping || pool.child_exited {
         return None;
     }
     let slot = pool.pending.take()?;
@@ -1084,14 +1083,67 @@ fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
 }
 
 fn stop_process(shared: &Shared, process: Option<EncoderProcess>) {
+    {
+        let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.child_pid = None;
+        pool.child_exited = false;
+    }
+    if let Some(process) = process {
+        process.stop();
+    }
+}
+
+fn watch_process(
+    shared: &Arc<Shared>,
+    wake: &Ping,
+    process: EncoderProcess,
+) -> io::Result<EncoderProcess> {
+    let pid = process.child.id();
     shared
         .pool
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .child_pid = None;
-    if let Some(process) = process {
-        process.stop();
+        .child_pid = Some(pid);
+    if let Err(error) = watch_child(Arc::clone(shared), wake.clone(), pid) {
+        stop_process(shared, Some(process));
+        return Err(error);
     }
+    Ok(process)
+}
+
+fn watch_child(shared: Arc<Shared>, wake: Ping, pid: u32) -> io::Result<()> {
+    // SAFETY: pidfd_open accepts a PID and flags and returns a new descriptor.
+    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = i32::try_from(fd).map_err(io::Error::other)?;
+    // SAFETY: the successful syscall returned a new owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    thread::Builder::new()
+        .name("ffmpeg-exit".into())
+        .spawn(move || {
+            let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+            let result = loop {
+                match poll(&mut fds, nix::poll::PollTimeout::NONE) {
+                    Err(Errno::EINTR) => {}
+                    result => break result,
+                }
+            };
+            let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
+            if pool.child_pid == Some(pid) {
+                if let Err(error) = result {
+                    pool.notification_failure =
+                        Some(format!("ffmpeg exit monitor failed: {error}"));
+                    pool.stopping = true;
+                    wake.ping();
+                } else {
+                    pool.child_exited = true;
+                }
+                shared.work.notify_one();
+            }
+        })?;
+    Ok(())
 }
 
 fn spawn_ffmpeg(
