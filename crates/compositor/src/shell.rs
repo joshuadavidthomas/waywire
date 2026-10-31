@@ -377,6 +377,7 @@ impl XdgShellHandler for State {
     }
     fn title_changed(&mut self, surface: ToplevelSurface) {
         self.update_toplevel_metadata(&surface);
+        self.dirty = true;
     }
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         self.update_toplevel_metadata(&surface);

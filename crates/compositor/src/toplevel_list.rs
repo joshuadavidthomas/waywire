@@ -865,6 +865,14 @@ mod tests {
         );
         state.window_action(&first, crate::WindowAction::Minimize);
         assert!(state.taskbar_chips()[0].minimized);
+        let top = second.toplevel().expect("top").clone();
+        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen, true);
+        assert_eq!(
+            state.taskbar_chips().len(),
+            2,
+            "fullscreen retains its chip"
+        );
+        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen, false);
         second_top.set_title("Renamed".into());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(state.taskbar_chips()[1].title, "Renamed");
@@ -879,6 +887,50 @@ mod tests {
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].window, second);
         assert_eq!(chips[0].title, "Renamed");
+    }
+
+    #[test]
+    fn chip_click_focuses_unfocused_window() {
+        let (mut display, mut state, connection, mut queue, mut app, first) = action_fixture();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Second",
+            "second",
+        );
+        state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&first)
+        );
+    }
+
+    #[test]
+    fn chip_click_minimizes_focused_window() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        assert!(state.windows.get(&window).expect("window").minimized);
+    }
+
+    #[test]
+    fn chip_click_restores_minimized_window() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.window_action(&window, crate::WindowAction::Minimize);
+        state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        assert!(!state.windows.get(&window).expect("window").minimized);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&window)
+        );
     }
 
     #[test]
@@ -1117,10 +1169,10 @@ mod tests {
             .expect("seat")
             .get_pointer(&queue.handle(), ());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        state.space.map_element(window.clone(), (100, 1050), true);
+        state.space.map_element(window.clone(), (300, 1050), true);
         let keyboard = state.seat.get_keyboard().expect("keyboard");
         let focus = keyboard.current_focus().expect("focused window");
-        state.pointer_motion(KeyboardSource::MAIN, (100.0, 1050.0).into());
+        state.pointer_motion(KeyboardSource::MAIN, (300.0, 1050.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);

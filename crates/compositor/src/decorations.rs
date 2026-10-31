@@ -41,6 +41,7 @@ struct Theme {
     resize_corner: i32,
     active: (u32, u32, u32),
     inactive: (u32, u32, u32),
+    accent: u32,
     close_hover: u32,
     close_pressed: u32,
     close_hover_foreground: u32,
@@ -57,6 +58,7 @@ impl Theme {
             resize_corner: 12,
             active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
             inactive: (0x20_25_2d, 0x98_a2_b2, 0x30_37_43),
+            accent: 0x36_6e_a8,
             close_hover: 0xb8_32_45,
             close_pressed: 0x85_29_36,
             close_hover_foreground: 0xff_ff_ff,
@@ -83,6 +85,7 @@ enum NodeStyle {
     Taskbar {
         scale: f64,
         theme: Theme,
+        chips: Vec<super::TaskbarChip>,
     },
     Titlebar {
         title: String,
@@ -355,6 +358,7 @@ fn paint_taskbar(
     size: Size<i32, Logical>,
     scale: f64,
     theme: Theme,
+    chips: &[super::TaskbarChip],
 ) -> Result<cairo::ImageSurface> {
     let pixels = raster_size(size, scale);
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pixels.w, pixels.h)?;
@@ -368,13 +372,50 @@ fn paint_taskbar(
     color(&context, theme.inactive.2);
     context.rectangle(0.0, 0.0, f64::from(size.w), 1.0);
     context.fill()?;
+    for (index, chip) in chips.iter().enumerate() {
+        let Some(rect) = chip_rectangle(size.w, chips.len(), index) else {
+            continue;
+        };
+        if chip.focused {
+            color(&context, theme.accent);
+            context.rectangle(
+                f64::from(rect.loc.x),
+                2.0,
+                f64::from(rect.size.w),
+                f64::from(size.h - 3),
+            );
+            context.fill()?;
+        }
+        context.save()?;
+        context.translate(f64::from(rect.loc.x), 2.0);
+        color(
+            &context,
+            if chip.focused {
+                theme.active.1
+            } else {
+                theme.inactive.1
+            },
+        );
+        draw_title(
+            &context,
+            &chip.title,
+            (rect.size.w - 2 * theme.title_padding).max(0),
+            theme,
+        )?;
+        context.restore()?;
+    }
     Ok(surface)
 }
 
 fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
     let node = &nodes[0];
-    if let NodeStyle::Taskbar { scale, theme } = node.style {
-        return paint_taskbar(node.rect.size, scale, theme);
+    if let NodeStyle::Taskbar {
+        scale,
+        theme,
+        ref chips,
+    } = node.style
+    {
+        return paint_taskbar(node.rect.size, scale, theme, chips);
     }
     paint_titlebar(nodes)
 }
@@ -609,6 +650,37 @@ pub(super) fn decorated(window: &Window) -> bool {
     }
 }
 
+pub(super) fn taskbar_window(window: &Window) -> bool {
+    if window_flags(window).0 {
+        return false;
+    }
+    if window.toplevel().is_some() {
+        return true;
+    }
+    window.x11_surface().is_some_and(|surface| {
+        use smithay::xwayland::xwm::WmWindowType;
+        !surface.is_override_redirect()
+            && matches!(surface.window_type(), None | Some(WmWindowType::Normal))
+    })
+}
+
+pub(super) fn chip_rectangle(
+    width: i32,
+    count: usize,
+    index: usize,
+) -> Option<Rectangle<i32, Logical>> {
+    let count = i32::try_from(count).ok()?;
+    let index = i32::try_from(index).ok()?;
+    if count == 0 || index >= count {
+        return None;
+    }
+    let chip_width = (width / count).min(180);
+    Some(Rectangle::new(
+        (index * chip_width, 0).into(),
+        (chip_width, TASKBAR).into(),
+    ))
+}
+
 pub(super) fn window_flags(window: &Window) -> (bool, bool) {
     if let Some(top) = window.toplevel() {
         (
@@ -650,6 +722,7 @@ impl Taskbar {
         renderer: &mut PixmanRenderer,
         output: Rectangle<i32, Logical>,
         scale: f64,
+        chips: Vec<super::TaskbarChip>,
     ) -> Result<MemoryRenderBufferRenderElement<PixmanRenderer>> {
         let rect = Rectangle::new(
             (output.loc.x, output.loc.y + output.size.h - TASKBAR).into(),
@@ -660,6 +733,7 @@ impl Taskbar {
             style: NodeStyle::Taskbar {
                 scale,
                 theme: Theme::dark(),
+                chips,
             },
             action: None,
             cursor: CursorShape::Default,
@@ -1069,7 +1143,8 @@ impl State {
         }
         elements.extend(upper);
         if let Some(output) = self.space.output_geometry(&self.output) {
-            match self.taskbar.element(renderer, output, scale) {
+            let chips = self.taskbar_chips();
+            match self.taskbar.element(renderer, output, scale, chips) {
                 Ok(bar) => elements.push(bar.into()),
                 Err(error) => tracing::warn!(%error, "taskbar rendering failed"),
             }

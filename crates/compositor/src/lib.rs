@@ -171,13 +171,6 @@ pub(crate) enum WindowAction {
     ToggleAlwaysOnTop,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the taskbar renderer consumes this model in the next step"
-    )
-)]
 #[derive(Clone, Debug, PartialEq)]
 struct TaskbarChip {
     window: Window,
@@ -465,13 +458,6 @@ impl State {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the taskbar renderer consumes this model in the next step"
-        )
-    )]
     fn taskbar_chips(&self) -> Vec<TaskbarChip> {
         let focus = self
             .seat
@@ -479,7 +465,7 @@ impl State {
             .and_then(|keyboard| keyboard.current_focus());
         self.mapped_order
             .iter()
-            .filter(|window| decorations::decorated(window) && !decorations::window_flags(window).0)
+            .filter(|window| decorations::taskbar_window(window))
             .map(|window| TaskbarChip {
                 window: window.clone(),
                 title: toplevel_list::metadata(window)
@@ -894,6 +880,33 @@ impl State {
                 self.refresh_pointer_focus();
             }
             return;
+        }
+        if state == ButtonState::Pressed && button == 0x110 && !pointer.is_grabbed() {
+            let position = pointer.current_location();
+            let covered = self
+                .element_under(position)
+                .is_some_and(|(window, _)| decorations::above_taskbar(window));
+            if !covered && let Some(output) = self.space.output_geometry(&self.output) {
+                let chips = self.taskbar_chips();
+                let relative = position
+                    - (output.loc + Point::from((0, output.size.h - decorations::TASKBAR)))
+                        .to_f64();
+                if let Some(chip) = chips.iter().enumerate().find_map(|(index, chip)| {
+                    let rect = decorations::chip_rectangle(output.size.w, chips.len(), index)?;
+                    rect.to_f64().contains(relative).then_some(chip)
+                }) {
+                    let action = if chip.minimized {
+                        WindowAction::Restore
+                    } else if chip.focused {
+                        WindowAction::Minimize
+                    } else {
+                        WindowAction::Focus
+                    };
+                    self.window_action(&chip.window, action);
+                    self.menu_button = Some((source, button));
+                    return;
+                }
+            }
         }
         if state == ButtonState::Pressed
             && button == 0x111

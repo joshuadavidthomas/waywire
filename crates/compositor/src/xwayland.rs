@@ -436,6 +436,7 @@ impl XwmHandler for State {
             && let Some(window) = self.x11_window(&surface)
         {
             self.toplevel_list.update(&window);
+            self.dirty = true;
         }
     }
 
