@@ -151,6 +151,17 @@ enum PointerMotionKind {
     WarpHint,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WindowAction {
+    Focus,
+    Move,
+    Resize(xdg_toplevel::ResizeEdge),
+    Maximize,
+    Restore,
+    Close,
+    ShowMenu,
+}
+
 #[expect(
     clippy::struct_field_names,
     reason = "Smithay protocol state names match their handler methods"
@@ -647,11 +658,19 @@ impl State {
         };
         let serial = SERIAL_COUNTER.next_serial();
         if state == ButtonState::Pressed
+            && button == 0x111
+            && !pointer.is_grabbed()
+            && let Some((window, decorations::DecorationAction::Move)) =
+                self.decoration_under(pointer.current_location())
+        {
+            self.window_action(&window, WindowAction::ShowMenu);
+        }
+        if state == ButtonState::Pressed
             && button == 0x110
             && !pointer.is_grabbed()
             && let Some((window, action)) = self.decoration_under(pointer.current_location())
         {
-            self.focus_window(Some(window.clone()));
+            self.window_action(&window, WindowAction::Focus);
             pointer.button(
                 self,
                 &ButtonEvent {
@@ -663,10 +682,13 @@ impl State {
             );
             match action {
                 decorations::DecorationAction::Move => {
-                    self.start_decoration_grab(window, serial, false);
+                    self.window_action(&window, WindowAction::Move);
                 }
                 decorations::DecorationAction::Resize => {
-                    self.start_decoration_grab(window, serial, true);
+                    self.window_action(
+                        &window,
+                        WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight),
+                    );
                 }
                 decorations::DecorationAction::Close => {
                     self.decoration_press = Some((source, window));
@@ -704,7 +726,33 @@ impl State {
             && self.decoration_under(pointer.current_location())
                 == Some((window.clone(), decorations::DecorationAction::Close))
         {
-            Self::close_window(&window);
+            self.window_action(&window, WindowAction::Close);
+        }
+    }
+
+    pub(crate) fn window_action(&mut self, window: &Window, action: WindowAction) {
+        match action {
+            WindowAction::Focus => self.focus_window(Some(window.clone())),
+            WindowAction::Move => {
+                self.start_decoration_action(window.clone(), SERIAL_COUNTER.next_serial(), None);
+            }
+            WindowAction::Resize(edges) => {
+                if edges != xdg_toplevel::ResizeEdge::None {
+                    self.start_decoration_action(
+                        window.clone(),
+                        SERIAL_COUNTER.next_serial(),
+                        Some(edges),
+                    );
+                }
+            }
+            WindowAction::Maximize => {
+                self.set_window_expanded(window, xdg_toplevel::State::Maximized, true);
+            }
+            WindowAction::Restore => {
+                self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
+            }
+            WindowAction::Close => Self::close_window(window),
+            WindowAction::ShowMenu => {}
         }
     }
 
@@ -727,7 +775,7 @@ impl State {
         if Seat::<Self>::from_resource(seat).as_ref() != Some(&self.seat) {
             return;
         }
-        self.focus_window(Some(window.clone()));
+        self.window_action(window, WindowAction::Focus);
     }
 
     /// Apply a maximize or fullscreen request to the window's native surface.

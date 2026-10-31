@@ -778,6 +778,97 @@ mod tests {
             .expect("mapped window")
     }
 
+    fn action_fixture() -> (
+        smithay::reexports::wayland_server::Display<crate::State>,
+        crate::State,
+        Connection,
+        EventQueue<App>,
+        App,
+        Window,
+    ) {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        let window = top_window(&state);
+        (display, state, connection, queue, app, window)
+    }
+
+    #[test]
+    fn action_focus_focuses_window() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.focus_window(None);
+        state.window_action(&window, crate::WindowAction::Focus);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&window)
+        );
+    }
+
+    #[test]
+    fn action_move_starts_a_grab() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.window_action(&window, crate::WindowAction::Move);
+        assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
+    }
+
+    #[test]
+    fn action_resize_starts_the_requested_edge_grab() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.window_action(&window, crate::WindowAction::Resize(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge::TopLeft));
+        assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
+        assert_eq!(
+            state
+                .windows
+                .get(&window)
+                .expect("window")
+                .resize
+                .as_ref()
+                .map(|resize| resize.0),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn action_maximize_sets_maximized_state() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.window_action(&window, crate::WindowAction::Maximize);
+        assert!(window.toplevel().expect("toplevel").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+    }
+
+    #[test]
+    fn action_restore_clears_maximized_state() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.window_action(&window, crate::WindowAction::Maximize);
+        state.window_action(&window, crate::WindowAction::Restore);
+        assert!(!window.toplevel().expect("toplevel").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+    }
+
+    #[test]
+    fn action_close_notifies_client() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        state.window_action(&window, crate::WindowAction::Close);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.close_requests, 1);
+    }
+
+    #[test]
+    fn action_show_menu_is_currently_inert() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        let before = state.space.element_location(&window);
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        assert_eq!(state.space.element_location(&window), before);
+        assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
+    }
+
     fn managed_handle(app: &App, title: &str) -> ZwlrForeignToplevelHandleV1 {
         app.managed
             .iter()

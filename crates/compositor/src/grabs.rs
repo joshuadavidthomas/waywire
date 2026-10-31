@@ -48,7 +48,21 @@ pub(super) struct WindowGrab {
 }
 
 impl State {
+    #[cfg(test)]
     pub(super) fn start_decoration_grab(&mut self, window: Window, serial: Serial, resize: bool) {
+        self.start_decoration_action(
+            window,
+            serial,
+            resize.then_some(xdg_toplevel::ResizeEdge::BottomRight),
+        );
+    }
+
+    pub(super) fn start_decoration_action(
+        &mut self,
+        window: Window,
+        serial: Serial,
+        edges: Option<xdg_toplevel::ResizeEdge>,
+    ) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -57,7 +71,7 @@ impl State {
             button: 0x110,
             location: pointer.current_location(),
         };
-        self.install_window_grab(window, serial, resize.then_some(10), start);
+        self.install_window_grab(window, serial, edges.map(|edge| edge as u32), start);
     }
 
     pub(crate) fn start_move(&mut self, window: Window, serial: Serial) {

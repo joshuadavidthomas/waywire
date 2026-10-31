@@ -30,6 +30,7 @@ use smithay::wayland::GlobalDispatch2;
 use smithay::xwayland::X11Surface;
 
 use crate::State;
+use crate::WindowAction;
 
 /// The newest protocol version we serve. Version 2 adds fullscreen state and
 /// requests; version 3 adds parent handles, which this compositor does not
@@ -115,12 +116,12 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
         }
         match request {
             Request::Activate { seat } => state.activate_foreign_toplevel(&self.window, &seat),
-            Request::Close => State::close_window(&self.window),
+            Request::Close => state.window_action(&self.window, WindowAction::Close),
             Request::SetMaximized => {
-                state.set_window_expanded(&self.window, xdg_toplevel::State::Maximized, true);
+                state.window_action(&self.window, WindowAction::Maximize);
             }
             Request::UnsetMaximized => {
-                state.set_window_expanded(&self.window, xdg_toplevel::State::Maximized, false);
+                state.window_action(&self.window, WindowAction::Restore);
             }
             Request::SetFullscreen { output: _ } => {
                 state.set_window_expanded(&self.window, xdg_toplevel::State::Fullscreen, true);
