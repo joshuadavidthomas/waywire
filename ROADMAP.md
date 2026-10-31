@@ -50,8 +50,6 @@ Each fix here is small and independent.
   `crates/protocol/src/pipe.rs`). A rejected resize closes the input socket.
   Share the pixel cap.
 - **Low:** a slow socket drain can cut short process-group cleanup on shutdown.
-- **Low:** a malformed browser record closes the whole input socket instead of
-  being dropped.
 
 ## 2. Agent control plane
 

@@ -179,13 +179,7 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                             .await
                         }
                         Message::Binary(bytes) => {
-                            let command = parse_browser_record(&bytes).map_err(|error| {
-                                SocketEnd::failed(
-                                    anyhow::Error::new(error)
-                                        .context("browser control parse failed"),
-                                )
-                            });
-                            match command {
+                            match parse_browser_record(&bytes) {
                                 Ok(Command::Resize(resize)) => {
                                     match state.sessions.resize(socket_id, resize).await {
                                         Ok(ResizeOutcome::Sent | ResizeOutcome::InputOwnedByAnother) => Ok(()),
@@ -215,7 +209,10 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                                         )),
                                     },
                                 },
-                                Err(error) => Err(error),
+                                Err(error) => {
+                                    warn!(socket_id = socket_id.get(), %error, "dropping invalid browser record");
+                                    Ok(())
+                                },
                             }
                         }
                         Message::Close(frame) => break 'connected SocketEnd::ClientClosed(frame),
@@ -1263,12 +1260,15 @@ mod tests {
     }
 
     async fn send_client_text(stream: &mut tokio::net::TcpStream, text: &str) {
+        send_client_frame(stream, 0x81, text.as_bytes()).await;
+    }
+
+    async fn send_client_frame(stream: &mut tokio::net::TcpStream, opcode: u8, payload: &[u8]) {
         use tokio::io::AsyncWriteExt;
 
-        let payload = text.as_bytes();
         assert!(payload.len() < 126, "test client frames should stay short");
         let mut frame = vec![
-            0x81,
+            opcode,
             0x80 | u8::try_from(payload.len()).expect("test client frame length should fit"),
         ];
         // A zero mask leaves the payload unchanged, which is all the tests need.
@@ -1310,6 +1310,27 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_record_does_not_close_control_socket() {
+        let (state, _commands) = test_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test HTTP listener should bind");
+        let address = listener.local_addr().expect("test HTTP listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::http::router(state))
+                .await
+                .expect("test HTTP server should not fail");
+        });
+        let mut client = control_websocket(address).await;
+        send_client_frame(&mut client, 0x82, &[0xff]).await;
+        send_client_text(&mut client, r#"{"type":"ping","id":1}"#).await;
+        timeout(READ_DEADLINE, next_server_pong(&mut client))
+            .await
+            .expect("control socket should answer after malformed input");
+        server.abort();
     }
 
     #[tokio::test]
