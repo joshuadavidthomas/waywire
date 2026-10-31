@@ -319,4 +319,7 @@ Add these alongside the phases above:
   they need no built-in token. A pass 2 network endpoint brings its own.
 - **Agent interface.** Standard protocols and existing tools first (see phase
   2). A custom endpoint is added only for a measured gap.
+- **Dialog modality.** Wayland children redirect focus only with the xdg-dialog
+  modal hint; X11 windows continue to use `_NET_WM_STATE_MODAL`. Dialog chrome
+  and taskbar grouping remain based on the parent relationship.
 - **Theme.** Chrome and apps follow the viewer's light or dark preference.

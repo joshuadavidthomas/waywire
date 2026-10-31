@@ -2724,6 +2724,27 @@ mod tests {
         );
     }
 
+    fn assert_modal_child_focus(state: &mut crate::State, parent: &Window, child: &Window) {
+        smithay::wayland::compositor::with_states(
+            child.toplevel().expect("child").wl_surface(),
+            |states| {
+                states
+                    .data_map
+                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                    .expect("xdg state")
+                    .lock()
+                    .expect("lock")
+                    .dialog_hint = smithay::wayland::shell::xdg::dialog::ToplevelDialogHint::Modal;
+            },
+        );
+        state.focus_window(Some(parent.clone()));
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(child),
+            "a modal hint redirects focus to the child"
+        );
+    }
+
     #[test]
     fn wayland_dialog_is_centered_and_stays_above_its_parent() {
         let (mut display, mut state) = crate::tests::test_state();
@@ -2788,9 +2809,11 @@ mod tests {
         assert_eq!(top_window(&state), child, "dialog stays above parent");
         assert_eq!(
             state.seat.get_keyboard().expect("keyboard").current_focus(),
-            KeyboardFocus::window(&child)
+            KeyboardFocus::window(&parent),
+            "a parented window without a modal hint must not redirect focus"
         );
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        assert_modal_child_focus(&mut state, &parent, &child);
         state.window_action(&parent, crate::WindowAction::ToggleAlwaysOnTop);
         map_toplevel(
             &mut display,

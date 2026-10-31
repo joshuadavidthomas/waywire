@@ -1483,7 +1483,7 @@ impl State {
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
                     .and_then(|data| data.lock().ok())
-                    .is_none_or(|data| data.dialog_hint != ToplevelDialogHint::Dialog)
+                    .is_some_and(|data| data.dialog_hint == ToplevelDialogHint::Modal)
             });
         }
         window
