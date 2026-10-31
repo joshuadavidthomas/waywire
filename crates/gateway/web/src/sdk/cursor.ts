@@ -6,6 +6,9 @@ type VideoDimensions = Readonly<{
 }>;
 
 const normalizedPointerExtent = 65_535;
+const defaultCursorImage = `url("data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 24"><path d="M1 1v20l4-5 4 6 3-2-4-6h7z" fill="white" stroke="black" stroke-linejoin="round"/></svg>',
+)}")`;
 
 export class LocalCursor {
   private readonly element: HTMLElement;
@@ -34,9 +37,7 @@ export class LocalCursor {
       top: "0",
       width: "16px",
       height: "24px",
-      backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 24"><path d="M1 1v20l4-5 4 6 3-2-4-6h7z" fill="white" stroke="black" stroke-linejoin="round"/></svg>',
-      )}")`,
+      backgroundImage: defaultCursorImage,
       pointerEvents: "none",
       zIndex: "2147483647",
     });
@@ -116,7 +117,13 @@ export class LocalCursor {
     } else if (this.pointerLocked || !this.state.visible) {
       this.element.style.setProperty("cursor", "none");
     } else {
-      this.element.style.setProperty("cursor", this.state.shape);
+      const image = this.state.image;
+      this.element.style.setProperty(
+        "cursor",
+        image
+          ? `url("${image.url}") ${image.hotspotX} ${image.hotspotY}, default`
+          : this.state.shape,
+      );
     }
     this.refreshOverlay();
   }
@@ -170,8 +177,21 @@ export class LocalCursor {
       height = width / aspect;
       top += (bounds.height - height) / 2;
     }
-    const x = left + (state.position.x / normalizedPointerExtent) * width;
-    const y = top + (state.position.y / normalizedPointerExtent) * height;
+    const scale = state.image ? width / state.image.outputWidth : 1;
+    this.overlay.style.width = `${state.image ? state.image.width * scale : 16}px`;
+    this.overlay.style.height = `${state.image ? state.image.height * scale : 24}px`;
+    this.overlay.style.backgroundSize = "100% 100%";
+    this.overlay.style.backgroundImage = state.image
+      ? `url("${state.image.url}")`
+      : defaultCursorImage;
+    const x =
+      left +
+      (state.position.x / normalizedPointerExtent) * width -
+      (state.image?.hotspotX ?? 0) * scale;
+    const y =
+      top +
+      (state.position.y / normalizedPointerExtent) * height -
+      (state.image?.hotspotY ?? 0) * scale;
     this.overlay.style.transform = `translate3d(${x}px, ${y}px, 0)`;
     this.overlay.style.display = "block";
   }

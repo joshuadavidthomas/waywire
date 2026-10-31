@@ -8,6 +8,10 @@ export class FakeTarget {
     priority: "",
     display: "",
     transform: "",
+    width: "",
+    height: "",
+    backgroundImage: "",
+    backgroundSize: "",
     getPropertyValue: (): string => this.style.cursor,
     getPropertyPriority: (): string => this.style.priority,
     setProperty: (_name: string, value: string, priority = ""): void => {

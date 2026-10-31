@@ -180,7 +180,24 @@ pub(super) async fn read_events(
                         events.publish(ClientEvent::ResetVideoRefused { reason });
                     }
                     Event::CursorShape(shape) => {
-                        publish_cursor(&events, |cursor| cursor.shape = shape);
+                        publish_cursor(&events, |cursor| {
+                            cursor.shape = shape;
+                            cursor.image = None;
+                        });
+                    }
+                    Event::CursorImage(image) => {
+                        use base64::Engine;
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&image.png);
+                        publish_cursor(&events, |cursor| {
+                            cursor.image = Some(waywire_protocol::browser::CursorImage {
+                                url: format!("data:image/png;base64,{encoded}"),
+                                width: image.width,
+                                height: image.height,
+                                hotspot_x: image.hotspot_x,
+                                hotspot_y: image.hotspot_y,
+                                output_width: image.output_width,
+                            });
+                        });
                     }
                     Event::CursorVisibility(visibility) => {
                         publish_cursor(&events, |cursor| cursor.visibility = visibility);

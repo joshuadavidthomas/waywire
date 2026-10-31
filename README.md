@@ -19,8 +19,8 @@ Waymote pairs labwc with a separate streaming process. They negotiate frames,
 cursor, clipboard, output size, and input through Wayland protocols. Everything
 the gateway needs belongs to the compositor, so waywire owns it directly:
 
-- Frames render straight into the encoder, and the cursor is reported by name
-  and position instead of being captured.
+- Frames render straight into the encoder, and the cursor is reported by shape
+  or image and position instead of being captured.
 - One seat serves the browser and agent drivers. XTest- and libei-based drivers
   arrive through the EIS socket instead of stopping inside Xwayland.
 - Agent operations and desktop controls should share one implementation. A
@@ -33,9 +33,9 @@ resumes it. See [ROADMAP.md](ROADMAP.md).
 
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while
-observers and pointer-locked clients show a positioned arrow. Cursor positions
-use the same normalized coordinates as absolute input, independent of video
-quality and output scaling.
+observers and pointer-locked clients show a positioned image or fallback arrow.
+Cursor positions use the same normalized coordinates as absolute input,
+independent of video quality and output scaling.
 
 ## Build from source
 

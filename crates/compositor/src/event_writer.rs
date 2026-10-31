@@ -43,7 +43,7 @@ enum Replacement {
 impl Replacement {
     fn for_event(event: &Event) -> Option<Self> {
         match event {
-            Event::CursorShape(_) => Some(Self::Shape),
+            Event::CursorShape(_) | Event::CursorImage(_) => Some(Self::Shape),
             Event::CursorVisibility(_) => Some(Self::Visibility),
             Event::CursorPosition(_) => Some(Self::Position),
             // Only the latest clipboard contents matter to a viewer; without

@@ -2,6 +2,7 @@
 
 mod capture;
 mod clipboard;
+mod cursor;
 mod decorations;
 mod eis;
 mod event_writer;
@@ -161,6 +162,8 @@ pub(crate) struct State {
     pub(crate) output: Output,
     pub(crate) compositor_state: CompositorState,
     pub(crate) surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    pub(crate) cursor_surface: Option<WlSurface>,
+    pub(crate) cursor_image: Option<pipe::CursorImage>,
     pub(crate) shm_state: ShmState,
     pub(crate) xdg_shell_state: XdgShellState,
     pub(crate) seat_state: SeatState<Self>,
@@ -290,6 +293,8 @@ impl State {
             output,
             compositor_state,
             surfaces: Vec::new(),
+            cursor_surface: None,
+            cursor_image: None,
             shm_state,
             xdg_shell_state,
             seat_state,
@@ -1035,6 +1040,7 @@ impl State {
                 self.space.map_output(&self.output, (0, 0));
                 crate::xwayland::update_scale(self)?;
                 self.output_resized();
+                self.update_cursor_image();
                 self.capture.output_resized();
                 crate::eis::refresh_regions(self);
                 self.advance_generation()?;
@@ -1214,6 +1220,7 @@ impl State {
         screencopy::serve_pending(self, image);
         self.dirty = false;
         self.frame_pending = FrameRequest::Idle;
+        self.send_cursor_frame();
         for window in self.space.elements() {
             window.send_frame(
                 &self.output,

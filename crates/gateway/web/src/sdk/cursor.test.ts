@@ -110,6 +110,30 @@ test("cursor parser accepts known shapes and rejects unknown ones", () => {
   );
 });
 
+test("cursor parser preserves a validated image and rejects unsafe URLs", () => {
+  const image = {
+    url: "data:image/png;base64,iVBORw0KGgo=",
+    width: 16,
+    height: 24,
+    hotspotX: 2,
+    hotspotY: 3,
+    outputWidth: 1600,
+  };
+  const cursor = { type: "cursor", visible: true, shape: "default", image };
+  assert.deepEqual(parseControlMessage(cursor), { ...cursor, position: null });
+  assert.equal(
+    parseControlMessage({
+      ...cursor,
+      image: { ...image, url: "https://example.com/cursor" },
+    }),
+    null,
+  );
+  assert.equal(
+    parseControlMessage({ ...cursor, image: { ...image, hotspotX: 16 } }),
+    null,
+  );
+});
+
 test("cursor parser requires normalized integer coordinates", () => {
   for (const position of [
     { x: -1, y: 0 },
@@ -204,6 +228,33 @@ test("overlay maps asymmetric normalized coordinates through letterbox and pilla
     ) < 0.001,
   );
   assert.ok(Math.abs(pillarbox.y - (40 + yFraction * 500)) < 0.001);
+});
+
+test("surface cursor image and hotspot follow video scaling for observers and pointer lock", () => {
+  const { cursor, element, overlay, state } = fixture();
+  const image = {
+    url: "data:image/png;base64,iVBORw0KGgo=",
+    width: 16,
+    height: 24,
+    hotspotX: 2,
+    hotspotY: 3,
+    outputWidth: 1600,
+  };
+  cursor.setVideoDimensions(1600, 900);
+  cursor.update({ ...state, image });
+  assert.equal(overlay.style.width, "10px");
+  assert.equal(overlay.style.height, "15px");
+  assert.ok(overlay.style.backgroundImage.includes(image.url));
+  const position = overlayPosition(overlay);
+  assert.ok(Math.abs(position.x - (10 + (10 / 65_535) * 1000 - 1.25)) < 0.001);
+  cursor.setActive(true);
+  assert.equal(element.style.cursor, `url("${image.url}") 2 3, default`);
+  cursor.setPointerLocked(true);
+  assert.equal(overlay.style.display, "block");
+  assert.ok(overlay.style.backgroundImage.includes(image.url));
+  cursor.update(state);
+  assert.equal(overlay.style.width, "16px");
+  assert.ok(overlay.style.backgroundImage.includes("data:image/svg+xml"));
 });
 
 test("unchanged frame dimensions skip layout work and captured scroll refreshes it", () => {

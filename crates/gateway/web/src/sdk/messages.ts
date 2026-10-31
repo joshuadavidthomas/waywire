@@ -64,6 +64,14 @@ export type CursorState = {
   readonly type: "cursor";
   readonly visible: boolean;
   readonly shape: CursorShape;
+  readonly image?: {
+    readonly url: string;
+    readonly width: number;
+    readonly height: number;
+    readonly hotspotX: number;
+    readonly hotspotY: number;
+    readonly outputWidth: number;
+  };
   // Null until the server has sent its first normalized 0..65535 position.
   readonly position: { readonly x: number; readonly y: number } | null;
 };
@@ -189,11 +197,41 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
     case "cursor": {
       if (typeof value.visible !== "boolean" || !isCursorShape(value.shape))
         return null;
+      let image: CursorState["image"];
+      if (value.image !== undefined) {
+        if (
+          !isRecord(value.image) ||
+          typeof value.image.url !== "string" ||
+          !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(value.image.url) ||
+          !isPointerCoordinate(value.image.width) ||
+          value.image.width < 1 ||
+          value.image.width > 128 ||
+          !isPointerCoordinate(value.image.height) ||
+          value.image.height < 1 ||
+          value.image.height > 128 ||
+          !isPointerCoordinate(value.image.hotspotX) ||
+          value.image.hotspotX >= value.image.width ||
+          !isPointerCoordinate(value.image.hotspotY) ||
+          value.image.hotspotY >= value.image.height ||
+          !isPointerCoordinate(value.image.outputWidth) ||
+          value.image.outputWidth < 1
+        )
+          return null;
+        image = {
+          url: value.image.url,
+          width: value.image.width,
+          height: value.image.height,
+          hotspotX: value.image.hotspotX,
+          hotspotY: value.image.hotspotY,
+          outputWidth: value.image.outputWidth,
+        };
+      }
       if (value.position === undefined || value.position === null) {
         return {
           type: value.type,
           visible: value.visible,
           shape: value.shape,
+          ...(image ? { image } : {}),
           position: null,
         };
       }
@@ -204,6 +242,7 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
             type: value.type,
             visible: value.visible,
             shape: value.shape,
+            ...(image ? { image } : {}),
             position: { x: value.position.x, y: value.position.y },
           }
         : null;

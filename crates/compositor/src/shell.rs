@@ -91,9 +91,17 @@ impl CompositorHandler for State {
     }
     fn destroyed(&mut self, surface: &WlSurface) {
         self.surfaces.retain(|item| item != surface);
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.cursor_surface = None;
+            self.cursor_image = None;
+            self.emit(Event::CursorVisibility(CursorVisibility::Hidden));
+        }
     }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.update_cursor_image();
+        }
         self.frame_pending = crate::FrameRequest::Pending;
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
@@ -197,9 +205,13 @@ impl SeatHandler for State {
     fn cursor_image(&mut self, _: &Seat<Self>, image: CursorImageStatus) {
         match image {
             CursorImageStatus::Hidden => {
+                self.cursor_surface = None;
+                self.cursor_image = None;
                 self.emit(Event::CursorVisibility(CursorVisibility::Hidden));
             }
             CursorImageStatus::Named(icon) => {
+                self.cursor_surface = None;
+                self.cursor_image = None;
                 let shape = CursorShape::ALL
                     .into_iter()
                     .find(|s| s.css_name() == icon.name())
@@ -207,9 +219,9 @@ impl SeatHandler for State {
                 self.emit(Event::CursorShape(shape));
                 self.emit(Event::CursorVisibility(CursorVisibility::Visible));
             }
-            CursorImageStatus::Surface(_) => {
-                self.emit(Event::CursorShape(CursorShape::Default));
-                self.emit(Event::CursorVisibility(CursorVisibility::Visible));
+            CursorImageStatus::Surface(surface) => {
+                self.cursor_surface = Some(surface);
+                self.update_cursor_image();
             }
         }
     }

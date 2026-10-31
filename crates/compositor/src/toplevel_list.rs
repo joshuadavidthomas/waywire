@@ -237,6 +237,7 @@ mod tests {
         close_requests: usize,
         keys: Vec<u32>,
         pointer_focus: Option<WlSurface>,
+        pointer_serial: Option<u32>,
         button_targets: Vec<WlSurface>,
         pointer_motions: usize,
         constraints: Option<ZwpPointerConstraintsV1>,
@@ -475,8 +476,11 @@ mod tests {
             _: &QueueHandle<Self>,
         ) {
             match event {
-                wayland_client::protocol::wl_pointer::Event::Enter { surface, .. } => {
+                wayland_client::protocol::wl_pointer::Event::Enter {
+                    surface, serial, ..
+                } => {
                     state.pointer_focus = Some(surface);
+                    state.pointer_serial = Some(serial);
                 }
                 wayland_client::protocol::wl_pointer::Event::Leave { .. } => {
                     state.pointer_focus = None;
@@ -1406,6 +1410,95 @@ mod tests {
             managed_states(&app, "A"),
             [WlrState::Activated as u32],
             "requests resume after handback"
+        );
+    }
+
+    #[test]
+    fn surface_cursor_sends_scaled_png_and_hotspot_once() {
+        use smithay::input::keyboard::KeyboardSource;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let pointer = app.seat.as_ref().expect("seat").get_pointer(&qh, ());
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Cursor",
+            "cursor",
+        );
+        attach_constraint_buffer(&surface, &app, &qh);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        state.space.map_element(window, (100, 100), true);
+        state.pointer_motion(KeyboardSource::MAIN, (120.0, 120.0).into());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let cursor = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let fd: OwnedFd =
+            nix::sys::memfd::memfd_create("cursor-test", nix::sys::memfd::MFdFlags::empty())
+                .expect("memfd");
+        nix::unistd::ftruncate(&fd, 256).expect("size");
+        let pixels = [0_u8, 0, 255, 255].repeat(64);
+        assert_eq!(nix::unistd::write(&fd, &pixels).expect("write pixels"), 256);
+        let pool = app
+            .shm
+            .as_ref()
+            .expect("shm")
+            .create_pool(fd.as_fd(), 256, &qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            8,
+            8,
+            32,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
+        cursor.set_buffer_scale(2);
+        cursor.attach(Some(&buffer), 0, 0);
+        pointer.set_cursor(
+            app.pointer_serial.expect("pointer enter"),
+            Some(&cursor),
+            1,
+            2,
+        );
+        cursor.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let events = state.event_sink.take_events();
+        let image = events
+            .iter()
+            .find_map(|event| {
+                if let waywire_protocol::pipe::Event::CursorImage(image) = event {
+                    Some(image)
+                } else {
+                    None
+                }
+            })
+            .expect("cursor image event");
+        assert_eq!(
+            (image.width, image.height, image.hotspot_x, image.hotspot_y),
+            (4, 4, 1, 2)
+        );
+        assert!(image.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let mut decoded =
+            cairo::ImageSurface::create_from_png(&mut image.png.as_slice()).expect("decode PNG");
+        assert_eq!(&decoded.data().expect("PNG pixels")[..4], &[0, 0, 255, 255]);
+        cursor.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(
+            !state
+                .event_sink
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, waywire_protocol::pipe::Event::CursorImage(_)))
         );
     }
 

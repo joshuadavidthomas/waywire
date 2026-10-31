@@ -91,9 +91,22 @@ pub struct CursorState {
     #[serde(rename = "visible")]
     pub visibility: CursorVisibility,
     pub shape: CursorShape,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<CursorImage>,
     /// `None` until the compositor has reported a position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<CursorPosition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorImage {
+    pub url: String,
+    pub width: u8,
+    pub height: u8,
+    pub hotspot_x: u8,
+    pub hotspot_y: u8,
+    pub output_width: u16,
 }
 
 impl Serialize for CursorVisibility {
@@ -110,6 +123,7 @@ impl Default for CursorState {
         Self {
             visibility: CursorVisibility::Visible,
             shape: CursorShape::Default,
+            image: None,
             position: None,
         }
     }
@@ -464,6 +478,7 @@ mod tests {
         let cursor = CursorState {
             visibility: CursorVisibility::Visible,
             shape: CursorShape::Pointer,
+            image: None,
             position: Some(CursorPosition {
                 x: value(pipe::PointerCoordinate::new(10)),
                 y: value(pipe::PointerCoordinate::new(20)),
@@ -472,6 +487,25 @@ mod tests {
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
             r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20}}"#
+        );
+    }
+
+    #[test]
+    fn cursor_image_json_is_exact() {
+        let cursor = CursorState {
+            image: Some(CursorImage {
+                url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                width: 16,
+                height: 24,
+                hotspot_x: 2,
+                hotspot_y: 3,
+                output_width: 1600,
+            }),
+            ..CursorState::default()
+        };
+        assert_eq!(
+            json(&ClientEvent::Cursor(cursor)),
+            r#"{"type":"cursor","visible":true,"shape":"default","image":{"url":"data:image/png;base64,iVBORw0KGgo=","width":16,"height":24,"hotspotX":2,"hotspotY":3,"outputWidth":1600}}"#
         );
     }
 

@@ -334,11 +334,6 @@ backgrounds: they cost CPU to draw and smear in 4:2:0 video.
 - **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
   keys are missing from the key map. The EI keycode subtraction can underflow.
 
-## 6. Sharpness and scale
-
-- **Medium:** custom cursor surfaces, used by all X11 and SDL apps, fall back to
-  a plain arrow.
-
 ## 7. Parity and missing protocols
 
 - Drag-and-drop: every drag is cancelled today.

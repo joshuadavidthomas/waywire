@@ -2486,6 +2486,7 @@ version = "0.1.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "futures-util",
  "nix",

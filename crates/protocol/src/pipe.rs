@@ -1447,11 +1447,61 @@ impl Wire for AgentInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u8,
+    pub height: u8,
+    pub hotspot_x: u8,
+    pub hotspot_y: u8,
+    pub output_width: u16,
+    pub png: Vec<u8>,
+}
+
+impl Wire for CursorImage {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.width);
+        out.put(&self.height);
+        out.put(&self.hotspot_x);
+        out.put(&self.hotspot_y);
+        out.put(&self.output_width);
+        out.bytes(&self.png);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let width = input.get()?;
+        let height = input.get()?;
+        let hotspot_x = input.get()?;
+        let hotspot_y = input.get()?;
+        let output_width = input.get()?;
+        let png = input.rest();
+        if width == 0
+            || width > 128
+            || height == 0
+            || height > 128
+            || hotspot_x >= width
+            || hotspot_y >= height
+            || output_width == 0
+            || !png.starts_with(b"\x89PNG\r\n\x1a\n")
+        {
+            return Err(InvalidValue("invalid cursor image"));
+        }
+        Ok(Self {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            output_width,
+            png: png.to_vec(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Clipboard(ClipboardText),
     Frame(FrameMetadata),
     ResizeApplied(ResizeApplied),
     CursorShape(CursorShape),
+    CursorImage(CursorImage),
     CursorVisibility(CursorVisibility),
     CursorPosition(CursorPosition),
     ResetVideoRefused(ResetVideoRefusal),
@@ -1469,6 +1519,7 @@ pub enum EventKind {
     CursorPosition = 6,
     ResetVideoRefused = 7,
     AgentInput = 8,
+    CursorImage = 9,
 }
 
 impl RecordKind for EventKind {
@@ -1482,6 +1533,7 @@ impl RecordKind for EventKind {
             Self::CursorPosition => 6,
             Self::ResetVideoRefused => 7,
             Self::AgentInput => 8,
+            Self::CursorImage => 9,
         }
     }
 
@@ -1495,6 +1547,7 @@ impl RecordKind for EventKind {
             6 => Some(Self::CursorPosition),
             7 => Some(Self::ResetVideoRefused),
             8 => Some(Self::AgentInput),
+            9 => Some(Self::CursorImage),
             _ => None,
         }
     }
@@ -1507,6 +1560,7 @@ impl RecordKind for EventKind {
             Self::CursorShape | Self::CursorVisibility | Self::ResetVideoRefused => 1,
             Self::CursorPosition => 8,
             Self::AgentInput => 2,
+            Self::CursorImage => 128 * 128 * 8 + 6,
         }
     }
 }
@@ -1518,6 +1572,7 @@ impl Event {
             Self::Frame(_) => EventKind::Frame,
             Self::ResizeApplied(_) => EventKind::ResizeApplied,
             Self::CursorShape(_) => EventKind::CursorShape,
+            Self::CursorImage(_) => EventKind::CursorImage,
             Self::CursorVisibility(_) => EventKind::CursorVisibility,
             Self::CursorPosition(_) => EventKind::CursorPosition,
             Self::ResetVideoRefused(_) => EventKind::ResetVideoRefused,
@@ -1539,6 +1594,7 @@ impl Record for Event {
             Self::Frame(payload) => out.put(payload),
             Self::ResizeApplied(payload) => out.put(payload),
             Self::CursorShape(payload) => out.put(payload),
+            Self::CursorImage(payload) => out.put(payload),
             Self::CursorVisibility(payload) => out.put(payload),
             Self::CursorPosition(payload) => out.put(payload),
             Self::ResetVideoRefused(payload) => out.put(payload),
@@ -1552,6 +1608,7 @@ impl Record for Event {
             EventKind::Frame => Ok(Self::Frame(input.get()?)),
             EventKind::ResizeApplied => Ok(Self::ResizeApplied(input.get()?)),
             EventKind::CursorShape => Ok(Self::CursorShape(input.get()?)),
+            EventKind::CursorImage => Ok(Self::CursorImage(input.get()?)),
             EventKind::CursorVisibility => Ok(Self::CursorVisibility(input.get()?)),
             EventKind::CursorPosition => Ok(Self::CursorPosition(input.get()?)),
             EventKind::ResetVideoRefused => Ok(Self::ResetVideoRefused(input.get()?)),
@@ -1911,6 +1968,26 @@ mod tests {
             Command::record_len(&header),
             Err(ProtocolError::InvalidHeader)
         );
+    }
+
+    #[test]
+    fn cursor_image_record_round_trips_and_rejects_invalid_hotspot() {
+        let event = Event::CursorImage(CursorImage {
+            width: 16,
+            height: 24,
+            hotspot_x: 2,
+            hotspot_y: 3,
+            output_width: 1600,
+            png: b"\x89PNG\r\n\x1a\nexample".to_vec(),
+        });
+        let bytes = event.encode();
+        assert_eq!(Event::decode(&bytes), Ok(event));
+        let mut invalid = bytes;
+        invalid[10] = 16;
+        assert!(matches!(
+            Event::decode(&invalid),
+            Err(ProtocolError::InvalidPayload { kind: 9, .. })
+        ));
     }
 
     #[test]
