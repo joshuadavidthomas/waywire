@@ -995,6 +995,35 @@ mod tests {
     }
 
     #[test]
+    fn expanded_windows_refuse_decoration_resize_grabs() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        let window = top_window(&state);
+        let pointer = state.seat.get_pointer().expect("pointer");
+        for mode in [
+            smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+            smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
+        ] {
+            state.set_window_expanded(&window, mode, true);
+            state.start_decoration_grab(window.clone(), smithay::utils::SERIAL_COUNTER.next_serial(), true);
+            assert!(!pointer.is_grabbed(), "expanded window must not begin resizing");
+            state.set_window_expanded(&window, mode, false);
+        }
+        state.start_decoration_grab(window, smithay::utils::SERIAL_COUNTER.next_serial(), true);
+        assert!(pointer.is_grabbed(), "normal window can begin resizing");
+    }
+
+    #[test]
     fn stationary_pointer_tracks_newly_mapped_window() {
         let (mut display, mut state) = crate::tests::test_state();
         let (connection, mut queue, mut app) = connect_client(&mut display.handle());

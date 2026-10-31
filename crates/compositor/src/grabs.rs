@@ -102,6 +102,18 @@ impl State {
         edges: Option<u32>,
         start: GrabStartData<State>,
     ) {
+        if edges.is_some()
+            && (window.toplevel().is_some_and(|top| {
+                top.with_pending_state(|state| {
+                    state.states.contains(xdg_toplevel::State::Maximized)
+                        || state.states.contains(xdg_toplevel::State::Fullscreen)
+                })
+            }) || window
+                .x11_surface()
+                .is_some_and(|surface| surface.is_maximized() || surface.is_fullscreen()))
+        {
+            return;
+        }
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
