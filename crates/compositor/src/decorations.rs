@@ -89,6 +89,7 @@ enum NodeStyle {
         theme: Theme,
         chips: Vec<super::TaskbarChip>,
         control: &'static str,
+        clock: String,
     },
     Titlebar {
         title: String,
@@ -363,6 +364,7 @@ fn paint_taskbar(
     theme: Theme,
     chips: &[super::TaskbarChip],
     control: &str,
+    clock: &str,
 ) -> Result<cairo::ImageSurface> {
     let pixels = raster_size(size, scale);
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pixels.w, pixels.h)?;
@@ -428,6 +430,11 @@ fn paint_taskbar(
     color(&context, theme.inactive.1);
     draw_title(&context, control, 110, theme)?;
     context.restore()?;
+    context.save()?;
+    context.translate(f64::from((size.w - 60).max(0)), 2.0);
+    color(&context, theme.inactive.1);
+    draw_title(&context, clock, 50, theme)?;
+    context.restore()?;
     Ok(surface)
 }
 
@@ -438,9 +445,10 @@ fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         theme,
         ref chips,
         control,
+        ref clock,
     } = node.style
     {
-        return paint_taskbar(node.rect.size, scale, theme, chips, control);
+        return paint_taskbar(node.rect.size, scale, theme, chips, control, clock);
     }
     paint_titlebar(nodes)
 }
@@ -749,6 +757,7 @@ impl Taskbar {
         scale: f64,
         chips: Vec<super::TaskbarChip>,
         control: &'static str,
+        clock: String,
     ) -> Result<MemoryRenderBufferRenderElement<PixmanRenderer>> {
         let rect = Rectangle::new(
             (output.loc.x, output.loc.y + output.size.h - TASKBAR).into(),
@@ -761,6 +770,7 @@ impl Taskbar {
                 theme: Theme::dark(),
                 chips,
                 control,
+                clock,
             },
             action: None,
             cursor: CursorShape::Default,
@@ -1172,9 +1182,10 @@ impl State {
         if let Some(output) = self.space.output_geometry(&self.output) {
             let chips = self.taskbar_chips();
             let control = self.control_text();
+            let clock = self.clock.clone();
             match self
                 .taskbar
-                .element(renderer, output, scale, chips, control)
+                .element(renderer, output, scale, chips, control, clock)
             {
                 Ok(bar) => elements.push(bar.into()),
                 Err(error) => tracing::warn!(%error, "taskbar rendering failed"),

@@ -35,6 +35,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -46,6 +48,8 @@ use calloop::PostAction;
 use calloop::generic::Generic;
 use calloop::signals::Signal;
 use calloop::signals::Signals;
+use calloop::timer::TimeoutAction;
+use calloop::timer::Timer;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
@@ -239,6 +243,7 @@ pub(crate) struct State {
     decoration_press: Option<(KeyboardSource, Window)>,
     window_menu: Option<decorations::WindowMenu>,
     taskbar: decorations::Taskbar,
+    clock: String,
     menu_button: Option<(KeyboardSource, u32)>,
     menu_escape: Option<KeyboardSource>,
     last_titlebar_press: Option<TitlebarPress>,
@@ -388,6 +393,7 @@ impl State {
             decoration_press: None,
             window_menu: None,
             taskbar: decorations::Taskbar::default(),
+            clock: local_clock(SystemTime::now())?,
             menu_button: None,
             menu_escape: None,
             last_titlebar_press: None,
@@ -701,6 +707,15 @@ impl State {
         } else {
             "Agent driving"
         }
+    }
+
+    fn update_clock(&mut self, time: SystemTime) -> Result<()> {
+        let clock = local_clock(time)?;
+        if self.clock != clock {
+            self.clock = clock;
+            self.dirty = true;
+        }
+        Ok(())
     }
 
     /// Apply a browser takeover or handback. On takeover, every agent source
@@ -1909,6 +1924,25 @@ impl State {
     }
 }
 
+fn local_clock(time: SystemTime) -> Result<String> {
+    let seconds = time.duration_since(UNIX_EPOCH)?.as_secs().try_into()?;
+    let mut local = std::mem::MaybeUninit::<nix::libc::tm>::uninit();
+    // SAFETY: both pointers reference valid storage, and localtime_r initializes it on success.
+    let result = unsafe { nix::libc::localtime_r(&raw const seconds, local.as_mut_ptr()) };
+    if result.is_null() {
+        return Err(anyhow!("local time conversion failed"));
+    }
+    // SAFETY: localtime_r returned a non-null pointer to the initialized storage.
+    let local = unsafe { local.assume_init() };
+    Ok(format!("{:02}:{:02}", local.tm_hour, local.tm_min))
+}
+
+fn next_minute_delay(time: SystemTime) -> Duration {
+    let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let remainder = Duration::new(elapsed.as_secs() % 60, elapsed.subsec_nanos());
+    Duration::from_mins(1).saturating_sub(remainder)
+}
+
 /// Run the compositor until shutdown, reading pipe commands from stdin and writing events to stdout.
 #[expect(
     clippy::too_many_lines,
@@ -1931,6 +1965,19 @@ pub fn run(mut options: Config) -> Result<()> {
         .take_notification_source()
         .context("encoder notification source missing")?;
     let mut state = State::new(display.handle(), &options, sink, video)?;
+    handle
+        .insert_source(
+            Timer::from_duration(next_minute_delay(SystemTime::now())),
+            |_, (), state| {
+                let now = SystemTime::now();
+                if let Err(error) = state.update_clock(now) {
+                    state.fail(error);
+                    return TimeoutAction::Drop;
+                }
+                TimeoutAction::ToDuration(next_minute_delay(now))
+            },
+        )
+        .map_err(|error| anyhow!("register clock timer: {error}"))?;
     let eis_path = runtime.path().join("eis");
     crate::eis::listen(&handle, &eis_path, options.xkb_layout.clone())?;
     crate::xwayland::start(&handle, &mut state, &eis_path)?;
@@ -2295,6 +2342,33 @@ mod tests {
         assert!(!state.dirty);
         lease(&mut state, false);
         assert_eq!(state.control_text(), "Agent driving");
+    }
+
+    #[test]
+    fn clock_updates_only_when_the_displayed_minute_changes() {
+        let (_display, mut state) = test_state();
+        let time = UNIX_EPOCH + Duration::from_mins(28_333_334);
+        state.update_clock(time).expect("local time");
+        assert_eq!(state.clock, local_clock(time).expect("local time"));
+        state.dirty = false;
+        state
+            .update_clock(time + Duration::from_secs(30))
+            .expect("local time");
+        assert!(!state.dirty);
+        state
+            .update_clock(time + Duration::from_mins(1))
+            .expect("local time");
+        assert!(state.dirty);
+        assert_ne!(state.clock, local_clock(time).expect("local time"));
+    }
+
+    #[test]
+    fn clock_timer_aligns_to_next_minute() {
+        assert_eq!(next_minute_delay(UNIX_EPOCH), Duration::from_mins(1));
+        assert_eq!(
+            next_minute_delay(UNIX_EPOCH + Duration::from_millis(75_250)),
+            Duration::from_millis(44_750)
+        );
     }
 
     #[test]
