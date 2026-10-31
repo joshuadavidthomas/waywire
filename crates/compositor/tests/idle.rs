@@ -837,15 +837,31 @@ fn xwayland_click_and_relative_warp_match_at_double_scale() {
 
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
+    x11_resize(false);
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_resize_respects_minimum_size_hints() {
+    x11_resize(true);
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the X11 client and resize assertions form one integration scenario"
 )]
-fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
+#[expect(clippy::expect_used, reason = "integration test requires live clients")]
+fn x11_resize(with_minimum: bool) {
     let runtime = tempfile::tempdir().expect("runtime");
     let script = runtime.path().join("client.py");
     let ready = runtime.path().join("ready");
-    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
+    let minimum = if with_minimum {
+        "r.minsize(395, 290)"
+    } else {
+        ""
+    };
+    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\n{minimum}\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
     let port = socket.local_addr().expect("address").port().to_string();
@@ -929,7 +945,22 @@ fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
             state: ButtonState::Released,
             sequence: InputSequence::new(sequence).expect("sequence"),
         }));
-        let expected = (x + dx, y + dy, width - dx, height - dy);
+        let new_width = if with_minimum {
+            (width - dx).max(395)
+        } else {
+            width - dx
+        };
+        let new_height = if with_minimum {
+            (height - dy).max(290)
+        } else {
+            height - dy
+        };
+        let expected = (
+            x + width - new_width,
+            y + height - new_height,
+            new_width,
+            new_height,
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let actual = geometry();

@@ -269,6 +269,14 @@ impl PointerGrab<State> for WindowGrab {
                         (cached.min_size, cached.max_size)
                     })
                 })
+                .or_else(|| {
+                    self.window.x11_surface().map(|surface| {
+                        (
+                            surface.min_size().unwrap_or_default(),
+                            surface.max_size().unwrap_or_default(),
+                        )
+                    })
+                })
                 .unwrap_or_default();
             let size = resize_size(self.initial.size, delta, edges, min, max);
             if let Some(top) = self.window.toplevel() {
