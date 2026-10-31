@@ -256,7 +256,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Medium:** X11 pre-map fullscreen or maximize are ignored.
 - **Medium:** a re-mapped toplevel loses its server-side decoration mode and
   bounds. Redundant maximize requests get no configure.
 - **Low:** grabs survive window destruction. Decorations follow pending state.

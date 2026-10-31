@@ -332,6 +332,114 @@ fn x11_requested_position_is_honored_and_constrained() {
 }
 
 #[test]
+#[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
+fn x11_pre_map_maximize_fills_work_area() {
+    x11_pre_map_expanded_fills_work_area("maximize", 540);
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
+fn x11_pre_map_fullscreen_fills_work_area() {
+    x11_pre_map_expanded_fills_work_area("fullscreen", 568);
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "integration scenario requires a live GTK client"
+)]
+fn x11_pre_map_expanded_fills_work_area(mode: &str, height: i32) {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("maximized.py");
+    let ready = runtime.path().join("ready");
+    fs::write(
+        &script,
+        format!(
+            r"#!/usr/bin/python3
+import os
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib
+window = Gtk.Window(title='waywire-premap-maximized')
+window.set_default_size(300, 200)
+window.{}()
+window.show_all()
+GLib.timeout_add(500, lambda: (open({:?}, 'w').write(str(os.getpid())), False)[1])
+Gtk.main()
+",
+            mode,
+            ready.to_string_lossy()
+        ),
+    )
+    .expect("write GTK script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("GDK_BACKEND", "x11")
+            .env("GTK_CSD", "0")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "GTK window did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
+    let environment = |name: &[u8]| {
+        environ
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(name))
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .expect("display environment")
+    };
+    let display = environment(b"DISPLAY=");
+    let id = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args([
+            "search",
+            "--onlyvisible",
+            "--name",
+            "waywire-premap-maximized",
+        ])
+        .output()
+        .expect("find window");
+    assert!(id.status.success());
+    let id = String::from_utf8(id.stdout).expect("window id");
+    let geometry = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args(["getwindowgeometry", "--shell", id.trim()])
+        .output()
+        .expect("window geometry");
+    assert!(geometry.status.success());
+    let geometry = String::from_utf8(geometry.stdout).expect("geometry");
+    assert!(geometry.contains("WIDTH=800\n"), "{geometry}");
+    assert!(
+        geometry.contains(&format!("HEIGHT={height}\n")),
+        "{geometry}"
+    );
+    if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
+        let status = ProcessCommand::new("grim")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("WAYLAND_DISPLAY", environment(b"WAYLAND_DISPLAY="))
+            .arg(path)
+            .status()
+            .expect("capture screenshot");
+        assert!(status.success());
+    }
+}
+
+#[test]
 #[ignore = "requires FFmpeg, Xwayland, distro gtk3-demo and xdotool"]
 fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
     let runtime = tempfile::tempdir().expect("runtime directory");

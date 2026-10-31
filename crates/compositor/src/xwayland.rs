@@ -362,8 +362,20 @@ impl XwmHandler for State {
         self.enforce_topmost();
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
-        self.center_dialog(&window);
-        self.constrain_window(&window);
+        if surface.is_maximized() || surface.is_fullscreen() {
+            surface
+                .user_data()
+                .insert_if_missing(RestoreGeometry::default);
+            if let Some(saved) = surface.user_data().get::<RestoreGeometry>() {
+                *saved.0.borrow_mut() = Some(geometry);
+            }
+            if let Some(output) = self.window_output_geometry(&window) {
+                self.x11_geometry(&surface, output + surface.frame_extents());
+            }
+        } else {
+            self.center_dialog(&window);
+            self.constrain_window(&window);
+        }
     }
 
     fn mapped_override_redirect_window(&mut self, _: XwmId, surface: X11Surface) {

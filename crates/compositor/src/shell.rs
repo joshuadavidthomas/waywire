@@ -509,9 +509,7 @@ impl State {
     ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
         let fullscreen = window.toplevel().is_some_and(|top| {
             top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
-        }) || window
-            .x11_surface()
-            .is_some_and(smithay::xwayland::X11Surface::is_fullscreen);
+        });
         let mut geometry = if fullscreen {
             self.space.output_geometry(&self.output)?
         } else {
