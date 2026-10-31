@@ -151,6 +151,13 @@ enum PointerMotionKind {
     WarpHint,
 }
 
+struct TitlebarPress {
+    source: KeyboardSource,
+    window: Window,
+    location: Point<f64, Logical>,
+    time: Instant,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WindowAction {
     Focus,
@@ -197,6 +204,8 @@ pub(crate) struct State {
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     decoration_press: Option<(KeyboardSource, Window)>,
+    last_titlebar_press: Option<TitlebarPress>,
+    pending_restore_drag: Option<TitlebarPress>,
     pointer_motion_kind: PointerMotionKind,
     start: Instant,
     running: bool,
@@ -326,6 +335,8 @@ impl State {
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
             decoration_press: None,
+            last_titlebar_press: None,
+            pending_restore_drag: None,
             pointer_motion_kind: PointerMotionKind::Input,
             start: Instant::now(),
             running: true,
@@ -590,6 +601,9 @@ impl State {
             self.activate_focused_constraint(&pointer);
             pointer.frame(self);
         }
+        if self.pointer_motion_kind == PointerMotionKind::Input {
+            self.update_titlebar_drag(source, location);
+        }
         if self.decoration_press.as_ref().is_some_and(|(_, window)| {
             self.decoration_under(location)
                 != Some((window.clone(), decorations::DecorationAction::Close))
@@ -603,6 +617,68 @@ impl State {
             x: normalized_coordinate(location.x * scale, self.size.width()),
             y: normalized_coordinate(location.y * scale, self.size.height()),
         }));
+    }
+
+    fn update_titlebar_drag(&mut self, source: KeyboardSource, location: Point<f64, Logical>) {
+        if self.pending_restore_drag.as_ref().is_some_and(|press| {
+            press.source == source
+                && (location - press.location)
+                    .x
+                    .hypot((location - press.location).y)
+                    > 4.0
+        }) && let Some(press) = self.pending_restore_drag.take()
+        {
+            self.last_titlebar_press = None;
+            if let Some(maximized) = self.window_output_geometry(&press.window) {
+                let restored = self
+                    .windows
+                    .get(&press.window)
+                    .and_then(|state| state.restore);
+                self.window_action(&press.window, WindowAction::Restore);
+                let restored_size = restored.map_or_else(
+                    || {
+                        press
+                            .window
+                            .x11_surface()
+                            .map_or(press.window.geometry().size, |surface| {
+                                surface.last_configure().size
+                            })
+                    },
+                    |geometry| geometry.size,
+                );
+                let fraction = ((press.location.x - f64::from(maximized.loc.x))
+                    / f64::from(maximized.size.w.max(1)))
+                .clamp(0.0, 1.0);
+                let position = Point::<f64, Logical>::from((
+                    location.x - fraction * f64::from(restored_size.w),
+                    location.y + f64::from(maximized.loc.y) - press.location.y,
+                ))
+                .to_i32_round();
+                self.space.map_element(press.window.clone(), position, true);
+                if let Some(surface) = press.window.x11_surface()
+                    && let Err(error) = surface.configure(Some(
+                        smithay::utils::Rectangle::new(position, restored_size)
+                            + surface.frame_extents(),
+                    ))
+                {
+                    tracing::warn!(%error, "position restored X11 window");
+                }
+                self.window_action(&press.window, WindowAction::Move);
+            }
+        }
+        if self.last_titlebar_press.as_ref().is_some_and(|press| {
+            press.source == source
+                && self
+                    .buttons
+                    .get(&source)
+                    .is_some_and(|buttons| buttons.contains(&0x110))
+                && (location - press.location)
+                    .x
+                    .hypot((location - press.location).y)
+                    > 4.0
+        }) {
+            self.last_titlebar_press = None;
+        }
     }
 
     pub(crate) fn pointer_button(
@@ -628,6 +704,15 @@ impl State {
     }
 
     fn pointer_button_inner(&mut self, source: KeyboardSource, button: u32, state: ButtonState) {
+        if button == 0x110
+            && state == ButtonState::Released
+            && self
+                .pending_restore_drag
+                .as_ref()
+                .is_some_and(|press| press.source == source)
+        {
+            self.pending_restore_drag = None;
+        }
         let before = self.buttons.values().any(|keys| keys.contains(&button));
         let keys = self.buttons.entry(source).or_default();
         match state {
@@ -724,7 +809,51 @@ impl State {
         action: decorations::DecorationAction,
     ) {
         match action {
-            decorations::DecorationAction::Move => self.window_action(&window, WindowAction::Move),
+            decorations::DecorationAction::Move => {
+                let now = Instant::now();
+                let double = self.last_titlebar_press.as_ref().is_some_and(|press| {
+                    press.source == source
+                        && press.window == window
+                        && now.duration_since(press.time) <= Duration::from_millis(400)
+                });
+                let maximized = window.toplevel().is_some_and(|top| {
+                    top.with_pending_state(|state| {
+                        state.states.contains(xdg_toplevel::State::Maximized)
+                    })
+                }) || window
+                    .x11_surface()
+                    .is_some_and(smithay::xwayland::X11Surface::is_maximized);
+                if double {
+                    self.last_titlebar_press = None;
+                    self.pending_restore_drag = None;
+                    self.window_action(
+                        &window,
+                        if maximized {
+                            WindowAction::Restore
+                        } else {
+                            WindowAction::Maximize
+                        },
+                    );
+                } else if let Some(pointer) = self.seat.get_pointer() {
+                    let press = TitlebarPress {
+                        source,
+                        window: window.clone(),
+                        location: pointer.current_location(),
+                        time: now,
+                    };
+                    self.last_titlebar_press = Some(TitlebarPress {
+                        source,
+                        window: window.clone(),
+                        location: press.location,
+                        time: now,
+                    });
+                    if maximized {
+                        self.pending_restore_drag = Some(press);
+                    } else {
+                        self.window_action(&window, WindowAction::Move);
+                    }
+                }
+            }
             decorations::DecorationAction::Resize => self.window_action(
                 &window,
                 WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight),
@@ -821,6 +950,20 @@ impl State {
             .is_some_and(|(owner, _)| *owner == source)
         {
             self.decoration_press = None;
+        }
+        if self
+            .last_titlebar_press
+            .as_ref()
+            .is_some_and(|press| press.source == source)
+        {
+            self.last_titlebar_press = None;
+        }
+        if self
+            .pending_restore_drag
+            .as_ref()
+            .is_some_and(|press| press.source == source)
+        {
+            self.pending_restore_drag = None;
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.release_source(self, source);

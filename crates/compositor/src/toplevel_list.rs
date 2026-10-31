@@ -174,7 +174,9 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::io::OwnedFd;
 
+    use smithay::backend::input::ButtonState;
     use smithay::desktop::Window;
+    use smithay::input::keyboard::KeyboardSource;
     use smithay::wayland::seat::WaylandFocus;
     use wayland_client::Connection;
     use wayland_client::Dispatch;
@@ -866,6 +868,76 @@ mod tests {
         assert_eq!(location.y - crate::decorations::BAR, output.loc.y);
         assert_eq!(content.h, output.size.h - crate::decorations::BAR);
         assert_eq!(content.w, output.size.w);
+    }
+
+    #[test]
+    fn titlebar_double_click_toggles_maximize_and_restore() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        attach_buffer(&surface, &app, &queue.handle(), 400);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        window.toplevel().expect("top").with_pending_state(|state| state.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        state.space.map_element(window.clone(), (100, 100), true);
+        state.pointer_motion(KeyboardSource::MAIN, (120.0, 80.0).into());
+        for _ in 0..2 {
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        }
+        assert!(window.toplevel().expect("top").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+        state.pointer_motion(KeyboardSource::MAIN, (20.0, 10.0).into());
+        for _ in 0..2 {
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        }
+        assert!(!window.toplevel().expect("top").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+    }
+
+    #[test]
+    fn dragging_maximized_titlebar_restores_at_relative_pointer_x() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        attach_buffer(&surface, &app, &queue.handle(), 400);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        window.toplevel().expect("top").with_pending_state(|state| state.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        state.space.map_element(window.clone(), (100, 100), true);
+        state.window_action(&window, crate::WindowAction::Maximize);
+        attach_buffer(&surface, &app, &queue.handle(), 1920);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        state.pointer_motion(KeyboardSource::MAIN, (480.0, 10.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_motion(KeyboardSource::MAIN, (490.0, 20.0).into());
+        assert!(!window.toplevel().expect("top").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+        assert_eq!(
+            state.space.element_location(&window).expect("location"),
+            (390, 42).into()
+        );
+        assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
     }
 
     #[test]

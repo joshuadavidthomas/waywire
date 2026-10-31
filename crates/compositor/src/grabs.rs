@@ -273,9 +273,10 @@ impl PointerGrab<State> for WindowGrab {
             let location = (self.initial.loc.to_f64() + delta).to_i32_round();
             state.space.map_element(self.window.clone(), location, true);
             if let Some(surface) = self.window.x11_surface()
-                && let Err(error) = surface.configure(Some(
-                    Rectangle::new(location, self.initial.size) + surface.frame_extents(),
-                ))
+                && let Err(error) = surface.configure(Some(Rectangle::new(
+                    location - self.window.geometry().loc,
+                    surface.last_configure().size,
+                )))
             {
                 tracing::warn!(%error, "configure X11 move");
             }
