@@ -49,8 +49,7 @@ Each fix here is small and independent.
   3840×2160 (`crates/gateway/web/src/sdk/resize.ts`,
   `crates/protocol/src/pipe.rs`). A rejected resize closes the input socket.
   Share the pixel cap.
-- **Low:** Xwayland starts with SIGTERM blocked. A slow socket drain can cut
-  short process-group cleanup on shutdown.
+- **Low:** a slow socket drain can cut short process-group cleanup on shutdown.
 - **Low:** a malformed browser record closes the whole input socket instead of
   being dropped.
 

@@ -115,6 +115,51 @@ fn idle_window_waits_only_near_minute_boundary() {
 
 #[test]
 #[ignore = "requires FFmpeg and a working Xwayland on PATH"]
+fn xwayland_starts_with_sigterm_unblocked() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600"])
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let pid = compositor.0.id();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let xwayland = loop {
+        let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .expect("compositor children");
+        if let Some(child) = children.split_whitespace().find(|child| {
+            fs::read_to_string(format!("/proc/{child}/comm"))
+                .is_ok_and(|name| name.trim() == "Xwayland")
+        }) {
+            break child.to_owned();
+        }
+        assert!(Instant::now() < deadline, "Xwayland did not start");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let status = fs::read_to_string(format!("/proc/{xwayland}/status")).expect("Xwayland status");
+    let blocked = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigBlk:"))
+        .expect("signal mask");
+    let blocked = u64::from_str_radix(blocked.trim(), 16).expect("hex signal mask");
+    assert_eq!(
+        blocked & (1 << (nix::libc::SIGTERM - 1)),
+        0,
+        "SIGTERM is blocked"
+    );
+}
+
+#[test]
+#[ignore = "requires FFmpeg and a working Xwayland on PATH"]
 fn idle_compositor_stops_rendering_and_emitting_frames() {
     let runtime = tempfile::tempdir().expect("runtime directory");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
