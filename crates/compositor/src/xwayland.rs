@@ -345,6 +345,7 @@ impl XwmHandler for State {
         let location = smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset));
         geometry.loc = location - window.geometry().loc;
         self.space.map_element(window.clone(), location, true);
+        self.mapped_order.push(window.clone());
         self.enforce_topmost();
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);

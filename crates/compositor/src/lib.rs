@@ -171,6 +171,21 @@ pub(crate) enum WindowAction {
     ToggleAlwaysOnTop,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the taskbar renderer consumes this model in the next step"
+    )
+)]
+#[derive(Clone, Debug, PartialEq)]
+struct TaskbarChip {
+    window: Window,
+    title: String,
+    minimized: bool,
+    focused: bool,
+}
+
 #[expect(
     clippy::struct_field_names,
     reason = "Smithay protocol state names match their handler methods"
@@ -205,6 +220,7 @@ pub(crate) struct State {
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
+    mapped_order: Vec<Window>,
     minimized_order: Vec<Window>,
     restore_key_source: Option<KeyboardSource>,
     decoration_press: Option<(KeyboardSource, Window)>,
@@ -342,6 +358,7 @@ impl State {
             toplevel_list,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
+            mapped_order: Vec::new(),
             minimized_order: Vec::new(),
             restore_key_source: None,
             decoration_press: None,
@@ -446,6 +463,34 @@ impl State {
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|_| (window, location))
         })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the taskbar renderer consumes this model in the next step"
+        )
+    )]
+    fn taskbar_chips(&self) -> Vec<TaskbarChip> {
+        let focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        self.mapped_order
+            .iter()
+            .filter(|window| decorations::decorated(window) && !decorations::window_flags(window).0)
+            .map(|window| TaskbarChip {
+                window: window.clone(),
+                title: toplevel_list::metadata(window)
+                    .map_or_else(String::new, |metadata| metadata.0),
+                minimized: self
+                    .windows
+                    .get(window)
+                    .is_some_and(|state| state.minimized),
+                focused: focus.is_some() && focus == focus::KeyboardFocus::window(window),
+            })
+            .collect()
     }
 
     /// Gate every seat input entry point. Browser input always passes. Agent

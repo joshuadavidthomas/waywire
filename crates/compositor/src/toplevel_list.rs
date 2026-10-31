@@ -137,7 +137,7 @@ impl ToplevelList {
 
 /// The window's observable metadata, or `None` for windows that must not be
 /// listed: override-redirect popups and surfaces without a toplevel role.
-fn metadata(window: &Window) -> Option<(String, String)> {
+pub(super) fn metadata(window: &Window) -> Option<(String, String)> {
     if window
         .x11_surface()
         .is_some_and(X11Surface::is_override_redirect)
@@ -802,6 +802,83 @@ mod tests {
         );
         let window = top_window(&state);
         (display, state, connection, queue, app, window)
+    }
+
+    #[test]
+    fn taskbar_chips_follow_mapping_title_focus_and_minimization() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (first_surface, _, first_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "First",
+            "first",
+        );
+        let first = top_window(&state);
+        first
+            .toplevel()
+            .expect("top")
+            .with_pending_state(|pending| pending.decoration_mode = Some(Mode::ServerSide));
+        let (_, _, second_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Second",
+            "second",
+        );
+        let second = top_window(&state);
+        second
+            .toplevel()
+            .expect("top")
+            .with_pending_state(|pending| pending.decoration_mode = Some(Mode::ServerSide));
+        assert_eq!(
+            state
+                .taskbar_chips()
+                .iter()
+                .map(|chip| chip.title.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+        assert_eq!(
+            state
+                .taskbar_chips()
+                .iter()
+                .map(|chip| chip.focused)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        state.window_action(&first, crate::WindowAction::Focus);
+        assert_eq!(
+            state
+                .taskbar_chips()
+                .iter()
+                .map(|chip| chip.focused)
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+        state.window_action(&first, crate::WindowAction::Minimize);
+        assert!(state.taskbar_chips()[0].minimized);
+        second_top.set_title("Renamed".into());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(state.taskbar_chips()[1].title, "Renamed");
+        second_top.set_parent(Some(&first_top));
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(state.taskbar_chips().len(), 1);
+        second_top.set_parent(None);
+        first_surface.attach(None, 0, 0);
+        first_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let chips = state.taskbar_chips();
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].window, second);
+        assert_eq!(chips[0].title, "Renamed");
     }
 
     #[test]

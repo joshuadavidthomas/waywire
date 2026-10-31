@@ -133,6 +133,9 @@ impl CompositorHandler for State {
                     // whenever the client re-commits.
                     self.toplevel_list.publish(&window);
                 }
+                if mapped && !previous && !self.mapped_order.contains(&window) {
+                    self.mapped_order.push(window.clone());
+                }
                 if mapped && !previous {
                     self.center_dialog(&window);
                 }
@@ -433,6 +436,7 @@ impl State {
 
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
         self.toplevel_list.unpublish(window);
+        self.mapped_order.retain(|item| item != window);
         self.minimized_order.retain(|item| item != window);
         if self
             .window_menu

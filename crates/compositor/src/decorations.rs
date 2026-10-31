@@ -609,7 +609,7 @@ pub(super) fn decorated(window: &Window) -> bool {
     }
 }
 
-fn window_flags(window: &Window) -> (bool, bool) {
+pub(super) fn window_flags(window: &Window) -> (bool, bool) {
     if let Some(top) = window.toplevel() {
         (
             top.parent().is_some(),
