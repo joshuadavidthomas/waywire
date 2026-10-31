@@ -1368,6 +1368,9 @@ impl State {
         if self.restore_key_source == Some(source) {
             self.restore_key_source = None;
         }
+        if self.menu_escape == Some(source) {
+            self.menu_escape = None;
+        }
         if self
             .decoration_press
             .as_ref()

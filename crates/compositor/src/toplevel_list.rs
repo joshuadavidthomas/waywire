@@ -1485,6 +1485,18 @@ mod tests {
     }
 
     #[test]
+    fn takeover_clears_pending_menu_escape() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        let agent = KeyboardSource::new_auxiliary();
+        state.keyboard_key(agent, 30, smithay::backend::input::KeyState::Pressed);
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        state.keyboard_key(agent, 1, smithay::backend::input::KeyState::Pressed);
+        assert_eq!(state.menu_escape, Some(agent));
+        state.set_browser_lease(true);
+        assert_eq!(state.menu_escape, None);
+    }
+
+    #[test]
     fn outside_click_dismisses_window_menu() {
         let (_, mut state, _, _, _, window) = action_fixture();
         state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
