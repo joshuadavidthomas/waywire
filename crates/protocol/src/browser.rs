@@ -448,7 +448,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![10, kind, 0, 0];
+        let mut bytes = vec![11, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -468,7 +468,7 @@ mod tests {
             let event = ClientEvent::video_config(chroma.h264_profile().codec());
             assert_eq!(
                 json(&event),
-                format!(r#"{{"type":"video-config","version":10,"codec":"{codec}"}}"#)
+                format!(r#"{{"type":"video-config","version":11,"codec":"{codec}"}}"#)
             );
         }
     }
@@ -482,11 +482,12 @@ mod tests {
             position: Some(CursorPosition {
                 x: value(pipe::PointerCoordinate::new(10)),
                 y: value(pipe::PointerCoordinate::new(20)),
+                source: pipe::CursorSource::Browser,
             }),
         };
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
-            r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20}}"#
+            r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20,"source":"browser"}}"#
         );
     }
 
@@ -812,7 +813,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            10, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            11, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

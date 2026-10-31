@@ -207,6 +207,7 @@ pub(super) async fn read_events(
                             publish_cursor(&events, |cursor| cursor.position = Some(position));
                         }
                     }
+                    Event::CursorClick(_) => {}
                     Event::AgentInput(agent) => {
                         *events
                             .latest_agent
@@ -341,6 +342,7 @@ mod tests {
         Event::CursorPosition(CursorPosition {
             x: PointerCoordinate::new(x).expect("valid test position"),
             y: PointerCoordinate::new(x + 1).expect("valid test position"),
+            source: waywire_protocol::pipe::CursorSource::Browser,
         })
     }
 
@@ -521,14 +523,17 @@ mod tests {
         let first = CursorPosition {
             x: PointerCoordinate::new(1).expect("valid test position"),
             y: PointerCoordinate::new(2).expect("valid test position"),
+            source: waywire_protocol::pipe::CursorSource::Browser,
         };
         let replaced = CursorPosition {
             x: PointerCoordinate::new(3).expect("valid test position"),
             y: PointerCoordinate::new(4).expect("valid test position"),
+            source: waywire_protocol::pipe::CursorSource::Browser,
         };
         let latest = CursorPosition {
             x: PointerCoordinate::new(5).expect("valid test position"),
             y: PointerCoordinate::new(6).expect("valid test position"),
+            source: waywire_protocol::pipe::CursorSource::Agent,
         };
         let mut gate = CursorPositionGate::Open;
 

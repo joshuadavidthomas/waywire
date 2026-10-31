@@ -49,7 +49,10 @@ impl Replacement {
             // Only the latest clipboard contents matter to a viewer; without
             // replacement, 1 MiB clipboards would fill the 4 MiB queue.
             Event::Clipboard(_) => Some(Self::Clipboard),
-            Event::Frame(_) | Event::ResizeApplied(_) | Event::ResetVideoRefused(_) => None,
+            Event::Frame(_)
+            | Event::ResizeApplied(_)
+            | Event::ResetVideoRefused(_)
+            | Event::CursorClick(_) => None,
             // The newest agent state is the only one that matters, so it
             // replaces an older queued update like clipboard contents do.
             Event::AgentInput(_) => Some(Self::AgentInput),
@@ -351,11 +354,13 @@ mod tests {
         sink.send(&Event::CursorPosition(CursorPosition {
             x: waywire_protocol::pipe::PointerCoordinate::new(1).expect("valid coordinate"),
             y: waywire_protocol::pipe::PointerCoordinate::new(2).expect("valid coordinate"),
+            source: waywire_protocol::pipe::CursorSource::Browser,
         }))
         .expect("first cursor position should queue");
         let position = Event::CursorPosition(CursorPosition {
             x: waywire_protocol::pipe::PointerCoordinate::new(3).expect("valid coordinate"),
             y: waywire_protocol::pipe::PointerCoordinate::new(4).expect("valid coordinate"),
+            source: waywire_protocol::pipe::CursorSource::Agent,
         });
         sink.send(&position)
             .expect("new cursor position should replace old position");

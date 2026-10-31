@@ -258,6 +258,8 @@ pub(crate) struct State {
     last_titlebar_press: Option<TitlebarPress>,
     pending_restore_drag: Option<TitlebarPress>,
     pointer_motion_kind: PointerMotionKind,
+    cursor_source: pipe::CursorSource,
+    focus_refresh_source: Option<pipe::CursorSource>,
     start: Instant,
     running: bool,
     failure: Option<anyhow::Error>,
@@ -408,6 +410,8 @@ impl State {
             last_titlebar_press: None,
             pending_restore_drag: None,
             pointer_motion_kind: PointerMotionKind::Input,
+            cursor_source: pipe::CursorSource::Browser,
+            focus_refresh_source: None,
             start: Instant::now(),
             running: true,
             failure: None,
@@ -837,7 +841,9 @@ impl State {
             if window_grab {
                 self.pointer_motion_kind = PointerMotionKind::RefreshGrabFocus;
             }
+            self.focus_refresh_source = Some(self.cursor_source);
             self.pointer_motion(KeyboardSource::MAIN, pointer.current_location());
+            self.focus_refresh_source = None;
             self.pointer_motion_kind = PointerMotionKind::Input;
         }
     }
@@ -911,9 +917,17 @@ impl State {
         } else if self.surface_under(location).is_none() {
             self.emit(Event::CursorShape(pipe::CursorShape::Default));
         }
+        self.cursor_source =
+            self.focus_refresh_source
+                .unwrap_or(if source == KeyboardSource::MAIN {
+                    pipe::CursorSource::Browser
+                } else {
+                    pipe::CursorSource::Agent
+                });
         self.emit(Event::CursorPosition(pipe::CursorPosition {
             x: normalized_coordinate(location.x * scale, self.size.width()),
             y: normalized_coordinate(location.y * scale, self.size.height()),
+            source: self.cursor_source,
         }));
     }
 
@@ -988,6 +1002,18 @@ impl State {
     ) {
         if !self.accepts_input(source) {
             return;
+        }
+        if source != KeyboardSource::MAIN
+            && state == ButtonState::Pressed
+            && let Some(pointer) = self.seat.get_pointer()
+        {
+            let location = pointer.current_location();
+            let scale = self.output.current_scale().fractional_scale();
+            self.emit(Event::CursorClick(pipe::CursorPosition {
+                x: normalized_coordinate(location.x * scale, self.size.width()),
+                y: normalized_coordinate(location.y * scale, self.size.height()),
+                source: pipe::CursorSource::Agent,
+            }));
         }
         self.pointer_button_inner(source, button, state);
     }
@@ -2406,6 +2432,36 @@ mod tests {
             next_minute_delay(UNIX_EPOCH + Duration::from_millis(75_250)),
             Duration::from_millis(44_750)
         );
+    }
+
+    #[test]
+    fn pointer_events_report_their_input_source() {
+        let (_display, mut state) = test_state();
+        let eis = KeyboardSource::new_auxiliary();
+        let virtual_pointer = KeyboardSource::new_auxiliary();
+        for (source, expected) in [
+            (KeyboardSource::MAIN, pipe::CursorSource::Browser),
+            (eis, pipe::CursorSource::Agent),
+            (virtual_pointer, pipe::CursorSource::Agent),
+        ] {
+            state.event_sink.take_events();
+            state.pointer_motion(source, (100.0, 100.0).into());
+            let positions: Vec<_> = state
+                .event_sink
+                .take_events()
+                .into_iter()
+                .filter_map(|event| {
+                    if let Event::CursorPosition(position) = event {
+                        Some(position.source)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(positions, vec![expected]);
+        }
+        state.pointer_button(virtual_pointer, 0x110, ButtonState::Pressed);
+        assert!(state.event_sink.take_events().iter().any(|event| matches!(event, Event::CursorClick(position) if position.source == pipe::CursorSource::Agent)));
     }
 
     #[test]

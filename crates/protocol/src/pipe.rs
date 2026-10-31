@@ -1,4 +1,4 @@
-//! Gateway-to-compositor pipe vocabulary for protocol version 10.
+//! Gateway-to-compositor pipe vocabulary for protocol version 11.
 
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
@@ -759,18 +759,45 @@ impl Wire for CursorShape {
 pub struct CursorPosition {
     pub x: PointerCoordinate,
     pub y: PointerCoordinate,
+    pub source: CursorSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorSource {
+    Browser,
+    Agent,
+}
+
+impl Wire for CursorSource {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Browser => 0_u8,
+            Self::Agent => 1,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get::<u8>()? {
+            0 => Ok(Self::Browser),
+            1 => Ok(Self::Agent),
+            _ => Err(InvalidValue("unknown cursor source")),
+        }
+    }
 }
 
 impl Wire for CursorPosition {
     fn write(&self, out: &mut Writer) {
         out.put(&self.x);
         out.put(&self.y);
+        out.put(&self.source);
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
         Ok(Self {
             x: input.get()?,
             y: input.get()?,
+            source: input.get()?,
         })
     }
 }
@@ -1521,6 +1548,7 @@ pub enum Event {
     CursorImage(CursorImage),
     CursorVisibility(CursorVisibility),
     CursorPosition(CursorPosition),
+    CursorClick(CursorPosition),
     ResetVideoRefused(ResetVideoRefusal),
     AgentInput(AgentInput),
 }
@@ -1537,6 +1565,7 @@ pub enum EventKind {
     ResetVideoRefused = 7,
     AgentInput = 8,
     CursorImage = 9,
+    CursorClick = 10,
 }
 
 impl RecordKind for EventKind {
@@ -1551,6 +1580,7 @@ impl RecordKind for EventKind {
             Self::ResetVideoRefused => 7,
             Self::AgentInput => 8,
             Self::CursorImage => 9,
+            Self::CursorClick => 10,
         }
     }
 
@@ -1565,6 +1595,7 @@ impl RecordKind for EventKind {
             7 => Some(Self::ResetVideoRefused),
             8 => Some(Self::AgentInput),
             9 => Some(Self::CursorImage),
+            10 => Some(Self::CursorClick),
             _ => None,
         }
     }
@@ -1575,7 +1606,7 @@ impl RecordKind for EventKind {
             Self::Frame => 33,
             Self::ResizeApplied => 16,
             Self::CursorShape | Self::CursorVisibility | Self::ResetVideoRefused => 1,
-            Self::CursorPosition => 8,
+            Self::CursorPosition | Self::CursorClick => 9,
             Self::AgentInput => 2,
             Self::CursorImage => 128 * 128 * 8 + 6,
         }
@@ -1592,6 +1623,7 @@ impl Event {
             Self::CursorImage(_) => EventKind::CursorImage,
             Self::CursorVisibility(_) => EventKind::CursorVisibility,
             Self::CursorPosition(_) => EventKind::CursorPosition,
+            Self::CursorClick(_) => EventKind::CursorClick,
             Self::ResetVideoRefused(_) => EventKind::ResetVideoRefused,
             Self::AgentInput(_) => EventKind::AgentInput,
         }
@@ -1613,7 +1645,7 @@ impl Record for Event {
             Self::CursorShape(payload) => out.put(payload),
             Self::CursorImage(payload) => out.put(payload),
             Self::CursorVisibility(payload) => out.put(payload),
-            Self::CursorPosition(payload) => out.put(payload),
+            Self::CursorPosition(payload) | Self::CursorClick(payload) => out.put(payload),
             Self::ResetVideoRefused(payload) => out.put(payload),
             Self::AgentInput(payload) => out.put(payload),
         }
@@ -1628,6 +1660,7 @@ impl Record for Event {
             EventKind::CursorImage => Ok(Self::CursorImage(input.get()?)),
             EventKind::CursorVisibility => Ok(Self::CursorVisibility(input.get()?)),
             EventKind::CursorPosition => Ok(Self::CursorPosition(input.get()?)),
+            EventKind::CursorClick => Ok(Self::CursorClick(input.get()?)),
             EventKind::ResetVideoRefused => Ok(Self::ResetVideoRefused(input.get()?)),
             EventKind::AgentInput => Ok(Self::AgentInput(input.get()?)),
         }
@@ -1656,7 +1689,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    10, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
+                    11, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1666,7 +1699,7 @@ mod tests {
                     state: ButtonState::Pressed,
                     sequence,
                 }),
-                vec![10, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
+                vec![11, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
             ),
             (
                 "pointer scroll",
@@ -1676,7 +1709,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    10, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    11, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1687,7 +1720,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    10, 14, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 66, 7, 0, 0, 0,
+                    11, 14, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 66, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1698,7 +1731,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    10, 15, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 7, 0, 0, 0,
+                    11, 15, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1708,12 +1741,12 @@ mod tests {
                     state: KeyState::Repeated,
                     sequence,
                 }),
-                vec![10, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
+                vec![11, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
             ),
             (
                 "release all",
                 Command::ReleaseAll(ReleaseAll),
-                vec![10, 5, 0, 0, 0, 0, 0, 0],
+                vec![11, 5, 0, 0, 0, 0, 0, 0],
             ),
             (
                 "resize",
@@ -1723,7 +1756,7 @@ mod tests {
                     request_id: value(RequestId::new(9)),
                 }),
                 vec![
-                    10, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
+                    11, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
                 ],
             ),
         ]
@@ -1735,7 +1768,7 @@ mod tests {
             (
                 "clipboard",
                 Command::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![10, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![11, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "pointer relative",
@@ -1745,7 +1778,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    10, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    11, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1758,7 +1791,7 @@ mod tests {
                     chroma: Chroma::Yuv420,
                 }),
                 vec![
-                    10, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 1,
+                    11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 1,
                 ],
             ),
             (
@@ -1768,7 +1801,7 @@ mod tests {
                     sequence,
                     text: value(InputText::new("hey".into())),
                 }),
-                vec![10, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
+                vec![11, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
             ),
             (
                 "keyframe readiness",
@@ -1776,22 +1809,22 @@ mod tests {
                     generation: value(Generation::new(4)),
                     state: KeyframeState::Cached,
                 }),
-                vec![10, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
+                vec![11, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
             ),
             (
                 "reset video",
                 Command::ResetVideo(ResetVideo),
-                vec![10, 12, 0, 0, 0, 0, 0, 0],
+                vec![11, 12, 0, 0, 0, 0, 0, 0],
             ),
             (
                 "browser input lease",
                 Command::InputLease(InputLease { held: true }),
-                vec![10, 13, 0, 0, 1, 0, 0, 0, 1],
+                vec![11, 13, 0, 0, 1, 0, 0, 0, 1],
             ),
             (
                 "browser input handback",
                 Command::InputLease(InputLease { held: false }),
-                vec![10, 13, 0, 0, 1, 0, 0, 0, 0],
+                vec![11, 13, 0, 0, 1, 0, 0, 0, 0],
             ),
         ]
     }
@@ -1807,7 +1840,7 @@ mod tests {
             (
                 "clipboard",
                 Event::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![10, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![11, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "frame",
@@ -1822,7 +1855,7 @@ mod tests {
                     chroma: Chroma::Yuv420,
                 }),
                 vec![
-                    10, 2, 0, 0, 33, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
+                    11, 2, 0, 0, 33, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
                     0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0, 1,
                 ],
             ),
@@ -1835,31 +1868,41 @@ mod tests {
                     generation: value(Generation::new(4)),
                 }),
                 vec![
-                    10, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
+                    11, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
                 ],
             ),
             (
                 "cursor shape",
                 Event::CursorShape(CursorShape::Pointer),
-                vec![10, 4, 0, 0, 1, 0, 0, 0, 4],
+                vec![11, 4, 0, 0, 1, 0, 0, 0, 4],
             ),
             (
                 "cursor visibility",
                 Event::CursorVisibility(CursorVisibility::Hidden),
-                vec![10, 5, 0, 0, 1, 0, 0, 0, 0],
+                vec![11, 5, 0, 0, 1, 0, 0, 0, 0],
             ),
             (
                 "cursor position",
                 Event::CursorPosition(CursorPosition {
                     x: value(PointerCoordinate::new(10)),
                     y: value(PointerCoordinate::new(20)),
+                    source: CursorSource::Agent,
                 }),
-                vec![10, 6, 0, 0, 8, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0],
+                vec![11, 6, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 1],
+            ),
+            (
+                "cursor click",
+                Event::CursorClick(CursorPosition {
+                    x: value(PointerCoordinate::new(10)),
+                    y: value(PointerCoordinate::new(20)),
+                    source: CursorSource::Agent,
+                }),
+                vec![11, 10, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 1],
             ),
             (
                 "video reset refused",
                 Event::ResetVideoRefused(ResetVideoRefusal::CurrentModeUnknown),
-                vec![10, 7, 0, 0, 1, 0, 0, 0, 1],
+                vec![11, 7, 0, 0, 1, 0, 0, 0, 1],
             ),
             (
                 "agent input",
@@ -1867,7 +1910,7 @@ mod tests {
                     connected: true,
                     dropped: true,
                 }),
-                vec![10, 8, 0, 0, 2, 0, 0, 0, 1, 1],
+                vec![11, 8, 0, 0, 2, 0, 0, 0, 1, 1],
             ),
         ]
     }
@@ -1932,7 +1975,7 @@ mod tests {
     #[test]
     fn quality_wire_rejects_an_invalid_crf() {
         let record = [
-            10, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 52, 0,
+            11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 52, 0,
         ];
         assert!(matches!(
             Command::decode(&record),
@@ -1944,7 +1987,7 @@ mod tests {
     fn quality_wire_pins_all_component_representations() {
         for (byte, chroma) in [(0, Chroma::Yuv444), (1, Chroma::Yuv420), (2, Chroma::Rgb)] {
             let record = [
-                10, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, byte,
+                11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, byte,
             ];
             let command = Command::Quality(Quality {
                 bitrate_kbps: value(Kbps::new(8_000)),
@@ -1961,7 +2004,7 @@ mod tests {
     #[test]
     fn quality_wire_rejects_unknown_chroma() {
         let record = [
-            10, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 3,
+            11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 3,
         ];
         assert!(matches!(
             Command::decode(&record),
@@ -1971,8 +2014,8 @@ mod tests {
 
     #[test]
     fn record_length_uses_the_common_header() {
-        let clipboard = [10, 7, 0, 0, 0, 0, 0, 0];
-        let release_all = [10, 5, 0, 0, 0, 0, 0, 0];
+        let clipboard = [11, 7, 0, 0, 0, 0, 0, 0];
+        let release_all = [11, 5, 0, 0, 0, 0, 0, 0];
 
         assert_eq!(Command::record_len(&clipboard), Ok(HEADER_BYTES));
         assert_eq!(Command::record_len(&release_all), Ok(HEADER_BYTES));
@@ -2009,12 +2052,13 @@ mod tests {
 
     #[test]
     fn cursor_position_rejects_out_of_range_coordinates() {
-        let record = [10, 6, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0];
+        let record = [11, 6, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0];
         assert_eq!(
             Event::decode(&record),
             Ok(Event::CursorPosition(CursorPosition {
                 x: value(PointerCoordinate::new(0)),
                 y: value(PointerCoordinate::new(65_535)),
+                source: CursorSource::Browser,
             }))
         );
         for offset in [8, 12] {
@@ -2029,7 +2073,7 @@ mod tests {
 
     #[test]
     fn nonzero_reserved_byte_is_an_invalid_header() {
-        let header = [10, 5, 1, 0, 0, 0, 0, 0];
+        let header = [11, 5, 1, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidHeader)
@@ -2038,7 +2082,7 @@ mod tests {
 
     #[test]
     fn unknown_command_kind_is_invalid_kind() {
-        let header = [10, 99, 0, 0, 0, 0, 0, 0];
+        let header = [11, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -2047,7 +2091,7 @@ mod tests {
 
     #[test]
     fn unknown_event_kind_is_invalid_kind() {
-        let header = [10, 99, 0, 0, 0, 0, 0, 0];
+        let header = [11, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Event::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -2056,7 +2100,7 @@ mod tests {
 
     #[test]
     fn command_text_payload_over_limit_is_too_large() {
-        let mut header = [10, 10, 0, 0, 0, 0, 0, 0];
+        let mut header = [11, 10, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_TEXT_BYTES + 6).expect("limit fits u32")).to_le_bytes(),
         );
@@ -2068,7 +2112,7 @@ mod tests {
 
     #[test]
     fn event_payload_over_limit_is_too_large() {
-        let mut header = [10, 1, 0, 0, 0, 0, 0, 0];
+        let mut header = [11, 1, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_CLIPBOARD_BYTES + 1).expect("limit fits u32")).to_le_bytes(),
         );
@@ -2080,7 +2124,7 @@ mod tests {
 
     #[test]
     fn clipboard_payload_must_be_utf8() {
-        let record = [10, 1, 0, 0, 1, 0, 0, 0, 0xff];
+        let record = [11, 1, 0, 0, 1, 0, 0, 0, 0xff];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 1, .. })
@@ -2089,7 +2133,7 @@ mod tests {
 
     #[test]
     fn text_payload_must_not_contain_nul() {
-        let record = [10, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let record = [11, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         assert!(matches!(
             Command::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 10, .. })
@@ -2098,7 +2142,7 @@ mod tests {
 
     #[test]
     fn short_frame_payload_is_invalid() {
-        let mut record = vec![10, 2, 0, 0, 32, 0, 0, 0];
+        let mut record = vec![11, 2, 0, 0, 32, 0, 0, 0];
         let mut payload = [0; 32];
         payload[0] = 1;
         payload[4] = 1;
@@ -2164,7 +2208,7 @@ mod tests {
 
     #[test]
     fn command_payload_length_must_match_its_header() {
-        let record = [10, 7, 0, 0, 1, 0, 0, 0];
+        let record = [11, 7, 0, 0, 1, 0, 0, 0];
         assert_eq!(Command::decode(&record), Err(ProtocolError::Truncated));
     }
 
@@ -2222,7 +2266,7 @@ mod tests {
     fn every_cursor_shape_has_its_pinned_wire_byte() {
         for (index, shape) in CursorShape::ALL.into_iter().enumerate() {
             let wire = u8::try_from(index + 1).expect("36 cursor shapes fit in a byte");
-            let bytes = vec![10, 4, 0, 0, 1, 0, 0, 0, wire];
+            let bytes = vec![11, 4, 0, 0, 1, 0, 0, 0, wire];
             assert_eq!(Event::CursorShape(shape).encode(), bytes);
             assert_eq!(Event::decode(&bytes), Ok(Event::CursorShape(shape)));
         }
@@ -2230,7 +2274,7 @@ mod tests {
 
     #[test]
     fn unknown_cursor_shape_wire_byte_is_invalid() {
-        let record = [10, 4, 0, 0, 1, 0, 0, 0, 37];
+        let record = [11, 4, 0, 0, 1, 0, 0, 0, 37];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 4, .. })
