@@ -279,6 +279,340 @@ fn compositor_exits_promptly_when_the_session_program_exits() {
 }
 
 #[test]
+#[ignore = "requires FFmpeg, Xwayland, xterm and xdotool"]
+fn x11_requested_position_is_honored_and_constrained() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let marker = runtime.path().join("xterm-window");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"
+                xterm -title waywire-position -geometry 40x10+120+100 &
+                app=$!
+                trap 'kill "$app" 2>/dev/null' EXIT
+                while :; do
+                    id=$(xdotool search --pid "$app" --onlyvisible 2>/dev/null | head -n 1)
+                    [ -n "$id" ] && break
+                    sleep 0.05
+                done
+                sleep 0.5
+                printf '%s %s %s' "$DISPLAY" "$WAYLAND_DISPLAY" "$id" > "$0"
+                wait "$app"
+                "#,
+            ])
+            .arg(&marker)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "xterm did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let target = fs::read_to_string(&marker).expect("xterm target");
+    let mut target = target.split_whitespace();
+    let display = target.next().expect("display");
+    let wayland = target.next().expect("Wayland display");
+    let id = target.next().expect("window id");
+    let geometry = || {
+        let output = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(["getwindowgeometry", "--shell", id])
+            .output()
+            .expect("query geometry");
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).expect("geometry UTF-8");
+        let dimension = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .expect("geometry dimension")
+                .parse::<i32>()
+                .expect("integer dimension")
+        };
+        (
+            dimension("X="),
+            dimension("Y="),
+            dimension("WIDTH="),
+            dimension("HEIGHT="),
+        )
+    };
+    let (x, y, _, _) = geometry();
+    assert_eq!((x, y), (120, 100), "initial requested position");
+    for (x, y) in [(2000, 2000), (150, 180)] {
+        let status = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(["windowmove", id, &x.to_string(), &y.to_string()])
+            .status()
+            .expect("move window");
+        assert!(status.success());
+        thread::sleep(Duration::from_millis(300));
+        let (actual_x, actual_y, width, height) = geometry();
+        if x == 2000 {
+            assert!(actual_x >= 0 && actual_x + width <= 800);
+            assert!(actual_y >= 24 && actual_y + height <= 568);
+        } else {
+            assert_eq!((actual_x, actual_y), (x, y), "requested position");
+        }
+    }
+    if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
+        let status = ProcessCommand::new("grim")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("WAYLAND_DISPLAY", wayland)
+            .arg(path)
+            .status()
+            .expect("capture screenshot");
+        assert!(status.success());
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
+fn x11_pre_map_maximize_fills_work_area() {
+    x11_pre_map_expanded_fills_work_area("maximize", 540);
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk, xdotool, xprop and grim"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the X11 session and minimize checks form one integration scenario"
+)]
+fn x11_minimize_requests_update_wm_state() {
+    use smithay::reexports::x11rb::connection::Connection as _;
+    use smithay::reexports::x11rb::protocol::xproto::ClientMessageEvent;
+    use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
+    use smithay::reexports::x11rb::protocol::xproto::EventMask;
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("minimize.py");
+    let ready = runtime.path().join("ready");
+    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-minimize-test')\nr.geometry('400x300+100+100')\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "client did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
+    let env = |name: &[u8]| {
+        environ
+            .split(|b| *b == 0)
+            .find_map(|e| e.strip_prefix(name))
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .expect("environment value")
+    };
+    let display = env(b"DISPLAY=");
+    let output = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args(["search", "--name", "waywire-minimize-test"])
+        .output()
+        .expect("xdotool");
+    let id = String::from_utf8(output.stdout)
+        .expect("id")
+        .lines()
+        .next()
+        .expect("window")
+        .parse::<u32>()
+        .expect("number");
+    let (conn, screen) = smithay::reexports::x11rb::connect(Some(display)).expect("X11 connection");
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &[u8]| {
+        conn.intern_atom(false, name)
+            .expect("intern")
+            .reply()
+            .expect("atom")
+            .atom
+    };
+    let change = atom(b"WM_CHANGE_STATE");
+    let net_state = atom(b"_NET_WM_STATE");
+    let hidden = atom(b"_NET_WM_STATE_HIDDEN");
+    let send = |ty, data: [u32; 5]| {
+        let event = ClientMessageEvent::new(32, id, ty, data);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .expect("send");
+        conn.flush().expect("flush");
+    };
+    let check = |minimized: bool, phase: &str| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let output = ProcessCommand::new("xprop")
+                .env("DISPLAY", display)
+                .args(["-id", &id.to_string(), "WM_STATE", "_NET_WM_STATE"])
+                .output()
+                .expect("xprop");
+            let props = String::from_utf8(output.stdout).expect("properties");
+            if props.contains(if minimized { "Iconic" } else { "Normal" })
+                && props.contains("_NET_WM_STATE_HIDDEN") == minimized
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unexpected X11 state after {phase}: {props}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    send(change, [3, 0, 0, 0, 0]);
+    check(true, "WM_CHANGE_STATE minimize");
+    if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            ProcessCommand::new("grim")
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("WAYLAND_DISPLAY", env(b"WAYLAND_DISPLAY="))
+                .arg(path)
+                .status()
+                .expect("grim")
+                .success()
+        );
+    }
+    send(change, [1, 0, 0, 0, 0]);
+    check(false, "WM_CHANGE_STATE restore");
+    send(net_state, [1, hidden, 0, 1, 0]);
+    check(true, "hidden add");
+    send(net_state, [0, hidden, 0, 1, 0]);
+    check(false, "hidden remove");
+    send(net_state, [2, hidden, 0, 1, 0]);
+    check(true, "hidden toggle on");
+    send(net_state, [2, hidden, 0, 1, 0]);
+    check(false, "hidden toggle off");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
+fn x11_pre_map_fullscreen_fills_work_area() {
+    x11_pre_map_expanded_fills_work_area("fullscreen", 568);
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "integration scenario requires a live GTK client"
+)]
+fn x11_pre_map_expanded_fills_work_area(mode: &str, height: i32) {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("maximized.py");
+    let ready = runtime.path().join("ready");
+    fs::write(
+        &script,
+        format!(
+            r"#!/usr/bin/python3
+import os
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib
+window = Gtk.Window(title='waywire-premap-maximized')
+window.set_default_size(300, 200)
+window.{}()
+window.show_all()
+GLib.timeout_add(500, lambda: (open({:?}, 'w').write(str(os.getpid())), False)[1])
+Gtk.main()
+",
+            mode,
+            ready.to_string_lossy()
+        ),
+    )
+    .expect("write GTK script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("GDK_BACKEND", "x11")
+            .env("GTK_CSD", "0")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "GTK window did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
+    let environment = |name: &[u8]| {
+        environ
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(name))
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .expect("display environment")
+    };
+    let display = environment(b"DISPLAY=");
+    let id = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args([
+            "search",
+            "--onlyvisible",
+            "--name",
+            "waywire-premap-maximized",
+        ])
+        .output()
+        .expect("find window");
+    assert!(id.status.success());
+    let id = String::from_utf8(id.stdout).expect("window id");
+    let geometry = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args(["getwindowgeometry", "--shell", id.trim()])
+        .output()
+        .expect("window geometry");
+    assert!(geometry.status.success());
+    let geometry = String::from_utf8(geometry.stdout).expect("geometry");
+    assert!(geometry.contains("WIDTH=800\n"), "{geometry}");
+    assert!(
+        geometry.contains(&format!("HEIGHT={height}\n")),
+        "{geometry}"
+    );
+    if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
+        let status = ProcessCommand::new("grim")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("WAYLAND_DISPLAY", environment(b"WAYLAND_DISPLAY="))
+            .arg(path)
+            .status()
+            .expect("capture screenshot");
+        assert!(status.success());
+    }
+}
+
+#[test]
 #[ignore = "requires FFmpeg, Xwayland, distro gtk3-demo and xdotool"]
 fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
     let runtime = tempfile::tempdir().expect("runtime directory");
@@ -676,15 +1010,61 @@ fn xwayland_click_and_relative_warp_match_at_double_scale() {
 
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
+    x11_resize("none");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_resize_respects_minimum_size_hints() {
+    x11_resize("minimum");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_resize_respects_increment_hints() {
+    x11_resize("increment");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_resize_respects_aspect_hints() {
+    x11_resize("aspect");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, xterm, xprop and xdotool"]
+fn xterm_resize_respects_character_width() {
+    x11_resize("xterm");
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the X11 client and resize assertions form one integration scenario"
 )]
-fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
+#[expect(clippy::expect_used, reason = "integration test requires live clients")]
+fn x11_resize(mode: &str) {
     let runtime = tempfile::tempdir().expect("runtime");
     let script = runtime.path().join("client.py");
     let ready = runtime.path().join("ready");
-    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
+    let hints = match mode {
+        "minimum" => "r.minsize(395, 290)",
+        "increment" => "r.wm_grid(400, 300, 20, 20)",
+        "aspect" => "r.aspect(4, 3, 4, 3)",
+        _ => "",
+    };
+    let program = if mode == "xterm" {
+        format!(
+            "#!/usr/bin/python3\nimport os, subprocess\nchild = subprocess.Popen(['xterm', '-title', 'waywire-resize-test', '-geometry', '80x24+100+100'])\nopen({:?}, 'w').write(str(os.getpid()))\nchild.wait()\n",
+            ready.to_string_lossy()
+        )
+    } else {
+        format!(
+            "#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\nr.update()\n{hints}\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n",
+            ready.to_string_lossy()
+        )
+    };
+    fs::write(&script, program).expect("script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
     let port = socket.local_addr().expect("address").port().to_string();
@@ -720,8 +1100,15 @@ fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
             .output()
             .expect("xdotool")
     };
-    let search = xdotool(&["search", "--name", "waywire-resize-test"]);
-    let ids = String::from_utf8(search.stdout).expect("window id");
+    let ids = loop {
+        let search = xdotool(&["search", "--name", "waywire-resize-test"]);
+        let ids = String::from_utf8(search.stdout).expect("window id");
+        if !ids.is_empty() {
+            break ids;
+        }
+        assert!(Instant::now() < deadline, "window did not appear");
+        thread::sleep(Duration::from_millis(20));
+    };
     let id = ids.lines().next().expect("window");
     let geometry = || {
         let output = xdotool(&["getwindowgeometry", "--shell", id]);
@@ -738,8 +1125,49 @@ fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
     let stdin = compositor.0.stdin.as_mut().expect("stdin");
     let mut sequence = 0;
     let mut send = |command: Command| stdin.write_all(&command.encode()).expect("send input");
+    if mode == "xterm" {
+        while geometry().2 < 300 {
+            assert!(
+                Instant::now() < deadline,
+                "xterm did not map at its final size"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    let xterm_hints = if mode == "xterm" {
+        let output = ProcessCommand::new("xprop")
+            .env("DISPLAY", display)
+            .args(["-id", id, "WM_NORMAL_HINTS"])
+            .output()
+            .expect("xprop");
+        let text = String::from_utf8(output.stdout).expect("hints");
+        let width = |label: &str| -> u32 {
+            text.lines()
+                .find_map(|line| line.trim().strip_prefix(label))
+                .expect("hint")
+                .split_whitespace()
+                .next()
+                .expect("width")
+                .parse()
+                .expect("number")
+        };
+        Some((
+            width("program specified base size: "),
+            width("program specified resize increment: "),
+        ))
+    } else {
+        None
+    };
     let (mut x, mut y, mut width, mut height) = geometry();
-    for (dx, dy) in [(10, 0), (0, 20), (10, 20)] {
+    let first_dx = if mode == "xterm" {
+        31
+    } else if mode == "increment" || mode == "aspect" {
+        30
+    } else {
+        10
+    };
+    for (dx, dy) in [(first_dx, 0), (0, 20), (10, 20)] {
         let (px, py) = (
             if dx == 0 { x + width / 2 } else { x },
             if dy == 0 { y + height / 2 } else { y - 28 },
@@ -768,7 +1196,49 @@ fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
             state: ButtonState::Released,
             sequence: InputSequence::new(sequence).expect("sequence"),
         }));
-        let expected = (x + dx, y + dy, width - dx, height - dy);
+        if mode == "increment" || mode == "aspect" || mode == "xterm" {
+            thread::sleep(Duration::from_millis(300));
+            let actual = geometry();
+            let (_, _, actual_width, actual_height) = actual;
+            assert!(
+                actual_width < width,
+                "resize must change window size: initial {:?}, actual {actual:?}",
+                (x, y, width, height)
+            );
+            if mode == "increment" {
+                assert_eq!(actual_width % 20, 0, "width increment");
+                assert_eq!(actual_height % 20, 0, "height increment");
+            } else if let Some((base, increment)) = xterm_hints {
+                assert_eq!(
+                    (actual_width - base) % increment,
+                    0,
+                    "xterm character width"
+                );
+            } else {
+                assert!(
+                    actual_width * 3 >= actual_height * 4 - 2
+                        && actual_width * 3 <= actual_height * 4 + 2,
+                    "aspect ratio"
+                );
+            }
+            return;
+        }
+        let new_width = if mode == "minimum" {
+            (width - dx).max(395)
+        } else {
+            width - dx
+        };
+        let new_height = if mode == "minimum" {
+            (height - dy).max(290)
+        } else {
+            height - dy
+        };
+        let expected = (
+            x + width - new_width,
+            y + height - new_height,
+            new_width,
+            new_height,
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let actual = geometry();

@@ -654,8 +654,27 @@ impl XdgDecorationHandler for State {
         self.request_mode(top, Mode::ServerSide);
     }
     fn request_mode(&mut self, top: ToplevelSurface, mode: Mode) {
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.toplevel() == Some(&top))
+            .cloned();
+        if let Some(window) = &window {
+            self.windows
+                .entry(window.clone())
+                .or_default()
+                .decoration_mode = Some(mode);
+        }
         top.with_pending_state(|state| state.decoration_mode = Some(mode));
-        top.send_pending_configure();
+        if let Some(bounds) = window
+            .as_ref()
+            .and_then(|window| self.window_output_geometry(window))
+        {
+            top.with_pending_state(|state| state.bounds = Some(bounds.size));
+        }
+        if top.is_initial_configure_sent() {
+            top.send_pending_configure();
+        }
         self.dirty = true;
     }
     fn unset_mode(&mut self, top: ToplevelSurface) {
@@ -665,9 +684,11 @@ impl XdgDecorationHandler for State {
 
 pub(super) fn decorated(window: &Window) -> bool {
     if let Some(top) = window.toplevel() {
-        top.with_pending_state(|state| {
-            state.decoration_mode == Some(Mode::ServerSide)
-                && !state.states.contains(xdg_toplevel::State::Fullscreen)
+        top.with_committed_state(|state| {
+            state.is_some_and(|state| {
+                state.decoration_mode == Some(Mode::ServerSide)
+                    && !state.states.contains(xdg_toplevel::State::Fullscreen)
+            })
         })
     } else {
         window.x11_surface().is_some_and(|x| {
@@ -718,7 +739,9 @@ pub(super) fn window_flags(window: &Window) -> (bool, bool) {
     if let Some(top) = window.toplevel() {
         (
             top.parent().is_some(),
-            top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)),
+            top.with_committed_state(|state| {
+                state.is_some_and(|state| state.states.contains(xdg_toplevel::State::Maximized))
+            }),
         )
     } else if let Some(x11) = window.x11_surface() {
         (x11.is_transient_for().is_some(), x11.is_maximized())
@@ -729,7 +752,9 @@ pub(super) fn window_flags(window: &Window) -> (bool, bool) {
 
 pub(super) fn above_taskbar(window: &Window) -> bool {
     window.toplevel().is_some_and(|top| {
-        top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+        top.with_committed_state(|state| {
+            state.is_some_and(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+        })
     }) || window
         .x11_surface()
         .is_some_and(|surface| surface.is_fullscreen() || surface.is_override_redirect())
@@ -1130,8 +1155,10 @@ impl State {
                 });
                 (
                     title,
-                    top.with_pending_state(|state| {
-                        state.states.contains(xdg_toplevel::State::Activated)
+                    top.with_committed_state(|state| {
+                        state.is_some_and(|state| {
+                            state.states.contains(xdg_toplevel::State::Activated)
+                        })
                     }),
                 )
             } else if let Some(x11) = window.x11_surface() {

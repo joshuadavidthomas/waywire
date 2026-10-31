@@ -249,6 +249,9 @@ mod tests {
         seat: Option<WlSeat>,
         manager: Option<ZwlrForeignToplevelManagerV1>,
         last_configure: Option<u32>,
+        bounds: Option<(i32, i32)>,
+        last_surface: Option<WlSurface>,
+        last_xdg: Option<XdgSurface>,
         handles: Vec<ToplevelHandleEvents>,
         managed: Vec<ManagedToplevelEvents>,
         close_requests: usize,
@@ -314,7 +317,7 @@ mod tests {
                         let _: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
                     }
                     "xdg_wm_base" => {
-                        state.wm_base = Some(registry.bind(name, version.min(1), qh, ()));
+                        state.wm_base = Some(registry.bind(name, version.min(4), qh, ()));
                     }
                     "ext_foreign_toplevel_list_v1" => {
                         state.list = Some(registry.bind(name, version.min(1), qh, ()));
@@ -587,6 +590,13 @@ mod tests {
             if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::Close = event {
                 state.close_requests += 1;
             }
+            if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::ConfigureBounds {
+                width,
+                height,
+            } = event
+            {
+                state.bounds = Some((width, height));
+            }
         }
     }
 
@@ -806,7 +816,39 @@ mod tests {
         attach_buffer(&surface, app, &qh, 1);
         surface.commit();
         sync(display, state, connection, queue, app);
+        app.last_surface = Some(surface.clone());
+        app.last_xdg = Some(xdg_surface.clone());
         (surface, xdg_surface, toplevel)
+    }
+
+    fn commit_configure(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        connection: &Connection,
+        queue: &mut EventQueue<App>,
+        app: &mut App,
+    ) {
+        sync(display, state, connection, queue, app);
+        app.last_xdg
+            .as_ref()
+            .expect("xdg surface")
+            .ack_configure(app.last_configure.expect("configure"));
+        app.last_surface.as_ref().expect("surface").commit();
+        sync(display, state, connection, queue, app);
+    }
+
+    fn commit_server_decoration(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        connection: &Connection,
+        queue: &mut EventQueue<App>,
+        app: &mut App,
+        window: &Window,
+    ) {
+        let top = window.toplevel().expect("toplevel");
+        top.with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        top.send_configure();
+        commit_configure(display, state, connection, queue, app);
     }
 
     fn top_window(state: &crate::State) -> Window {
@@ -816,6 +858,366 @@ mod tests {
             .last()
             .cloned()
             .expect("mapped window")
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "constructing a disconnected X11 surface requires Smithay's complete atom table"
+    )]
+    fn x11_unmap_removes_window_state() {
+        use std::sync::Arc;
+        use std::sync::Weak;
+        use std::sync::atomic::AtomicBool;
+
+        use smithay::xwayland::X11Surface;
+        use smithay::xwayland::xwm::Atoms;
+
+        let atoms = Atoms {
+            WL_SURFACE_ID: 0,
+            WL_SURFACE_SERIAL: 0,
+            _SMITHAY_CLOSE_CONNECTION: 0,
+            UTF8_STRING: 0,
+            TEXT: 0,
+            WM_NAME: 0,
+            WM_HINTS: 0,
+            WM_PROTOCOLS: 0,
+            WM_TAKE_FOCUS: 0,
+            WM_DELETE_WINDOW: 0,
+            WM_CHANGE_STATE: 0,
+            _NET_WM_NAME: 0,
+            _NET_WM_MOVERESIZE: 0,
+            _NET_WM_PID: 0,
+            _NET_WM_WINDOW_OPACITY: 0,
+            _NET_WM_WINDOW_TYPE: 0,
+            _NET_WM_WINDOW_TYPE_COMBO: 0,
+            _NET_WM_WINDOW_TYPE_DESKTOP: 0,
+            _NET_WM_WINDOW_TYPE_DND: 0,
+            _NET_WM_WINDOW_TYPE_DOCK: 0,
+            _NET_WM_WINDOW_TYPE_DROPDOWN_MENU: 0,
+            _NET_WM_WINDOW_TYPE_DIALOG: 0,
+            _NET_WM_WINDOW_TYPE_MENU: 0,
+            _NET_WM_WINDOW_TYPE_NOTIFICATION: 0,
+            _NET_WM_WINDOW_TYPE_NORMAL: 0,
+            _NET_WM_WINDOW_TYPE_POPUP_MENU: 0,
+            _NET_WM_WINDOW_TYPE_SPLASH: 0,
+            _NET_WM_WINDOW_TYPE_TOOLBAR: 0,
+            _NET_WM_WINDOW_TYPE_TOOLTIP: 0,
+            _NET_WM_WINDOW_TYPE_UTILITY: 0,
+            _NET_WM_STATE_MODAL: 0,
+            _NET_WM_OPAQUE_REGION: 0,
+            _MOTIF_WM_HINTS: 0,
+            _NET_STARTUP_ID: 0,
+            _GTK_FRAME_EXTENTS: 0,
+            WM_S0: 0,
+            WM_STATE: 0,
+            _NET_WM_CM_S0: 0,
+            _NET_SUPPORTED: 0,
+            _NET_ACTIVE_WINDOW: 0,
+            _NET_CLIENT_LIST: 0,
+            _NET_CLIENT_LIST_STACKING: 0,
+            _NET_WM_PING: 0,
+            _NET_WM_STATE: 0,
+            _NET_WM_STATE_MAXIMIZED_VERT: 0,
+            _NET_WM_STATE_MAXIMIZED_HORZ: 0,
+            _NET_WM_STATE_HIDDEN: 0,
+            _NET_WM_STATE_FULLSCREEN: 0,
+            _NET_WM_STATE_DEMANDS_ATTENTION: 0,
+            _NET_WM_STATE_FOCUSED: 0,
+            _NET_WM_STATE_ABOVE: 0,
+            _NET_WM_STATE_BELOW: 0,
+            _NET_WM_STATE_SHADED: 0,
+            _NET_WM_STATE_SKIP_TASKBAR: 0,
+            _NET_WM_STATE_SKIP_PAGER: 0,
+            _NET_WM_STATE_STICKY: 0,
+            _NET_WM_SYNC_REQUEST: 0,
+            _NET_WM_SYNC_REQUEST_COUNTER: 0,
+            _NET_SHOWING_DESKTOP: 0,
+            _NET_SUPPORTING_WM_CHECK: 0,
+            _XSETTINGS_SETTINGS: 0,
+            _XWAYLAND_ALLOW_COMMITS: 0,
+            _WL_SELECTION: 0,
+            CLIPBOARD_MANAGER: 0,
+            CLIPBOARD: 0,
+            PRIMARY: 0,
+            TARGETS: 0,
+            TIMESTAMP: 0,
+            INCR: 0,
+            DELETE: 0,
+            _XSETTINGS_S0: 0,
+            XdndSelection: 0,
+            XdndAware: 0,
+            XdndStatus: 0,
+            XdndPosition: 0,
+            XdndEnter: 0,
+            XdndLeave: 0,
+            XdndDrop: 0,
+            XdndFinished: 0,
+            XdndProxy: 0,
+            XdndTypeList: 0,
+            XdndActionMove: 0,
+            XdndActionCopy: 0,
+            XdndActionAsk: 0,
+            XdndActionPrivate: 0,
+        };
+        let surface = X11Surface::new(
+            None,
+            123,
+            false,
+            Weak::new(),
+            atoms,
+            None,
+            smithay::utils::Rectangle::new((0, 0).into(), (100, 100).into()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let window = Window::new_x11_window(surface);
+        let (_display, mut state) = crate::tests::test_state();
+        state.space.map_element(window.clone(), (32, 32), false);
+        state.windows.entry(window.clone()).or_default().mapped = true;
+        state.window_unmapped(&window);
+        assert!(!state.windows.contains_key(&window));
+    }
+
+    #[test]
+    fn uncommitted_toplevel_receives_no_configure() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as TopState;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        #[derive(Debug)]
+        enum Path {
+            Decoration,
+            Focus,
+            Resize,
+            Expand,
+        }
+        let mut premature = Vec::new();
+        for path in [Path::Decoration, Path::Focus, Path::Resize, Path::Expand] {
+            let (mut display, mut state) = crate::tests::test_state();
+            let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let qh = queue.handle();
+            let surface = app
+                .compositor
+                .as_ref()
+                .expect("compositor")
+                .create_surface(&qh, ());
+            let xdg = app
+                .wm_base
+                .as_ref()
+                .expect("xdg shell")
+                .get_xdg_surface(&surface, &qh, ());
+            let _top = xdg.get_toplevel(&qh, ());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let window = top_window(&state);
+            let top = window.toplevel().expect("toplevel").clone();
+            match path {
+                Path::Decoration => state.request_mode(top, Mode::ServerSide),
+                Path::Focus => state.focus_window(Some(window)),
+                Path::Resize => state.output_resized(),
+                Path::Expand => state.set_expanded(&top, TopState::Maximized, true),
+            }
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            if app.last_configure.is_some() {
+                premature.push(path);
+            }
+        }
+        assert!(
+            premature.is_empty(),
+            "premature configure from {premature:?}"
+        );
+    }
+
+    #[test]
+    fn initial_bounds_leave_room_for_server_titlebar() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg.get_toplevel(&qh, ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        state.request_mode(
+            window.toplevel().expect("toplevel").clone(),
+            Mode::ServerSide,
+        );
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.bounds, Some((1920, 1020)));
+        let top = window.toplevel().expect("toplevel").clone();
+        state.request_mode(top, Mode::ClientSide);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.bounds, Some((1920, 1048)));
+    }
+
+    #[test]
+    fn remapped_toplevel_retains_decoration_and_bounds() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, xdg, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        let window = top_window(&state);
+        let top = window.toplevel().expect("toplevel").clone();
+        state.request_mode(top.clone(), Mode::ServerSide);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("decoration configure"));
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        app.last_configure = None;
+        surface.attach(None, 0, 0);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(app.last_configure.is_none(), "no configure on unmap");
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        top.with_pending_state(|pending| {
+            assert_eq!(pending.decoration_mode, Some(Mode::ServerSide));
+            assert_eq!(pending.bounds, Some((1920, 1020).into()));
+        });
+        xdg.ack_configure(app.last_configure.expect("remap configure"));
+        attach_buffer(&surface, &app, &queue.handle(), 1);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(state.windows.get(&window).expect("window state").mapped);
+    }
+
+    #[test]
+    fn repeated_maximize_still_sends_configure() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        let top = window.toplevel().expect("toplevel").clone();
+        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized, true);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let first = app.last_configure.expect("first maximize configure");
+        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized, true);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_ne!(
+            app.last_configure,
+            Some(first),
+            "repeated maximize configure"
+        );
+    }
+
+    #[test]
+    fn destroying_a_window_ends_its_move_and_resize_grabs() {
+        for resize in [false, true] {
+            let (mut display, mut state) = crate::tests::test_state();
+            let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let (_, _, toplevel) = map_toplevel(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                "Window",
+                "window",
+            );
+            let window = top_window(&state);
+            let (_, _, other) = map_toplevel(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                "Other",
+                "other",
+            );
+            let pointer = state.seat.get_pointer().expect("pointer");
+            state.start_decoration_grab(
+                window,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                resize,
+            );
+            assert!(pointer.is_grabbed());
+            other.destroy();
+            connection.flush().expect("client flush");
+            display
+                .dispatch_clients(&mut state)
+                .expect("server dispatch");
+            assert!(pointer.is_grabbed(), "another window must not end the grab");
+            toplevel.destroy();
+            connection.flush().expect("client flush");
+            display
+                .dispatch_clients(&mut state)
+                .expect("server dispatch");
+            assert!(!pointer.is_grabbed(), "grab survives window destruction");
+        }
+    }
+
+    #[test]
+    fn window_chrome_follows_client_committed_state() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as TopState;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, xdg, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        let window = top_window(&state);
+        let top = window.toplevel().expect("toplevel").clone();
+        state.request_mode(top.clone(), Mode::ServerSide);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("decoration configure"));
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(crate::decorations::decorated(&window));
+        top.with_pending_state(|pending| {
+            pending.states.set(TopState::Maximized);
+            pending.states.set(TopState::Fullscreen);
+        });
+        top.send_configure();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(
+            crate::decorations::decorated(&window),
+            "pending fullscreen must not hide chrome"
+        );
+        assert!(
+            !crate::decorations::window_flags(&window).1,
+            "pending maximize must not change chrome"
+        );
+        assert!(
+            !crate::decorations::above_taskbar(&window),
+            "pending fullscreen must not change stacking"
+        );
+        xdg.ack_configure(app.last_configure.expect("fullscreen configure"));
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(!crate::decorations::decorated(&window));
+        assert!(crate::decorations::window_flags(&window).1);
+        assert!(crate::decorations::above_taskbar(&window));
     }
 
     fn action_fixture() -> (
@@ -1313,6 +1715,65 @@ mod tests {
     }
 
     #[test]
+    fn reactive_popup_is_reconstrained_after_output_resize() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, parent, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "parent",
+            "parent",
+        );
+        let window = top_window(&state);
+        state.space.map_element(window, (100, 400), true);
+        let qh = queue.handle();
+        let positioner = app
+            .wm_base
+            .as_ref()
+            .expect("wm base")
+            .create_positioner(&qh, ());
+        positioner.set_size(100, 100);
+        positioner.set_anchor_rect(0, 150, 1, 1);
+        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideY);
+        positioner.set_reactive();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("wm base")
+            .get_xdg_surface(&surface, &qh, ());
+        let _popup = xdg.get_popup(Some(&parent), &positioner, &qh, ());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("popup configure"));
+        attach_buffer(&surface, &app, &qh, 100);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        app.popup_geometry = None;
+        state.output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (800, 600).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        state.output_resized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, y, _, height) = app.popup_geometry.expect("updated popup configure");
+        assert_eq!(400 + y + height, 568);
+    }
+
+    #[test]
     fn very_wide_window_keeps_its_decoration_and_scene_running() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
@@ -1342,10 +1803,13 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let window = top_window(&state);
         assert_eq!(window.geometry().size.w, 50_000);
-        window
-            .toplevel()
-            .expect("toplevel")
-            .with_pending_state(|pending| pending.decoration_mode = Some(Mode::ServerSide));
+        let top = window.toplevel().expect("toplevel");
+        top.with_pending_state(|pending| pending.decoration_mode = Some(Mode::ServerSide));
+        top.send_configure();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("decoration configure"));
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let mut renderer = PixmanRenderer::new().expect("renderer");
         let scene = state.scene_elements(&mut renderer);
         assert_eq!(
@@ -1365,7 +1829,7 @@ mod tests {
 
         use crate::decorations::SceneElement;
 
-        let (_, mut state, _, _, _, window) = action_fixture();
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         let mut renderer = PixmanRenderer::new().expect("renderer");
         let normal = state.scene_elements(&mut renderer);
         assert!(matches!(normal.first(), Some(SceneElement::Decoration(_))));
@@ -1391,6 +1855,7 @@ mod tests {
 
         let top = window.toplevel().expect("toplevel").clone();
         state.set_expanded(&top, xdg_toplevel::State::Fullscreen, true);
+        commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         let fullscreen = state.scene_elements(&mut renderer);
         assert!(matches!(fullscreen.first(), Some(SceneElement::Surface(_))));
         assert!(
@@ -1477,7 +1942,14 @@ mod tests {
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let window = top_window(&state);
-        window.toplevel().expect("top").with_pending_state(|state| state.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        commit_server_decoration(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &window,
+        );
         state.space.map_element(window.clone(), (100, 100), true);
         state.pointer_motion(KeyboardSource::MAIN, (120.0, 80.0).into());
         for _ in 0..2 {
@@ -1485,6 +1957,7 @@ mod tests {
             state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
         }
         assert!(window.toplevel().expect("top").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+        commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         state.pointer_motion(KeyboardSource::MAIN, (20.0, 10.0).into());
         for _ in 0..2 {
             state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
@@ -1511,9 +1984,17 @@ mod tests {
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let window = top_window(&state);
-        window.toplevel().expect("top").with_pending_state(|state| state.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        commit_server_decoration(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &window,
+        );
         state.space.map_element(window.clone(), (100, 100), true);
         state.window_action(&window, crate::WindowAction::Maximize);
+        commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         attach_buffer(&surface, &app, &queue.handle(), 1920);
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
@@ -1635,10 +2116,11 @@ mod tests {
 
     #[test]
     fn menu_maximize_and_restore() {
-        let (_, mut state, _, _, _, window) = action_fixture();
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         click_menu_item(&mut state, &window, 1);
         assert!(state.window_menu.is_none());
         assert!(window.toplevel().expect("toplevel").with_pending_state(|pending| pending.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+        commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         click_menu_item(&mut state, &window, 1);
         assert!(!window.toplevel().expect("toplevel").with_pending_state(|pending| pending.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
     }
@@ -1685,8 +2167,9 @@ mod tests {
 
     #[test]
     fn disabled_menu_items_do_nothing() {
-        let (_, mut state, _, _, _, window) = action_fixture();
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         state.window_action(&window, crate::WindowAction::Maximize);
+        commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         for row in [3, 4] {
             click_menu_item(&mut state, &window, row);
             assert!(state.window_menu.is_some());
@@ -1740,7 +2223,14 @@ mod tests {
         attach_constraint_buffer(&surface, &app, &queue.handle());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let window = top_window(&state);
-        window.toplevel().expect("top").with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        commit_server_decoration(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &window,
+        );
         state.space.map_element(window.clone(), (100, 100), true);
         for (point, edge, cursor) in [
             ((150.0, 72.0), 1, CursorShape::NResize),
@@ -1791,7 +2281,14 @@ mod tests {
             sync(&mut display, &mut state, &connection, &mut queue, &mut app);
             let window = top_window(&state);
             let top = window.toplevel().expect("top");
-            top.with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+            commit_server_decoration(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                &window,
+            );
             state.space.map_element(window.clone(), (100, 100), true);
             state.pointer_motion(KeyboardSource::MAIN, point.into());
             state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
@@ -1841,7 +2338,14 @@ mod tests {
         attach_constraint_buffer(&surface, &app, &queue.handle());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let window = top_window(&state);
-        window.toplevel().expect("top").with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        commit_server_decoration(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &window,
+        );
         state.space.map_element(window, (100, 100), true);
         state.pointer_motion(KeyboardSource::MAIN, (100.0, 72.0).into());
         assert!(

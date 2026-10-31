@@ -227,18 +227,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Medium:** configures can be sent before a client's initial commit (from
-  decoration negotiation, `focus_window`, `output_resized` and
-  `set_expanded`). Guard each with `is_initial_configure_sent()`.
-- **Medium:** X11 requested positions and pre-map fullscreen or maximize are
-  ignored.
-- **Medium:** a re-mapped toplevel loses its server-side decoration mode and
-  bounds. Redundant maximize requests get no configure.
-- **Low:** grabs survive window destruction. Decorations follow pending state.
-  X11 size hints are ignored during resize. New toplevels get bounds without the
-  titlebar. Popups aren't re-constrained after output resize. X11 `WindowState`
-  entries leak on unmap. X11 client minimize requests are not handled.
-
 ## 4. Desktop chrome and shell
 
 The compositor draws titlebars, window menus, and a taskbar into the desktop.
@@ -254,8 +242,6 @@ Remaining:
   colour scheme to applications when theme selection is supported.
 - Expose the node list to an agent query API so agents can find windows and
   controls without searching pixels.
-- Minimized X11 windows do not receive iconic `WM_STATE` or
-  `_NET_WM_STATE_HIDDEN`.
 - Clicking a pin does nothing when its child is alive but has no matching
   window, such as a wrapper that forks.
 - The gateway does not validate `--pin` quoting before starting the compositor.

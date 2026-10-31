@@ -1,6 +1,7 @@
 //! Rootless software Xwayland and its small floating-window manager.
 use std::cell::RefCell;
 use std::fmt::Write;
+use std::os::fd::AsFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::process::Stdio;
@@ -13,14 +14,20 @@ use nix::sys::signal::SigSet;
 use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
 use smithay::desktop::Window;
+use smithay::reexports::calloop::Interest;
 use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::calloop::Mode;
+use smithay::reexports::calloop::PostAction;
+use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::TimeoutAction;
 use smithay::reexports::calloop::timer::Timer;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::x11rb;
 use smithay::reexports::x11rb::connection::Connection;
 use smithay::reexports::x11rb::protocol::xproto::AtomEnum;
+use smithay::reexports::x11rb::protocol::xproto::ChangeWindowAttributesAux;
 use smithay::reexports::x11rb::protocol::xproto::ConnectionExt;
+use smithay::reexports::x11rb::protocol::xproto::EventMask;
 use smithay::reexports::x11rb::protocol::xproto::PropMode;
 use smithay::utils::Logical;
 use smithay::utils::Rectangle;
@@ -117,6 +124,9 @@ pub(crate) fn start(
                 Ok(wm) => {
                     state.xwm = Some(wm);
                     state.xdisplay = Some(display_number);
+                    if let Err(error) = watch_hidden_requests(&ready_handle, display_number) {
+                        state.fail(error.context("watch X11 hidden requests"));
+                    }
                     if let Err(error) = update_scale(state) {
                         state.fail(error.context("configure Xwayland scale"));
                     }
@@ -151,6 +161,83 @@ pub(crate) fn start(
             },
         )
         .map_err(|error| anyhow!(error.to_string()))?;
+    Ok(())
+}
+
+// Smithay handles WM_CHANGE_STATE, but its XWM does not dispatch HIDDEN
+// client messages. EWMH sends them to the root with SUBSTRUCTURE_NOTIFY, so a
+// second X11 connection can observe them without claiming window management.
+fn watch_hidden_requests(handle: &LoopHandle<'static, State>, display: u32) -> Result<()> {
+    let (connection, screen) = x11rb::connect(Some(&format!(":{display}")))?;
+    let root = connection.setup().roots[screen].root;
+    let net_state = connection
+        .intern_atom(false, b"_NET_WM_STATE")?
+        .reply()?
+        .atom;
+    let hidden = connection
+        .intern_atom(false, b"_NET_WM_STATE_HIDDEN")?
+        .reply()?
+        .atom;
+    connection
+        .change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+        )?
+        .check()?;
+    connection.flush()?;
+    let fd = connection.stream().as_fd().try_clone_to_owned()?;
+    handle
+        .insert_source(
+            Generic::new(fd, Interest::READ, Mode::Level),
+            move |_, _, state| {
+                while let Some(event) =
+                    connection.poll_for_event().map_err(std::io::Error::other)?
+                {
+                    if let x11rb::protocol::Event::ClientMessage(event) = event
+                        && event.type_ == net_state
+                        && event.format == 32
+                    {
+                        let data = event.data.as_data32();
+                        let window = state
+                            .space
+                            .elements()
+                            .find(|window| {
+                                window
+                                    .x11_surface()
+                                    .is_some_and(|surface| surface.window_id() == event.window)
+                            })
+                            .cloned();
+                        if (data[1] == hidden || data[2] == hidden)
+                            && let Some(window) = window
+                        {
+                            let minimized = state
+                                .windows
+                                .get(&window)
+                                .is_some_and(|state| state.minimized);
+                            match data[0] {
+                                0 if minimized => {
+                                    state.window_action(&window, crate::WindowAction::Restore);
+                                }
+                                1 if !minimized => {
+                                    state.window_action(&window, crate::WindowAction::Minimize);
+                                }
+                                2 => state.window_action(
+                                    &window,
+                                    if minimized {
+                                        crate::WindowAction::Restore
+                                    } else {
+                                        crate::WindowAction::Minimize
+                                    },
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|error| anyhow!("register X11 hidden request listener: {error}"))?;
     Ok(())
 }
 
@@ -342,15 +429,40 @@ impl XwmHandler for State {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Modulo 8.
         let offset = (self.space.elements().count() % 8) as i32 * 48;
         let window = Window::new_x11_window(surface.clone());
-        let location = smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset));
+        let hint_position = surface.size_hints().and_then(|hints| hints.position);
+        if geometry.loc == (0, 0).into()
+            && let Some((_, x, y)) = hint_position
+        {
+            geometry.loc = smithay::utils::Point::<i32, smithay::utils::Physical>::from((x, y))
+                .to_f64()
+                .to_logical(self.output.current_scale().fractional_scale().max(1.0))
+                .to_i32_round();
+        }
+        let location = if hint_position.is_some() || geometry.loc != (0, 0).into() {
+            geometry.loc + window.geometry().loc
+        } else {
+            smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset))
+        };
         geometry.loc = location - window.geometry().loc;
         self.space.map_element(window.clone(), location, true);
         self.mapped_order.push(window.clone());
         self.enforce_topmost();
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
-        self.center_dialog(&window);
-        self.constrain_window(&window);
+        if surface.is_maximized() || surface.is_fullscreen() {
+            surface
+                .user_data()
+                .insert_if_missing(RestoreGeometry::default);
+            if let Some(saved) = surface.user_data().get::<RestoreGeometry>() {
+                *saved.0.borrow_mut() = Some(geometry);
+            }
+            if let Some(output) = self.window_output_geometry(&window) {
+                self.x11_geometry(&surface, output + surface.frame_extents());
+            }
+        } else {
+            self.center_dialog(&window);
+            self.constrain_window(&window);
+        }
     }
 
     fn mapped_override_redirect_window(&mut self, _: XwmId, surface: X11Surface) {
@@ -363,8 +475,8 @@ impl XwmHandler for State {
 
     fn unmapped_window(&mut self, _: XwmId, surface: X11Surface) {
         if let Some(window) = self.x11_window(&surface) {
-            self.space.unmap_elem(&window);
             self.window_unmapped(&window);
+            self.space.unmap_elem(&window);
         }
         if !surface.is_override_redirect()
             && let Err(error) = surface.set_mapped(false)
@@ -382,14 +494,20 @@ impl XwmHandler for State {
         &mut self,
         _: XwmId,
         surface: X11Surface,
-        _: Option<i32>,
-        _: Option<i32>,
+        x: Option<i32>,
+        y: Option<i32>,
         width: Option<u32>,
         height: Option<u32>,
         reorder: Option<Reorder>,
     ) {
         let mut geometry = surface.last_configure();
         if !surface.is_fullscreen() && !surface.is_maximized() {
+            if let Some(x) = x {
+                geometry.loc.x = x;
+            }
+            if let Some(y) = y {
+                geometry.loc.y = y;
+            }
             if let Some(width) = width {
                 geometry.size.w = width.clamp(1, u16::MAX.into()).cast_signed();
             }
@@ -398,6 +516,11 @@ impl XwmHandler for State {
             }
         }
         self.x11_geometry(&surface, geometry);
+        if (x.is_some() || y.is_some())
+            && let Some(window) = self.x11_window(&surface)
+        {
+            self.constrain_window(&window);
+        }
         if reorder == Some(Reorder::Top)
             && let Some(window) = self.x11_window(&surface)
         {
@@ -449,6 +572,23 @@ impl XwmHandler for State {
     fn unmodal_request(&mut self, _: XwmId, surface: X11Surface) {
         if let Err(error) = surface.set_modal(false) {
             tracing::warn!(%error, "clear X11 modal state");
+        }
+    }
+
+    fn minimize_request(&mut self, _: XwmId, surface: X11Surface) {
+        if let Some(window) = self.x11_window(&surface) {
+            self.window_action(&window, crate::WindowAction::Minimize);
+        }
+    }
+
+    fn unminimize_request(&mut self, _: XwmId, surface: X11Surface) {
+        if let Some(window) = self.x11_window(&surface)
+            && self
+                .windows
+                .get(&window)
+                .is_some_and(|state| state.minimized)
+        {
+            self.window_action(&window, crate::WindowAction::Restore);
         }
     }
 

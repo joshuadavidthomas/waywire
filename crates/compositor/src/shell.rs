@@ -90,6 +90,14 @@ impl CompositorHandler for State {
         self.surfaces.push(surface.clone());
     }
     fn destroyed(&mut self, surface: &WlSurface) {
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().is_some_and(|root| *root == *surface))
+            .cloned();
+        if let Some(window) = window {
+            self.end_window_grab(&window);
+        }
         self.surfaces.retain(|item| item != surface);
         if self.cursor_surface.as_ref() == Some(surface) {
             self.cursor_surface = None;
@@ -154,7 +162,15 @@ impl CompositorHandler for State {
                 }
                 if let Some(top) = window.toplevel()
                     && !top.is_initial_configure_sent()
+                    && (!previous || mapped)
                 {
+                    let mode = self
+                        .windows
+                        .get(&window)
+                        .and_then(|state| state.decoration_mode);
+                    top.with_pending_state(|state| state.decoration_mode = mode);
+                    let bounds = self.window_output_geometry(&window).map(|area| area.size);
+                    top.with_pending_state(|state| state.bounds = bounds);
                     top.send_configure();
                 }
             }
@@ -308,6 +324,16 @@ impl XdgShellHandler for State {
         self.space
             .map_element(window, (32 + offset, 32 + offset), false);
     }
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.toplevel() == Some(&surface))
+            .cloned();
+        if let Some(window) = window {
+            self.end_window_grab(&window);
+        }
+    }
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
         if Seat::<Self>::from_resource(&seat).as_ref() != Some(&self.seat) {
             return;
@@ -436,6 +462,7 @@ impl State {
     }
 
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
+        self.end_window_grab(window);
         self.toplevel_list.unpublish(window);
         self.mapped_order.retain(|item| item != window);
         self.minimized_order.retain(|item| item != window);
@@ -468,6 +495,9 @@ impl State {
             self.focus_window(self.topmost_focusable(Some(window)));
         }
         self.refresh_pointer_focus();
+        if window.x11_surface().is_some() {
+            self.windows.remove(window);
+        }
     }
 
     pub(super) fn constrain_window(&mut self, window: &Window) {
@@ -509,15 +539,20 @@ impl State {
     ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
         let fullscreen = window.toplevel().is_some_and(|top| {
             top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
-        }) || window
-            .x11_surface()
-            .is_some_and(smithay::xwayland::X11Surface::is_fullscreen);
+        });
         let mut geometry = if fullscreen {
             self.space.output_geometry(&self.output)?
         } else {
             self.work_area()?
         };
-        if super::decorations::decorated(window) {
+        let decorated = window.toplevel().map_or_else(
+            || super::decorations::decorated(window),
+            |top| top.with_pending_state(|state| {
+                state.decoration_mode == Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide)
+                    && !state.states.contains(xdg_toplevel::State::Fullscreen)
+            }),
+        );
+        if decorated {
             geometry.loc.y += super::decorations::BAR;
             geometry.size.h = (geometry.size.h - super::decorations::BAR).max(1);
         }
@@ -561,7 +596,9 @@ impl State {
                     }
                     expanded
                 });
-                top.send_pending_configure();
+                if top.is_initial_configure_sent() {
+                    top.send_pending_configure();
+                }
                 expanded
             } else if let Some(x11) = window.x11_surface() {
                 let expanded = x11.is_maximized() || x11.is_fullscreen();
@@ -576,6 +613,18 @@ impl State {
                 self.space.map_element(window, geometry.loc, false);
             } else {
                 self.constrain_window(&window);
+            }
+        }
+        for popup in self.xdg_shell_state.popup_surfaces() {
+            if !popup.is_initial_configure_sent() {
+                self.unconstrain_popup(popup);
+            } else if popup
+                .with_committed_state(|state| state.is_some_and(|state| state.positioner.reactive))
+            {
+                self.unconstrain_popup(popup);
+                if let Err(error) = popup.send_pending_configure() {
+                    tracing::warn!(%error, "reconfigure popup after output resize");
+                }
             }
         }
         if let Some(pointer) = self.seat.get_pointer() {
@@ -634,7 +683,9 @@ impl State {
         surface.with_pending_state(|state| {
             state.size = Some(geometry.size);
         });
-        surface.send_pending_configure();
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
         self.space.map_element(window, geometry.loc, true);
         self.enforce_topmost();
         self.refresh_pointer_focus();

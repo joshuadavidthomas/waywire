@@ -38,8 +38,10 @@ pub(super) struct WindowState {
     pub minimized: bool,
     pub always_on_top: bool,
     pub decoration: Option<super::decorations::Decoration>,
+    pub decoration_mode: Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>,
     pub restore: Option<Rectangle<i32, Logical>>,
     pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
+    pub grab_serial: Option<Serial>,
 }
 
 pub(super) struct WindowGrab {
@@ -151,13 +153,27 @@ impl State {
             self,
             WindowGrab {
                 start,
-                window,
+                window: window.clone(),
                 initial,
                 edges,
             },
             serial,
             Focus::Clear,
         );
+        self.windows.entry(window).or_default().grab_serial = Some(serial);
+    }
+
+    pub(super) fn end_window_grab(&mut self, window: &Window) {
+        let serial = self.windows.get(window).and_then(|state| state.grab_serial);
+        if let (Some(pointer), Some(serial)) = (self.seat.get_pointer(), serial)
+            && pointer.has_grab(serial)
+        {
+            pointer.unset_grab(
+                self,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                smithay::backend::input::InputTime::now(),
+            );
+        }
     }
 
     pub(super) fn resize_committed(&mut self, window: &Window) {
@@ -229,6 +245,60 @@ fn resize_size(
         .into()
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "X11 hints use integer client pixels"
+)]
+fn x11_resize_size(
+    mut size: Size<i32, Logical>,
+    edges: u32,
+    surface: &smithay::xwayland::X11Surface,
+    scale: f64,
+) -> Size<i32, Logical> {
+    let Some(hints) = surface.size_hints() else {
+        return size;
+    };
+    if let Some((inc_w, inc_h)) = hints.size_increment {
+        let base = surface.base_size().unwrap_or_default();
+        let snap = |value: i32, base: i32, increment: i32| {
+            let increment = (f64::from(increment) / scale).round() as i32;
+            if increment <= 0 {
+                value
+            } else {
+                (i64::from(base)
+                    + (i64::from(value) - i64::from(base)).div_euclid(i64::from(increment))
+                        * i64::from(increment))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+            }
+        };
+        size = (snap(size.w, base.w, inc_w), snap(size.h, base.h, inc_h)).into();
+    }
+    let min = surface.min_size().unwrap_or_default();
+    let max = surface.max_size().unwrap_or_default();
+    size = resize_size(size, (0.0, 0.0).into(), 0, min, max);
+    if let Some((minimum, maximum)) = hints.aspect
+        && minimum.numerator > 0
+        && minimum.denominator > 0
+        && maximum.numerator > 0
+        && maximum.denominator > 0
+    {
+        let min_ratio = f64::from(minimum.numerator) / f64::from(minimum.denominator);
+        let max_ratio = f64::from(maximum.numerator) / f64::from(maximum.denominator);
+        if min_ratio <= max_ratio {
+            if edges & 0b1100 == 0 {
+                size.w = f64::from(size.w)
+                    .clamp(f64::from(size.h) * min_ratio, f64::from(size.h) * max_ratio)
+                    .round() as i32;
+            } else {
+                size.h = f64::from(size.h)
+                    .clamp(f64::from(size.w) / max_ratio, f64::from(size.w) / min_ratio)
+                    .round() as i32;
+            }
+        }
+    }
+    resize_size(size, (0.0, 0.0).into(), 0, min, max)
+}
+
 impl PointerGrab<State> for WindowGrab {
     fn motion(
         &mut self,
@@ -253,6 +323,14 @@ impl PointerGrab<State> for WindowGrab {
                         (cached.min_size, cached.max_size)
                     })
                 })
+                .or_else(|| {
+                    self.window.x11_surface().map(|surface| {
+                        (
+                            surface.min_size().unwrap_or_default(),
+                            surface.max_size().unwrap_or_default(),
+                        )
+                    })
+                })
                 .unwrap_or_default();
             let size = resize_size(self.initial.size, delta, edges, min, max);
             if let Some(top) = self.window.toplevel() {
@@ -262,6 +340,19 @@ impl PointerGrab<State> for WindowGrab {
                 });
                 top.send_pending_configure();
             } else if let Some(surface) = self.window.x11_surface() {
+                let scale = state
+                    .xwayland_client
+                    .as_ref()
+                    .and_then(|client| client.get_data::<smithay::xwayland::XWaylandClientData>())
+                    .map_or(1.0, |data| data.compositor_state.client_scale());
+                let requested = resize_size(
+                    self.initial.size,
+                    delta,
+                    edges,
+                    (0, 0).into(),
+                    (0, 0).into(),
+                );
+                let size = x11_resize_size(requested, edges, surface, scale);
                 let mut rect = Rectangle::new(self.initial.loc, size);
                 if edges & 4 != 0 {
                     rect.loc.x += self.initial.size.w - size.w;
@@ -306,8 +397,13 @@ impl PointerGrab<State> for WindowGrab {
         }
     }
     fn unset(&mut self, state: &mut State) {
+        if let Some(window_state) = state.windows.get_mut(&self.window) {
+            window_state.grab_serial = None;
+        }
         if self.edges.is_some()
             && let Some(top) = self.window.toplevel()
+            && top.alive()
+            && top.is_initial_configure_sent()
         {
             top.with_pending_state(|pending| pending.states.unset(xdg_toplevel::State::Resizing));
             let serial = top.send_configure();
@@ -322,6 +418,7 @@ impl PointerGrab<State> for WindowGrab {
             }
         } else if self.edges.is_some()
             && let Some(surface) = self.window.x11_surface()
+            && surface.alive()
         {
             // X11 has no xdg configure acknowledgment to retire the resize anchor.
             // Keep the final configured position even if an older buffer commits later.
