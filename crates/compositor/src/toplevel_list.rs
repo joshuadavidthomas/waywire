@@ -1003,6 +1003,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn top_and_left_resize_keep_opposite_edges_fixed() {
+        for (point, delta, expected_size, expected_location) in [
+            ((100.0, 150.0), (10.0, 0.0), (90, 100), (110, 100)),
+            ((150.0, 72.0), (0.0, 20.0), (100, 80), (100, 120)),
+            ((100.0, 72.0), (10.0, 20.0), (90, 80), (110, 120)),
+        ] {
+            let (mut display, mut state) = crate::tests::test_state();
+            let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let (surface, xdg, _) = map_toplevel(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                "Window",
+                "window",
+            );
+            attach_constraint_buffer(&surface, &app, &queue.handle());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let window = top_window(&state);
+            let top = window.toplevel().expect("top");
+            top.with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+            state.space.map_element(window.clone(), (100, 100), true);
+            state.pointer_motion(KeyboardSource::MAIN, point.into());
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+            state.pointer_motion(
+                KeyboardSource::MAIN,
+                (point.0 + delta.0, point.1 + delta.1).into(),
+            );
+            assert_eq!(
+                top.with_pending_state(|pending| pending.size),
+                Some(expected_size.into())
+            );
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            xdg.ack_configure(app.last_configure.expect("resize configure"));
+            attach_rectangle_buffer(
+                &surface,
+                &app,
+                &queue.handle(),
+                expected_size.0,
+                expected_size.1,
+            );
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert_eq!(window.geometry().size, expected_size.into());
+            assert_eq!(
+                state.space.element_location(&window),
+                Some(expected_location.into())
+            );
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        }
+    }
+
     fn managed_handle(app: &App, title: &str) -> ZwlrForeignToplevelHandleV1 {
         app.managed
             .iter()
@@ -1020,20 +1074,32 @@ mod tests {
     }
 
     fn attach_constraint_buffer(surface: &WlSurface, app: &App, qh: &QueueHandle<App>) {
+        attach_rectangle_buffer(surface, app, qh, 100, 100);
+    }
+
+    fn attach_rectangle_buffer(
+        surface: &WlSurface,
+        app: &App,
+        qh: &QueueHandle<App>,
+        width: i32,
+        height: i32,
+    ) {
         let fd: OwnedFd =
             nix::sys::memfd::memfd_create("constraint-test", nix::sys::memfd::MFdFlags::empty())
                 .expect("memfd");
-        nix::unistd::ftruncate(&fd, 40000).expect("ftruncate");
+        let stride = 4 * width;
+        let bytes = stride * height;
+        nix::unistd::ftruncate(&fd, i64::from(bytes)).expect("ftruncate");
         let pool = app
             .shm
             .as_ref()
             .expect("shm")
-            .create_pool(fd.as_fd(), 40000, qh, ());
+            .create_pool(fd.as_fd(), bytes, qh, ());
         let buffer = pool.create_buffer(
             0,
-            100,
-            100,
-            400,
+            width,
+            height,
+            stride,
             wayland_client::protocol::wl_shm::Format::Argb8888,
             qh,
             (),

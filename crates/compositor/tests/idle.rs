@@ -451,6 +451,117 @@ fn xwayland_click_and_relative_warp_match_at_double_scale() {
     xwayland_pointer_at_scale(240);
 }
 
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the X11 client and resize assertions form one integration scenario"
+)]
+fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("client.py");
+    let ready = runtime.path().join("ready");
+    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "client did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
+    let display = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"DISPLAY="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .expect("DISPLAY");
+    let xdotool = |args: &[&str]| {
+        ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(args)
+            .output()
+            .expect("xdotool")
+    };
+    let search = xdotool(&["search", "--name", "waywire-resize-test"]);
+    let ids = String::from_utf8(search.stdout).expect("window id");
+    let id = ids.lines().next().expect("window");
+    let geometry = || {
+        let output = xdotool(&["getwindowgeometry", "--shell", id]);
+        let text = String::from_utf8(output.stdout).expect("geometry");
+        let value = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .expect("field")
+                .parse::<u32>()
+                .expect("number")
+        };
+        (value("X="), value("Y="), value("WIDTH="), value("HEIGHT="))
+    };
+    let stdin = compositor.0.stdin.as_mut().expect("stdin");
+    let mut sequence = 0;
+    let mut send = |command: Command| stdin.write_all(&command.encode()).expect("send input");
+    let (mut x, mut y, mut width, mut height) = geometry();
+    for (dx, dy) in [(10, 0), (0, 20), (10, 20)] {
+        let (px, py) = (
+            if dx == 0 { x + width / 2 } else { x },
+            if dy == 0 { y + height / 2 } else { y - 28 },
+        );
+        sequence += 1;
+        send(Command::PointerAbsolute(PointerAbsolute {
+            x: PointerCoordinate::new(px * 65535 / 800).expect("x"),
+            y: PointerCoordinate::new(py * 65535 / 600).expect("y"),
+            sequence: InputSequence::new(sequence).expect("sequence"),
+        }));
+        sequence += 1;
+        send(Command::PointerButton(PointerButton {
+            button: Button::Left,
+            state: ButtonState::Pressed,
+            sequence: InputSequence::new(sequence).expect("sequence"),
+        }));
+        sequence += 1;
+        send(Command::PointerAbsolute(PointerAbsolute {
+            x: PointerCoordinate::new((px + dx) * 65535 / 800).expect("x"),
+            y: PointerCoordinate::new((py + dy) * 65535 / 600).expect("y"),
+            sequence: InputSequence::new(sequence).expect("sequence"),
+        }));
+        sequence += 1;
+        send(Command::PointerButton(PointerButton {
+            button: Button::Left,
+            state: ButtonState::Released,
+            sequence: InputSequence::new(sequence).expect("sequence"),
+        }));
+        let expected = (x + dx, y + dy, width - dx, height - dy);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let actual = geometry();
+            if actual == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected:?}, got {actual:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        (x, y, width, height) = expected;
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the X11 session and pointer assertions form one integration scenario"

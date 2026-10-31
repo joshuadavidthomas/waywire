@@ -134,7 +134,12 @@ impl State {
         let Some(location) = self.space.element_location(&window) else {
             return;
         };
-        let initial = Rectangle::new(location, window.geometry().size);
+        let size = window
+            .x11_surface()
+            .map_or(window.geometry().size, |surface| {
+                (surface.last_configure() - surface.frame_extents()).size
+            });
+        let initial = Rectangle::new(location, size);
         if let Some(edges) = edges {
             self.windows.entry(window.clone()).or_default().resize = Some((edges, initial, None));
         } else {
