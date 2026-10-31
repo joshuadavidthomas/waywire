@@ -154,7 +154,17 @@ impl CompositorHandler for State {
                 }
                 if let Some(top) = window.toplevel()
                     && !top.is_initial_configure_sent()
+                    && (!previous || mapped)
                 {
+                    let mode = self
+                        .windows
+                        .get(&window)
+                        .and_then(|state| state.decoration_mode);
+                    let bounds = self.work_area().map(|area| area.size);
+                    top.with_pending_state(|state| {
+                        state.decoration_mode = mode;
+                        state.bounds = bounds;
+                    });
                     top.send_configure();
                 }
             }
@@ -635,7 +645,7 @@ impl State {
             state.size = Some(geometry.size);
         });
         if surface.is_initial_configure_sent() {
-            surface.send_pending_configure();
+            surface.send_configure();
         }
         self.space.map_element(window, geometry.loc, true);
         self.enforce_topmost();

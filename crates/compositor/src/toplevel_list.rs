@@ -868,6 +868,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remapped_toplevel_retains_decoration_and_bounds() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, xdg, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        let window = top_window(&state);
+        let top = window.toplevel().expect("toplevel").clone();
+        state.request_mode(top.clone(), Mode::ServerSide);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("decoration configure"));
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        app.last_configure = None;
+        surface.attach(None, 0, 0);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(app.last_configure.is_none(), "no configure on unmap");
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        top.with_pending_state(|pending| {
+            assert_eq!(pending.decoration_mode, Some(Mode::ServerSide));
+            assert_eq!(pending.bounds, Some((1920, 1048).into()));
+        });
+        xdg.ack_configure(app.last_configure.expect("remap configure"));
+        attach_buffer(&surface, &app, &queue.handle(), 1);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(state.windows.get(&window).expect("window state").mapped);
+    }
+
+    #[test]
+    fn repeated_maximize_still_sends_configure() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        let top = window.toplevel().expect("toplevel").clone();
+        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized, true);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let first = app.last_configure.expect("first maximize configure");
+        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized, true);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_ne!(
+            app.last_configure,
+            Some(first),
+            "repeated maximize configure"
+        );
+    }
+
     fn action_fixture() -> (
         smithay::reexports::wayland_server::Display<crate::State>,
         crate::State,

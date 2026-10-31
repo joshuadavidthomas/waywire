@@ -256,8 +256,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Medium:** a re-mapped toplevel loses its server-side decoration mode and
-  bounds. Redundant maximize requests get no configure.
 - **Low:** grabs survive window destruction. Decorations follow pending state.
   X11 size hints are ignored during resize. New toplevels get bounds without the
   titlebar. Popups aren't re-constrained after output resize. X11 `WindowState`
