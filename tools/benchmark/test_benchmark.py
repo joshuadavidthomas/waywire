@@ -2,12 +2,15 @@
 
 import copy
 import io
+import os
+import signal
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from benchmark import main
+from benchmark import main, process_snapshot
 
 
 def result():
@@ -27,6 +30,27 @@ def result():
         "latency": {"median_ms": 100, "p95_ms": 100},
         "agents": {"xdotool": "pass", "anthropic_grim": "pass"},
     }
+
+
+class ProcessSnapshotTest(unittest.TestCase):
+    def test_session_members_are_included_without_ancestry(self):
+        process = subprocess.Popen(
+            ["sh", "-c", "(sleep 30 >/dev/null 2>&1 & echo $!); sleep 30"],
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        child = int(process.stdout.readline())
+        try:
+            self.assertNotIn(child, {pid for pid, _ in process_snapshot([process.pid])})
+            self.assertIn(
+                child,
+                {pid for pid, _ in process_snapshot([process.pid], [process.pid])},
+            )
+        finally:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait()
+            process.stdout.close()
 
 
 class RegressionCheckTest(unittest.TestCase):

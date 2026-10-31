@@ -48,7 +48,7 @@ def evaluate(expression):
     return json.loads(browser("--json", "eval", expression))["data"]["result"]
 
 
-def process_snapshot(roots):
+def process_snapshot(roots, sessions=()):
     processes = {}
     for path in Path("/proc").iterdir():
         if not path.name.isdigit():
@@ -61,10 +61,13 @@ def process_snapshot(roots):
                 int(stat[11]) + int(stat[12]),
                 int(stat[19]),
                 int(stat[21]),
+                int(stat[3]),
             )
         except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
             continue
-    included = set(roots)
+    included = set(roots) | {
+        pid for pid, values in processes.items() if values[4] in sessions
+    }
     while True:
         more = {
             pid for pid, values in processes.items() if values[0] in included
@@ -79,11 +82,11 @@ def process_snapshot(roots):
     }
 
 
-def measure(roots, action=None, env=None):
+def measure(roots, action=None, env=None, sessions=()):
     before = evaluate(
         "({time: performance.now(), sockets: window.benchmarkSockets, frames: window.benchmarkFrames})"
     )
-    previous = process_snapshot(roots)
+    previous = process_snapshot(roots, sessions)
     ticks = 0
     rss = []
     started = time.monotonic()
@@ -96,7 +99,7 @@ def measure(roots, action=None, env=None):
     )
     while time.monotonic() - started < SECONDS:
         time.sleep(0.2)
-        current = process_snapshot(roots)
+        current = process_snapshot(roots, sessions)
         ticks += sum(
             max(0, values[0] - previous.get(key, (values[0], 0))[0])
             for key, values in current.items()
@@ -380,10 +383,12 @@ def run_desktop(name, fixture):
                 if name == "waywire":
                     browser("eval", "document.querySelector('#control-toggle').click()")
                 roots = [process.pid for process in processes] + [terminal_pid]
+                # Labwc's Xwayland is reparented to PID 1 but stays in its session.
+                sessions = [processes[0].pid] if name == "waymote" else []
                 time.sleep(2)
                 results = {
                     "launch_ms": round(first_frame - launched),
-                    "idle": measure(roots),
+                    "idle": measure(roots, sessions=sessions),
                 }
                 subprocess.run(
                     ["xdotool", "windowfocus", window], env=app_env, check=True
@@ -398,6 +403,7 @@ def run_desktop(name, fixture):
                         "waywire benchmark typing " * 6,
                     ],
                     app_env,
+                    sessions,
                 )
 
                 page = directory / "scroll.html"
@@ -463,6 +469,7 @@ def run_desktop(name, fixture):
                     roots,
                     ["xdotool", "key", "--repeat", "80", "--delay", "100", "Down"],
                     app_env,
+                    sessions,
                 )
                 results["scroll"]["quality"] = evaluate("window.benchmarkQuality")
                 stop(chrome)
