@@ -11,6 +11,8 @@ use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
@@ -88,6 +90,29 @@ fn switches(pid: u32) -> u64 {
         .sum()
 }
 
+fn idle_window_delay(now: Duration) -> Duration {
+    let elapsed = Duration::new(now.as_secs() % 60, now.subsec_nanos());
+    let remaining = Duration::from_mins(1).saturating_sub(elapsed);
+    if remaining < Duration::from_secs(3) {
+        remaining + Duration::from_secs(1)
+    } else {
+        Duration::ZERO
+    }
+}
+
+#[test]
+fn idle_window_waits_only_near_minute_boundary() {
+    assert_eq!(idle_window_delay(Duration::from_secs(57)), Duration::ZERO);
+    assert_eq!(
+        idle_window_delay(Duration::from_millis(57_500)),
+        Duration::from_millis(3500)
+    );
+    assert_eq!(
+        idle_window_delay(Duration::from_millis(59_950)),
+        Duration::from_millis(1050)
+    );
+}
+
 #[test]
 #[ignore = "requires FFmpeg and a working Xwayland on PATH"]
 fn idle_compositor_stops_rendering_and_emitting_frames() {
@@ -146,6 +171,10 @@ fn idle_compositor_stops_rendering_and_emitting_frames() {
         thread::sleep(Duration::from_millis(10));
     }
     thread::sleep(Duration::from_secs(2));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("wall clock");
+    thread::sleep(idle_window_delay(now));
     events(&mut compositor.0, &mut decoder);
     let before = switches(compositor.0.id());
     thread::sleep(Duration::from_secs(2));
