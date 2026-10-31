@@ -1094,6 +1094,7 @@ impl State {
             });
         let mut upper = Vec::new();
         let mut lower = Vec::new();
+        let mut above_bar = true;
         for window in self.space.elements().rev() {
             if self
                 .windows
@@ -1105,11 +1106,8 @@ impl State {
             let Some(location) = self.space.element_location(window) else {
                 continue;
             };
-            let target = if above_taskbar(window) {
-                &mut upper
-            } else {
-                &mut lower
-            };
+            above_bar &= above_taskbar(window);
+            let target = if above_bar { &mut upper } else { &mut lower };
             target.extend(window.render_elements::<SceneElement<PixmanRenderer>>(
                 renderer,
                 (location - window.geometry().loc).to_physical_precise_round(scale),

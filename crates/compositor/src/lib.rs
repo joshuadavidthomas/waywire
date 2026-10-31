@@ -473,26 +473,29 @@ impl State {
     }
 
     fn element_under(&self, pos: Point<f64, Logical>) -> Option<(&Window, Point<i32, Logical>)> {
-        self.space.elements().rev().find_map(|window| {
+        let over_bar = self
+            .work_area()
+            .is_some_and(|area| pos.y >= f64::from(area.loc.y + area.size.h));
+        for window in self.space.elements().rev() {
             if self
                 .windows
                 .get(window)
                 .is_some_and(|state| state.minimized)
             {
-                return None;
+                continue;
             }
-            if self
-                .work_area()
-                .is_some_and(|area| pos.y >= f64::from(area.loc.y + area.size.h))
-                && !decorations::above_taskbar(window)
-            {
-                return None;
+            if over_bar && !decorations::above_taskbar(window) {
+                break;
             }
             let location = self.space.element_location(window)? - window.geometry().loc;
-            window
+            if window
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|_| (window, location))
-        })
+                .is_some()
+            {
+                return Some((window, location));
+            }
+        }
+        None
     }
 
     fn taskbar_chips(&self) -> Vec<TaskbarChip> {

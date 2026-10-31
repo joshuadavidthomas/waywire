@@ -1249,6 +1249,33 @@ mod tests {
     }
 
     #[test]
+    fn normal_window_above_fullscreen_stays_above_it_in_scene() {
+        use smithay::backend::renderer::pixman::PixmanRenderer;
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+        use crate::decorations::SceneElement;
+
+        let (mut display, mut state, connection, mut queue, mut app, fullscreen) = action_fixture();
+        let top = fullscreen.toplevel().expect("toplevel").clone();
+        state.set_expanded(&top, xdg_toplevel::State::Fullscreen, true);
+        let _normal = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "normal",
+            "normal",
+        );
+        let mut renderer = PixmanRenderer::new().expect("renderer");
+        let scene = state.scene_elements(&mut renderer);
+        assert!(
+            matches!(scene.first(), Some(SceneElement::Decoration(_))),
+            "the taskbar precedes the normal and fullscreen windows"
+        );
+    }
+
+    #[test]
     fn empty_taskbar_click_keeps_focus_and_does_not_reach_window() {
         let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         let _pointer = app
