@@ -838,13 +838,31 @@ fn xwayland_click_and_relative_warp_match_at_double_scale() {
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
 fn x11_top_and_left_resize_keep_opposite_edges_fixed() {
-    x11_resize(false);
+    x11_resize("none");
 }
 
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
 fn x11_resize_respects_minimum_size_hints() {
-    x11_resize(true);
+    x11_resize("minimum");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_resize_respects_increment_hints() {
+    x11_resize("increment");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk and xdotool"]
+fn x11_resize_respects_aspect_hints() {
+    x11_resize("aspect");
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, xterm, xprop and xdotool"]
+fn xterm_resize_respects_character_width() {
+    x11_resize("xterm");
 }
 
 #[expect(
@@ -852,16 +870,28 @@ fn x11_resize_respects_minimum_size_hints() {
     reason = "the X11 client and resize assertions form one integration scenario"
 )]
 #[expect(clippy::expect_used, reason = "integration test requires live clients")]
-fn x11_resize(with_minimum: bool) {
+fn x11_resize(mode: &str) {
     let runtime = tempfile::tempdir().expect("runtime");
     let script = runtime.path().join("client.py");
     let ready = runtime.path().join("ready");
-    let minimum = if with_minimum {
-        "r.minsize(395, 290)"
-    } else {
-        ""
+    let hints = match mode {
+        "minimum" => "r.minsize(395, 290)",
+        "increment" => "r.wm_grid(400, 300, 20, 20)",
+        "aspect" => "r.aspect(4, 3, 4, 3)",
+        _ => "",
     };
-    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\n{minimum}\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
+    let program = if mode == "xterm" {
+        format!(
+            "#!/usr/bin/python3\nimport os, subprocess\nchild = subprocess.Popen(['xterm', '-title', 'waywire-resize-test', '-geometry', '80x24+100+100'])\nopen({:?}, 'w').write(str(os.getpid()))\nchild.wait()\n",
+            ready.to_string_lossy()
+        )
+    } else {
+        format!(
+            "#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-resize-test')\nr.geometry('400x300')\nr.update()\n{hints}\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n",
+            ready.to_string_lossy()
+        )
+    };
+    fs::write(&script, program).expect("script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
     let port = socket.local_addr().expect("address").port().to_string();
@@ -897,8 +927,15 @@ fn x11_resize(with_minimum: bool) {
             .output()
             .expect("xdotool")
     };
-    let search = xdotool(&["search", "--name", "waywire-resize-test"]);
-    let ids = String::from_utf8(search.stdout).expect("window id");
+    let ids = loop {
+        let search = xdotool(&["search", "--name", "waywire-resize-test"]);
+        let ids = String::from_utf8(search.stdout).expect("window id");
+        if !ids.is_empty() {
+            break ids;
+        }
+        assert!(Instant::now() < deadline, "window did not appear");
+        thread::sleep(Duration::from_millis(20));
+    };
     let id = ids.lines().next().expect("window");
     let geometry = || {
         let output = xdotool(&["getwindowgeometry", "--shell", id]);
@@ -915,8 +952,49 @@ fn x11_resize(with_minimum: bool) {
     let stdin = compositor.0.stdin.as_mut().expect("stdin");
     let mut sequence = 0;
     let mut send = |command: Command| stdin.write_all(&command.encode()).expect("send input");
+    if mode == "xterm" {
+        while geometry().2 < 300 {
+            assert!(
+                Instant::now() < deadline,
+                "xterm did not map at its final size"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    let xterm_hints = if mode == "xterm" {
+        let output = ProcessCommand::new("xprop")
+            .env("DISPLAY", display)
+            .args(["-id", id, "WM_NORMAL_HINTS"])
+            .output()
+            .expect("xprop");
+        let text = String::from_utf8(output.stdout).expect("hints");
+        let width = |label: &str| -> u32 {
+            text.lines()
+                .find_map(|line| line.trim().strip_prefix(label))
+                .expect("hint")
+                .split_whitespace()
+                .next()
+                .expect("width")
+                .parse()
+                .expect("number")
+        };
+        Some((
+            width("program specified base size: "),
+            width("program specified resize increment: "),
+        ))
+    } else {
+        None
+    };
     let (mut x, mut y, mut width, mut height) = geometry();
-    for (dx, dy) in [(10, 0), (0, 20), (10, 20)] {
+    let first_dx = if mode == "xterm" {
+        31
+    } else if mode == "increment" || mode == "aspect" {
+        30
+    } else {
+        10
+    };
+    for (dx, dy) in [(first_dx, 0), (0, 20), (10, 20)] {
         let (px, py) = (
             if dx == 0 { x + width / 2 } else { x },
             if dy == 0 { y + height / 2 } else { y - 28 },
@@ -945,12 +1023,39 @@ fn x11_resize(with_minimum: bool) {
             state: ButtonState::Released,
             sequence: InputSequence::new(sequence).expect("sequence"),
         }));
-        let new_width = if with_minimum {
+        if mode == "increment" || mode == "aspect" || mode == "xterm" {
+            thread::sleep(Duration::from_millis(300));
+            let actual = geometry();
+            let (_, _, actual_width, actual_height) = actual;
+            assert!(
+                actual_width < width,
+                "resize must change window size: initial {:?}, actual {actual:?}",
+                (x, y, width, height)
+            );
+            if mode == "increment" {
+                assert_eq!(actual_width % 20, 0, "width increment");
+                assert_eq!(actual_height % 20, 0, "height increment");
+            } else if let Some((base, increment)) = xterm_hints {
+                assert_eq!(
+                    (actual_width - base) % increment,
+                    0,
+                    "xterm character width"
+                );
+            } else {
+                assert!(
+                    actual_width * 3 >= actual_height * 4 - 2
+                        && actual_width * 3 <= actual_height * 4 + 2,
+                    "aspect ratio"
+                );
+            }
+            return;
+        }
+        let new_width = if mode == "minimum" {
             (width - dx).max(395)
         } else {
             width - dx
         };
-        let new_height = if with_minimum {
+        let new_height = if mode == "minimum" {
             (height - dy).max(290)
         } else {
             height - dy

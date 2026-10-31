@@ -245,6 +245,60 @@ fn resize_size(
         .into()
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "X11 hints use integer client pixels"
+)]
+fn x11_resize_size(
+    mut size: Size<i32, Logical>,
+    edges: u32,
+    surface: &smithay::xwayland::X11Surface,
+    scale: f64,
+) -> Size<i32, Logical> {
+    let Some(hints) = surface.size_hints() else {
+        return size;
+    };
+    if let Some((inc_w, inc_h)) = hints.size_increment {
+        let base = surface.base_size().unwrap_or_default();
+        let snap = |value: i32, base: i32, increment: i32| {
+            let increment = (f64::from(increment) / scale).round() as i32;
+            if increment <= 0 {
+                value
+            } else {
+                (i64::from(base)
+                    + (i64::from(value) - i64::from(base)).div_euclid(i64::from(increment))
+                        * i64::from(increment))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+            }
+        };
+        size = (snap(size.w, base.w, inc_w), snap(size.h, base.h, inc_h)).into();
+    }
+    let min = surface.min_size().unwrap_or_default();
+    let max = surface.max_size().unwrap_or_default();
+    size = resize_size(size, (0.0, 0.0).into(), 0, min, max);
+    if let Some((minimum, maximum)) = hints.aspect
+        && minimum.numerator > 0
+        && minimum.denominator > 0
+        && maximum.numerator > 0
+        && maximum.denominator > 0
+    {
+        let min_ratio = f64::from(minimum.numerator) / f64::from(minimum.denominator);
+        let max_ratio = f64::from(maximum.numerator) / f64::from(maximum.denominator);
+        if min_ratio <= max_ratio {
+            if edges & 0b1100 == 0 {
+                size.w = f64::from(size.w)
+                    .clamp(f64::from(size.h) * min_ratio, f64::from(size.h) * max_ratio)
+                    .round() as i32;
+            } else {
+                size.h = f64::from(size.h)
+                    .clamp(f64::from(size.w) / max_ratio, f64::from(size.w) / min_ratio)
+                    .round() as i32;
+            }
+        }
+    }
+    resize_size(size, (0.0, 0.0).into(), 0, min, max)
+}
+
 impl PointerGrab<State> for WindowGrab {
     fn motion(
         &mut self,
@@ -286,6 +340,19 @@ impl PointerGrab<State> for WindowGrab {
                 });
                 top.send_pending_configure();
             } else if let Some(surface) = self.window.x11_surface() {
+                let scale = state
+                    .xwayland_client
+                    .as_ref()
+                    .and_then(|client| client.get_data::<smithay::xwayland::XWaylandClientData>())
+                    .map_or(1.0, |data| data.compositor_state.client_scale());
+                let requested = resize_size(
+                    self.initial.size,
+                    delta,
+                    edges,
+                    (0, 0).into(),
+                    (0, 0).into(),
+                );
+                let size = x11_resize_size(requested, edges, surface, scale);
                 let mut rect = Rectangle::new(self.initial.loc, size);
                 if edges & 4 != 0 {
                     rect.loc.x += self.initial.size.w - size.w;

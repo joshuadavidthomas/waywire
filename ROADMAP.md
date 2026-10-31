@@ -256,8 +256,8 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Low:** X11 resize increments and aspect ratio hints are ignored. New toplevels get bounds without the
-  titlebar. Popups aren't re-constrained after output resize. X11 `WindowState`
+- **Low:** New toplevels get bounds without the titlebar. Popups aren't
+  re-constrained after output resize. X11 `WindowState`
   entries leak on unmap. X11 client minimize requests are not handled.
 
 ## 4. Desktop chrome and shell
