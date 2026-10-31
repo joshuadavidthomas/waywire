@@ -28,11 +28,13 @@ use waywire_protocol::pipe::Kbps;
 
 use self::commands::CommandReader;
 pub(crate) use self::commands::CommandSink;
-use self::commands::CommandSinkError;
+pub(crate) use self::commands::CommandSinkError;
 #[cfg(test)]
 pub(crate) use self::commands::TestCommandReceiver;
 #[cfg(test)]
 pub(crate) use self::commands::test_command_sink;
+#[cfg(test)]
+pub(crate) use self::commands::test_stalled_command_sink;
 use self::commands::write_commands;
 pub(crate) use self::events::AppEvents;
 use self::events::read_events;

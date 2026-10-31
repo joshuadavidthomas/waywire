@@ -40,6 +40,7 @@ use super::outbound::control_writer;
 use super::socket::SocketEnd;
 use super::socket::WRITE_LIMIT;
 use super::socket::log_socket_close;
+use crate::daemon::CommandSinkError;
 use crate::session::FeedbackOutcome;
 use crate::session::InputOutcome;
 use crate::session::OwnershipAvailability;
@@ -371,6 +372,33 @@ async fn finish_control_socket(
 ) -> SocketEnd {
     cancellation.cancel();
     let release_error = state.sessions.release(socket_id).await.err();
+    if release_error.as_ref().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<CommandSinkError>(),
+            Some(CommandSinkError::ByteBudgetStalled | CommandSinkError::CountBudgetStalled)
+        )
+    }) {
+        let sessions = state.sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                match sessions.release(socket_id).await {
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<CommandSinkError>(),
+                            Some(
+                                CommandSinkError::ByteBudgetStalled
+                                    | CommandSinkError::CountBudgetStalled
+                            )
+                        ) => {}
+                    Err(error) => {
+                        warn!(socket_id = socket_id.get(), %error, "deferred input handback failed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     let writer_error = match writer_status {
         WriterStatus::Finished => None,
@@ -610,6 +638,7 @@ mod tests {
     use crate::daemon::AppEvents;
     use crate::daemon::TestCommandReceiver;
     use crate::daemon::test_command_sink;
+    use crate::daemon::test_stalled_command_sink;
     use crate::http::AppState;
     use crate::http::Origin;
     use crate::http::SocketConnections;
@@ -1310,6 +1339,104 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_owner_command_closes_only_its_socket() {
+        use tokio::io::AsyncReadExt;
+        use waywire_protocol::Record;
+        use waywire_protocol::pipe::ReleaseAll;
+
+        let (sink, commands, mut fatal, readiness) = test_stalled_command_sink();
+        let (mut pipe, writer_output) = tokio::io::duplex(1);
+        let command_writer = commands.start_writer(writer_output);
+        readiness.mark_video_ready();
+        let sessions = Sessions::new(
+            sink.clone(),
+            Kbps::new(8_000).expect("bitrate"),
+            Fps::new(60).expect("fps"),
+        );
+        let mut ownership = sessions.subscribe_ownership();
+        let state = AppState {
+            readiness: readiness.clone(),
+            events: AppEvents::new(),
+            sessions,
+            hub: VideoHub::new(Fps::new(60).expect("fps")),
+            origin: Origin::parse("https://x.test").expect("origin"),
+            connections: SocketConnections::new(),
+            next_socket_id: Arc::new(AtomicU64::new(1)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::http::router(state))
+                .await
+                .expect("server");
+        });
+        let mut owner = control_websocket(address).await;
+        let mut other = control_websocket(address).await;
+        send_client_text(&mut owner, r#"{"type":"acquire"}"#).await;
+        timeout(Duration::from_secs(1), ownership.changed())
+            .await
+            .expect("acquisition timeout")
+            .expect("ownership channel");
+        sink.browser_system(Command::ReleaseAll(ReleaseAll))
+            .await
+            .expect("fill queue");
+        send_client_text(
+            &mut owner,
+            r#"{"type":"text","action":"commit","text":"hi","sequence":3}"#,
+        )
+        .await;
+        let keep_other = tokio::spawn(async move {
+            for _ in 0..20 {
+                send_client_text(&mut other, r#"{"type":"ping","id":1}"#).await;
+                timeout(READ_DEADLINE, next_server_pong(&mut other))
+                    .await
+                    .expect("other socket responds");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other
+        });
+        let mut buffer = [0; 512];
+        timeout(Duration::from_secs(6), async {
+            while owner.read(&mut buffer).await.expect("read owner") != 0 {}
+        })
+        .await
+        .expect("stalled socket closes");
+        let mut other = keep_other.await.expect("other socket task");
+        assert!(readiness.is_ready(), "session must stay ready");
+        assert!(
+            fatal.try_recv().is_err(),
+            "session must not receive a fatal error"
+        );
+        assert!(
+            !command_writer.is_finished(),
+            "a stalled pipe must not stop the writer"
+        );
+        let expected = [
+            Command::InputLease(InputLease { held: true }).encode(),
+            Command::ReleaseAll(ReleaseAll).encode(),
+            Command::InputLease(InputLease { held: false }).encode(),
+        ]
+        .concat();
+        let mut received = vec![0; expected.len()];
+        timeout(Duration::from_secs(3), pipe.read_exact(&mut received))
+            .await
+            .expect("eventual handback")
+            .expect("pipe read");
+        assert_eq!(
+            received, expected,
+            "pipe records must stay intact and ordered"
+        );
+        send_client_text(&mut other, r#"{"type":"ping","id":2}"#).await;
+        timeout(READ_DEADLINE, next_server_pong(&mut other))
+            .await
+            .expect("other socket still responds");
+        command_writer.abort();
+        server.abort();
     }
 
     #[tokio::test]

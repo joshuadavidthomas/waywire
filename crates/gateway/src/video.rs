@@ -446,6 +446,7 @@ impl VideoWorker {
 mod tests {
     use super::*;
     use crate::daemon::test_command_sink;
+    use crate::daemon::test_stalled_command_sink;
 
     pub(super) fn packet(
         sequence: u16,
@@ -646,6 +647,37 @@ mod tests {
             drop(pipeline);
             drain.await.expect("metadata drained");
         }
+    }
+
+    #[tokio::test]
+    async fn full_command_queue_does_not_block_video_delivery() {
+        use waywire_protocol::pipe::ReleaseAll;
+
+        let (commands, _command_events, mut fatal, readiness) = test_stalled_command_sink();
+        commands
+            .browser_system(Command::ReleaseAll(ReleaseAll))
+            .await
+            .expect("fill command queue");
+        let hub = video_hub();
+        let sessions = Sessions::new(
+            commands.clone(),
+            waywire_protocol::pipe::Kbps::new(8_000).expect("valid bitrate"),
+            fps(60),
+        );
+        let (pipeline, worker) =
+            VideoPipeline::new(hub.clone(), commands, readiness.clone(), sessions);
+        let worker_task = tokio::spawn(worker.run());
+        let mut viewer = hub.subscribe();
+        pipeline.metadata(metadata(1, 1)).await.expect("metadata");
+        pipeline.unit(unit(1, 1)).await.expect("keyframe");
+        let frame = tokio::time::timeout(Duration::from_secs(1), viewer.next())
+            .await
+            .expect("frame despite full command queue");
+        assert_eq!(frame.metadata.sequence, 1);
+        assert_eq!(readiness.state(), ReadinessState::Ready);
+        assert!(fatal.try_recv().is_err());
+        drop(pipeline);
+        assert!(worker_task.await.expect("worker task").is_err());
     }
 
     #[tokio::test]

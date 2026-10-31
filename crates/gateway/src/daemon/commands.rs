@@ -77,6 +77,15 @@ impl TestCommandReceiver {
         let command = self.0.recv().await?;
         Some(Command::decode(&command.encoded).expect("test command should decode"))
     }
+
+    pub(crate) fn start_writer(
+        self,
+        output: tokio::io::DuplexStream,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _result = write_commands(output, self.0).await;
+        })
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +93,19 @@ pub(crate) fn test_command_sink() -> (CommandSink, TestCommandReceiver) {
     let (fatal, _) = mpsc::channel(1);
     let (sink, receiver) = CommandSink::new(COMMAND_COUNT, COMMAND_BYTES, fatal, Readiness::new());
     (sink, TestCommandReceiver(receiver))
+}
+
+#[cfg(test)]
+pub(crate) fn test_stalled_command_sink() -> (
+    CommandSink,
+    TestCommandReceiver,
+    mpsc::Receiver<CommandSinkError>,
+    Readiness,
+) {
+    let (fatal, errors) = mpsc::channel(1);
+    let readiness = Readiness::new();
+    let (sink, receiver) = CommandSink::new(1, COMMAND_BYTES, fatal, readiness.clone());
+    (sink, TestCommandReceiver(receiver), errors, readiness)
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -174,11 +196,14 @@ impl CommandSink {
 
     /// Sends a gateway-internal command.
     ///
-    /// Send failures are fatal to the session: readiness stops and the fatal
-    /// error reaches the session supervisor.
+    /// A closed writer is fatal, but temporary queue backpressure is not.
     pub(crate) async fn system(&self, command: Command) -> Result<(), CommandSinkError> {
         match self.send(Authority::System, command).await {
             Ok(()) => Ok(()),
+            Err(
+                error
+                @ (CommandSinkError::ByteBudgetStalled | CommandSinkError::CountBudgetStalled),
+            ) => Err(error),
             Err(error) => Err(self.fail(error)),
         }
     }
@@ -252,8 +277,6 @@ pub(super) enum CommandWriterError {
     QueueClosed,
     #[error("write daemon command: {0}")]
     Write(#[source] std::io::Error),
-    #[error("daemon command write timed out after {deadline:?}", deadline = PIPE_DEADLINE)]
-    WriteTimeout,
 }
 
 pub(super) async fn write_commands<W>(
@@ -265,13 +288,9 @@ where
 {
     while let Some(command) = commands.recv().await {
         let AuthorizedCommand { encoded, permit } = command;
-        let write_result = timeout(PIPE_DEADLINE, output.write_all(&encoded)).await;
+        let write_result = output.write_all(&encoded).await;
         drop(permit);
-        match write_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(CommandWriterError::Write(error)),
-            Err(_elapsed) => return Err(CommandWriterError::WriteTimeout),
-        }
+        write_result.map_err(CommandWriterError::Write)?;
     }
     Err(CommandWriterError::QueueClosed)
 }
@@ -306,6 +325,35 @@ mod tests {
     fn command_sink(capacity: usize) -> (CommandSink, CommandReader) {
         let (fatal, _) = mpsc::channel(1);
         CommandSink::new(capacity, COMMAND_BYTES, fatal, Readiness::new())
+    }
+
+    #[tokio::test]
+    async fn slow_pipe_write_remains_pending_and_resumes() {
+        let (commands, reader) = command_sink(1);
+        let (mut input, output) = tokio::io::duplex(1);
+        let writer = tokio::spawn(write_commands(output, reader));
+        let record = Command::ReleaseAll(ReleaseAll);
+        let expected = record.encode();
+        commands
+            .browser_system(record)
+            .await
+            .expect("queue command");
+        tokio::time::sleep(PIPE_DEADLINE + Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "a blocked pipe must not stop the session"
+        );
+        let mut actual = vec![0; expected.len()];
+        input
+            .read_exact(&mut actual)
+            .await
+            .expect("read resumed command");
+        assert_eq!(actual, expected);
+        drop(commands);
+        assert!(matches!(
+            writer.await.expect("writer task"),
+            Err(CommandWriterError::QueueClosed)
+        ));
     }
 
     #[tokio::test]

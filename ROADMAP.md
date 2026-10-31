@@ -39,12 +39,7 @@ _(hypothesis)_ were traced in code but not reproduced against a real client.
 ## 1. Session stability
 
 An agent session that dies mid-task is worse than one with a visual glitch.
-Each fix here is small and independent.
-
-- **Medium:** a 2 s stall in the command pipe ends the session. Browser command
-  errors go through `fail()` (`crates/gateway/src/daemon/commands.rs`). Close
-  only the offending socket, and make the video worker's readiness send
-  non-blocking. _(The browser trigger is a hypothesis.)_
+The session stability items are complete.
 
 ## 2. Agent control plane
 
