@@ -926,6 +926,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn destroying_a_window_ends_its_move_and_resize_grabs() {
+        for resize in [false, true] {
+            let (mut display, mut state) = crate::tests::test_state();
+            let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let (_, _, toplevel) = map_toplevel(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                "Window",
+                "window",
+            );
+            let window = top_window(&state);
+            let (_, _, other) = map_toplevel(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                "Other",
+                "other",
+            );
+            let pointer = state.seat.get_pointer().expect("pointer");
+            state.start_decoration_grab(
+                window,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                resize,
+            );
+            assert!(pointer.is_grabbed());
+            other.destroy();
+            connection.flush().expect("client flush");
+            display
+                .dispatch_clients(&mut state)
+                .expect("server dispatch");
+            assert!(pointer.is_grabbed(), "another window must not end the grab");
+            toplevel.destroy();
+            connection.flush().expect("client flush");
+            display
+                .dispatch_clients(&mut state)
+                .expect("server dispatch");
+            assert!(!pointer.is_grabbed(), "grab survives window destruction");
+        }
+    }
+
     fn action_fixture() -> (
         smithay::reexports::wayland_server::Display<crate::State>,
         crate::State,

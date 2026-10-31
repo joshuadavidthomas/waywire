@@ -256,7 +256,7 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Low:** grabs survive window destruction. Decorations follow pending state.
+- **Low:** Decorations follow pending state.
   X11 size hints are ignored during resize. New toplevels get bounds without the
   titlebar. Popups aren't re-constrained after output resize. X11 `WindowState`
   entries leak on unmap. X11 client minimize requests are not handled.

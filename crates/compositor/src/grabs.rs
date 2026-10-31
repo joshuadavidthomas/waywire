@@ -41,6 +41,7 @@ pub(super) struct WindowState {
     pub decoration_mode: Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>,
     pub restore: Option<Rectangle<i32, Logical>>,
     pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
+    pub grab_serial: Option<Serial>,
 }
 
 pub(super) struct WindowGrab {
@@ -152,13 +153,27 @@ impl State {
             self,
             WindowGrab {
                 start,
-                window,
+                window: window.clone(),
                 initial,
                 edges,
             },
             serial,
             Focus::Clear,
         );
+        self.windows.entry(window).or_default().grab_serial = Some(serial);
+    }
+
+    pub(super) fn end_window_grab(&mut self, window: &Window) {
+        let serial = self.windows.get(window).and_then(|state| state.grab_serial);
+        if let (Some(pointer), Some(serial)) = (self.seat.get_pointer(), serial)
+            && pointer.has_grab(serial)
+        {
+            pointer.unset_grab(
+                self,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                smithay::backend::input::InputTime::now(),
+            );
+        }
     }
 
     pub(super) fn resize_committed(&mut self, window: &Window) {
@@ -307,8 +322,13 @@ impl PointerGrab<State> for WindowGrab {
         }
     }
     fn unset(&mut self, state: &mut State) {
+        if let Some(window_state) = state.windows.get_mut(&self.window) {
+            window_state.grab_serial = None;
+        }
         if self.edges.is_some()
             && let Some(top) = self.window.toplevel()
+            && top.alive()
+            && top.is_initial_configure_sent()
         {
             top.with_pending_state(|pending| pending.states.unset(xdg_toplevel::State::Resizing));
             let serial = top.send_configure();
@@ -323,6 +343,7 @@ impl PointerGrab<State> for WindowGrab {
             }
         } else if self.edges.is_some()
             && let Some(surface) = self.window.x11_surface()
+            && surface.alive()
         {
             // X11 has no xdg configure acknowledgment to retire the resize anchor.
             // Keep the final configured position even if an older buffer commits later.

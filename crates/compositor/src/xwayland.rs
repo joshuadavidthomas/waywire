@@ -388,8 +388,8 @@ impl XwmHandler for State {
 
     fn unmapped_window(&mut self, _: XwmId, surface: X11Surface) {
         if let Some(window) = self.x11_window(&surface) {
-            self.space.unmap_elem(&window);
             self.window_unmapped(&window);
+            self.space.unmap_elem(&window);
         }
         if !surface.is_override_redirect()
             && let Err(error) = surface.set_mapped(false)

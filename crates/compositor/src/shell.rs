@@ -90,6 +90,14 @@ impl CompositorHandler for State {
         self.surfaces.push(surface.clone());
     }
     fn destroyed(&mut self, surface: &WlSurface) {
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().is_some_and(|root| *root == *surface))
+            .cloned();
+        if let Some(window) = window {
+            self.end_window_grab(&window);
+        }
         self.surfaces.retain(|item| item != surface);
         if self.cursor_surface.as_ref() == Some(surface) {
             self.cursor_surface = None;
@@ -318,6 +326,16 @@ impl XdgShellHandler for State {
         self.space
             .map_element(window, (32 + offset, 32 + offset), false);
     }
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.toplevel() == Some(&surface))
+            .cloned();
+        if let Some(window) = window {
+            self.end_window_grab(&window);
+        }
+    }
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
         if Seat::<Self>::from_resource(&seat).as_ref() != Some(&self.seat) {
             return;
@@ -446,6 +464,7 @@ impl State {
     }
 
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
+        self.end_window_grab(window);
         self.toplevel_list.unpublish(window);
         self.mapped_order.retain(|item| item != window);
         self.minimized_order.retain(|item| item != window);
