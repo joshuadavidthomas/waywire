@@ -577,17 +577,25 @@ Gtk.main()
             .expect("display environment")
     };
     let display = environment(b"DISPLAY=");
-    let id = ProcessCommand::new("xdotool")
-        .env("DISPLAY", display)
-        .args([
-            "search",
-            "--onlyvisible",
-            "--name",
-            "waywire-premap-maximized",
-        ])
-        .output()
-        .expect("find window");
-    assert!(id.status.success());
+    // GTK reports the map before the window manager has made it viewable.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let id = loop {
+        let id = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args([
+                "search",
+                "--onlyvisible",
+                "--name",
+                "waywire-premap-maximized",
+            ])
+            .output()
+            .expect("find window");
+        if id.status.success() || Instant::now() >= deadline {
+            break id;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(id.status.success(), "window never became viewable");
     let id = String::from_utf8(id.stdout).expect("window id");
     let geometry = ProcessCommand::new("xdotool")
         .env("DISPLAY", display)
@@ -814,19 +822,31 @@ Gtk.main()
         sequence: InputSequence::new(seq).expect("sequence"),
     }));
     let pixel = || {
-        let output = ProcessCommand::new("grim")
-            .env("WAYLAND_DISPLAY", wayland)
-            .env("XDG_RUNTIME_DIR", runtime.path())
-            .args([
-                "-t",
-                "ppm",
-                "-g",
-                &format!("{},{} 1x1", x + 10, y + 40),
-                "-",
-            ])
-            .output()
-            .expect("capture menu");
-        assert!(output.status.success(), "grim failed");
+        // grim can fail transiently on a loaded host; retry the capture only.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            let output = ProcessCommand::new("grim")
+                .env("WAYLAND_DISPLAY", wayland)
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .args([
+                    "-t",
+                    "ppm",
+                    "-g",
+                    &format!("{},{} 1x1", x + 10, y + 40),
+                    "-",
+                ])
+                .output()
+                .expect("capture menu");
+            if output.status.success() || Instant::now() >= deadline {
+                break output;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            output.status.success(),
+            "grim failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             output.stdout.ends_with(&[32, 37, 45]),
             "menu not visible: {:?}",
