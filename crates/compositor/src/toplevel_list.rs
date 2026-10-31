@@ -853,6 +853,22 @@ mod tests {
     }
 
     #[test]
+    fn maximized_decorated_window_fills_output_including_titlebar() {
+        let (_display, mut state, _connection, _queue, _app, window) = action_fixture();
+        let top = window.toplevel().expect("toplevel");
+        top.with_pending_state(|pending| {
+            pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        });
+        state.window_action(&window, crate::WindowAction::Maximize);
+        let output = state.space.output_geometry(&state.output).expect("output");
+        let location = state.space.element_location(&window).expect("location");
+        let content = top.with_pending_state(|pending| pending.size.expect("maximized size"));
+        assert_eq!(location.y - crate::decorations::BAR, output.loc.y);
+        assert_eq!(content.h, output.size.h - crate::decorations::BAR);
+        assert_eq!(content.w, output.size.w);
+    }
+
+    #[test]
     fn action_close_notifies_client() {
         let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         state.window_action(&window, crate::WindowAction::Close);

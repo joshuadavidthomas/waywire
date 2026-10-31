@@ -495,8 +495,19 @@ impl State {
         let mut geometry = self.space.output_geometry(&self.output)?;
         if super::decorations::decorated(window) {
             geometry.loc.y += super::decorations::BAR;
-            geometry.size.h =
-                (geometry.size.h - super::decorations::BAR - super::decorations::STRIP).max(1);
+            let maximized = window.toplevel().is_some_and(|top| {
+                top.with_pending_state(|state| {
+                    state.states.contains(xdg_toplevel::State::Maximized)
+                })
+            }) || window
+                .x11_surface()
+                .is_some_and(smithay::xwayland::X11Surface::is_maximized);
+            let bottom = if maximized {
+                0
+            } else {
+                super::decorations::STRIP
+            };
+            geometry.size.h = (geometry.size.h - super::decorations::BAR - bottom).max(1);
         }
         Some(geometry)
     }

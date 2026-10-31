@@ -182,6 +182,9 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
             }
         }
     }
+    if appearance.window_flags.1 {
+        result.remove(2);
+    }
     result
 }
 
@@ -233,6 +236,9 @@ impl Decoration {
         }
         let next = nodes((appearance.width, 0).into(), &appearance, Theme::dark());
         for (index, (buffer, height)) in self.buffers.iter_mut().zip([BAR, STRIP]).enumerate() {
+            if index == 1 && appearance.window_flags.1 {
+                continue;
+            }
             let node = &next[[0, 2][index]];
             if self
                 .nodes
@@ -264,8 +270,16 @@ impl Decoration {
         location: Point<i32, Logical>,
         scale: f64,
     ) -> Result<Vec<MemoryRenderBufferRenderElement<PixmanRenderer>>> {
-        let mut rects = [self.nodes[0].rect, self.nodes[2].rect];
-        rects[1].loc.y = size.h;
+        let mut rects = vec![self.nodes[0].rect];
+        if let Some(grip) = self
+            .nodes
+            .iter()
+            .find(|node| matches!(node.style, NodeStyle::Grip { .. }))
+        {
+            let mut rect = grip.rect;
+            rect.loc.y = size.h;
+            rects.push(rect);
+        }
         self.buffers
             .iter()
             .zip(rects)
@@ -805,6 +819,19 @@ mod tests {
                 Some(DecorationAction::Close)
             ]
         );
+    }
+
+    #[test]
+    fn maximized_window_has_no_resize_grip() {
+        let mut look = appearance(1.0);
+        look.window_flags.1 = true;
+        let nodes = nodes((501, 57).into(), &look, Theme::dark());
+        assert!(
+            !nodes
+                .iter()
+                .any(|node| node.action == Some(DecorationAction::Resize))
+        );
+        assert_eq!(hit(&nodes, (500.0, 60.0).into()), None);
     }
 
     #[test]
