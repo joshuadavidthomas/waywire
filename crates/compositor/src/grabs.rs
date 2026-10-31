@@ -35,6 +35,7 @@ use super::State;
 #[derive(Default)]
 pub(super) struct WindowState {
     pub mapped: bool,
+    pub minimized: bool,
     pub always_on_top: bool,
     pub decoration: Option<super::decorations::Decoration>,
     pub restore: Option<Rectangle<i32, Logical>>,

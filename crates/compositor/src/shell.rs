@@ -433,6 +433,7 @@ impl State {
 
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
         self.toplevel_list.unpublish(window);
+        self.minimized_order.retain(|item| item != window);
         if self
             .window_menu
             .as_ref()
@@ -450,6 +451,7 @@ impl State {
         }
         if let Some(state) = self.windows.get_mut(window) {
             state.mapped = false;
+            state.minimized = false;
             state.resize = None;
             state.decoration = None;
         }

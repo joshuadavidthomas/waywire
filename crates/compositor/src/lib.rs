@@ -163,6 +163,7 @@ pub(crate) enum WindowAction {
     Focus,
     Move,
     Resize(xdg_toplevel::ResizeEdge),
+    Minimize,
     Maximize,
     Restore,
     Close,
@@ -204,6 +205,8 @@ pub(crate) struct State {
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
+    minimized_order: Vec<Window>,
+    restore_key_source: Option<KeyboardSource>,
     decoration_press: Option<(KeyboardSource, Window)>,
     window_menu: Option<decorations::WindowMenu>,
     menu_button: Option<(KeyboardSource, u32)>,
@@ -338,6 +341,8 @@ impl State {
             toplevel_list,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
+            minimized_order: Vec::new(),
+            restore_key_source: None,
             decoration_press: None,
             window_menu: None,
             menu_button: None,
@@ -411,13 +416,27 @@ impl State {
         if self.window_menu.is_some() || self.decoration_under(pos).is_some() {
             return None;
         }
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(surface, offset)| (surface, (offset + location).to_f64()))
-            })
+        self.element_under(pos).and_then(|(window, location)| {
+            window
+                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                .map(|(surface, offset)| (surface, (offset + location).to_f64()))
+        })
+    }
+
+    fn element_under(&self, pos: Point<f64, Logical>) -> Option<(&Window, Point<i32, Logical>)> {
+        self.space.elements().rev().find_map(|window| {
+            if self
+                .windows
+                .get(window)
+                .is_some_and(|state| state.minimized)
+            {
+                return None;
+            }
+            let location = self.space.element_location(window)? - window.geometry().loc;
+            window
+                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                .map(|_| (window, location))
+        })
     }
 
     /// Gate every seat input entry point. Browser input always passes. Agent
@@ -508,6 +527,23 @@ impl State {
         }
         if key == 1 && state == KeyState::Released && self.menu_escape == Some(source) {
             self.menu_escape = None;
+            return;
+        }
+        if key == 50 && state == KeyState::Released && self.restore_key_source == Some(source) {
+            self.restore_key_source = None;
+            return;
+        }
+        if key == 50
+            && state == KeyState::Pressed
+            && self.seat.get_keyboard().is_some_and(|keyboard| {
+                let mods = keyboard.modifier_state();
+                mods.logo && mods.shift && !mods.ctrl && !mods.alt
+            })
+        {
+            self.restore_key_source = Some(source);
+            if let Some(window) = self.minimized_order.last().cloned() {
+                self.window_action(&window, WindowAction::Restore);
+            }
             return;
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -837,7 +873,6 @@ impl State {
         if state == ButtonState::Pressed
             && !pointer.is_grabbed()
             && let Some(window) = self
-                .space
                 .element_under(pointer.current_location())
                 .map(|(window, _)| window.clone())
         {
@@ -922,7 +957,9 @@ impl State {
             decorations::DecorationAction::Resize(edges) => {
                 self.window_action(&window, WindowAction::Resize(edges));
             }
-            decorations::DecorationAction::Minimize => {}
+            decorations::DecorationAction::Minimize => {
+                self.window_action(&window, WindowAction::Minimize);
+            }
             decorations::DecorationAction::Maximize => {
                 self.window_action(&window, WindowAction::Maximize);
             }
@@ -951,8 +988,36 @@ impl State {
             WindowAction::Maximize => {
                 self.set_window_expanded(window, xdg_toplevel::State::Maximized, true);
             }
+            WindowAction::Minimize => {
+                let state = self.windows.entry(window.clone()).or_default();
+                if !state.minimized {
+                    state.minimized = true;
+                    self.minimized_order.push(window.clone());
+                    let focused = self
+                        .seat
+                        .get_keyboard()
+                        .and_then(|keyboard| keyboard.current_focus());
+                    if focused == focus::KeyboardFocus::window(window) {
+                        self.focus_window(self.topmost_focusable(Some(window)));
+                    }
+                    self.refresh_pointer_focus();
+                    self.dirty = true;
+                }
+            }
             WindowAction::Restore => {
-                self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
+                if self
+                    .windows
+                    .get(window)
+                    .is_some_and(|state| state.minimized)
+                {
+                    if let Some(state) = self.windows.get_mut(window) {
+                        state.minimized = false;
+                    }
+                    self.minimized_order.retain(|item| item != window);
+                    self.focus_window(Some(window.clone()));
+                } else {
+                    self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
+                }
             }
             WindowAction::Close => Self::close_window(window),
             WindowAction::ToggleAlwaysOnTop => {
@@ -1000,7 +1065,15 @@ impl State {
         if Seat::<Self>::from_resource(seat).as_ref() != Some(&self.seat) {
             return;
         }
-        self.window_action(window, WindowAction::Focus);
+        if self
+            .windows
+            .get(window)
+            .is_some_and(|state| state.minimized)
+        {
+            self.window_action(window, WindowAction::Restore);
+        } else {
+            self.window_action(window, WindowAction::Focus);
+        }
     }
 
     /// Apply a maximize or fullscreen request to the window's native surface.
@@ -1030,6 +1103,9 @@ impl State {
 
     pub(crate) fn release_input(&mut self, source: KeyboardSource) {
         // Disconnect/ownership loss must release buttons without activating Close.
+        if self.restore_key_source == Some(source) {
+            self.restore_key_source = None;
+        }
         if self
             .decoration_press
             .as_ref()
@@ -1072,7 +1148,10 @@ impl State {
             .find(|window| {
                 Some(*window) != except
                     && !is_override_redirect(window)
-                    && self.windows.get(*window).is_some_and(|state| state.mapped)
+                    && self
+                        .windows
+                        .get(*window)
+                        .is_some_and(|state| state.mapped && !state.minimized)
             })
             .cloned()
     }
@@ -1124,7 +1203,7 @@ impl State {
             .filter(|candidate| {
                 self.windows
                     .get(*candidate)
-                    .is_some_and(|state| state.mapped)
+                    .is_some_and(|state| state.mapped && !state.minimized)
                     && self.parent_window(candidate).as_ref() == Some(parent)
             })
             .cloned()
@@ -1200,6 +1279,13 @@ impl State {
     }
 
     pub(crate) fn focus_window(&mut self, window: Option<Window>) {
+        if window.as_ref().is_some_and(|window| {
+            self.windows
+                .get(window)
+                .is_some_and(|state| state.minimized)
+        }) {
+            return;
+        }
         let mut window = window;
         if let Some(target) = &window {
             let mut family = vec![target.clone()];
@@ -1477,6 +1563,7 @@ impl State {
         self.space.refresh();
         self.windows
             .retain(|window, _| smithay::utils::IsAlive::alive(window));
+        self.minimized_order.retain(smithay::utils::IsAlive::alive);
         self.toplevel_list.cleanup();
         self.popups.cleanup();
         if self

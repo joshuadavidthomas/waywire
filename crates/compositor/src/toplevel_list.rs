@@ -816,6 +816,64 @@ mod tests {
     }
 
     #[test]
+    fn minimize_keeps_window_mapped_and_moves_focus() {
+        let (mut display, mut state, connection, mut queue, mut app, first) = action_fixture();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Other",
+            "other",
+        );
+        let second = top_window(&state);
+        state.window_action(&second, crate::WindowAction::Minimize);
+        assert!(state.windows.get(&second).expect("window").minimized);
+        assert!(state.space.element_location(&second).is_some());
+        assert_eq!(state.topmost_focusable(None), Some(first.clone()));
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&first)
+        );
+        state.focus_window(Some(second.clone()));
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&first)
+        );
+    }
+
+    #[test]
+    fn restore_shortcut_recovers_most_recent_minimized_window() {
+        use smithay::backend::input::KeyState;
+        let (mut display, mut state, connection, mut queue, mut app, first) = action_fixture();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Other",
+            "other",
+        );
+        let second = top_window(&state);
+        state.window_action(&first, crate::WindowAction::Minimize);
+        state.window_action(&second, crate::WindowAction::Minimize);
+        for key in [125, 42, 50] {
+            state.keyboard_key(KeyboardSource::MAIN, key, KeyState::Pressed);
+        }
+        assert!(!state.windows.get(&second).expect("window").minimized);
+        assert!(state.windows.get(&first).expect("window").minimized);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&second)
+        );
+        for key in [50, 42, 125] {
+            state.keyboard_key(KeyboardSource::MAIN, key, KeyState::Released);
+        }
+    }
+
+    #[test]
     fn action_move_starts_a_grab() {
         let (_, mut state, _, _, _, window) = action_fixture();
         state.window_action(&window, crate::WindowAction::Move);
@@ -995,6 +1053,14 @@ mod tests {
     }
 
     #[test]
+    fn menu_minimize_hides_window() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        click_menu_item(&mut state, &window, 0);
+        assert!(state.window_menu.is_none());
+        assert!(state.windows.get(&window).expect("window").minimized);
+    }
+
+    #[test]
     fn menu_maximize_and_restore() {
         let (_, mut state, _, _, _, window) = action_fixture();
         click_menu_item(&mut state, &window, 1);
@@ -1047,10 +1113,6 @@ mod tests {
     #[test]
     fn disabled_menu_items_do_nothing() {
         let (_, mut state, _, _, _, window) = action_fixture();
-        click_menu_item(&mut state, &window, 0);
-        assert!(state.window_menu.is_some());
-        assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
-        state.window_menu = None;
         state.window_action(&window, crate::WindowAction::Maximize);
         for row in [3, 4] {
             click_menu_item(&mut state, &window, row);
@@ -1781,8 +1843,10 @@ mod tests {
         );
         assert_eq!(managed_states(&app, "B"), [WlrState::Activated as u32]);
 
+        state.window_action(&window_a, crate::WindowAction::Minimize);
         managed_handle(&app, "A").activate(app.seat.as_ref().expect("seat bound"));
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(!state.windows.get(&window_a).expect("window").minimized);
 
         assert_eq!(
             state

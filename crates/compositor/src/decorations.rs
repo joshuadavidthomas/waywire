@@ -648,6 +648,7 @@ impl WindowMenu {
 
     fn action(&self, index: usize) -> Option<super::WindowAction> {
         match index {
+            0 => Some(super::WindowAction::Minimize),
             1 => Some(if self.maximized {
                 super::WindowAction::Restore
             } else {
@@ -793,6 +794,13 @@ impl State {
 
     fn decoration_node_under(&self, point: Point<f64, Logical>) -> Option<(Window, Node)> {
         for window in self.space.elements().rev() {
+            if self
+                .windows
+                .get(window)
+                .is_some_and(|state| state.minimized)
+            {
+                continue;
+            }
             let location = self.space.element_location(window)?;
             let surface_location = location - window.geometry().loc;
             if !decorated(window)
@@ -835,6 +843,7 @@ impl State {
         None
     }
 
+    #[expect(clippy::too_many_lines, reason = "one pass builds the ordered scene")]
     pub(super) fn scene_elements(
         &mut self,
         renderer: &mut PixmanRenderer,
@@ -863,6 +872,13 @@ impl State {
                 pointer.as_ref().is_some_and(|p| !p.is_grabbed()) || self.decoration_press.is_some()
             });
         for window in self.space.elements().rev() {
+            if self
+                .windows
+                .get(window)
+                .is_some_and(|state| state.minimized)
+            {
+                continue;
+            }
             let Some(location) = self.space.element_location(window) else {
                 continue;
             };
