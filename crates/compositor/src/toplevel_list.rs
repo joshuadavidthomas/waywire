@@ -1507,6 +1507,36 @@ mod tests {
     }
 
     #[test]
+    fn dialog_menu_cannot_minimize() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, _, parent_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "parent",
+            "parent",
+        );
+        let (_, _, dialog_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "dialog",
+            "dialog",
+        );
+        let dialog = top_window(&state);
+        dialog_top.set_parent(Some(&parent_top));
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        click_menu_item(&mut state, &dialog, 0);
+        assert!(!state.windows.get(&dialog).expect("dialog state").minimized);
+    }
+
+    #[test]
     fn menu_minimize_hides_window() {
         let (_, mut state, _, _, _, window) = action_fixture();
         click_menu_item(&mut state, &window, 0);

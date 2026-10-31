@@ -863,7 +863,7 @@ impl WindowMenu {
 
     fn action(&self, index: usize) -> Option<super::WindowAction> {
         match index {
-            0 => Some(super::WindowAction::Minimize),
+            0 if !window_flags(&self.window).0 => Some(super::WindowAction::Minimize),
             1 => Some(if self.maximized {
                 super::WindowAction::Restore
             } else {
