@@ -45,9 +45,6 @@ Each fix here is small and independent.
   errors go through `fail()` (`crates/gateway/src/daemon/commands.rs`). Close
   only the offending socket, and make the video worker's readiness send
   non-blocking. _(The browser trigger is a hypothesis.)_
-- **Medium:** a client can crash the compositor with a decoration wider than
-  Cairo's 32767 px limit (`crates/compositor/src/decorations.rs`). Clamp the
-  width and skip a decoration that fails to paint.
 - **Medium:** TypeScript allows 6000×6000 displays, while Rust caps the total at
   3840×2160 (`crates/gateway/web/src/sdk/resize.ts`,
   `crates/protocol/src/pipe.rs`). A rejected resize closes the input socket.

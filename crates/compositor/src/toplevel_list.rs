@@ -1313,6 +1313,52 @@ mod tests {
     }
 
     #[test]
+    fn very_wide_window_keeps_its_decoration_and_scene_running() {
+        use smithay::backend::renderer::pixman::PixmanRenderer;
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+
+        use crate::decorations::SceneElement;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("xdg shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let _top = xdg.get_toplevel(&qh, ());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("initial configure"));
+        attach_buffer(&surface, &app, &queue.handle(), 50_000);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        assert_eq!(window.geometry().size.w, 50_000);
+        window
+            .toplevel()
+            .expect("toplevel")
+            .with_pending_state(|pending| pending.decoration_mode = Some(Mode::ServerSide));
+        let mut renderer = PixmanRenderer::new().expect("renderer");
+        let scene = state.scene_elements(&mut renderer);
+        assert_eq!(
+            scene
+                .iter()
+                .filter(|item| matches!(item, SceneElement::Decoration(_)))
+                .count(),
+            2,
+            "both the taskbar and clamped window decoration should render"
+        );
+    }
+
+    #[test]
     fn fullscreen_and_menu_render_above_taskbar() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
