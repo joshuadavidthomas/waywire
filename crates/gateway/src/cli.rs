@@ -35,6 +35,9 @@ pub(super) struct Options {
         value_parser = parse_resolution
     )]
     pub(super) resolution: FrameSize,
+    /// Read gateway configuration from this path instead of the default.
+    #[arg(long)]
+    pub(super) config: Option<PathBuf>,
     /// Pin an application command to the taskbar. May be supplied more than once.
     #[arg(long)]
     pub(super) pin: Vec<String>,
@@ -100,6 +103,18 @@ mod tests {
         for value in ["1920", "1920X1080", "1920x1080x60", "1919x1080", "8000x100"] {
             assert!(parse_resolution(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn explicit_config_path_is_accepted() {
+        let options = Options::try_parse_from([
+            "waywire-gateway",
+            "--public-url",
+            "https://desktop.example.com",
+            "--config",
+            "/tmp/waywire-test.toml",
+        ]);
+        assert!(options.is_ok(), "gateway must accept a config path");
     }
 
     #[test]

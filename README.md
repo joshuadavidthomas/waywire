@@ -86,6 +86,18 @@ for taskbar application commands. Pin arguments use shell-style quoting, without
 shell expansion. Clicking a pin launches its command, or focuses or minimizes
 its window.
 
+The gateway also reads pins from a TOML configuration file:
+
+```toml
+pins = ["foot", "xterm -fa Mono"]
+```
+
+By default it looks for `$XDG_CONFIG_HOME/waywire/config.toml`, or
+`~/.config/waywire/config.toml` if `XDG_CONFIG_HOME` is unset or empty. A missing
+default file is ignored. Use `--config <path>` to select a file explicitly; a
+missing explicit file, malformed TOML, or unknown key is an error. File pins
+come first, followed by any `--pin` options, and use the same quoting rules.
+
 ## Local checks
 
 ```sh

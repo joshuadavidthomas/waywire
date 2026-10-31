@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod daemon;
 mod http;
 mod session;
@@ -38,6 +39,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let options = Options::parse();
+    let pins = config::pins(options.config.as_deref(), options.pin)?;
     let listener = http_listener(&options.listen).await?;
     let rtp = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -53,7 +55,7 @@ async fn main() -> Result<()> {
             bitrate: options.bitrate,
             xkb_layout: options.xkb_layout,
             resolution: options.resolution,
-            pins: options.pin,
+            pins,
             session: options.session,
         },
         rtp,
