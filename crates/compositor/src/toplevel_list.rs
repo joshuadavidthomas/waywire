@@ -978,6 +978,80 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_and_menu_render_above_taskbar() {
+        use smithay::backend::renderer::pixman::PixmanRenderer;
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+        use crate::decorations::SceneElement;
+
+        let (_, mut state, _, _, _, window) = action_fixture();
+        let mut renderer = PixmanRenderer::new().expect("renderer");
+        let normal = state.scene_elements(&mut renderer);
+        assert!(matches!(normal.first(), Some(SceneElement::Decoration(_))));
+        assert!(
+            normal
+                .iter()
+                .skip(1)
+                .any(|element| matches!(element, SceneElement::Surface(_)))
+        );
+
+        state.window_action(&window, crate::WindowAction::Maximize);
+        let maximized = state.scene_elements(&mut renderer);
+        assert!(matches!(
+            maximized.first(),
+            Some(SceneElement::Decoration(_))
+        ));
+        assert!(
+            maximized
+                .iter()
+                .skip(1)
+                .any(|element| matches!(element, SceneElement::Surface(_)))
+        );
+
+        let top = window.toplevel().expect("toplevel").clone();
+        state.set_expanded(&top, xdg_toplevel::State::Fullscreen, true);
+        let fullscreen = state.scene_elements(&mut renderer);
+        assert!(matches!(fullscreen.first(), Some(SceneElement::Surface(_))));
+        assert!(
+            fullscreen
+                .iter()
+                .skip(1)
+                .any(|element| matches!(element, SceneElement::Decoration(_)))
+        );
+
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        let menu = state.scene_elements(&mut renderer);
+        assert!(matches!(menu.first(), Some(SceneElement::Decoration(_))));
+        assert!(matches!(menu.get(1), Some(SceneElement::Surface(_))));
+        assert!(
+            menu.iter()
+                .skip(2)
+                .any(|element| matches!(element, SceneElement::Decoration(_)))
+        );
+    }
+
+    #[test]
+    fn empty_taskbar_click_keeps_focus_and_does_not_reach_window() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        let _pointer = app
+            .seat
+            .as_ref()
+            .expect("seat")
+            .get_pointer(&queue.handle(), ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        state.space.map_element(window.clone(), (100, 1050), true);
+        let keyboard = state.seat.get_keyboard().expect("keyboard");
+        let focus = keyboard.current_focus().expect("focused window");
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 1050.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(keyboard.current_focus(), Some(focus));
+        assert!(app.button_targets.is_empty());
+    }
+
+    #[test]
     fn titlebar_double_click_toggles_maximize_and_restore() {
         let (mut display, mut state) = crate::tests::test_state();
         let (connection, mut queue, mut app) = connect_client(&mut display.handle());
