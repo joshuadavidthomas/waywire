@@ -256,8 +256,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Medium:** maximized windows can be dragged and resized. Unmaximize on
-  titlebar drag and refuse resize while maximized or fullscreen.
 - **Medium:** configures can be sent before a client's initial commit (from
   decoration negotiation, `focus_window`, `output_resized` and
   `set_expanded`). Guard each with `is_initial_configure_sent()`.
@@ -268,61 +266,23 @@ mainstream apps work.
 - **Low:** grabs survive window destruction. Decorations follow pending state.
   X11 size hints are ignored during resize. New toplevels get bounds without the
   titlebar. Popups aren't re-constrained after output resize. X11 `WindowState`
-  entries leak on unmap. X11 minimize does nothing.
+  entries leak on unmap. X11 client minimize requests are not handled.
 
 ## 4. Desktop chrome and shell
 
-The goal is a minimal desktop like the hosted sandbox computers: overlapping
-windows, a way to find them, and decorations that work.
+The compositor draws titlebars, window menus, and a taskbar into the desktop.
+The taskbar shows window and pinned-app chips, the control state, and a clock.
+Viewer interaction takes control through the web UI; the bar has no Take over
+button.
 
-**Look:** flat and dense, in the style of Zed's dark theme. Slim 28 px
-titlebars, small sans text, monochrome line icons, 1px borders, small corner
-radius, and one accent colour. Avoid gradients, soft shadows and textured
-backgrounds: they cost CPU to draw and smear in 4:2:0 video.
+Remaining:
 
-**Windows:**
-
-- Titlebar with the title on the left and minimize, maximize and close on the
-  right. Close turns red on hover. Dialogs show close only.
-- Double-click the titlebar to maximize or restore. A maximized window fills the
-  area above the taskbar with no border, and maximize becomes restore.
-- A window menu on right-click: Minimize, Maximize or Restore, Always on Top,
-  Move, Resize, Close. Move and Resize are disabled while maximized; dragging a
-  maximized titlebar restores the window first.
-- Edge and corner resizing with resize cursors, replacing the single 24 px grip.
-- Decorate only normal and dialog windows, not splash, utility or tooltip types.
-
-**Taskbar:** a 32 px bar along the bottom.
-
-- Pinned apps from the session configuration, such as a terminal, browser and
-  file manager. A pinned app shows as a chip even when it isn't running;
-  clicking it starts or focuses the app. There is no start menu.
-- Chips for the other open windows. Clicking a chip focuses or restores its
-  window; the focused window's chip is highlighted.
-- On the right, the control state ("Agent driving" or the human owner) with a
-  Take over button, and a clock. The state is drawn by the compositor so agents
-  see it in their screenshots too.
-- Window placement, maximize and size bounds exclude the taskbar's area.
-
-**Implementation:**
-
-- One `WindowAction` type (focus, move, resize, minimize, maximize, restore,
-  close, show menu). Titlebar buttons, the window menu, taskbar chips,
-  keybindings and the agent API all dispatch it. Deferred until the taskbar
-  lands: minimize with restore through its chip, the restore keybinding, and
-  the full `WindowAction` type. Foreign-toplevel activate and close already
-  share the titlebar's focus and close paths.
-- Chrome is built from window state and the theme as a short list of nodes,
-  each with a rectangle, a style and an optional action. Painting, hit testing
-  and cursor shapes all read that list, replacing the separate `Layout` and
-  hand-written cache comparison in `decorations.rs`.
-- Cache rasterized nodes and redraw a node only when its inputs change.
-- Put colours, sizes and spacing in one `Theme`, with dark and light variants.
-  Pass the matching colour scheme to apps.
-- Expose the node list to the agent query API, so agents can find windows and
+- Cache rasterized chrome per node rather than redrawing the entire cached
+  titlebar or taskbar when its inputs change.
+- The light palette is provisional and has no selector. Pass the selected
+  colour scheme to applications when theme selection is supported.
+- Expose the node list to an agent query API so agents can find windows and
   controls without searching pixels.
-- Keep Cairo and Pango on the CPU. GPU UI toolkits such as GPUI or Rune are a
-  design reference, not a dependency.
 
 ## 5. Input fidelity
 

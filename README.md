@@ -74,6 +74,13 @@ to loopback port 8080 by default and provides no authentication; remote access
 needs an authenticating HTTPS proxy. Application arguments are passed without
 shell parsing. `WAYWIRE_SESSION` is a fallback for a single executable path.
 
+The compositor draws a taskbar at the bottom of the desktop. Its window chips
+focus or restore windows; clicking the focused chip minimizes it. Super+Shift+M
+restores the most recently minimized window. The bar also shows the local time
+and whether the agent or a browser viewer holds input. Interacting with the web
+viewer takes control when remote input is enabled; there is no in-desktop
+Take over button.
+
 The gateway and compositor accept repeated `--pin 'COMMAND ARG...'` options
 for taskbar application commands. Pin arguments use shell-style quoting, without
 shell expansion. Clicking a pin launches its command, or focuses or minimizes
@@ -187,7 +194,7 @@ The browser's debug console logs decoder configuration and reset causes separate
 ## Known limits
 
 This is a prototype, not a general-purpose desktop environment. There is one
-output and no panel, dock, workspaces, audio, or GPU acceleration. Custom surface
+output and no workspaces, audio, or GPU acceleration. Custom surface
 cursors fall back to the default shape. Browser playback requires WebCodecs H.264
 High decoding; support depends on the browser and its available decoders.
 The XTest bridge covers input, not desktop capture: X11 screenshot tools do not
