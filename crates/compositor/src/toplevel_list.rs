@@ -1031,6 +1031,30 @@ mod tests {
     }
 
     #[test]
+    fn dropping_state_reaps_pinned_child() {
+        let (_, mut state, _, _, _, _) = action_fixture();
+        state.pins.push(crate::Pin {
+            command: vec!["sleep".into(), "30".into()],
+            pid: None,
+            child: None,
+        });
+        state.launch_pin(0);
+        let pid = nix::unistd::Pid::from_raw(
+            i32::try_from(state.pins[0].pid.expect("spawned process")).expect("valid pid"),
+        );
+        drop(state);
+        let result = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        if matches!(result, Ok(nix::sys::wait::WaitStatus::StillAlive)) {
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).expect("kill child");
+            nix::sys::wait::waitpid(pid, None).expect("reap child");
+        }
+        assert!(
+            matches!(result, Err(nix::errno::Errno::ECHILD)),
+            "child was not reaped: {result:?}"
+        );
+    }
+
+    #[test]
     fn clicking_running_pin_minimizes_its_window() {
         let (_, mut state, _, _, _, window) = action_fixture();
         state.pins.push(crate::Pin {

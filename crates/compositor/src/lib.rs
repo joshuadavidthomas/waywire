@@ -193,6 +193,15 @@ struct Pin {
     child: Option<Child>,
 }
 
+impl Drop for Pin {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
+}
+
 struct LaunchEnvironment {
     socket: std::path::PathBuf,
     runtime: std::path::PathBuf,
