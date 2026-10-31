@@ -495,6 +495,9 @@ impl State {
             self.focus_window(self.topmost_focusable(Some(window)));
         }
         self.refresh_pointer_focus();
+        if window.x11_surface().is_some() {
+            self.windows.remove(window);
+        }
     }
 
     pub(super) fn constrain_window(&mut self, window: &Window) {

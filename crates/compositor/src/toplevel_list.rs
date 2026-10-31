@@ -861,6 +861,124 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "constructing a disconnected X11 surface requires Smithay's complete atom table"
+    )]
+    fn x11_unmap_removes_window_state() {
+        use std::sync::Arc;
+        use std::sync::Weak;
+        use std::sync::atomic::AtomicBool;
+
+        use smithay::xwayland::X11Surface;
+        use smithay::xwayland::xwm::Atoms;
+
+        let atoms = Atoms {
+            WL_SURFACE_ID: 0,
+            WL_SURFACE_SERIAL: 0,
+            _SMITHAY_CLOSE_CONNECTION: 0,
+            UTF8_STRING: 0,
+            TEXT: 0,
+            WM_NAME: 0,
+            WM_HINTS: 0,
+            WM_PROTOCOLS: 0,
+            WM_TAKE_FOCUS: 0,
+            WM_DELETE_WINDOW: 0,
+            WM_CHANGE_STATE: 0,
+            _NET_WM_NAME: 0,
+            _NET_WM_MOVERESIZE: 0,
+            _NET_WM_PID: 0,
+            _NET_WM_WINDOW_OPACITY: 0,
+            _NET_WM_WINDOW_TYPE: 0,
+            _NET_WM_WINDOW_TYPE_COMBO: 0,
+            _NET_WM_WINDOW_TYPE_DESKTOP: 0,
+            _NET_WM_WINDOW_TYPE_DND: 0,
+            _NET_WM_WINDOW_TYPE_DOCK: 0,
+            _NET_WM_WINDOW_TYPE_DROPDOWN_MENU: 0,
+            _NET_WM_WINDOW_TYPE_DIALOG: 0,
+            _NET_WM_WINDOW_TYPE_MENU: 0,
+            _NET_WM_WINDOW_TYPE_NOTIFICATION: 0,
+            _NET_WM_WINDOW_TYPE_NORMAL: 0,
+            _NET_WM_WINDOW_TYPE_POPUP_MENU: 0,
+            _NET_WM_WINDOW_TYPE_SPLASH: 0,
+            _NET_WM_WINDOW_TYPE_TOOLBAR: 0,
+            _NET_WM_WINDOW_TYPE_TOOLTIP: 0,
+            _NET_WM_WINDOW_TYPE_UTILITY: 0,
+            _NET_WM_STATE_MODAL: 0,
+            _NET_WM_OPAQUE_REGION: 0,
+            _MOTIF_WM_HINTS: 0,
+            _NET_STARTUP_ID: 0,
+            _GTK_FRAME_EXTENTS: 0,
+            WM_S0: 0,
+            WM_STATE: 0,
+            _NET_WM_CM_S0: 0,
+            _NET_SUPPORTED: 0,
+            _NET_ACTIVE_WINDOW: 0,
+            _NET_CLIENT_LIST: 0,
+            _NET_CLIENT_LIST_STACKING: 0,
+            _NET_WM_PING: 0,
+            _NET_WM_STATE: 0,
+            _NET_WM_STATE_MAXIMIZED_VERT: 0,
+            _NET_WM_STATE_MAXIMIZED_HORZ: 0,
+            _NET_WM_STATE_HIDDEN: 0,
+            _NET_WM_STATE_FULLSCREEN: 0,
+            _NET_WM_STATE_DEMANDS_ATTENTION: 0,
+            _NET_WM_STATE_FOCUSED: 0,
+            _NET_WM_STATE_ABOVE: 0,
+            _NET_WM_STATE_BELOW: 0,
+            _NET_WM_STATE_SHADED: 0,
+            _NET_WM_STATE_SKIP_TASKBAR: 0,
+            _NET_WM_STATE_SKIP_PAGER: 0,
+            _NET_WM_STATE_STICKY: 0,
+            _NET_WM_SYNC_REQUEST: 0,
+            _NET_WM_SYNC_REQUEST_COUNTER: 0,
+            _NET_SHOWING_DESKTOP: 0,
+            _NET_SUPPORTING_WM_CHECK: 0,
+            _XSETTINGS_SETTINGS: 0,
+            _XWAYLAND_ALLOW_COMMITS: 0,
+            _WL_SELECTION: 0,
+            CLIPBOARD_MANAGER: 0,
+            CLIPBOARD: 0,
+            PRIMARY: 0,
+            TARGETS: 0,
+            TIMESTAMP: 0,
+            INCR: 0,
+            DELETE: 0,
+            _XSETTINGS_S0: 0,
+            XdndSelection: 0,
+            XdndAware: 0,
+            XdndStatus: 0,
+            XdndPosition: 0,
+            XdndEnter: 0,
+            XdndLeave: 0,
+            XdndDrop: 0,
+            XdndFinished: 0,
+            XdndProxy: 0,
+            XdndTypeList: 0,
+            XdndActionMove: 0,
+            XdndActionCopy: 0,
+            XdndActionAsk: 0,
+            XdndActionPrivate: 0,
+        };
+        let surface = X11Surface::new(
+            None,
+            123,
+            false,
+            Weak::new(),
+            atoms,
+            None,
+            smithay::utils::Rectangle::new((0, 0).into(), (100, 100).into()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let window = Window::new_x11_window(surface);
+        let (_display, mut state) = crate::tests::test_state();
+        state.space.map_element(window.clone(), (32, 32), false);
+        state.windows.entry(window.clone()).or_default().mapped = true;
+        state.window_unmapped(&window);
+        assert!(!state.windows.contains_key(&window));
+    }
+
+    #[test]
     fn uncommitted_toplevel_receives_no_configure() {
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as TopState;
