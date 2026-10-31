@@ -27,6 +27,9 @@ pub(super) const STRIP: i32 = 8;
 pub(super) enum DecorationAction {
     Move,
     Resize,
+    Minimize,
+    Maximize,
+    Restore,
     Close,
 }
 
@@ -87,6 +90,8 @@ enum NodeStyle {
         active: bool,
         close_hovered: bool,
         pressed: bool,
+        dialog: bool,
+        maximized: bool,
         theme: Theme,
     },
     Grip {
@@ -116,7 +121,7 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
         ((size.w - theme.grip).max(0), size.h).into(),
         (size.w.min(theme.grip), theme.strip).into(),
     );
-    vec![
+    let mut result = vec![
         Node {
             rect: bar,
             style: NodeStyle::Titlebar {
@@ -125,6 +130,8 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
                 active: appearance.active,
                 close_hovered: appearance.hover == Some(DecorationAction::Close),
                 pressed: appearance.pressed,
+                dialog: appearance.window_flags.0,
+                maximized: appearance.window_flags.1,
                 theme,
             },
             action: Some(DecorationAction::Move),
@@ -147,7 +154,35 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
             action: Some(DecorationAction::Resize),
             cursor: CursorShape::Default,
         },
-    ]
+    ];
+    if !appearance.window_flags.0 {
+        for (offset, action) in [
+            (3, DecorationAction::Minimize),
+            (
+                2,
+                if appearance.window_flags.1 {
+                    DecorationAction::Restore
+                } else {
+                    DecorationAction::Maximize
+                },
+            ),
+        ] {
+            let left = (size.w - offset * theme.bar).max(0);
+            let right = (size.w - (offset - 1) * theme.bar).max(0);
+            if right > left {
+                result.push(Node {
+                    rect: Rectangle::new(
+                        (left, -theme.bar).into(),
+                        (right - left, theme.bar).into(),
+                    ),
+                    style: NodeStyle::Hit,
+                    action: Some(action),
+                    cursor: CursorShape::Default,
+                });
+            }
+        }
+    }
+    result
 }
 
 fn hit_test(nodes: &[Node], point: Point<f64, Logical>) -> Option<&Node> {
@@ -168,6 +203,7 @@ struct Appearance {
     width: i32,
     scale: f64,
     active: bool,
+    window_flags: (bool, bool),
     hover: Option<DecorationAction>,
     pressed: bool,
 }
@@ -288,6 +324,7 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
             close_hovered,
             pressed,
             theme,
+            ..
         } => (
             *theme,
             *scale,
@@ -336,7 +373,14 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
             context.fill()?;
         }
         color(&context, foreground);
-        draw_title(&context, title, (close.loc.x - 24).max(0), theme)?;
+        let title_end = nodes
+            .iter()
+            .skip(1)
+            .filter(|node| node.rect.loc.y < 0)
+            .map(|node| node.rect.loc.x)
+            .min()
+            .unwrap_or(close.loc.x);
+        draw_title(&context, title, (title_end - 24).max(0), theme)?;
         context.save()?;
         context.rectangle(
             f64::from(close.loc.x),
@@ -362,6 +406,7 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
         context.line_to(x - 4.0, 20.0);
         context.stroke()?;
         context.restore()?;
+        draw_buttons(&context, nodes, foreground, theme)?;
     } else {
         draw_grip(&context, width, hovered, theme)?;
     }
@@ -370,6 +415,51 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
     context.fill()?;
     context.status()?;
     Ok(surface)
+}
+
+fn draw_buttons(
+    context: &cairo::Context,
+    nodes: &[Node],
+    foreground: u32,
+    theme: Theme,
+) -> Result<()> {
+    for button in nodes.iter().filter(|node| {
+        matches!(
+            node.action,
+            Some(
+                DecorationAction::Minimize | DecorationAction::Maximize | DecorationAction::Restore
+            )
+        )
+    }) {
+        let x = f64::from(button.rect.loc.x) + f64::from(button.rect.size.w) / 2.0;
+        context.save()?;
+        context.rectangle(
+            f64::from(button.rect.loc.x),
+            0.0,
+            f64::from(button.rect.size.w),
+            f64::from(theme.bar),
+        );
+        context.clip();
+        color(context, foreground);
+        context.set_line_width(1.0);
+        match button.action {
+            Some(DecorationAction::Minimize) => {
+                context.move_to(x - 4.0, 17.0);
+                context.line_to(x + 4.0, 17.0);
+            }
+            Some(DecorationAction::Maximize) => context.rectangle(x - 4.0, 12.0, 8.0, 8.0),
+            Some(DecorationAction::Restore) => {
+                context.rectangle(x - 4.0, 13.0, 7.0, 7.0);
+                context.move_to(x - 2.0, 11.0);
+                context.line_to(x + 4.0, 11.0);
+                context.line_to(x + 4.0, 17.0);
+            }
+            _ => {}
+        }
+        context.stroke()?;
+        context.restore()?;
+    }
+    Ok(())
 }
 
 fn draw_grip(context: &cairo::Context, width: i32, hovered: bool, theme: Theme) -> Result<()> {
@@ -451,9 +541,29 @@ pub(super) fn decorated(window: &Window) -> bool {
                 && !state.states.contains(xdg_toplevel::State::Fullscreen)
         })
     } else {
-        window
-            .x11_surface()
-            .is_some_and(|x| !x.is_override_redirect() && !x.is_decorated() && !x.is_fullscreen())
+        window.x11_surface().is_some_and(|x| {
+            use smithay::xwayland::xwm::WmWindowType;
+            !x.is_override_redirect()
+                && !x.is_decorated()
+                && !x.is_fullscreen()
+                && matches!(
+                    x.window_type(),
+                    None | Some(WmWindowType::Normal | WmWindowType::Dialog)
+                )
+        })
+    }
+}
+
+fn window_flags(window: &Window) -> (bool, bool) {
+    if let Some(top) = window.toplevel() {
+        (
+            top.parent().is_some(),
+            top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)),
+        )
+    } else if let Some(x11) = window.x11_surface() {
+        (x11.is_transient_for().is_some(), x11.is_maximized())
+    } else {
+        (false, false)
     }
 }
 
@@ -500,6 +610,7 @@ impl State {
                 width: size.w,
                 scale: 1.0,
                 active: false,
+                window_flags: window_flags(window),
                 hover: None,
                 pressed: false,
             };
@@ -570,6 +681,7 @@ impl State {
             let state = self.windows.entry(window.clone()).or_default();
             let size = window.geometry().size;
             let width = decoration_width(size.w, output_width);
+            let (dialog, maximized) = window_flags(window);
             let decoration = state.decoration.get_or_insert_with(Decoration::default);
             let appearance = Appearance {
                 title: if title.is_empty() {
@@ -580,6 +692,7 @@ impl State {
                 width,
                 scale,
                 active,
+                window_flags: (dialog, maximized),
                 hover: hover
                     .as_ref()
                     .filter(|(target, _)| target == window)
@@ -621,6 +734,7 @@ mod tests {
             width: 501,
             scale,
             active: true,
+            window_flags: (false, false),
             hover: None,
             pressed: false,
         }
@@ -656,6 +770,67 @@ mod tests {
             assert_eq!(found.action, Some(action));
             assert_eq!(found.cursor, nodes[index].cursor);
         }
+    }
+
+    #[test]
+    fn titlebar_buttons_match_window_kind_and_state() {
+        let mut look = appearance(1.0);
+        let buttons = |look: &Appearance| {
+            let nodes = nodes((501, 57).into(), look, Theme::dark());
+            [430.0, 460.0, 490.0].map(|x| hit(&nodes, (x, -10.0).into()))
+        };
+        assert_eq!(
+            buttons(&look),
+            [
+                Some(DecorationAction::Minimize),
+                Some(DecorationAction::Maximize),
+                Some(DecorationAction::Close)
+            ]
+        );
+        look.window_flags.1 = true;
+        assert_eq!(
+            buttons(&look),
+            [
+                Some(DecorationAction::Minimize),
+                Some(DecorationAction::Restore),
+                Some(DecorationAction::Close)
+            ]
+        );
+        look.window_flags.0 = true;
+        assert_eq!(
+            buttons(&look),
+            [
+                Some(DecorationAction::Move),
+                Some(DecorationAction::Move),
+                Some(DecorationAction::Close)
+            ]
+        );
+    }
+
+    #[test]
+    fn close_hover_changes_titlebar_paint_input() {
+        let mut look = appearance(1.0);
+        let normal = nodes((look.width, 57).into(), &look, Theme::dark());
+        look.hover = Some(DecorationAction::Close);
+        let hovered = nodes((look.width, 57).into(), &look, Theme::dark());
+        assert!(matches!(
+            normal[0].style,
+            NodeStyle::Titlebar {
+                close_hovered: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            hovered[0].style,
+            NodeStyle::Titlebar {
+                close_hovered: true,
+                theme: Theme {
+                    close_hover: 0xb8_3245,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -697,7 +872,7 @@ mod tests {
             ((-0.1, -1.0), None),
             ((0.0, -32.1), None),
             ((0.0, -32.0), Some(DecorationAction::Move)),
-            ((68.9, -0.1), Some(DecorationAction::Move)),
+            ((68.9, -0.1), Some(DecorationAction::Maximize)),
             ((69.0, -32.0), Some(DecorationAction::Close)),
             ((100.9, -0.1), Some(DecorationAction::Close)),
             ((101.0, -1.0), None),

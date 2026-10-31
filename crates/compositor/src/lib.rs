@@ -680,20 +680,7 @@ impl State {
                     time: InputTime::now(),
                 },
             );
-            match action {
-                decorations::DecorationAction::Move => {
-                    self.window_action(&window, WindowAction::Move);
-                }
-                decorations::DecorationAction::Resize => {
-                    self.window_action(
-                        &window,
-                        WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight),
-                    );
-                }
-                decorations::DecorationAction::Close => {
-                    self.decoration_press = Some((source, window));
-                }
-            }
+            self.press_decoration(source, window, action);
             pointer.frame(self);
             return;
         }
@@ -727,6 +714,29 @@ impl State {
                 == Some((window.clone(), decorations::DecorationAction::Close))
         {
             self.window_action(&window, WindowAction::Close);
+        }
+    }
+
+    fn press_decoration(
+        &mut self,
+        source: KeyboardSource,
+        window: Window,
+        action: decorations::DecorationAction,
+    ) {
+        match action {
+            decorations::DecorationAction::Move => self.window_action(&window, WindowAction::Move),
+            decorations::DecorationAction::Resize => self.window_action(
+                &window,
+                WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight),
+            ),
+            decorations::DecorationAction::Minimize => {}
+            decorations::DecorationAction::Maximize => {
+                self.window_action(&window, WindowAction::Maximize);
+            }
+            decorations::DecorationAction::Restore => {
+                self.window_action(&window, WindowAction::Restore);
+            }
+            decorations::DecorationAction::Close => self.decoration_press = Some((source, window)),
         }
     }
 
