@@ -957,6 +957,52 @@ mod tests {
         assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
     }
 
+    #[test]
+    fn resize_edges_start_matching_grabs_and_cursor_shapes() {
+        use waywire_protocol::pipe::CursorShape;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Window",
+            "window",
+        );
+        attach_constraint_buffer(&surface, &app, &queue.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        window.toplevel().expect("top").with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        state.space.map_element(window.clone(), (100, 100), true);
+        for (point, edge, cursor) in [
+            ((150.0, 72.0), 1, CursorShape::NResize),
+            ((150.0, 200.0), 2, CursorShape::SResize),
+            ((100.0, 150.0), 4, CursorShape::WResize),
+            ((200.0, 150.0), 8, CursorShape::EResize),
+            ((100.0, 72.0), 5, CursorShape::NwResize),
+            ((200.0, 72.0), 9, CursorShape::NeResize),
+            ((100.0, 200.0), 6, CursorShape::SwResize),
+            ((200.0, 200.0), 10, CursorShape::SeResize),
+        ] {
+            state.pointer_motion(KeyboardSource::MAIN, point.into());
+            assert_eq!(state.decoration_cursor_under(point.into()), Some(cursor));
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+            assert_eq!(
+                state
+                    .windows
+                    .get(&window)
+                    .and_then(|state| state.resize)
+                    .map(|resize| resize.0),
+                Some(edge)
+            );
+            assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
+            state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        }
+    }
+
     fn managed_handle(app: &App, title: &str) -> ZwlrForeignToplevelHandleV1 {
         app.managed
             .iter()

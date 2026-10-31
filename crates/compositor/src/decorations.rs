@@ -26,7 +26,7 @@ pub(super) const STRIP: i32 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DecorationAction {
     Move,
-    Resize,
+    Resize(xdg_toplevel::ResizeEdge),
     Minimize,
     Maximize,
     Restore,
@@ -36,15 +36,13 @@ pub(super) enum DecorationAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Theme {
     bar: i32,
-    strip: i32,
-    grip: i32,
+    resize_band: i32,
+    resize_corner: i32,
     active: (u32, u32, u32),
     inactive: (u32, u32, u32),
     close_hover: u32,
     close_pressed: u32,
     close_hover_foreground: u32,
-    grip_hover: u32,
-    grip_foreground: u32,
     title_padding: i32,
     title_size: i32,
 }
@@ -53,15 +51,13 @@ impl Theme {
     const fn dark() -> Self {
         Self {
             bar: 28,
-            strip: STRIP,
-            grip: 24,
+            resize_band: 6,
+            resize_corner: 12,
             active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
             inactive: (0x20_25_2d, 0x98_a2_b2, 0x30_37_43),
             close_hover: 0xb8_32_45,
             close_pressed: 0x85_29_36,
             close_hover_foreground: 0xff_ff_ff,
-            grip_hover: 0xe7_eb_f0,
-            grip_foreground: 0x76_83_99,
             title_padding: 12,
             title_size: 13,
         }
@@ -75,8 +71,6 @@ impl Theme {
         Self {
             active: (0xe9_ec_f0, 0x20_25_2d, 0x98_a2_b2),
             inactive: (0xf4_f5_f7, 0x76_83_99, 0xc8_cf_d8),
-            grip_hover: 0x20_25_2d,
-            grip_foreground: 0x76_83_99,
             ..Self::dark()
         }
     }
@@ -92,12 +86,6 @@ enum NodeStyle {
         pressed: bool,
         dialog: bool,
         maximized: bool,
-        theme: Theme,
-    },
-    Grip {
-        scale: f64,
-        active: bool,
-        hovered: bool,
         theme: Theme,
     },
     Hit,
@@ -116,10 +104,6 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
     let close = Rectangle::new(
         ((size.w - theme.bar).max(0), -theme.bar).into(),
         (size.w.min(theme.bar), theme.bar).into(),
-    );
-    let grip = Rectangle::new(
-        ((size.w - theme.grip).max(0), size.h).into(),
-        (size.w.min(theme.grip), theme.strip).into(),
     );
     let mut result = vec![
         Node {
@@ -141,17 +125,6 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
             rect: close,
             style: NodeStyle::Hit,
             action: Some(DecorationAction::Close),
-            cursor: CursorShape::Default,
-        },
-        Node {
-            rect: grip,
-            style: NodeStyle::Grip {
-                scale: appearance.scale,
-                active: appearance.active,
-                hovered: appearance.hover == Some(DecorationAction::Resize),
-                theme,
-            },
-            action: Some(DecorationAction::Resize),
             cursor: CursorShape::Default,
         },
     ];
@@ -182,10 +155,74 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
             }
         }
     }
-    if appearance.window_flags.1 {
-        result.remove(2);
+    if !appearance.window_flags.1 {
+        result.extend(resize_nodes(size, theme));
     }
     result
+}
+
+fn resize_nodes(size: Size<i32, Logical>, theme: Theme) -> Vec<Node> {
+    use xdg_toplevel::ResizeEdge as Edge;
+    let band = theme.resize_band;
+    let corner = theme.resize_corner;
+    let half_band = band / 2;
+    let half_corner = corner / 2;
+    let top = -theme.bar;
+    let bottom = size.h;
+    let right = size.w;
+    [
+        (
+            (0, top - half_band, right, band),
+            Edge::Top,
+            CursorShape::NResize,
+        ),
+        (
+            (0, bottom - half_band, right, band),
+            Edge::Bottom,
+            CursorShape::SResize,
+        ),
+        (
+            (-half_band, top, band, bottom - top),
+            Edge::Left,
+            CursorShape::WResize,
+        ),
+        (
+            (right - half_band, top, band, bottom - top),
+            Edge::Right,
+            CursorShape::EResize,
+        ),
+        (
+            (-half_corner, top - half_corner, corner, corner),
+            Edge::TopLeft,
+            CursorShape::NwResize,
+        ),
+        (
+            (right - half_corner, top - half_corner, corner, corner),
+            Edge::TopRight,
+            CursorShape::NeResize,
+        ),
+        (
+            (-half_corner, bottom - half_corner, corner, corner),
+            Edge::BottomLeft,
+            CursorShape::SwResize,
+        ),
+        (
+            (right - half_corner, bottom - half_corner, corner, corner),
+            Edge::BottomRight,
+            CursorShape::SeResize,
+        ),
+    ]
+    .into_iter()
+    .map(|(rect, edge, cursor)| {
+        let (x, y, w, h) = rect;
+        Node {
+            rect: Rectangle::new((x, y).into(), (w, h).into()),
+            style: NodeStyle::Hit,
+            action: Some(DecorationAction::Resize(edge)),
+            cursor,
+        }
+    })
+    .collect()
 }
 
 fn hit_test(nodes: &[Node], point: Point<f64, Logical>) -> Option<&Node> {
@@ -214,7 +251,7 @@ struct Appearance {
 pub(super) struct Decoration {
     appearance: Option<Appearance>,
     nodes: Vec<Node>,
-    buffers: [MemoryRenderBuffer; 2],
+    buffer: MemoryRenderBuffer,
 }
 
 impl Default for Decoration {
@@ -222,9 +259,7 @@ impl Default for Decoration {
         Self {
             appearance: None,
             nodes: Vec::new(),
-            buffers: std::array::from_fn(|_| {
-                MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None)
-            }),
+            buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
         }
     }
 }
@@ -235,21 +270,15 @@ impl Decoration {
             return Ok(false);
         }
         let next = nodes((appearance.width, 0).into(), &appearance, Theme::dark());
-        for (index, (buffer, height)) in self.buffers.iter_mut().zip([BAR, STRIP]).enumerate() {
-            if index == 1 && appearance.window_flags.1 {
-                continue;
-            }
-            let node = &next[[0, 2][index]];
-            if self
-                .nodes
-                .get([0, 2][index])
-                .is_some_and(|old| old.style == node.style && old.rect.size == node.rect.size)
-            {
-                continue;
-            }
-            let mut surface = paint_nodes(&next, height)?;
+        let node = &next[0];
+        if !self
+            .nodes
+            .first()
+            .is_some_and(|old| old.style == node.style && old.rect.size == node.rect.size)
+        {
+            let mut surface = paint_nodes(&next)?;
             let size = (surface.width(), surface.height()).into();
-            let mut target = buffer.render();
+            let mut target = self.buffer.render();
             target.resize(size);
             target.update_opaque_regions(Some(vec![Rectangle::from_size(size)]));
             let pixels = surface.data()?;
@@ -266,23 +295,11 @@ impl Decoration {
     fn elements(
         &self,
         renderer: &mut PixmanRenderer,
-        size: Size<i32, Logical>,
+        _size: Size<i32, Logical>,
         location: Point<i32, Logical>,
         scale: f64,
     ) -> Result<Vec<MemoryRenderBufferRenderElement<PixmanRenderer>>> {
-        let mut rects = vec![self.nodes[0].rect];
-        if let Some(grip) = self
-            .nodes
-            .iter()
-            .find(|node| matches!(node.style, NodeStyle::Grip { .. }))
-        {
-            let mut rect = grip.rect;
-            rect.loc.y = size.h;
-            rects.push(rect);
-        }
-        self.buffers
-            .iter()
-            .zip(rects)
+        std::iter::once((&self.buffer, self.nodes[0].rect))
             .map(|(buffer, rect)| {
                 let pixels = raster_size(rect.size, scale);
                 Ok(MemoryRenderBufferRenderElement::from_buffer(
@@ -328,8 +345,8 @@ fn color(context: &cairo::Context, rgb: u32) {
     );
 }
 
-fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
-    let node = &nodes[if height == BAR { 0 } else { 2 }];
+fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
+    let node = &nodes[0];
     let (theme, scale, active, hovered, pressed, title) = match &node.style {
         NodeStyle::Titlebar {
             title,
@@ -347,16 +364,10 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
             *pressed,
             title.as_str(),
         ),
-        NodeStyle::Grip {
-            scale,
-            active,
-            hovered,
-            theme,
-        } => (*theme, *scale, *active, *hovered, false, ""),
         NodeStyle::Hit => anyhow::bail!("hit-only node cannot be painted"),
     };
     let width = node.rect.size.w;
-    let size: Size<i32, Logical> = (width, height).into();
+    let size: Size<i32, Logical> = (width, theme.bar).into();
     let pixels = raster_size(size, scale);
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pixels.w, pixels.h)?;
     let context = cairo::Context::new(&surface)?;
@@ -367,7 +378,7 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
     let (background, foreground, border) = if active { theme.active } else { theme.inactive };
     color(&context, background);
     context.paint()?;
-    if height == BAR {
+    {
         let close = nodes[1].rect;
         if hovered {
             color(
@@ -390,7 +401,17 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
         let title_end = nodes
             .iter()
             .skip(1)
-            .filter(|node| node.rect.loc.y < 0)
+            .filter(|node| {
+                matches!(
+                    node.action,
+                    Some(
+                        DecorationAction::Close
+                            | DecorationAction::Minimize
+                            | DecorationAction::Maximize
+                            | DecorationAction::Restore
+                    )
+                )
+            })
             .map(|node| node.rect.loc.x)
             .min()
             .unwrap_or(close.loc.x);
@@ -417,11 +438,9 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
         draw_close(&context, x, theme)?;
         context.restore()?;
         draw_buttons(&context, nodes, foreground, theme)?;
-    } else {
-        draw_grip(&context, width, hovered, theme)?;
     }
     color(&context, border);
-    context.rectangle(0.0, f64::from(height - 1), f64::from(width), 1.0);
+    context.rectangle(0.0, f64::from(theme.bar - 1), f64::from(width), 1.0);
     context.fill()?;
     context.status()?;
     Ok(surface)
@@ -480,25 +499,6 @@ fn draw_buttons(
         context.stroke()?;
         context.restore()?;
     }
-    Ok(())
-}
-
-fn draw_grip(context: &cairo::Context, width: i32, hovered: bool, theme: Theme) -> Result<()> {
-    color(
-        context,
-        if hovered {
-            theme.grip_hover
-        } else {
-            theme.grip_foreground
-        },
-    );
-    context.set_line_width(1.0);
-    let right = f64::from(width) - 4.0;
-    for offset in [0.0, 4.0, 8.0] {
-        context.move_to(right - offset - 3.0, 5.5);
-        context.line_to(right - offset, 2.5);
-    }
-    context.stroke()?;
     Ok(())
 }
 
@@ -609,16 +609,16 @@ impl State {
         for window in self.space.elements().rev() {
             let location = self.space.element_location(window)?;
             let surface_location = location - window.geometry().loc;
-            if window
-                .surface_under(point - surface_location.to_f64(), WindowSurfaceType::ALL)
-                .is_some()
-            {
-                return None;
-            }
             if !decorated(window)
                 || window.geometry().size.is_empty()
                 || !self.windows.get(window).is_some_and(|state| state.mapped)
             {
+                if window
+                    .surface_under(point - surface_location.to_f64(), WindowSurfaceType::ALL)
+                    .is_some()
+                {
+                    return None;
+                }
                 continue;
             }
             let size: Size<i32, Logical> = (
@@ -638,6 +638,12 @@ impl State {
             let nodes = nodes(size, &appearance, Theme::dark());
             if let Some(node) = hit_test(&nodes, point - location.to_f64()) {
                 return Some((window.clone(), node.clone()));
+            }
+            if window
+                .surface_under(point - surface_location.to_f64(), WindowSurfaceType::ALL)
+                .is_some()
+            {
+                return None;
             }
         }
         None
@@ -761,35 +767,47 @@ mod tests {
         }
     }
 
-    fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
-        paint_nodes(
-            &nodes((appearance.width, 0).into(), appearance, Theme::dark()),
-            height,
-        )
+    fn paint(appearance: &Appearance, _height: i32) -> Result<cairo::ImageSurface> {
+        paint_nodes(&nodes(
+            (appearance.width, 0).into(),
+            appearance,
+            Theme::dark(),
+        ))
     }
 
     #[test]
     fn node_actions_and_cursors_match_hit_test() {
         let nodes = nodes((101, 57).into(), &appearance(1.0), Theme::dark());
-        for (index, rect, action, point) in [
-            (
-                1,
-                Rectangle::new((73, -28).into(), (28, 28).into()),
-                DecorationAction::Close,
-                (80.0, -10.0),
-            ),
-            (
-                2,
-                Rectangle::new((77, 57).into(), (24, 8).into()),
-                DecorationAction::Resize,
-                (80.0, 60.0),
-            ),
+        assert_eq!(
+            nodes[1].rect,
+            Rectangle::new((73, -28).into(), (28, 28).into())
+        );
+        let found = hit_test(&nodes, (80.0, -10.0).into()).expect("close");
+        assert_eq!(found.action, Some(DecorationAction::Close));
+        assert_eq!(found.cursor, CursorShape::Default);
+    }
+
+    #[test]
+    fn resize_nodes_match_edges_and_cursor_shapes() {
+        use xdg_toplevel::ResizeEdge as Edge;
+        let nodes = nodes((500, 200).into(), &appearance(1.0), Theme::dark());
+        for (point, edge, cursor) in [
+            ((250.0, -28.0), Edge::Top, CursorShape::NResize),
+            ((250.0, 200.0), Edge::Bottom, CursorShape::SResize),
+            ((0.0, 80.0), Edge::Left, CursorShape::WResize),
+            ((500.0, 80.0), Edge::Right, CursorShape::EResize),
+            ((0.0, -28.0), Edge::TopLeft, CursorShape::NwResize),
+            ((500.0, -28.0), Edge::TopRight, CursorShape::NeResize),
+            ((0.0, 200.0), Edge::BottomLeft, CursorShape::SwResize),
+            ((500.0, 200.0), Edge::BottomRight, CursorShape::SeResize),
         ] {
-            assert_eq!(nodes[index].rect, rect);
-            assert_eq!(nodes[index].action, Some(action));
-            let found = hit_test(&nodes, point.into()).expect("node hit");
-            assert_eq!(found.action, Some(action));
-            assert_eq!(found.cursor, nodes[index].cursor);
+            let found = hit_test(&nodes, point.into()).expect("resize node");
+            assert_eq!(
+                found.action,
+                Some(DecorationAction::Resize(edge)),
+                "{point:?}"
+            );
+            assert_eq!(found.cursor, cursor, "{point:?}");
         }
     }
 
@@ -836,7 +854,7 @@ mod tests {
         assert!(
             !nodes
                 .iter()
-                .any(|node| node.action == Some(DecorationAction::Resize))
+                .any(|node| matches!(node.action, Some(DecorationAction::Resize(_))))
         );
         assert_eq!(hit(&nodes, (500.0, 60.0).into()), None);
     }
@@ -890,11 +908,11 @@ mod tests {
         // clamped right edge, not at the window's own right edge.
         let layout = nodes((look.width, 57).into(), &look, Theme::dark());
         assert_eq!(
-            hit(&layout, (f64::from(look.width) - 1.0, -1.0).into()),
+            hit(&layout, (f64::from(look.width) - 10.0, -10.0).into()),
             Some(DecorationAction::Close)
         );
         assert_eq!(
-            hit(&layout, (f64::from(look.width) + 0.5, -1.0).into()),
+            hit(&layout, (f64::from(look.width) + 4.0, -10.0).into()),
             None
         );
     }
@@ -903,33 +921,21 @@ mod tests {
     fn hit_regions_match_painted_edges_including_narrow_windows() {
         let layout = nodes((101, 57).into(), &appearance(1.0), Theme::dark());
         for (point, expected) in [
-            ((-0.1, -1.0), None),
-            ((0.0, -28.1), None),
-            ((0.0, -28.0), Some(DecorationAction::Move)),
-            ((72.9, -0.1), Some(DecorationAction::Maximize)),
-            ((73.0, -28.0), Some(DecorationAction::Close)),
-            ((100.9, -0.1), Some(DecorationAction::Close)),
-            ((101.0, -1.0), None),
-            ((99.0, 0.0), None),
-            ((76.9, 57.0), None),
-            ((77.0, 57.0), Some(DecorationAction::Resize)),
-            ((100.9, 64.9), Some(DecorationAction::Resize)),
-            ((99.0, 65.0), None),
-            ((101.0, 58.0), None),
+            ((-4.0, 10.0), None),
+            ((10.0, -20.0), Some(DecorationAction::Move)),
+            ((72.9, -10.0), Some(DecorationAction::Maximize)),
+            ((80.0, -10.0), Some(DecorationAction::Close)),
+            ((50.0, 30.0), None),
+            ((50.0, 60.0), None),
         ] {
             assert_eq!(hit(&layout, point.into()), expected, "{point:?}");
         }
         let narrow = nodes((13, 57).into(), &appearance(1.0), Theme::dark());
         assert_eq!(narrow[1].rect, narrow[0].rect);
         assert_eq!(
-            narrow[2].rect,
-            Rectangle::new((0, 57).into(), (13, 8).into())
-        );
-        assert_eq!(
-            hit(&narrow, (12.9, -1.0).into()),
+            hit(&narrow, (6.5, -14.0).into()),
             Some(DecorationAction::Close)
         );
-        assert_eq!(hit(&narrow, (13.0, -1.0).into()), None);
     }
 
     #[test]
@@ -985,10 +991,10 @@ mod tests {
 
     #[test]
     fn cached_buffers_map_full_fractional_raster_and_leave_idle_output_undamaged() {
-        for (scale, widths, bar_height, grip_width) in [
-            (1.0, [501.0, 533.0], 28.0, 24.0),
-            (1.25, [626.0, 666.0], 35.0, 30.0),
-            (2.0, [1002.0, 1066.0], 56.0, 48.0),
+        for (scale, widths, bar_height) in [
+            (1.0, [501.0, 533.0], 28.0),
+            (1.25, [626.0, 666.0], 35.0),
+            (2.0, [1002.0, 1066.0], 56.0),
         ] {
             let mut renderer = PixmanRenderer::new().expect("renderer");
             let mut image = renderer
@@ -998,33 +1004,34 @@ mod tests {
             let mut cache = Decoration::default();
             let mut look = appearance(scale);
             assert!(cache.update(look.clone()).expect("first paint"));
-            let mut previous: Option<([_; 2], [_; 2])> = None;
+            let mut previous = None;
             for step in 0..7 {
                 let changed = match step {
-                    0 => [true, true],
+                    0 => true,
                     1 => {
-                        look.hover = Some(DecorationAction::Resize);
-                        [false, true]
+                        look.hover =
+                            Some(DecorationAction::Resize(xdg_toplevel::ResizeEdge::Bottom));
+                        false
                     }
                     2 => {
                         look.title = "Changed without a client buffer commit".into();
-                        [true, false]
+                        true
                     }
                     3 => {
                         look.hover = Some(DecorationAction::Close);
-                        [true, true]
+                        true
                     }
                     4 => {
                         look.pressed = true;
-                        [true, false]
+                        true
                     }
                     5 => {
                         look.active = false;
-                        [true, true]
+                        true
                     }
                     _ => {
                         look.width = 533;
-                        [true, false]
+                        true
                     }
                 };
                 cache.update(look.clone()).expect("paint update");
@@ -1037,24 +1044,19 @@ mod tests {
                         scale,
                     )
                     .expect("elements");
-                let commits = [parts[0].current_commit(), parts[1].current_commit()];
-                let ids = [parts[0].id().clone(), parts[1].id().clone()];
-                if let Some((old_ids, old_commits)) = previous {
-                    assert_eq!(ids, old_ids, "stable buffer IDs");
-                    assert_eq!(
-                        [commits[0] != old_commits[0], commits[1] != old_commits[1]],
-                        changed,
-                        "step {step}"
-                    );
+                let commit = parts[0].current_commit();
+                let id = parts[0].id().clone();
+                if let Some((old_id, old_commit)) = previous {
+                    assert_eq!(id, old_id, "stable buffer ID");
+                    assert_eq!(commit != old_commit, changed, "step {step}");
                 }
-                previous = Some((ids, commits));
+                previous = Some((id, commit));
                 assert_eq!(
                     parts[0].src().size,
                     (widths[usize::from(step == 6)], bar_height).into()
                 );
-                assert_eq!(parts[1].src().size, (grip_width, 8.0 * scale).into());
                 let mut target = renderer.bind(&mut image).expect("bind");
-                assert!(
+                assert_eq!(
                     tracker
                         .render_output(
                             &mut renderer,
@@ -1065,7 +1067,8 @@ mod tests {
                         )
                         .expect("changed render")
                         .damage
-                        .is_some()
+                        .is_some(),
+                    changed
                 );
                 assert!(
                     tracker

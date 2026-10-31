@@ -854,10 +854,9 @@ impl State {
                     }
                 }
             }
-            decorations::DecorationAction::Resize => self.window_action(
-                &window,
-                WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight),
-            ),
+            decorations::DecorationAction::Resize(edges) => {
+                self.window_action(&window, WindowAction::Resize(edges));
+            }
             decorations::DecorationAction::Minimize => {}
             decorations::DecorationAction::Maximize => {
                 self.window_action(&window, WindowAction::Maximize);
