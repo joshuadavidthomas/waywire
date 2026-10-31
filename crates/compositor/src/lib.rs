@@ -899,6 +899,8 @@ impl State {
         }
         if let Some(shape) = self.decoration_cursor_under(location) {
             self.emit(Event::CursorShape(shape));
+        } else if self.surface_under(location).is_none() {
+            self.emit(Event::CursorShape(pipe::CursorShape::Default));
         }
         self.emit(Event::CursorPosition(pipe::CursorPosition {
             x: normalized_coordinate(location.x * scale, self.size.width()),

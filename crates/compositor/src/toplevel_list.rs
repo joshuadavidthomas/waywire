@@ -1745,6 +1745,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cursor_returns_to_default_after_leaving_resize_band() {
+        use waywire_protocol::pipe::CursorShape;
+        use waywire_protocol::pipe::Event;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "window",
+            "window",
+        );
+        attach_constraint_buffer(&surface, &app, &queue.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        window.toplevel().expect("top").with_pending_state(|pending| pending.decoration_mode = Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide));
+        state.space.map_element(window, (100, 100), true);
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 72.0).into());
+        assert!(
+            state
+                .event_sink
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, Event::CursorShape(CursorShape::NwResize)))
+        );
+        state.pointer_motion(KeyboardSource::MAIN, (500.0, 500.0).into());
+        assert!(
+            state
+                .event_sink
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, Event::CursorShape(CursorShape::Default)))
+        );
+    }
+
     fn managed_handle(app: &App, title: &str) -> ZwlrForeignToplevelHandleV1 {
         app.managed
             .iter()
