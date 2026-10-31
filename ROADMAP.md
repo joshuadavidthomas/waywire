@@ -95,18 +95,18 @@ environment there, so portals work without an inherited session bus and never
 modify a host desktop's activation environment. The wlr virtual-pointer and
 virtual-keyboard protocols cover drivers that synthesize input directly.
 
-| Protocol or interface           | Installed tools that use it                                    | Status                                               |
-| ------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
-| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Done; compositor's private bus                       |
-| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; compositor's private bus                       |
-| wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                 |
-| ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                 |
-| wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                        |
-| virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                 |
-| ext-foreign-toplevel-list       | lswt                                                           | Done                                                 |
-| wlr-foreign-toplevel-management | wlrctl window actions                                          | Done; activate and close                             |
-| Pointer constraints + relative  | Xwayland's warp emulator, games                                | Partial; locks and confines not enforced (see 5)     |
-| XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below) |
+| Protocol or interface           | Installed tools that use it                                    | Status                                                            |
+| ------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------- |
+| RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Done; compositor's private bus                                    |
+| Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; compositor's private bus                                    |
+| wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                              |
+| ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                              |
+| wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                                     |
+| virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                              |
+| ext-foreign-toplevel-list       | lswt                                                           | Done                                                              |
+| wlr-foreign-toplevel-management | wlrctl window actions                                          | Done; activate, close, maximize, fullscreen, minimize and restore |
+| Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done; locks, confines and relative motion                         |
+| XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below)              |
 
 ### X11-only drivers
 
@@ -153,9 +153,9 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   and the viewer animates the overlay for agent motion: it glides between
   points, pulses on clicks and has a distinct look. The video stays
   cursor-free.
-- **Window actions shared with the desktop.** Foreign-toplevel activate and
-  close share the titlebar's focus and close functions. The full `WindowAction`
-  type, minimize with restore, and a restore keybinding wait for the taskbar.
+- **Window actions shared with the desktop.** Done. Foreign-toplevel actions
+  share the desktop's window actions, including minimize and restore. Super+Shift+M
+  restores a minimized window.
 - **Acceptance tests,** on packaged tools from Debian 13 and Fedora 42:
   computer-use-linux or cua-driver drives a Wayland application through the
   portals, and Anthropic's demo loop drives an X11 application with xdotool
@@ -299,7 +299,7 @@ Remaining:
 - **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
   keys are missing from the key map. The EI keycode subtraction can underflow.
 
-## 7. Parity and missing protocols
+## 6. Parity and missing protocols
 
 - Drag-and-drop: every drag is cancelled today.
 - Primary selection for middle-click paste.
