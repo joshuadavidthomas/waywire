@@ -544,7 +544,14 @@ impl State {
         } else {
             self.work_area()?
         };
-        if super::decorations::decorated(window) {
+        let decorated = window.toplevel().map_or_else(
+            || super::decorations::decorated(window),
+            |top| top.with_pending_state(|state| {
+                state.decoration_mode == Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide)
+                    && !state.states.contains(xdg_toplevel::State::Fullscreen)
+            }),
+        );
+        if decorated {
             geometry.loc.y += super::decorations::BAR;
             geometry.size.h = (geometry.size.h - super::decorations::BAR).max(1);
         }
