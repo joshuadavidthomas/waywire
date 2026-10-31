@@ -1098,6 +1098,20 @@ mod tests {
     }
 
     #[test]
+    fn moving_window_keeps_titlebar_above_taskbar() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 40.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.window_action(&window, crate::WindowAction::Move);
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 1079.0).into());
+        assert_eq!(
+            state.space.element_location(&window).expect("location").y,
+            1048
+        );
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+    }
+
+    #[test]
     fn action_resize_starts_the_requested_edge_grab() {
         let (_, mut state, _, _, _, window) = action_fixture();
         state.window_action(&window, crate::WindowAction::Resize(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge::TopLeft));

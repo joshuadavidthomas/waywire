@@ -277,7 +277,10 @@ impl PointerGrab<State> for WindowGrab {
                     .map_element(self.window.clone(), rect.loc, false);
             }
         } else {
-            let location = (self.initial.loc.to_f64() + delta).to_i32_round();
+            let mut location = (self.initial.loc.to_f64() + delta).to_i32_round::<i32>();
+            if let Some(area) = state.work_area() {
+                location.y = location.y.min(area.loc.y + area.size.h);
+            }
             state.space.map_element(self.window.clone(), location, true);
             state.enforce_topmost();
             if let Some(surface) = self.window.x11_surface()
