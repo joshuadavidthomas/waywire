@@ -1,3 +1,5 @@
+import maximumOutputPixels from "../../../../protocol/max-display-pixels.json";
+
 export interface RemoteDisplayManualPolicy {
   readonly mode: "manual";
 }
@@ -31,11 +33,6 @@ const minimumOutputWidth = 320;
 const maximumOutputWidth = 6000;
 const minimumOutputHeight = 180;
 const maximumOutputHeight = 6000;
-// The compositor rejects any frame above 3840×2160 total pixels
-// (MAX_RAW_PIXELS in crates/protocol/src/pipe.rs), and a rejected resize
-// closes the input socket.
-const maximumOutputPixels = 3840 * 2160;
-const defaultAutomaticOutputPixels = 3840 * 2160;
 
 export function fitObservedResize(
   rawWidth: number,
@@ -60,7 +57,7 @@ export function fitObservedResize(
   );
   const maxPixels = Math.min(
     maximumOutputPixels,
-    policy.maxPixels ?? defaultAutomaticOutputPixels,
+    policy.maxPixels ?? maximumOutputPixels,
   );
   if (minWidth * minHeight > maxPixels) {
     throw new RangeError("Remote display minimum size exceeds maxPixels");

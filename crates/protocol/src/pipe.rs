@@ -15,7 +15,24 @@ use crate::wire::Writer;
 
 pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 4_000;
-pub const MAX_RAW_PIXELS: u64 = 3840 * 2160;
+pub const MAX_RAW_PIXELS: u64 = parse_pixel_cap(include_str!("../max-display-pixels.json"));
+
+const fn parse_pixel_cap(value: &str) -> u64 {
+    let bytes = value.as_bytes();
+    let mut result = 0_u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\n' && index + 1 == bytes.len() {
+            break;
+        }
+        assert!(byte >= b'0' && byte <= b'9', "invalid display pixel cap");
+        result = result * 10 + (byte - b'0') as u64;
+        index += 1;
+    }
+    assert!(result > 0, "display pixel cap must be positive");
+    result
+}
 
 macro_rules! nonzero_newtype {
     ($name:ident, $inner:ty, $nonzero:ty, $label:literal) => {
@@ -2124,6 +2141,17 @@ mod tests {
                 FrameSize::new(width, height).is_err(),
                 "{width}x{height} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn frame_size_accepts_the_entire_viewer_resize_envelope() {
+        for width in (320..=6000).step_by(2) {
+            for height in (180..=6000).step_by(2) {
+                if u64::from(width) * u64::from(height) <= MAX_RAW_PIXELS {
+                    assert!(FrameSize::new(width, height).is_ok(), "{width}x{height}");
+                }
+            }
         }
     }
 

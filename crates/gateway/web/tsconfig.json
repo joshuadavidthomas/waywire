@@ -12,6 +12,7 @@
     "noFallthroughCasesInSwitch": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
     "verbatimModuleSyntax": true
   },
   "include": ["src/**/*.ts", "vite.config.ts"]

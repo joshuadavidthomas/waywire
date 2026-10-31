@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import maximumProtocolPixels from "../../../../protocol/max-display-pixels.json";
 import { fitObservedResize, normalizeResizeDimensions } from "./resize.ts";
 import "./test-support.ts";
 
@@ -51,7 +52,6 @@ test("observed resize preserves fitting math and the protocol envelope", () => {
 });
 
 test("normalized resizes fit the compositor's 3840x2160 pixel cap", () => {
-  const maximumProtocolPixels = 3840 * 2160;
   // An asymmetric oversize request scales both sides down proportionally.
   assert.deepEqual(normalizeResizeDimensions(6000, 2000), {
     width: 4988,
@@ -75,5 +75,26 @@ test("normalized resizes fit the compositor's 3840x2160 pixel cap", () => {
     );
     assert.equal(normalized.width % 2, 0);
     assert.equal(normalized.height % 2, 0);
+  }
+});
+
+test("every even resize in the supported range normalizes into the Rust envelope", () => {
+  for (let width = 320; width <= 6000; width += 2) {
+    for (let height = 180; height <= 6000; height += 2) {
+      const output = normalizeResizeDimensions(width, height);
+      if (
+        output.width < 320 ||
+        output.width > 6000 ||
+        output.width % 2 !== 0 ||
+        output.height < 180 ||
+        output.height > 6000 ||
+        output.height % 2 !== 0 ||
+        output.width * output.height > maximumProtocolPixels
+      ) {
+        assert.fail(
+          `${width}x${height} normalized outside the protocol envelope`,
+        );
+      }
+    }
   }
 });

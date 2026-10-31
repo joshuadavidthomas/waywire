@@ -1334,6 +1334,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_resize_does_not_close_control_socket() {
+        use waywire_protocol::Record;
+        use waywire_protocol::pipe::Resize;
+
+        let (state, _commands) = test_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test HTTP listener should bind");
+        let address = listener.local_addr().expect("test HTTP listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::http::router(state))
+                .await
+                .expect("test HTTP server should not fail");
+        });
+        let mut client = control_websocket(address).await;
+        let mut resize = Command::Resize(Resize {
+            size: FrameSize::new(3840, 2160).expect("valid size"),
+            scale_v120: ScaleV120::new(120).expect("valid scale"),
+            request_id: RequestId::new(1).expect("valid request"),
+        })
+        .encode();
+        resize[8..12].copy_from_slice(&6000_u32.to_le_bytes());
+        send_client_frame(&mut client, 0x82, &resize).await;
+        send_client_text(&mut client, r#"{"type":"ping","id":1}"#).await;
+        timeout(READ_DEADLINE, next_server_pong(&mut client))
+            .await
+            .expect("control socket should answer after an oversized resize");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn pings_keep_the_control_socket_alive_until_silence_ends_it() {
         use tokio::io::AsyncReadExt;
 
