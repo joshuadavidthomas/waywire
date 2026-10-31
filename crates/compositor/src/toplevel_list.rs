@@ -885,7 +885,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let chips = state.taskbar_chips();
         assert_eq!(chips.len(), 1);
-        assert_eq!(chips[0].window, second);
+        assert_eq!(chips[0].window, Some(second));
         assert_eq!(chips[0].title, "Renamed");
     }
 
@@ -908,6 +908,55 @@ mod tests {
             state.seat.get_keyboard().expect("keyboard").current_focus(),
             KeyboardFocus::window(&first)
         );
+    }
+
+    #[test]
+    fn pinned_chips_prioritize_pid_then_app_id_without_duplicates() {
+        let (mut display, mut state, connection, mut queue, mut app, first) = action_fixture();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Beta",
+            "beta",
+        );
+        let second = top_window(&state);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Other",
+            "other",
+        );
+        let third = top_window(&state);
+        state.pins = vec![
+            crate::Pin {
+                command: vec!["/usr/bin/beta".into()],
+                pid: None,
+            },
+            crate::Pin {
+                command: vec!["different-name".into()],
+                pid: state.window_pid(&first),
+            },
+            crate::Pin {
+                command: vec!["absent".into()],
+                pid: None,
+            },
+        ];
+        let chips = state.taskbar_chips();
+        assert_eq!(chips.len(), 4);
+        assert_eq!(chips[0].pin, Some(0));
+        assert_eq!(chips[0].window, Some(second));
+        assert_eq!(chips[1].pin, Some(1));
+        assert_eq!(chips[1].window, Some(first));
+        assert_eq!(chips[2].pin, Some(2));
+        assert_eq!(chips[2].window, None);
+        assert_eq!(chips[3].pin, None);
+        assert_eq!(chips[3].window, Some(third));
     }
 
     #[test]

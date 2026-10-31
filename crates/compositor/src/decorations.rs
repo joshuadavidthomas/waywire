@@ -1143,7 +1143,11 @@ impl State {
         }
         elements.extend(upper);
         if let Some(output) = self.space.output_geometry(&self.output) {
-            let chips = self.taskbar_chips();
+            let chips = self
+                .taskbar_chips()
+                .into_iter()
+                .filter(|chip| chip.window.is_some())
+                .collect();
             match self.taskbar.element(renderer, output, scale, chips) {
                 Ok(bar) => elements.push(bar.into()),
                 Err(error) => tracing::warn!(%error, "taskbar rendering failed"),

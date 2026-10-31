@@ -81,6 +81,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::ListeningSocket;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Logical;
@@ -174,10 +175,16 @@ pub(crate) enum WindowAction {
 
 #[derive(Clone, Debug, PartialEq)]
 struct TaskbarChip {
-    window: Window,
+    window: Option<Window>,
+    pin: Option<usize>,
     title: String,
     minimized: bool,
     focused: bool,
+}
+
+struct Pin {
+    command: Vec<String>,
+    pid: Option<u32>,
 }
 
 #[expect(
@@ -214,8 +221,7 @@ pub(crate) struct State {
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
-    #[expect(dead_code, reason = "pins are used by the taskbar in the next step")]
-    pins: Vec<Vec<String>>,
+    pins: Vec<Pin>,
     mapped_order: Vec<Window>,
     minimized_order: Vec<Window>,
     restore_key_source: Option<KeyboardSource>,
@@ -354,7 +360,14 @@ impl State {
             toplevel_list,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
-            pins: options.pins.clone(),
+            pins: options
+                .pins
+                .iter()
+                .map(|command| Pin {
+                    command: command.clone(),
+                    pid: None,
+                })
+                .collect(),
             mapped_order: Vec::new(),
             minimized_order: Vec::new(),
             restore_key_source: None,
@@ -467,20 +480,92 @@ impl State {
             .seat
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
-        self.mapped_order
+        let windows: Vec<_> = self
+            .mapped_order
             .iter()
             .filter(|window| decorations::taskbar_window(window))
-            .map(|window| TaskbarChip {
-                window: window.clone(),
-                title: toplevel_list::metadata(window)
-                    .map_or_else(String::new, |metadata| metadata.0),
-                minimized: self
-                    .windows
-                    .get(window)
+            .cloned()
+            .collect();
+        let mut matches = vec![None; self.pins.len()];
+        let mut used = Vec::new();
+        for (index, pin) in self.pins.iter().enumerate() {
+            if let Some(pid) = pin.pid
+                && let Some(window) = windows
+                    .iter()
+                    .find(|window| !used.contains(*window) && self.window_pid(window) == Some(pid))
+            {
+                used.push(window.clone());
+                matches[index] = Some(window.clone());
+            }
+        }
+        for (index, pin) in self.pins.iter().enumerate() {
+            if matches[index].is_some() {
+                continue;
+            }
+            let name = pin
+                .command
+                .first()
+                .and_then(|command| std::path::Path::new(command).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if let Some(window) = windows.iter().find(|window| {
+                !used.contains(*window)
+                    && toplevel_list::metadata(window)
+                        .is_some_and(|metadata| metadata.1.eq_ignore_ascii_case(name))
+            }) {
+                used.push(window.clone());
+                matches[index] = Some(window.clone());
+            }
+        }
+        let make_chip = |window: Option<Window>, pin: Option<usize>, fallback: String| {
+            let title = window
+                .as_ref()
+                .and_then(toplevel_list::metadata)
+                .map_or(fallback, |metadata| metadata.0);
+            TaskbarChip {
+                minimized: window
+                    .as_ref()
+                    .and_then(|window| self.windows.get(window))
                     .is_some_and(|state| state.minimized),
-                focused: focus.is_some() && focus == focus::KeyboardFocus::window(window),
+                focused: window.as_ref().is_some_and(|window| {
+                    focus.is_some() && focus == focus::KeyboardFocus::window(window)
+                }),
+                window,
+                pin,
+                title,
+            }
+        };
+        let mut chips: Vec<_> = self
+            .pins
+            .iter()
+            .enumerate()
+            .map(|(index, pin)| {
+                make_chip(
+                    matches[index].clone(),
+                    Some(index),
+                    pin.command.first().cloned().unwrap_or_default(),
+                )
             })
-            .collect()
+            .collect();
+        chips.extend(
+            windows
+                .into_iter()
+                .filter(|window| !used.contains(window))
+                .map(|window| make_chip(Some(window), None, String::new())),
+        );
+        chips
+    }
+
+    fn window_pid(&self, window: &Window) -> Option<u32> {
+        if let Some(surface) = window.x11_surface() {
+            return surface.pid();
+        }
+        let surface = window.toplevel()?.wl_surface();
+        let credentials = surface
+            .client()?
+            .get_credentials(&self.display_handle)
+            .ok()?;
+        u32::try_from(credentials.pid).ok()
     }
 
     /// Gate every seat input entry point. Browser input always passes. Agent
@@ -891,7 +976,11 @@ impl State {
                 .element_under(position)
                 .is_some_and(|(window, _)| decorations::above_taskbar(window));
             if !covered && let Some(output) = self.space.output_geometry(&self.output) {
-                let chips = self.taskbar_chips();
+                let chips: Vec<_> = self
+                    .taskbar_chips()
+                    .into_iter()
+                    .filter(|chip| chip.window.is_some())
+                    .collect();
                 let relative = position
                     - (output.loc + Point::from((0, output.size.h - decorations::TASKBAR)))
                         .to_f64();
@@ -906,7 +995,9 @@ impl State {
                     } else {
                         WindowAction::Focus
                     };
-                    self.window_action(&chip.window, action);
+                    if let Some(window) = &chip.window {
+                        self.window_action(window, action);
+                    }
                     self.menu_button = Some((source, button));
                     return;
                 }
