@@ -325,6 +325,155 @@ fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
     }
 }
 
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings, xdotool and grim"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the GTK dialog and menu form one integration scenario"
+)]
+fn gtk3_x11_dialog_menu_does_not_minimize() {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("dialog.py");
+    let ready = runtime.path().join("ready");
+    fs::write(
+        &script,
+        format!(
+            r"#!/usr/bin/python3
+import os
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib
+parent = Gtk.Window(title='waywire-dialog-parent')
+parent.set_default_size(500, 300)
+parent.show_all()
+dialog = Gtk.Dialog(title='waywire-modal-dialog', transient_for=parent, modal=True)
+dialog.set_default_size(320, 150)
+dialog.show_all()
+GLib.timeout_add(500, lambda: (open({:?}, 'w').write(str(os.getpid())), False)[1])
+Gtk.main()
+",
+            ready.to_string_lossy()
+        ),
+    )
+    .expect("write GTK script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("GDK_BACKEND", "x11")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "GTK dialog did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
+    let display = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"DISPLAY="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .expect("DISPLAY");
+    let wayland = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"WAYLAND_DISPLAY="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .expect("WAYLAND_DISPLAY");
+    let xdotool = |args: &[&str]| {
+        ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(args)
+            .output()
+            .expect("xdotool")
+    };
+    let search = xdotool(&["search", "--name", "waywire-modal-dialog"]);
+    let id = String::from_utf8(search.stdout).expect("dialog id");
+    let id = id.lines().next().expect("dialog window");
+    let geometry = xdotool(&["getwindowgeometry", "--shell", id]);
+    let geometry = String::from_utf8(geometry.stdout).expect("geometry");
+    let value = |key: &str| {
+        geometry
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .expect("coordinate")
+            .parse::<u32>()
+            .expect("number")
+    };
+    let (x, y) = (value("X=") + 60, value("Y=") - 14);
+    let stdin = compositor.0.stdin.as_mut().expect("stdin");
+    let mut seq = 0;
+    let mut send = |command: Command| stdin.write_all(&command.encode()).expect("input");
+    seq += 1;
+    send(Command::PointerAbsolute(PointerAbsolute {
+        x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
+        y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
+        sequence: InputSequence::new(seq).expect("sequence"),
+    }));
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        seq += 1;
+        send(Command::PointerButton(PointerButton {
+            button: Button::Right,
+            state,
+            sequence: InputSequence::new(seq).expect("sequence"),
+        }));
+    }
+    seq += 1;
+    send(Command::PointerAbsolute(PointerAbsolute {
+        x: PointerCoordinate::new((x + 10) * 65535 / 800).expect("x"),
+        y: PointerCoordinate::new((y + 13) * 65535 / 600).expect("y"),
+        sequence: InputSequence::new(seq).expect("sequence"),
+    }));
+    let pixel = || {
+        let output = ProcessCommand::new("grim")
+            .env("WAYLAND_DISPLAY", wayland)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .args([
+                "-t",
+                "ppm",
+                "-g",
+                &format!("{},{} 1x1", x + 10, y + 40),
+                "-",
+            ])
+            .output()
+            .expect("capture menu");
+        assert!(output.status.success(), "grim failed");
+        assert!(
+            output.stdout.ends_with(&[32, 37, 45]),
+            "menu not visible: {:?}",
+            output.stdout
+        );
+    };
+    thread::sleep(Duration::from_millis(300));
+    pixel();
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        seq += 1;
+        send(Command::PointerButton(PointerButton {
+            button: Button::Left,
+            state,
+            sequence: InputSequence::new(seq).expect("sequence"),
+        }));
+    }
+    thread::sleep(Duration::from_millis(300));
+    pixel();
+    let focused = xdotool(&["getwindowfocus"]);
+    assert_eq!(
+        String::from_utf8(focused.stdout).expect("focus").trim(),
+        id,
+        "dialog lost focus after clicking disabled Minimize"
+    );
+}
+
 fn text_client_script(wayland: bool, output: &std::path::Path) -> String {
     if wayland {
         format!(
