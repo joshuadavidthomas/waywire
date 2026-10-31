@@ -20,8 +20,10 @@ use tokio::time::sleep;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameSize;
+use waywire_protocol::pipe::InputLease;
 use waywire_protocol::pipe::Kbps;
 
 use self::commands::CommandReader;
@@ -119,6 +121,10 @@ impl Daemon {
         );
         let (shutdown, shutdown_rx) = mpsc::channel(1);
         let sessions = Sessions::new(commands.clone(), config.bitrate, config.frame_rate);
+        anyhow::ensure!(
+            commands.try_system(&Command::InputLease(InputLease { held: false }))?,
+            "initial input lease could not be queued"
+        );
         let (pipeline, video_worker) =
             VideoPipeline::new(hub, commands, readiness.clone(), sessions.clone());
         let process = spawn_daemon(config, socket.local_addr()?.port())?;

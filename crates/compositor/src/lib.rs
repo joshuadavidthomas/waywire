@@ -695,6 +695,14 @@ impl State {
         }
     }
 
+    fn control_text(&self) -> &'static str {
+        if self.browser_holds_input {
+            "You're driving"
+        } else {
+            "Agent driving"
+        }
+    }
+
     /// Apply a browser takeover or handback. On takeover, every agent source
     /// releases what it holds before its future input is dropped. On handback,
     /// the browser's own keys are released and agent input resumes.
@@ -703,6 +711,7 @@ impl State {
             return;
         }
         self.browser_holds_input = held;
+        self.dirty = true;
         if held {
             let sources: Vec<_> = self.agent_sources.iter().copied().collect();
             for source in sources {
@@ -2271,6 +2280,21 @@ mod tests {
                 held,
             }))
             .expect("lease command");
+    }
+
+    #[test]
+    fn control_text_follows_gateway_lease() {
+        let (_display, mut state) = test_state();
+        assert_eq!(state.control_text(), "Agent driving");
+        state.dirty = false;
+        lease(&mut state, true);
+        assert_eq!(state.control_text(), "You're driving");
+        assert!(state.dirty);
+        state.dirty = false;
+        lease(&mut state, true);
+        assert!(!state.dirty);
+        lease(&mut state, false);
+        assert_eq!(state.control_text(), "Agent driving");
     }
 
     #[test]

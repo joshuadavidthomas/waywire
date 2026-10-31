@@ -88,6 +88,7 @@ enum NodeStyle {
         scale: f64,
         theme: Theme,
         chips: Vec<super::TaskbarChip>,
+        control: &'static str,
     },
     Titlebar {
         title: String,
@@ -361,6 +362,7 @@ fn paint_taskbar(
     scale: f64,
     theme: Theme,
     chips: &[super::TaskbarChip],
+    control: &str,
 ) -> Result<cairo::ImageSurface> {
     let pixels = raster_size(size, scale);
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pixels.w, pixels.h)?;
@@ -421,6 +423,11 @@ fn paint_taskbar(
         );
         context.fill()?;
     }
+    context.save()?;
+    context.translate(f64::from((size.w - 180).max(0)), 2.0);
+    color(&context, theme.inactive.1);
+    draw_title(&context, control, 110, theme)?;
+    context.restore()?;
     Ok(surface)
 }
 
@@ -430,9 +437,10 @@ fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         scale,
         theme,
         ref chips,
+        control,
     } = node.style
     {
-        return paint_taskbar(node.rect.size, scale, theme, chips);
+        return paint_taskbar(node.rect.size, scale, theme, chips, control);
     }
     paint_titlebar(nodes)
 }
@@ -691,7 +699,7 @@ pub(super) fn chip_rectangle(
     if count == 0 || index >= count {
         return None;
     }
-    let chip_width = (width / count).min(180);
+    let chip_width = ((width - 180).max(0) / count).min(180);
     Some(Rectangle::new(
         (index * chip_width, 0).into(),
         (chip_width, TASKBAR).into(),
@@ -740,6 +748,7 @@ impl Taskbar {
         output: Rectangle<i32, Logical>,
         scale: f64,
         chips: Vec<super::TaskbarChip>,
+        control: &'static str,
     ) -> Result<MemoryRenderBufferRenderElement<PixmanRenderer>> {
         let rect = Rectangle::new(
             (output.loc.x, output.loc.y + output.size.h - TASKBAR).into(),
@@ -751,6 +760,7 @@ impl Taskbar {
                 scale,
                 theme: Theme::dark(),
                 chips,
+                control,
             },
             action: None,
             cursor: CursorShape::Default,
@@ -1161,7 +1171,11 @@ impl State {
         elements.extend(upper);
         if let Some(output) = self.space.output_geometry(&self.output) {
             let chips = self.taskbar_chips();
-            match self.taskbar.element(renderer, output, scale, chips) {
+            let control = self.control_text();
+            match self
+                .taskbar
+                .element(renderer, output, scale, chips, control)
+            {
                 Ok(bar) => elements.push(bar.into()),
                 Err(error) => tracing::warn!(%error, "taskbar rendering failed"),
             }
