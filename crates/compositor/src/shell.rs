@@ -434,6 +434,14 @@ impl State {
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
         self.toplevel_list.unpublish(window);
         if self
+            .window_menu
+            .as_ref()
+            .is_some_and(|menu| &menu.window == window)
+        {
+            self.window_menu = None;
+            self.dirty = true;
+        }
+        if self
             .decoration_press
             .as_ref()
             .is_some_and(|(_, target)| target == window)

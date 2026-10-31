@@ -949,12 +949,38 @@ mod tests {
     }
 
     #[test]
-    fn action_show_menu_is_currently_inert() {
+    fn action_show_menu_opens_and_dismisses() {
         let (_, mut state, _, _, _, window) = action_fixture();
         let before = state.space.element_location(&window);
         state.window_action(&window, crate::WindowAction::ShowMenu);
+        assert!(state.window_menu.is_some());
         assert_eq!(state.space.element_location(&window), before);
         assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
+        state.keyboard_key(
+            KeyboardSource::MAIN,
+            1,
+            smithay::backend::input::KeyState::Pressed,
+        );
+        assert!(state.window_menu.is_none());
+        state.keyboard_key(
+            KeyboardSource::MAIN,
+            1,
+            smithay::backend::input::KeyState::Released,
+        );
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        state.window_unmapped(&window);
+        assert!(state.window_menu.is_none());
+    }
+
+    #[test]
+    fn outside_click_dismisses_window_menu() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        state.pointer_motion(KeyboardSource::MAIN, (400.0, 400.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        assert!(state.window_menu.is_none());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
     }
 
     #[test]

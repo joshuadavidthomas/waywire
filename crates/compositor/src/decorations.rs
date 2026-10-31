@@ -588,6 +588,127 @@ fn window_flags(window: &Window) -> (bool, bool) {
     }
 }
 
+const MENU_WIDTH: i32 = 180;
+const MENU_ROW: i32 = 26;
+const MENU_HEIGHT: i32 = MENU_ROW * 6;
+
+pub(super) struct WindowMenu {
+    pub(super) window: Window,
+    location: Point<i32, Logical>,
+    maximized: bool,
+    painted: bool,
+    buffer: MemoryRenderBuffer,
+}
+
+impl WindowMenu {
+    pub(super) fn new(
+        window: Window,
+        point: Point<f64, Logical>,
+        output: Size<i32, Logical>,
+    ) -> Self {
+        let maximized = window_flags(&window).1;
+        let point = point.to_i32_round::<i32>();
+        Self {
+            window,
+            location: (
+                point.x.clamp(0, (output.w - MENU_WIDTH).max(0)),
+                point.y.clamp(0, (output.h - MENU_HEIGHT).max(0)),
+            )
+                .into(),
+            maximized,
+            painted: false,
+            buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
+        }
+    }
+
+    pub(super) fn contains(&self, point: Point<f64, Logical>) -> bool {
+        let point = point - self.location.to_f64();
+        point.x >= 0.0
+            && point.x < f64::from(MENU_WIDTH)
+            && point.y >= 0.0
+            && point.y < f64::from(MENU_HEIGHT)
+    }
+
+    fn element(
+        &mut self,
+        renderer: &mut PixmanRenderer,
+        scale: f64,
+    ) -> Result<MemoryRenderBufferRenderElement<PixmanRenderer>> {
+        if !self.painted {
+            let size = raster_size((MENU_WIDTH, MENU_HEIGHT).into(), scale);
+            let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, size.w, size.h)?;
+            let context = cairo::Context::new(&surface)?;
+            context.scale(scale, scale);
+            let theme = Theme::dark();
+            color(&context, theme.inactive.0);
+            context.paint()?;
+            let labels = [
+                "Minimize",
+                if self.maximized {
+                    "Restore"
+                } else {
+                    "Maximize"
+                },
+                "Always on Top",
+                "Move",
+                "Resize",
+                "Close",
+            ];
+            for (index, label) in labels.iter().enumerate() {
+                let disabled =
+                    index == 0 || index == 2 || (self.maximized && (index == 3 || index == 4));
+                color(
+                    &context,
+                    if disabled {
+                        theme.inactive.1
+                    } else {
+                        theme.active.1
+                    },
+                );
+                context.save()?;
+                context.translate(
+                    0.0,
+                    f64::from(i32::try_from(index)? * MENU_ROW) - f64::from(BAR - MENU_ROW) / 2.0,
+                );
+                draw_title(&context, label, MENU_WIDTH - theme.title_padding * 2, theme)?;
+                context.restore()?;
+            }
+            color(&context, theme.active.2);
+            context.set_line_width(1.0);
+            context.rectangle(
+                0.5,
+                0.5,
+                f64::from(MENU_WIDTH - 1),
+                f64::from(MENU_HEIGHT - 1),
+            );
+            context.stroke()?;
+            drop(context);
+            let mut target = self.buffer.render();
+            target.resize(size);
+            let pixels = surface.data()?;
+            target.draw(|bytes| {
+                bytes.copy_from_slice(&pixels);
+                Ok::<_, anyhow::Error>(vec![Rectangle::from_size(size)])
+            })?;
+            self.painted = true;
+        }
+        let pixels = raster_size((MENU_WIDTH, MENU_HEIGHT).into(), scale);
+        Ok(MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            self.location
+                .to_physical_precise_round::<_, i32>(scale)
+                .to_f64(),
+            &self.buffer,
+            None,
+            Some(Rectangle::from_size(
+                (f64::from(pixels.w), f64::from(pixels.h)).into(),
+            )),
+            Some((MENU_WIDTH, MENU_HEIGHT).into()),
+            Kind::Unspecified,
+        )?)
+    }
+}
+
 impl State {
     pub(super) fn decoration_under(
         &self,
@@ -655,6 +776,12 @@ impl State {
     ) -> Vec<SceneElement<PixmanRenderer>> {
         let mut elements = Vec::new();
         let scale = self.output.current_scale().fractional_scale();
+        if let Some(menu) = self.window_menu.as_mut() {
+            match menu.element(renderer, scale) {
+                Ok(element) => elements.push(element.into()),
+                Err(error) => tracing::warn!(%error, "window menu rendering failed"),
+            }
+        }
         let output_width = self.size.width();
         let pointer = self.seat.get_pointer();
         let hit = pointer

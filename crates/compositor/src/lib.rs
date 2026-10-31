@@ -204,6 +204,9 @@ pub(crate) struct State {
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     decoration_press: Option<(KeyboardSource, Window)>,
+    window_menu: Option<decorations::WindowMenu>,
+    menu_button: Option<(KeyboardSource, u32)>,
+    menu_escape: Option<KeyboardSource>,
     last_titlebar_press: Option<TitlebarPress>,
     pending_restore_drag: Option<TitlebarPress>,
     pointer_motion_kind: PointerMotionKind,
@@ -335,6 +338,9 @@ impl State {
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
             decoration_press: None,
+            window_menu: None,
+            menu_button: None,
+            menu_escape: None,
             last_titlebar_press: None,
             pending_restore_drag: None,
             pointer_motion_kind: PointerMotionKind::Input,
@@ -401,7 +407,7 @@ impl State {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        if self.decoration_under(pos).is_some() {
+        if self.window_menu.is_some() || self.decoration_under(pos).is_some() {
             return None;
         }
         self.space
@@ -491,6 +497,16 @@ impl State {
 
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
         if !self.accepts_input(source) {
+            return;
+        }
+        if key == 1 && state == KeyState::Pressed && self.window_menu.take().is_some() {
+            self.menu_escape = Some(source);
+            self.dirty = true;
+            self.refresh_pointer_focus();
+            return;
+        }
+        if key == 1 && state == KeyState::Released && self.menu_escape == Some(source) {
+            self.menu_escape = None;
             return;
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -703,6 +719,10 @@ impl State {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "pointer dispatch keeps button ownership together"
+    )]
     fn pointer_button_inner(&mut self, source: KeyboardSource, button: u32, state: ButtonState) {
         if button == 0x110
             && state == ButtonState::Released
@@ -742,6 +762,21 @@ impl State {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
+        if state == ButtonState::Released && self.menu_button == Some((source, button)) {
+            self.menu_button = None;
+            return;
+        }
+        if let Some(menu) = self.window_menu.as_ref() {
+            if state == ButtonState::Pressed {
+                if !menu.contains(pointer.current_location()) {
+                    self.window_menu = None;
+                    self.dirty = true;
+                }
+                self.menu_button = Some((source, button));
+                self.refresh_pointer_focus();
+            }
+            return;
+        }
         if state == ButtonState::Pressed
             && button == 0x111
             && !pointer.is_grabbed()
@@ -749,6 +784,8 @@ impl State {
                 self.decoration_under(pointer.current_location())
         {
             self.window_action(&window, WindowAction::ShowMenu);
+            self.menu_button = Some((source, button));
+            return;
         }
         if state == ButtonState::Pressed
             && button == 0x110
@@ -890,7 +927,20 @@ impl State {
                 self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
             }
             WindowAction::Close => Self::close_window(window),
-            WindowAction::ShowMenu => {}
+            WindowAction::ShowMenu => {
+                if let (Some(pointer), Some(output)) = (
+                    self.seat.get_pointer(),
+                    self.space.output_geometry(&self.output),
+                ) {
+                    self.window_menu = Some(decorations::WindowMenu::new(
+                        window.clone(),
+                        pointer.current_location(),
+                        output.size,
+                    ));
+                    self.refresh_pointer_focus();
+                    self.dirty = true;
+                }
+            }
         }
     }
 
