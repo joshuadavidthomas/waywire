@@ -43,10 +43,10 @@ pub(super) async fn finish_shutdown(
 ) -> Result<()> {
     connections.begin_shutdown();
     let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+    daemon.shutdown().await;
     let sockets_result = timeout_at(deadline, connections.wait())
         .await
         .map_err(|_elapsed| anyhow!("WebSocket shutdown exceeded {SHUTDOWN_DEADLINE:?}"));
-    daemon.shutdown().await;
 
     let results = match stop {
         Stop::Signal(signal_result) => {
@@ -132,9 +132,114 @@ pub(super) async fn http_listener(
 
 #[cfg(test)]
 mod tests {
-    use axum::serve::Listener;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
+    use axum::serve::Listener;
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    use tokio::time::sleep;
+    use tokio::time::timeout;
+    use waywire_protocol::pipe::Fps;
+    use waywire_protocol::pipe::FrameSize;
+    use waywire_protocol::pipe::Kbps;
+
+    use super::Stop;
+    use super::finish_shutdown;
     use super::http_listener;
+    use crate::daemon::Config;
+    use crate::daemon::Daemon;
+    use crate::daemon::XkbLayout;
+    use crate::http::SocketConnections;
+    use crate::video::VideoHub;
+
+    #[tokio::test]
+    async fn slow_socket_drain_does_not_delay_process_group_cleanup() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("waywire-shutdown-{unique}"));
+        fs::create_dir(&directory).expect("test directory");
+        let script = directory.join("compositor");
+        let pid_file = directory.join("pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\necho $$ > '{}'\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .expect("test compositor script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable script");
+        let fps = Fps::new(60).expect("fps");
+        let rtp = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("RTP socket");
+        let started = Daemon::start(
+            &Config {
+                path: script,
+                frame_rate: fps,
+                bitrate: Kbps::new(8_000).expect("bitrate"),
+                xkb_layout: XkbLayout::parse("us").expect("layout"),
+                resolution: FrameSize::new(800, 600).expect("resolution"),
+                pins: vec![],
+                session: vec![],
+            },
+            rtp,
+            VideoHub::new(fps),
+        )
+        .expect("start daemon");
+        timeout(Duration::from_secs(2), async {
+            while !pid_file.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("daemon started");
+        let pid = Pid::from_raw(
+            fs::read_to_string(&pid_file)
+                .expect("pid file")
+                .trim()
+                .parse()
+                .expect("pid"),
+        );
+        let connections = SocketConnections::new();
+        let held_socket = connections.hold_for_test();
+        let shutdown = tokio::spawn(async move {
+            let mut daemon_task = started.supervisor;
+            let mut server = tokio::spawn(async { Ok(()) });
+            finish_shutdown(
+                Stop::Signal(Ok(())),
+                connections,
+                &started.daemon,
+                &mut daemon_task,
+                &mut server,
+            )
+            .await
+        });
+        let cleaned = timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(kill(pid, None), Err(Errno::ESRCH)) {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        drop(held_socket);
+        let outcome = shutdown.await.expect("shutdown task");
+        fs::remove_dir_all(directory).expect("remove test directory");
+        assert!(
+            cleaned.is_ok(),
+            "process group cleanup waited for the socket drain"
+        );
+        outcome.expect("shutdown succeeds");
+    }
 
     #[tokio::test]
     async fn production_http_listener_sets_nodelay() {

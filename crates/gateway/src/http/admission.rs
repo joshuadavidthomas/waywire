@@ -98,6 +98,11 @@ impl SocketConnections {
         self.tasks.wait().await;
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> TaskTrackerToken {
+        self.tasks.token()
+    }
+
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
     }

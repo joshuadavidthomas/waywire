@@ -45,7 +45,6 @@ Each fix here is small and independent.
   errors go through `fail()` (`crates/gateway/src/daemon/commands.rs`). Close
   only the offending socket, and make the video worker's readiness send
   non-blocking. _(The browser trigger is a hypothesis.)_
-- **Low:** a slow socket drain can cut short process-group cleanup on shutdown.
 
 ## 2. Agent control plane
 
