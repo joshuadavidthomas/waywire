@@ -592,6 +592,9 @@ impl State {
             if self.pointer_motion_kind == PointerMotionKind::Input {
                 (location, locked) = self.constrain_pointer_motion(&pointer, location);
             }
+            if let Some(menu) = self.window_menu.as_mut() {
+                self.dirty |= menu.motion(location);
+            }
             if !locked {
                 pointer.motion(
                     self,
@@ -768,9 +771,32 @@ impl State {
         }
         if let Some(menu) = self.window_menu.as_ref() {
             if state == ButtonState::Pressed {
-                if !menu.contains(pointer.current_location()) {
+                let position = pointer.current_location();
+                let selected = menu.click(position);
+                let outside = !menu.contains(position);
+                let window = menu.window.clone();
+                if outside || (button == 0x110 && selected.is_some()) {
                     self.window_menu = None;
                     self.dirty = true;
+                }
+                if button == 0x110
+                    && let Some(action) = selected
+                {
+                    if matches!(action, WindowAction::Move | WindowAction::Resize(_)) {
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                button,
+                                state,
+                                serial,
+                                time: InputTime::now(),
+                            },
+                        );
+                        self.window_action(&window, action);
+                        pointer.frame(self);
+                        return;
+                    }
+                    self.window_action(&window, action);
                 }
                 self.menu_button = Some((source, button));
                 self.refresh_pointer_focus();

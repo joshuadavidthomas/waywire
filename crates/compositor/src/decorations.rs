@@ -597,6 +597,7 @@ pub(super) struct WindowMenu {
     location: Point<i32, Logical>,
     maximized: bool,
     painted: bool,
+    hover: Option<usize>,
     buffer: MemoryRenderBuffer,
 }
 
@@ -617,6 +618,7 @@ impl WindowMenu {
                 .into(),
             maximized,
             painted: false,
+            hover: None,
             buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
         }
     }
@@ -627,6 +629,50 @@ impl WindowMenu {
             && point.x < f64::from(MENU_WIDTH)
             && point.y >= 0.0
             && point.y < f64::from(MENU_HEIGHT)
+    }
+
+    fn item_at(&self, point: Point<f64, Logical>) -> Option<usize> {
+        if !self.contains(point) {
+            return None;
+        }
+        (0..6)
+            .find(|index| {
+                let y = point.y - f64::from(self.location.y);
+                y >= f64::from(*index * MENU_ROW) && y < f64::from((*index + 1) * MENU_ROW)
+            })
+            .and_then(|index| usize::try_from(index).ok())
+    }
+
+    fn action(&self, index: usize) -> Option<super::WindowAction> {
+        match index {
+            1 => Some(if self.maximized {
+                super::WindowAction::Restore
+            } else {
+                super::WindowAction::Maximize
+            }),
+            3 if !self.maximized => Some(super::WindowAction::Move),
+            4 if !self.maximized => Some(super::WindowAction::Resize(
+                xdg_toplevel::ResizeEdge::BottomRight,
+            )),
+            5 => Some(super::WindowAction::Close),
+            _ => None,
+        }
+    }
+
+    pub(super) fn click(&self, point: Point<f64, Logical>) -> Option<super::WindowAction> {
+        self.item_at(point).and_then(|index| self.action(index))
+    }
+
+    pub(super) fn motion(&mut self, point: Point<f64, Logical>) -> bool {
+        let hover = self
+            .item_at(point)
+            .filter(|index| self.action(*index).is_some());
+        if self.hover == hover {
+            return false;
+        }
+        self.hover = hover;
+        self.painted = false;
+        true
     }
 
     fn element(
@@ -655,8 +701,17 @@ impl WindowMenu {
                 "Close",
             ];
             for (index, label) in labels.iter().enumerate() {
-                let disabled =
-                    index == 0 || index == 2 || (self.maximized && (index == 3 || index == 4));
+                let disabled = self.action(index).is_none();
+                if self.hover == Some(index) {
+                    color(&context, theme.active.0);
+                    context.rectangle(
+                        1.0,
+                        f64::from(i32::try_from(index)? * MENU_ROW),
+                        f64::from(MENU_WIDTH - 2),
+                        f64::from(MENU_ROW),
+                    );
+                    context.fill()?;
+                }
                 color(
                     &context,
                     if disabled {

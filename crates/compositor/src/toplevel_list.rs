@@ -983,6 +983,85 @@ mod tests {
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
     }
 
+    fn click_menu_item(state: &mut crate::State, window: &Window, row: i32) {
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.window_action(window, crate::WindowAction::ShowMenu);
+        state.pointer_motion(
+            KeyboardSource::MAIN,
+            (110.0, f64::from(113 + row * 26)).into(),
+        );
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+    }
+
+    #[test]
+    fn menu_maximize_and_restore() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        click_menu_item(&mut state, &window, 1);
+        assert!(state.window_menu.is_none());
+        assert!(window.toplevel().expect("toplevel").with_pending_state(|pending| pending.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+        click_menu_item(&mut state, &window, 1);
+        assert!(!window.toplevel().expect("toplevel").with_pending_state(|pending| pending.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
+    }
+
+    #[test]
+    fn menu_move_starts_grab() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        state.pointer_motion(KeyboardSource::MAIN, (110.0, 191.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
+        assert!(state.window_menu.is_none());
+    }
+
+    #[test]
+    fn menu_resize_starts_bottom_right_grab() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.window_action(&window, crate::WindowAction::ShowMenu);
+        state.pointer_motion(KeyboardSource::MAIN, (110.0, 217.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        assert_eq!(
+            state
+                .windows
+                .get(&window)
+                .expect("window")
+                .resize
+                .as_ref()
+                .map(|resize| resize.0),
+            Some(10)
+        );
+        assert!(state.window_menu.is_none());
+    }
+
+    #[test]
+    fn menu_close_notifies_client() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        click_menu_item(&mut state, &window, 5);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.close_requests, 1);
+        assert!(state.window_menu.is_none());
+    }
+
+    #[test]
+    fn disabled_menu_items_do_nothing() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        for row in [0, 2] {
+            click_menu_item(&mut state, &window, row);
+            assert!(state.window_menu.is_some());
+            assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
+            state.window_menu = None;
+        }
+        state.window_action(&window, crate::WindowAction::Maximize);
+        for row in [3, 4] {
+            click_menu_item(&mut state, &window, row);
+            assert!(state.window_menu.is_some());
+            assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
+            state.window_menu = None;
+        }
+    }
+
     #[test]
     fn resize_edges_start_matching_grabs_and_cursor_shapes() {
         use waywire_protocol::pipe::CursorShape;
