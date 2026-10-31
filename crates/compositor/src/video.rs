@@ -1220,6 +1220,16 @@ fn ffmpeg_args(
         "-loglevel".into(),
         "warning".into(),
         "-nostdin".into(),
+    ];
+    // Small YUV workloads spend more CPU distributing conversion across filter
+    // threads. Keep FFmpeg's automatic parallelism for larger or faster frames.
+    let pixel_rate = u64::from(config.raw_width.get())
+        * u64::from(config.raw_height.get())
+        * u64::from(config.fps.get());
+    if !rgb && pixel_rate <= 1280 * 720 * 30 {
+        args.extend(["-filter_threads".into(), "1".into()]);
+    }
+    args.extend([
         "-f".into(),
         "rawvideo".into(),
         "-pixel_format".into(),
@@ -1232,7 +1242,7 @@ fn ffmpeg_args(
         "-i".into(),
         "pipe:0".into(),
         "-an".into(),
-    ];
+    ]);
     if matches!(encoder, Encoder::X264 | Encoder::X264WithoutRgb) {
         args.extend([
             "-c:v".into(),

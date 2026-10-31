@@ -1491,6 +1491,8 @@ fn openh264_arguments_use_bitrate_control_and_rtp_contract() {
             "-loglevel",
             "warning",
             "-nostdin",
+            "-filter_threads",
+            "1",
             "-f",
             "rawvideo",
             "-pixel_format",
