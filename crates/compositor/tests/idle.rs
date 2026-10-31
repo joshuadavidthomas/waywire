@@ -338,6 +338,134 @@ fn x11_pre_map_maximize_fills_work_area() {
 }
 
 #[test]
+#[ignore = "requires FFmpeg, Xwayland, python3-tk, xdotool, xprop and grim"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the X11 session and minimize checks form one integration scenario"
+)]
+fn x11_minimize_requests_update_wm_state() {
+    use smithay::reexports::x11rb::connection::Connection as _;
+    use smithay::reexports::x11rb::protocol::xproto::ClientMessageEvent;
+    use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
+    use smithay::reexports::x11rb::protocol::xproto::EventMask;
+    let runtime = tempfile::tempdir().expect("runtime");
+    let script = runtime.path().join("minimize.py");
+    let ready = runtime.path().join("ready");
+    fs::write(&script, format!("#!/usr/bin/python3\nimport os, tkinter as tk\nr=tk.Tk()\nr.title('waywire-minimize-test')\nr.geometry('400x300+100+100')\nr.update()\nopen({:?}, 'w').write(str(os.getpid()))\nr.mainloop()\n", ready.to_string_lossy())).expect("script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .arg(&script)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "client did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&ready).expect("pid");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
+    let env = |name: &[u8]| {
+        environ
+            .split(|b| *b == 0)
+            .find_map(|e| e.strip_prefix(name))
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .expect("environment value")
+    };
+    let display = env(b"DISPLAY=");
+    let output = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args(["search", "--name", "waywire-minimize-test"])
+        .output()
+        .expect("xdotool");
+    let id = String::from_utf8(output.stdout)
+        .expect("id")
+        .lines()
+        .next()
+        .expect("window")
+        .parse::<u32>()
+        .expect("number");
+    let (conn, screen) = smithay::reexports::x11rb::connect(Some(display)).expect("X11 connection");
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &[u8]| {
+        conn.intern_atom(false, name)
+            .expect("intern")
+            .reply()
+            .expect("atom")
+            .atom
+    };
+    let change = atom(b"WM_CHANGE_STATE");
+    let net_state = atom(b"_NET_WM_STATE");
+    let hidden = atom(b"_NET_WM_STATE_HIDDEN");
+    let send = |ty, data: [u32; 5]| {
+        let event = ClientMessageEvent::new(32, id, ty, data);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .expect("send");
+        conn.flush().expect("flush");
+    };
+    let check = |minimized: bool, phase: &str| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let output = ProcessCommand::new("xprop")
+                .env("DISPLAY", display)
+                .args(["-id", &id.to_string(), "WM_STATE", "_NET_WM_STATE"])
+                .output()
+                .expect("xprop");
+            let props = String::from_utf8(output.stdout).expect("properties");
+            if props.contains(if minimized { "Iconic" } else { "Normal" })
+                && props.contains("_NET_WM_STATE_HIDDEN") == minimized
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unexpected X11 state after {phase}: {props}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    send(change, [3, 0, 0, 0, 0]);
+    check(true, "WM_CHANGE_STATE minimize");
+    if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            ProcessCommand::new("grim")
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("WAYLAND_DISPLAY", env(b"WAYLAND_DISPLAY="))
+                .arg(path)
+                .status()
+                .expect("grim")
+                .success()
+        );
+    }
+    send(change, [1, 0, 0, 0, 0]);
+    check(false, "WM_CHANGE_STATE restore");
+    send(net_state, [1, hidden, 0, 1, 0]);
+    check(true, "hidden add");
+    send(net_state, [0, hidden, 0, 1, 0]);
+    check(false, "hidden remove");
+    send(net_state, [2, hidden, 0, 1, 0]);
+    check(true, "hidden toggle on");
+    send(net_state, [2, hidden, 0, 1, 0]);
+    check(false, "hidden toggle off");
+}
+
+#[test]
 #[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
 fn x11_pre_map_fullscreen_fills_work_area() {
     x11_pre_map_expanded_fills_work_area("fullscreen", 568);

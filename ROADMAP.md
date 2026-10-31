@@ -256,8 +256,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Low:** X11 client minimize requests are not handled.
-
 ## 4. Desktop chrome and shell
 
 The compositor draws titlebars, window menus, and a taskbar into the desktop.
@@ -273,8 +271,6 @@ Remaining:
   colour scheme to applications when theme selection is supported.
 - Expose the node list to an agent query API so agents can find windows and
   controls without searching pixels.
-- Minimized X11 windows do not receive iconic `WM_STATE` or
-  `_NET_WM_STATE_HIDDEN`.
 - Clicking a pin does nothing when its child is alive but has no matching
   window, such as a wrapper that forks.
 - The gateway does not validate `--pin` quoting before starting the compositor.

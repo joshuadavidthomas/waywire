@@ -1266,6 +1266,14 @@ impl State {
                 if !state.minimized {
                     state.minimized = true;
                     self.minimized_order.push(window.clone());
+                    if let Some(surface) = window.x11_surface()
+                        && let Err(error) = surface.set_hidden(true)
+                    {
+                        tracing::warn!(%error, "set X11 hidden state");
+                    }
+                    if window.x11_surface().is_some() {
+                        self.x11_stacking = None;
+                    }
                     let focused = self
                         .seat
                         .get_keyboard()
@@ -1288,6 +1296,14 @@ impl State {
                         state.minimized = false;
                     }
                     self.minimized_order.retain(|item| item != window);
+                    if let Some(surface) = window.x11_surface()
+                        && let Err(error) = surface.set_hidden(false)
+                    {
+                        tracing::warn!(%error, "clear X11 hidden state");
+                    }
+                    if window.x11_surface().is_some() {
+                        self.x11_stacking = None;
+                    }
                     self.focus_window(Some(window.clone()));
                 } else {
                     self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
