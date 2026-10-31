@@ -100,30 +100,31 @@ missing comparison.
 Both runs below used 1280×720 at 30 Hz and a 30 fps, 12,000 kbps encoder
 target, with xterm and Debian Chromium 156.0.8078.73 as the applications.
 Waywire (0.1.0-rc.1) was built from
-`e72dd7192b31d8226c8a80f4f218e1cbb512bd4c`. Waymote gateway and streamd were
+`f1792bb931d86d96864f94344700fd83545940d4`. Waymote gateway and streamd were
 0.1.7 (protocol 2), with labwc 0.9.8. The packaged Waymote binaries did not
 report a source commit. Hardware: 2 vCPUs, Intel Xeon @ 2.60 GHz, 4,025,412 kB
 RAM. Date: 2026-10-31.
 
 | Metric                             | Run 1 waywire | Run 1 Waymote | Run 2 waywire | Run 2 Waymote |
 | ---------------------------------- | ------------: | ------------: | ------------: | ------------: |
-| Launch to first decoded frame (ms) |           726 |          1673 |           613 |           354 |
-| Idle CPU (% of one core)           |           0.0 |           0.0 |           0.0 |           0.0 |
-| Idle RSS (MiB)                     |         143.6 |         154.1 |         142.2 |         154.1 |
-| Typing CPU (%)                     |          17.0 |          15.4 |          16.5 |          17.0 |
-| Typing RSS (MiB)                   |         144.9 |         154.7 |         143.2 |         154.8 |
-| Typing stream (kbps)               |         133.0 |         122.7 |         132.9 |         124.6 |
-| Scrolling CPU (%)                  |          48.6 |          45.6 |          53.2 |          47.0 |
-| Scrolling RSS (MiB)                |        1069.9 |        1071.5 |        1070.5 |        1073.2 |
-| Scrolling stream (kbps)            |        2318.8 |        2151.5 |        2324.9 |        2105.1 |
-| Input-to-screen median (ms)        |          70.2 |          68.2 |          66.7 |          67.9 |
-| Input-to-screen p95 (ms)           |          75.9 |         118.7 |          78.0 |         122.3 |
+| Launch to first decoded frame (ms) |           593 |           900 |           540 |           552 |
+| Idle CPU (% of one core)           |           0.0 |           0.0 |           0.0 |           0.1 |
+| Idle RSS (MiB)                     |         141.2 |         222.1 |         141.1 |         222.1 |
+| Typing CPU (%)                     |          17.4 |          15.6 |          16.7 |          16.2 |
+| Typing RSS (MiB)                   |         136.0 |         222.9 |         142.7 |         222.8 |
+| Typing stream (kbps)               |         133.2 |         123.3 |         133.9 |         124.8 |
+| Scrolling CPU (%)                  |          50.7 |          48.2 |          50.2 |          46.9 |
+| Scrolling RSS (MiB)                |        1049.0 |        1159.2 |        1070.1 |        1162.7 |
+| Scrolling stream (kbps)            |        2303.4 |        2124.1 |        2342.7 |        2142.5 |
+| Input-to-screen median (ms)        |          66.1 |          67.9 |          69.0 |          67.8 |
+| Input-to-screen p95 (ms)           |          76.2 |          86.8 |          77.7 |         119.3 |
 | xdotool XTest                      |          pass |          pass |          pass |          pass |
 | Anthropic ComputerTool + grim      |          pass |          pass |          pass |          pass |
 
-CPU and RSS are sampled across the desktop process trees, including the active
-application, but excluding the viewer and workload driver. RSS is summed per
-process, so shared pages may be counted more than once; short-lived processes
+CPU and RSS are sampled across the desktop process trees and labwc's session,
+including the active application and its reparented Xwayland, but excluding the
+viewer and workload driver. Earlier measurements omitted Waymote's Xwayland.
+RSS is summed per process, so shared pages may be counted more than once; short-lived processes
 between samples may be missed. Each workload lasts eight seconds. Bitrate is
 the viewer's `/stream` WebSocket payload rate, including protocol framing, not
 network-interface traffic. A lower bitrate does not establish equal visual
