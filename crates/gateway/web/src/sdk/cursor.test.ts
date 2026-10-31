@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { LocalCursor } from "./cursor.ts";
 import { parseControlMessage } from "./messages.ts";
-import { FakeTarget, installBrowser } from "./test-support.ts";
+import { FakeTarget, installBrowser, installGlobal } from "./test-support.ts";
 
 // The keyword list pinned in crates/protocol/src/pipe.rs, in wire order.
 const rustCursorShapes = [
@@ -45,8 +45,9 @@ const rustCursorShapes = [
   "all-resize",
 ];
 
-function fixture() {
+function fixture(reducedMotion?: FakeTarget) {
   const { document, window } = installBrowser();
+  if (reducedMotion) Object.assign(window, { matchMedia: () => reducedMotion });
   const element = new FakeTarget();
   const display = new FakeTarget();
   const host = new FakeTarget();
@@ -195,6 +196,86 @@ test("cursor parser requires normalized integer coordinates", () => {
       position: { x: 0, y: 65_535, source: "agent" },
     },
   );
+});
+
+test("agent motion glides to the latest point within 120ms and browser motion snaps", () => {
+  const { cursor, overlay, state } = fixture();
+  const originalPerformance = globalThis.performance;
+  let now = 1000;
+  let frame: FrameRequestCallback | undefined;
+  installGlobal("performance", { now: () => now });
+  installGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    frame = callback;
+    return 1;
+  });
+  installGlobal("cancelAnimationFrame", () => {
+    frame = undefined;
+  });
+  try {
+    cursor.setVideoDimensions(1600, 900);
+    cursor.update(state);
+    const start = overlayPosition(overlay).x;
+    cursor.update({
+      ...state,
+      position: { x: 30_000, y: 20, source: "agent" },
+    });
+    assert.equal(overlayPosition(overlay).x, start);
+    assert.match(overlay.style.filter, /00e5ff/);
+    now = 1060;
+    assert.ok(frame);
+    frame(now);
+    const middle = overlayPosition(overlay).x;
+    assert.ok(middle > start && middle < 10 + (30_000 / 65_535) * 1000);
+    cursor.update({
+      ...state,
+      position: { x: 50_000, y: 20, source: "agent" },
+    });
+    now = 1120;
+    assert.ok(frame);
+    frame(now);
+    assert.ok(
+      Math.abs(overlayPosition(overlay).x - (10 + (50_000 / 65_535) * 1000)) <
+        0.001,
+    );
+    cursor.update({ ...state, position: { x: 100, y: 20, source: "browser" } });
+    assert.ok(
+      Math.abs(overlayPosition(overlay).x - (10 + (100 / 65_535) * 1000)) <
+        0.001,
+    );
+    assert.equal(overlay.style.filter, "none");
+    cursor.dispose();
+  } finally {
+    installGlobal("performance", originalPerformance);
+  }
+});
+
+test("reduced motion snaps agent cursor and flashes clicks without scaling", () => {
+  const media = new FakeTarget();
+  Object.assign(media, { matches: true });
+  const { cursor, overlay, state } = fixture(media);
+  const pulse = overlay.children[0];
+  assert.ok(pulse);
+  let frames: Keyframe[] = [];
+  Object.assign(pulse, {
+    animate: (keyframes: Keyframe[]) => {
+      frames = keyframes;
+      return { cancel() {} };
+    },
+  });
+  cursor.setVideoDimensions(1600, 900);
+  cursor.update(state);
+  cursor.update({
+    ...state,
+    click: true,
+    position: { x: 32_768, y: 20, source: "agent" },
+  });
+  assert.ok(
+    Math.abs(overlayPosition(overlay).x - (10 + (32_768 / 65_535) * 1000)) <
+      0.001,
+  );
+  assert.match(overlay.style.filter, /00e5ff/);
+  assert.deepEqual(frames, [{ opacity: 0.9 }, { opacity: 0 }]);
+  cursor.dispose();
 });
 
 test("observer, absolute control, pointer lock, and hidden states choose one remote cursor", () => {
