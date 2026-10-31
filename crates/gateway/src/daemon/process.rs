@@ -77,6 +77,10 @@ fn daemon_args(config: &Config, rtp_port: u16) -> Vec<OsString> {
         )
         .into(),
     ];
+    for pin in &config.pins {
+        args.push("--pin".into());
+        args.push(pin.into());
+    }
     if !config.session.is_empty() {
         args.push("--".into());
         args.extend(config.session.iter().cloned());
@@ -191,6 +195,7 @@ mod tests {
             bitrate: Kbps::new(16_000).expect("valid bitrate"),
             xkb_layout: XkbLayout::parse("us").expect("valid layout"),
             resolution: FrameSize::new(2560, 1440).expect("valid resolution"),
+            pins: Vec::new(),
             session: Vec::new(),
         };
 
@@ -209,6 +214,11 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
+        assert_eq!(daemon_args(&config, 5000), expected);
+
+        config.pins = vec!["xterm -title 'My Window'".into(), "editor".into()];
+        expected
+            .extend(["--pin", "xterm -title 'My Window'", "--pin", "editor"].map(OsString::from));
         assert_eq!(daemon_args(&config, 5000), expected);
 
         config.session = vec![

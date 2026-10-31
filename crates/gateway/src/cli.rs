@@ -35,6 +35,9 @@ pub(super) struct Options {
         value_parser = parse_resolution
     )]
     pub(super) resolution: FrameSize,
+    /// Pin an application command to the taskbar. May be supplied more than once.
+    #[arg(long)]
+    pub(super) pin: Vec<String>,
     /// Application to launch inside the desktop, followed by its arguments.
     #[arg(last = true, value_name = "COMMAND")]
     pub(super) session: Vec<OsString>,

@@ -32,10 +32,24 @@ struct Options {
         value_parser = parse_resolution
     )]
     resolution: FrameSize,
+    /// Pin an application command to the taskbar. May be supplied more than once.
+    #[arg(long, value_parser = parse_pin)]
+    pin: Vec<PinCommand>,
     /// Application argv after --. If absent, `WAYWIRE_SESSION` names one executable.
     /// No shell parsing is performed. Without either, only serve external clients.
     #[arg(last = true)]
     session: Vec<OsString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PinCommand(Vec<String>);
+
+fn parse_pin(value: &str) -> Result<PinCommand, String> {
+    let argv = shlex::split(value).ok_or_else(|| "invalid quoted pin command".to_owned())?;
+    if argv.first().is_none_or(String::is_empty) {
+        return Err("pin command must name an executable".into());
+    }
+    Ok(PinCommand(argv))
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -98,6 +112,7 @@ fn main() -> Result<()> {
         rtp_port: options.rtp_port,
         xkb_layout: options.xkb_layout,
         resolution: options.resolution,
+        pins: options.pin.into_iter().map(|pin| pin.0).collect(),
         session: options.session,
     })
 }
@@ -107,6 +122,27 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn repeatable_pins_parse_quoted_arguments() {
+        let options = Options::try_parse_from([
+            "waywire-compositor",
+            "--rtp-port",
+            "5000",
+            "--pin",
+            "xterm -title 'My Window'",
+            "--pin",
+            "editor --file \"two words\"",
+        ])
+        .expect("pin arguments");
+        assert_eq!(
+            options.pin,
+            vec![
+                PinCommand(vec!["xterm".into(), "-title".into(), "My Window".into()]),
+                PinCommand(vec!["editor".into(), "--file".into(), "two words".into()])
+            ]
+        );
+    }
 
     #[test]
     fn resolution_default_is_full_hd() {

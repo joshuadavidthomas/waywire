@@ -12,6 +12,7 @@ calloop = { workspace = true }
 clap = { workspace = true }
 nix = { workspace = true }
 pangocairo = { workspace = true }
+shlex = "2.0.1"
 smithay = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

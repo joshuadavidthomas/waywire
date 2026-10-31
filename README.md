@@ -74,6 +74,10 @@ to loopback port 8080 by default and provides no authentication; remote access
 needs an authenticating HTTPS proxy. Application arguments are passed without
 shell parsing. `WAYWIRE_SESSION` is a fallback for a single executable path.
 
+The gateway and compositor accept repeated `--pin 'COMMAND ARG...'` options
+for taskbar application commands. Pin arguments use shell-style quoting, without
+shell expansion or execution. Taskbar pin display and launching are in progress.
+
 ## Local checks
 
 ```sh

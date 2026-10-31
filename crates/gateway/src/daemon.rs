@@ -98,6 +98,7 @@ pub(crate) struct Config {
     pub(crate) bitrate: Kbps,
     pub(crate) xkb_layout: XkbLayout,
     pub(crate) resolution: FrameSize,
+    pub(crate) pins: Vec<String>,
     pub(crate) session: Vec<OsString>,
 }
 

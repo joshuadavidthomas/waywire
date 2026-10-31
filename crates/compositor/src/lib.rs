@@ -134,6 +134,7 @@ pub struct Config {
     pub rtp_port: u16,
     pub xkb_layout: String,
     pub resolution: FrameSize,
+    pub pins: Vec<Vec<String>>,
     /// Application argv. When empty, `WAYWIRE_SESSION` names one executable.
     pub session: Vec<OsString>,
 }
@@ -213,6 +214,8 @@ pub(crate) struct State {
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
+    #[expect(dead_code, reason = "pins are used by the taskbar in the next step")]
+    pins: Vec<Vec<String>>,
     mapped_order: Vec<Window>,
     minimized_order: Vec<Window>,
     restore_key_source: Option<KeyboardSource>,
@@ -351,6 +354,7 @@ impl State {
             toplevel_list,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
+            pins: options.pins.clone(),
             mapped_order: Vec::new(),
             minimized_order: Vec::new(),
             restore_key_source: None,
@@ -2050,6 +2054,7 @@ mod tests {
             rtp_port: 0,
             xkb_layout: "us".into(),
             resolution: FrameSize::new(1920, 1080).expect("test resolution"),
+            pins: Vec::new(),
             session: Vec::new(),
         };
         let video = VideoEncoder::idle_for_test().expect("idle encoder");

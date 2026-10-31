@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
             bitrate: options.bitrate,
             xkb_layout: options.xkb_layout,
             resolution: options.resolution,
+            pins: options.pin,
             session: options.session,
         },
         rtp,
