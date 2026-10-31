@@ -21,7 +21,7 @@ use waywire_protocol::pipe::CursorShape;
 use super::State;
 
 pub(super) const BAR: i32 = Theme::dark().bar;
-pub(super) const STRIP: i32 = 8;
+pub(super) const TASKBAR: i32 = Theme::dark().taskbar;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DecorationAction {
@@ -36,6 +36,7 @@ pub(super) enum DecorationAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Theme {
     bar: i32,
+    taskbar: i32,
     resize_band: i32,
     resize_corner: i32,
     active: (u32, u32, u32),
@@ -51,6 +52,7 @@ impl Theme {
     const fn dark() -> Self {
         Self {
             bar: 28,
+            taskbar: 32,
             resize_band: 6,
             resize_corner: 12,
             active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
@@ -78,6 +80,10 @@ impl Theme {
 
 #[derive(Clone, Debug, PartialEq)]
 enum NodeStyle {
+    Taskbar {
+        scale: f64,
+        theme: Theme,
+    },
     Titlebar {
         title: String,
         scale: f64,
@@ -345,7 +351,35 @@ fn color(context: &cairo::Context, rgb: u32) {
     );
 }
 
+fn paint_taskbar(
+    size: Size<i32, Logical>,
+    scale: f64,
+    theme: Theme,
+) -> Result<cairo::ImageSurface> {
+    let pixels = raster_size(size, scale);
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pixels.w, pixels.h)?;
+    let context = cairo::Context::new(&surface)?;
+    context.scale(
+        f64::from(pixels.w) / f64::from(size.w),
+        f64::from(pixels.h) / f64::from(size.h),
+    );
+    color(&context, theme.inactive.0);
+    context.paint()?;
+    color(&context, theme.inactive.2);
+    context.rectangle(0.0, 0.0, f64::from(size.w), 1.0);
+    context.fill()?;
+    Ok(surface)
+}
+
 fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
+    let node = &nodes[0];
+    if let NodeStyle::Taskbar { scale, theme } = node.style {
+        return paint_taskbar(node.rect.size, scale, theme);
+    }
+    paint_titlebar(nodes)
+}
+
+fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
     let node = &nodes[0];
     let (theme, scale, active, hovered, pressed, title) = match &node.style {
         NodeStyle::Titlebar {
@@ -364,7 +398,7 @@ fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
             *pressed,
             title.as_str(),
         ),
-        NodeStyle::Hit => anyhow::bail!("hit-only node cannot be painted"),
+        NodeStyle::Hit | NodeStyle::Taskbar { .. } => anyhow::bail!("invalid titlebar node"),
     };
     let width = node.rect.size.w;
     let size: Size<i32, Logical> = (width, theme.bar).into();
@@ -588,6 +622,76 @@ fn window_flags(window: &Window) -> (bool, bool) {
     }
 }
 
+pub(super) fn above_taskbar(window: &Window) -> bool {
+    window.toplevel().is_some_and(|top| {
+        top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+    }) || window
+        .x11_surface()
+        .is_some_and(|surface| surface.is_fullscreen() || surface.is_override_redirect())
+}
+
+pub(super) struct Taskbar {
+    node: Option<Node>,
+    buffer: MemoryRenderBuffer,
+}
+
+impl Default for Taskbar {
+    fn default() -> Self {
+        Self {
+            node: None,
+            buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
+        }
+    }
+}
+
+impl Taskbar {
+    fn element(
+        &mut self,
+        renderer: &mut PixmanRenderer,
+        output: Rectangle<i32, Logical>,
+        scale: f64,
+    ) -> Result<MemoryRenderBufferRenderElement<PixmanRenderer>> {
+        let rect = Rectangle::new(
+            (output.loc.x, output.loc.y + output.size.h - TASKBAR).into(),
+            (output.size.w, TASKBAR).into(),
+        );
+        let node = Node {
+            rect,
+            style: NodeStyle::Taskbar {
+                scale,
+                theme: Theme::dark(),
+            },
+            action: None,
+            cursor: CursorShape::Default,
+        };
+        if self.node.as_ref() != Some(&node) {
+            let mut surface = paint_nodes(std::slice::from_ref(&node))?;
+            let size = (surface.width(), surface.height()).into();
+            let mut target = self.buffer.render();
+            target.resize(size);
+            target.update_opaque_regions(Some(vec![Rectangle::from_size(size)]));
+            let pixels = surface.data()?;
+            target.draw(|bytes| {
+                bytes.copy_from_slice(&pixels);
+                Ok::<_, anyhow::Error>(vec![Rectangle::from_size(size)])
+            })?;
+            self.node = Some(node);
+        }
+        let pixels = raster_size(rect.size, scale);
+        Ok(MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            rect.loc.to_physical_precise_round::<_, i32>(scale).to_f64(),
+            &self.buffer,
+            None,
+            Some(Rectangle::from_size(
+                (f64::from(pixels.w), f64::from(pixels.h)).into(),
+            )),
+            Some(rect.size),
+            Kind::Unspecified,
+        )?)
+    }
+}
+
 const MENU_WIDTH: i32 = 180;
 const MENU_ROW: i32 = 26;
 const MENU_HEIGHT: i32 = MENU_ROW * 6;
@@ -793,6 +897,12 @@ impl State {
     }
 
     fn decoration_node_under(&self, point: Point<f64, Logical>) -> Option<(Window, Node)> {
+        if self
+            .work_area()
+            .is_some_and(|area| point.y >= f64::from(area.loc.y + area.size.h))
+        {
+            return None;
+        }
         for window in self.space.elements().rev() {
             if self
                 .windows
@@ -871,6 +981,8 @@ impl State {
             .filter(|_| {
                 pointer.as_ref().is_some_and(|p| !p.is_grabbed()) || self.decoration_press.is_some()
             });
+        let mut upper = Vec::new();
+        let mut lower = Vec::new();
         for window in self.space.elements().rev() {
             if self
                 .windows
@@ -882,7 +994,12 @@ impl State {
             let Some(location) = self.space.element_location(window) else {
                 continue;
             };
-            elements.extend(window.render_elements::<SceneElement<PixmanRenderer>>(
+            let target = if above_taskbar(window) {
+                &mut upper
+            } else {
+                &mut lower
+            };
+            target.extend(window.render_elements::<SceneElement<PixmanRenderer>>(
                 renderer,
                 (location - window.geometry().loc).to_physical_precise_round(scale),
                 scale.into(),
@@ -944,12 +1061,20 @@ impl State {
                 continue;
             }
             match decoration.elements(renderer, (width, size.h).into(), location, scale) {
-                Ok(parts) => elements.extend(parts.into_iter().map(Into::into)),
+                Ok(parts) => target.extend(parts.into_iter().map(Into::into)),
                 Err(error) => {
                     tracing::warn!(%error, "decoration elements failed; skipping window decoration");
                 }
             }
         }
+        elements.extend(upper);
+        if let Some(output) = self.space.output_geometry(&self.output) {
+            match self.taskbar.element(renderer, output, scale) {
+                Ok(bar) => elements.push(bar.into()),
+                Err(error) => tracing::warn!(%error, "taskbar rendering failed"),
+            }
+        }
+        elements.extend(lower);
         elements
     }
 }

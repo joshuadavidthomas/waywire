@@ -924,8 +924,57 @@ mod tests {
         let location = state.space.element_location(&window).expect("location");
         let content = top.with_pending_state(|pending| pending.size.expect("maximized size"));
         assert_eq!(location.y - crate::decorations::BAR, output.loc.y);
-        assert_eq!(content.h, output.size.h - crate::decorations::BAR);
+        assert_eq!(
+            content.h,
+            output.size.h - crate::decorations::BAR - crate::decorations::TASKBAR
+        );
         assert_eq!(content.w, output.size.w);
+    }
+
+    #[test]
+    fn work_area_follows_output_size_and_scale() {
+        let (_, mut state) = crate::tests::test_state();
+        assert_eq!(
+            state.work_area().expect("work area"),
+            smithay::utils::Rectangle::new((0, 0).into(), (1920, 1048).into())
+        );
+        state.output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (800, 600).into(),
+                refresh: 60_000,
+            }),
+            None,
+            Some(smithay::output::Scale::Integer(1)),
+            None,
+        );
+        state.output_resized();
+        assert_eq!(
+            state.work_area().expect("work area"),
+            smithay::utils::Rectangle::new((0, 0).into(), (800, 568).into())
+        );
+        state.output.change_current_state(
+            None,
+            None,
+            Some(smithay::output::Scale::Integer(2)),
+            None,
+        );
+        state.output_resized();
+        assert_eq!(
+            state.work_area().expect("work area"),
+            smithay::utils::Rectangle::new((0, 0).into(), (400, 268).into())
+        );
+    }
+
+    #[test]
+    fn placement_and_output_resize_constrain_window_to_work_area() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        assert_eq!(state.space.element_location(&window), Some((32, 32).into()));
+        state.space.map_element(window.clone(), (1900, 1070), false);
+        state.output_resized();
+        assert_eq!(
+            state.space.element_location(&window),
+            Some((1900, 1047).into())
+        );
     }
 
     #[test]

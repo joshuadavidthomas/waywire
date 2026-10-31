@@ -349,6 +349,7 @@ impl XwmHandler for State {
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
         self.center_dialog(&window);
+        self.constrain_window(&window);
     }
 
     fn mapped_override_redirect_window(&mut self, _: XwmId, surface: X11Surface) {

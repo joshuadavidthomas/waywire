@@ -298,7 +298,7 @@ impl XdgShellHandler for State {
     }
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let offset = [0, 48, 96, 144, 192, 240, 288, 336][self.space.elements().count() % 8];
-        if let Some(output) = self.space.output_geometry(&self.output) {
+        if let Some(output) = self.work_area() {
             surface.with_pending_state(|state| state.bounds = Some(output.size));
         }
         let window = Window::new_wayland_window(surface);
@@ -465,7 +465,7 @@ impl State {
         self.refresh_pointer_focus();
     }
 
-    fn constrain_window(&mut self, window: &Window) {
+    pub(super) fn constrain_window(&mut self, window: &Window) {
         if window
             .x11_surface()
             .is_some_and(smithay::xwayland::X11Surface::is_override_redirect)
@@ -502,24 +502,29 @@ impl State {
         &self,
         window: &Window,
     ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
-        let mut geometry = self.space.output_geometry(&self.output)?;
+        let fullscreen = window.toplevel().is_some_and(|top| {
+            top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+        }) || window
+            .x11_surface()
+            .is_some_and(smithay::xwayland::X11Surface::is_fullscreen);
+        let mut geometry = if fullscreen {
+            self.space.output_geometry(&self.output)?
+        } else {
+            self.work_area()?
+        };
         if super::decorations::decorated(window) {
             geometry.loc.y += super::decorations::BAR;
-            let maximized = window.toplevel().is_some_and(|top| {
-                top.with_pending_state(|state| {
-                    state.states.contains(xdg_toplevel::State::Maximized)
-                })
-            }) || window
-                .x11_surface()
-                .is_some_and(smithay::xwayland::X11Surface::is_maximized);
-            let bottom = if maximized {
-                0
-            } else {
-                super::decorations::STRIP
-            };
-            geometry.size.h = (geometry.size.h - super::decorations::BAR - bottom).max(1);
+            geometry.size.h = (geometry.size.h - super::decorations::BAR).max(1);
         }
         Some(geometry)
+    }
+
+    pub(crate) fn work_area(
+        &self,
+    ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
+        let mut output = self.space.output_geometry(&self.output)?;
+        output.size.h = (output.size.h - super::decorations::TASKBAR).max(1);
+        Some(output)
     }
 
     pub(super) fn output_resized(&mut self) {

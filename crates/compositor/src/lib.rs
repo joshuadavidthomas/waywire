@@ -209,6 +209,7 @@ pub(crate) struct State {
     restore_key_source: Option<KeyboardSource>,
     decoration_press: Option<(KeyboardSource, Window)>,
     window_menu: Option<decorations::WindowMenu>,
+    taskbar: decorations::Taskbar,
     menu_button: Option<(KeyboardSource, u32)>,
     menu_escape: Option<KeyboardSource>,
     last_titlebar_press: Option<TitlebarPress>,
@@ -345,6 +346,7 @@ impl State {
             restore_key_source: None,
             decoration_press: None,
             window_menu: None,
+            taskbar: decorations::Taskbar::default(),
             menu_button: None,
             menu_escape: None,
             last_titlebar_press: None,
@@ -429,6 +431,13 @@ impl State {
                 .windows
                 .get(window)
                 .is_some_and(|state| state.minimized)
+            {
+                return None;
+            }
+            if self
+                .work_area()
+                .is_some_and(|area| pos.y >= f64::from(area.loc.y + area.size.h))
+                && !decorations::above_taskbar(window)
             {
                 return None;
             }
@@ -1263,11 +1272,21 @@ impl State {
         };
         let parent_geometry = parent.geometry();
         let child_geometry = window.geometry();
-        let location = parent_location
+        let mut location = parent_location
             + Point::from((
                 (parent_geometry.size.w - child_geometry.size.w) / 2,
                 (parent_geometry.size.h - child_geometry.size.h) / 2,
             ));
+        if let Some(area) = self.window_output_geometry(window) {
+            location.x = location.x.clamp(
+                area.loc.x,
+                area.loc.x + (area.size.w - child_geometry.size.w).max(0),
+            );
+            location.y = location.y.clamp(
+                area.loc.y,
+                area.loc.y + (area.size.h - child_geometry.size.h).max(0),
+            );
+        }
         self.space.map_element(window.clone(), location, false);
         if let Some(surface) = window.x11_surface() {
             let mut geometry = surface.last_configure();
