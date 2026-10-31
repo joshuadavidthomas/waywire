@@ -34,6 +34,9 @@ resumes it. See [ROADMAP.md](ROADMAP.md).
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while
 observers and pointer-locked clients show a positioned image or fallback arrow.
+For agent input, the viewer gives the overlay a cyan glow, glides it between
+positions, and pulses it on clicks. With reduced motion enabled, the cursor
+snaps to each position and clicks flash without expanding.
 Cursor positions use the same normalized coordinates as absolute input,
 independent of video quality and output scaling.
 

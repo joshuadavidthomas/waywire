@@ -115,15 +115,6 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   drops later agent input, and gives browser keys the seat's own keymap; the
   viewer shows agent driving versus the takeover. Agent input resumes when
   the browser releases control.
-- **Agent ghost cursor.** Agents move the same seat pointer as the browser, so
-  watchers see an overlay cursor that jumps between points and cannot tell
-  agent motion from human motion. On macOS and Windows the agent tool draws
-  this cursor in its own overlay window; here the viewer is the only display,
-  so it is waywire's job. The compositor tags each cursor update with the
-  `KeyboardSource` that moved it, the browser cursor event carries that tag,
-  and the viewer animates the overlay for agent motion: it glides between
-  points, pulses on clicks and has a distinct look. The video stays
-  cursor-free.
 - **Window actions shared with the desktop.** Done. Foreign-toplevel actions
   share the desktop's window actions, including minimize and restore. Super+Shift+M
   restores a minimized window.
