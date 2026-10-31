@@ -16,6 +16,7 @@ use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+use waywire_protocol::pipe::CursorShape;
 
 use super::State;
 
@@ -29,38 +30,136 @@ pub(super) enum DecorationAction {
     Close,
 }
 
-struct Layout(Size<i32, Logical>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Theme {
+    bar: i32,
+    strip: i32,
+    grip: i32,
+    active: (u32, u32, u32),
+    inactive: (u32, u32, u32),
+    close_hover: u32,
+    close_pressed: u32,
+    close_hover_foreground: u32,
+    grip_hover: u32,
+    grip_foreground: u32,
+    title_padding: i32,
+    title_size: i32,
+}
 
-impl Layout {
-    fn bar(&self) -> Rectangle<i32, Logical> {
-        Rectangle::new((0, -BAR).into(), (self.0.w, BAR).into())
-    }
-
-    fn close(&self) -> Rectangle<i32, Logical> {
-        Rectangle::new(
-            ((self.0.w - BAR).max(0), -BAR).into(),
-            (self.0.w.min(BAR), BAR).into(),
-        )
-    }
-
-    fn resize(&self) -> Rectangle<i32, Logical> {
-        Rectangle::new(
-            ((self.0.w - 24).max(0), self.0.h).into(),
-            (self.0.w.min(24), STRIP).into(),
-        )
-    }
-
-    fn hit(&self, point: Point<f64, Logical>) -> Option<DecorationAction> {
-        if self.close().to_f64().contains(point) {
-            Some(DecorationAction::Close)
-        } else if self.bar().to_f64().contains(point) {
-            Some(DecorationAction::Move)
-        } else if self.resize().to_f64().contains(point) {
-            Some(DecorationAction::Resize)
-        } else {
-            None
+impl Theme {
+    const fn dark() -> Self {
+        Self {
+            bar: BAR,
+            strip: STRIP,
+            grip: 24,
+            active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
+            inactive: (0x20_25_2d, 0x98_a2_b2, 0x30_37_43),
+            close_hover: 0xb8_32_45,
+            close_pressed: 0x85_29_36,
+            close_hover_foreground: 0xff_ff_ff,
+            grip_hover: 0xe7_eb_f0,
+            grip_foreground: 0x76_83_99,
+            title_padding: 12,
+            title_size: 13,
         }
     }
+
+    #[expect(
+        dead_code,
+        reason = "light palette is available for a future theme selector"
+    )]
+    const fn light() -> Self {
+        Self {
+            active: (0xe9_ec_f0, 0x20_25_2d, 0x98_a2_b2),
+            inactive: (0xf4_f5_f7, 0x76_83_99, 0xc8_cf_d8),
+            grip_hover: 0x20_25_2d,
+            grip_foreground: 0x76_83_99,
+            ..Self::dark()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NodeStyle {
+    Titlebar {
+        title: String,
+        scale: f64,
+        active: bool,
+        close_hovered: bool,
+        pressed: bool,
+        theme: Theme,
+    },
+    Grip {
+        scale: f64,
+        active: bool,
+        hovered: bool,
+        theme: Theme,
+    },
+    Hit,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Node {
+    rect: Rectangle<i32, Logical>,
+    style: NodeStyle,
+    action: Option<DecorationAction>,
+    cursor: CursorShape,
+}
+
+fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec<Node> {
+    let bar = Rectangle::new((0, -theme.bar).into(), (size.w, theme.bar).into());
+    let close = Rectangle::new(
+        ((size.w - theme.bar).max(0), -theme.bar).into(),
+        (size.w.min(theme.bar), theme.bar).into(),
+    );
+    let grip = Rectangle::new(
+        ((size.w - theme.grip).max(0), size.h).into(),
+        (size.w.min(theme.grip), theme.strip).into(),
+    );
+    vec![
+        Node {
+            rect: bar,
+            style: NodeStyle::Titlebar {
+                title: appearance.title.clone(),
+                scale: appearance.scale,
+                active: appearance.active,
+                close_hovered: appearance.hover == Some(DecorationAction::Close),
+                pressed: appearance.pressed,
+                theme,
+            },
+            action: Some(DecorationAction::Move),
+            cursor: CursorShape::Default,
+        },
+        Node {
+            rect: close,
+            style: NodeStyle::Hit,
+            action: Some(DecorationAction::Close),
+            cursor: CursorShape::Default,
+        },
+        Node {
+            rect: grip,
+            style: NodeStyle::Grip {
+                scale: appearance.scale,
+                active: appearance.active,
+                hovered: appearance.hover == Some(DecorationAction::Resize),
+                theme,
+            },
+            action: Some(DecorationAction::Resize),
+            cursor: CursorShape::Default,
+        },
+    ]
+}
+
+fn hit_test(nodes: &[Node], point: Point<f64, Logical>) -> Option<&Node> {
+    nodes
+        .iter()
+        .rev()
+        .find(|node| node.action.is_some() && node.rect.to_f64().contains(point))
+}
+
+#[cfg(test)]
+fn hit(nodes: &[Node], point: Point<f64, Logical>) -> Option<DecorationAction> {
+    hit_test(nodes, point).and_then(|node| node.action)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +174,7 @@ struct Appearance {
 
 pub(super) struct Decoration {
     appearance: Option<Appearance>,
+    nodes: Vec<Node>,
     buffers: [MemoryRenderBuffer; 2],
 }
 
@@ -82,6 +182,7 @@ impl Default for Decoration {
     fn default() -> Self {
         Self {
             appearance: None,
+            nodes: Vec::new(),
             buffers: std::array::from_fn(|_| {
                 MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None)
             }),
@@ -90,33 +191,21 @@ impl Default for Decoration {
 }
 
 impl Decoration {
-    #[expect(
-        clippy::float_cmp,
-        reason = "cache keys compare the exact configured output scale"
-    )]
     fn update(&mut self, appearance: Appearance) -> Result<bool> {
         if self.appearance.as_ref() == Some(&appearance) {
             return Ok(false);
         }
-        for (buffer, height) in self.buffers.iter_mut().zip([BAR, STRIP]) {
-            if self.appearance.as_ref().is_some_and(|previous| {
-                previous.scale == appearance.scale
-                    && previous.active == appearance.active
-                    && if height == BAR {
-                        previous.width == appearance.width
-                            && previous.title == appearance.title
-                            && previous.pressed == appearance.pressed
-                            && (previous.hover == Some(DecorationAction::Close))
-                                == (appearance.hover == Some(DecorationAction::Close))
-                    } else {
-                        previous.width.min(24) == appearance.width.min(24)
-                            && (previous.hover == Some(DecorationAction::Resize))
-                                == (appearance.hover == Some(DecorationAction::Resize))
-                    }
-            }) {
+        let next = nodes((appearance.width, 0).into(), &appearance, Theme::dark());
+        for (index, (buffer, height)) in self.buffers.iter_mut().zip([BAR, STRIP]).enumerate() {
+            let node = &next[[0, 2][index]];
+            if self
+                .nodes
+                .get([0, 2][index])
+                .is_some_and(|old| old.style == node.style && old.rect.size == node.rect.size)
+            {
                 continue;
             }
-            let mut surface = paint(&appearance, height)?;
+            let mut surface = paint_nodes(&next, height)?;
             let size = (surface.width(), surface.height()).into();
             let mut target = buffer.render();
             target.resize(size);
@@ -127,6 +216,7 @@ impl Decoration {
                 Ok::<_, anyhow::Error>(vec![Rectangle::from_size(size)])
             })?;
         }
+        self.nodes = next;
         self.appearance = Some(appearance);
         Ok(true)
     }
@@ -134,13 +224,15 @@ impl Decoration {
     fn elements(
         &self,
         renderer: &mut PixmanRenderer,
-        layout: &Layout,
+        size: Size<i32, Logical>,
         location: Point<i32, Logical>,
         scale: f64,
     ) -> Result<Vec<MemoryRenderBufferRenderElement<PixmanRenderer>>> {
+        let mut rects = [self.nodes[0].rect, self.nodes[2].rect];
+        rects[1].loc.y = size.h;
         self.buffers
             .iter()
-            .zip([layout.bar(), layout.resize()])
+            .zip(rects)
             .map(|(buffer, rect)| {
                 let pixels = raster_size(rect.size, scale);
                 Ok(MemoryRenderBufferRenderElement::from_buffer(
@@ -186,37 +278,53 @@ fn color(context: &cairo::Context, rgb: u32) {
     );
 }
 
-fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
-    let width = if height == BAR {
-        appearance.width
-    } else {
-        appearance.width.min(24)
+fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
+    let node = &nodes[if height == BAR { 0 } else { 2 }];
+    let (theme, scale, active, hovered, pressed, title) = match &node.style {
+        NodeStyle::Titlebar {
+            title,
+            scale,
+            active,
+            close_hovered,
+            pressed,
+            theme,
+        } => (
+            *theme,
+            *scale,
+            *active,
+            *close_hovered,
+            *pressed,
+            title.as_str(),
+        ),
+        NodeStyle::Grip {
+            scale,
+            active,
+            hovered,
+            theme,
+        } => (*theme, *scale, *active, *hovered, false, ""),
+        NodeStyle::Hit => anyhow::bail!("hit-only node cannot be painted"),
     };
+    let width = node.rect.size.w;
     let size: Size<i32, Logical> = (width, height).into();
-    let pixels = raster_size(size, appearance.scale);
+    let pixels = raster_size(size, scale);
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pixels.w, pixels.h)?;
     let context = cairo::Context::new(&surface)?;
     context.scale(
         f64::from(pixels.w) / f64::from(size.w),
         f64::from(pixels.h) / f64::from(size.h),
     );
-    let (background, foreground, border) = if appearance.active {
-        (0x0027_2e39, 0x00e7_ebf0, 0x0046_5164)
-    } else {
-        (0x0020_252d, 0x0098_a2b2, 0x0030_3743)
-    };
+    let (background, foreground, border) = if active { theme.active } else { theme.inactive };
     color(&context, background);
     context.paint()?;
-    let layout = Layout((width, 0).into());
     if height == BAR {
-        let close = layout.close();
-        if appearance.hover == Some(DecorationAction::Close) {
+        let close = nodes[1].rect;
+        if hovered {
             color(
                 &context,
-                if appearance.pressed {
-                    0x85_29_36
+                if pressed {
+                    theme.close_pressed
                 } else {
-                    0xb8_32_45
+                    theme.close_hover
                 },
             );
             context.rectangle(
@@ -228,7 +336,7 @@ fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
             context.fill()?;
         }
         color(&context, foreground);
-        draw_title(&context, &appearance.title, (close.loc.x - 24).max(0))?;
+        draw_title(&context, title, (close.loc.x - 24).max(0), theme)?;
         context.save()?;
         context.rectangle(
             f64::from(close.loc.x),
@@ -240,8 +348,8 @@ fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
         let x = f64::from(close.loc.x) + f64::from(close.size.w) / 2.0;
         color(
             &context,
-            if appearance.hover == Some(DecorationAction::Close) {
-                0xff_ff_ff
+            if hovered {
+                theme.close_hover_foreground
             } else {
                 foreground
             },
@@ -255,21 +363,7 @@ fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
         context.stroke()?;
         context.restore()?;
     } else {
-        color(
-            &context,
-            if appearance.hover == Some(DecorationAction::Resize) {
-                0xe7_eb_f0
-            } else {
-                0x76_83_99
-            },
-        );
-        context.set_line_width(1.0);
-        let right = f64::from(layout.resize().loc.x + layout.resize().size.w) - 4.0;
-        for offset in [0.0, 4.0, 8.0] {
-            context.move_to(right - offset - 3.0, 5.5);
-            context.line_to(right - offset, 2.5);
-        }
-        context.stroke()?;
+        draw_grip(&context, width, hovered, theme)?;
     }
     color(&context, border);
     context.rectangle(0.0, f64::from(height - 1), f64::from(width), 1.0);
@@ -278,13 +372,32 @@ fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
     Ok(surface)
 }
 
-fn draw_title(context: &cairo::Context, title: &str, width: i32) -> Result<()> {
+fn draw_grip(context: &cairo::Context, width: i32, hovered: bool, theme: Theme) -> Result<()> {
+    color(
+        context,
+        if hovered {
+            theme.grip_hover
+        } else {
+            theme.grip_foreground
+        },
+    );
+    context.set_line_width(1.0);
+    let right = f64::from(width) - 4.0;
+    for offset in [0.0, 4.0, 8.0] {
+        context.move_to(right - offset - 3.0, 5.5);
+        context.line_to(right - offset, 2.5);
+    }
+    context.stroke()?;
+    Ok(())
+}
+
+fn draw_title(context: &cairo::Context, title: &str, width: i32, theme: Theme) -> Result<()> {
     if width == 0 {
         return Ok(());
     }
     // Absolute logical-pixel size avoids depending on the host's font DPI.
     let mut font = pango::FontDescription::from_string("Sans");
-    font.set_absolute_size(13.0 * f64::from(pango::SCALE));
+    font.set_absolute_size(f64::from(theme.title_size * pango::SCALE));
     let text = pangocairo::functions::create_layout(context);
     let mut options = cairo::FontOptions::new()?;
     options.set_antialias(cairo::Antialias::Gray);
@@ -295,9 +408,17 @@ fn draw_title(context: &cairo::Context, title: &str, width: i32) -> Result<()> {
     text.set_width(width * pango::SCALE);
     text.set_text(title);
     context.save()?;
-    context.rectangle(12.0, 0.0, f64::from(width), f64::from(BAR));
+    context.rectangle(
+        f64::from(theme.title_padding),
+        0.0,
+        f64::from(width),
+        f64::from(BAR),
+    );
     context.clip();
-    context.move_to(12.0, f64::from(BAR - text.pixel_size().1) / 2.0);
+    context.move_to(
+        f64::from(theme.title_padding),
+        f64::from(BAR - text.pixel_size().1) / 2.0,
+    );
     pangocairo::functions::show_layout(context, &text);
     context.restore()?;
     Ok(())
@@ -341,6 +462,19 @@ impl State {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(Window, DecorationAction)> {
+        self.decoration_node_under(point)
+            .and_then(|(window, node)| Some((window, node.action?)))
+    }
+
+    pub(super) fn decoration_cursor_under(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<CursorShape> {
+        self.decoration_node_under(point)
+            .map(|(_, node)| node.cursor)
+    }
+
+    fn decoration_node_under(&self, point: Point<f64, Logical>) -> Option<(Window, Node)> {
         for window in self.space.elements().rev() {
             let location = self.space.element_location(window)?;
             let surface_location = location - window.geometry().loc;
@@ -356,15 +490,22 @@ impl State {
             {
                 continue;
             }
-            let layout = Layout(
-                (
-                    decoration_width(window.geometry().size.w, self.size.width()),
-                    window.geometry().size.h,
-                )
-                    .into(),
-            );
-            if let Some(action) = layout.hit(point - location.to_f64()) {
-                return Some((window.clone(), action));
+            let size: Size<i32, Logical> = (
+                decoration_width(window.geometry().size.w, self.size.width()),
+                window.geometry().size.h,
+            )
+                .into();
+            let appearance = Appearance {
+                title: String::new(),
+                width: size.w,
+                scale: 1.0,
+                active: false,
+                hover: None,
+                pressed: false,
+            };
+            let nodes = nodes(size, &appearance, Theme::dark());
+            if let Some(node) = hit_test(&nodes, point - location.to_f64()) {
+                return Some((window.clone(), node.clone()));
             }
         }
         None
@@ -454,7 +595,7 @@ impl State {
                 tracing::warn!(%error, "decoration update failed; skipping window decoration");
                 continue;
             }
-            match decoration.elements(renderer, &Layout((width, size.h).into()), location, scale) {
+            match decoration.elements(renderer, (width, size.h).into(), location, scale) {
                 Ok(parts) => elements.extend(parts.into_iter().map(Into::into)),
                 Err(error) => {
                     tracing::warn!(%error, "decoration elements failed; skipping window decoration");
@@ -485,6 +626,38 @@ mod tests {
         }
     }
 
+    fn paint(appearance: &Appearance, height: i32) -> Result<cairo::ImageSurface> {
+        paint_nodes(
+            &nodes((appearance.width, 0).into(), appearance, Theme::dark()),
+            height,
+        )
+    }
+
+    #[test]
+    fn node_actions_and_cursors_match_hit_test() {
+        let nodes = nodes((101, 57).into(), &appearance(1.0), Theme::dark());
+        for (index, rect, action, point) in [
+            (
+                1,
+                Rectangle::new((69, -32).into(), (32, 32).into()),
+                DecorationAction::Close,
+                (80.0, -10.0),
+            ),
+            (
+                2,
+                Rectangle::new((77, 57).into(), (24, 8).into()),
+                DecorationAction::Resize,
+                (80.0, 60.0),
+            ),
+        ] {
+            assert_eq!(nodes[index].rect, rect);
+            assert_eq!(nodes[index].action, Some(action));
+            let found = hit_test(&nodes, point.into()).expect("node hit");
+            assert_eq!(found.action, Some(action));
+            assert_eq!(found.cursor, nodes[index].cursor);
+        }
+    }
+
     #[test]
     fn a_very_wide_window_clamps_its_decoration_to_the_output_width() {
         let output_width = 3840_u32;
@@ -506,17 +679,20 @@ mod tests {
 
         // Hit testing follows the clamped paint: the close button sits at the
         // clamped right edge, not at the window's own right edge.
-        let layout = Layout((look.width, 57).into());
+        let layout = nodes((look.width, 57).into(), &look, Theme::dark());
         assert_eq!(
-            layout.hit((f64::from(look.width) - 1.0, -1.0).into()),
+            hit(&layout, (f64::from(look.width) - 1.0, -1.0).into()),
             Some(DecorationAction::Close)
         );
-        assert_eq!(layout.hit((f64::from(look.width) + 0.5, -1.0).into()), None);
+        assert_eq!(
+            hit(&layout, (f64::from(look.width) + 0.5, -1.0).into()),
+            None
+        );
     }
 
     #[test]
     fn hit_regions_match_painted_edges_including_narrow_windows() {
-        let layout = Layout((101, 57).into());
+        let layout = nodes((101, 57).into(), &appearance(1.0), Theme::dark());
         for (point, expected) in [
             ((-0.1, -1.0), None),
             ((0.0, -32.1), None),
@@ -532,19 +708,19 @@ mod tests {
             ((99.0, 65.0), None),
             ((101.0, 58.0), None),
         ] {
-            assert_eq!(layout.hit(point.into()), expected, "{point:?}");
+            assert_eq!(hit(&layout, point.into()), expected, "{point:?}");
         }
-        let narrow = Layout((13, 57).into());
-        assert_eq!(narrow.close(), narrow.bar());
+        let narrow = nodes((13, 57).into(), &appearance(1.0), Theme::dark());
+        assert_eq!(narrow[1].rect, narrow[0].rect);
         assert_eq!(
-            narrow.resize(),
+            narrow[2].rect,
             Rectangle::new((0, 57).into(), (13, 8).into())
         );
         assert_eq!(
-            narrow.hit((12.9, -1.0).into()),
+            hit(&narrow, (12.9, -1.0).into()),
             Some(DecorationAction::Close)
         );
-        assert_eq!(narrow.hit((13.0, -1.0).into()), None);
+        assert_eq!(hit(&narrow, (13.0, -1.0).into()), None);
     }
 
     #[test]
@@ -647,7 +823,7 @@ mod tests {
                 let parts = cache
                     .elements(
                         &mut renderer,
-                        &Layout((look.width, 53).into()),
+                        (look.width, 53).into(),
                         (10, 42).into(),
                         scale,
                     )

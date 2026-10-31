@@ -585,6 +585,9 @@ impl State {
         }) {
             self.decoration_press = None;
         }
+        if let Some(shape) = self.decoration_cursor_under(location) {
+            self.emit(Event::CursorShape(shape));
+        }
         self.emit(Event::CursorPosition(pipe::CursorPosition {
             x: normalized_coordinate(location.x * scale, self.size.width()),
             y: normalized_coordinate(location.y * scale, self.size.height()),
