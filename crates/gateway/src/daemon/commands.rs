@@ -23,6 +23,7 @@ use crate::video::Readiness;
 pub(super) const COMMAND_COUNT: usize = 128;
 pub(super) const COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const PIPE_DEADLINE: Duration = Duration::from_secs(2);
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authority {
@@ -277,6 +278,8 @@ pub(super) enum CommandWriterError {
     QueueClosed,
     #[error("write daemon command: {0}")]
     Write(#[source] std::io::Error),
+    #[error("daemon command write stalled after {WRITE_DEADLINE:?}")]
+    WriteStalled,
 }
 
 pub(super) async fn write_commands<W>(
@@ -288,9 +291,11 @@ where
 {
     while let Some(command) = commands.recv().await {
         let AuthorizedCommand { encoded, permit } = command;
-        let write_result = output.write_all(&encoded).await;
+        let write_result = timeout(WRITE_DEADLINE, output.write_all(&encoded)).await;
         drop(permit);
-        write_result.map_err(CommandWriterError::Write)?;
+        write_result
+            .map_err(|_elapsed| CommandWriterError::WriteStalled)?
+            .map_err(CommandWriterError::Write)?;
     }
     Err(CommandWriterError::QueueClosed)
 }
@@ -327,7 +332,7 @@ mod tests {
         CommandSink::new(capacity, COMMAND_BYTES, fatal, Readiness::new())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn slow_pipe_write_remains_pending_and_resumes() {
         let (commands, reader) = command_sink(1);
         let (mut input, output) = tokio::io::duplex(1);
@@ -338,7 +343,7 @@ mod tests {
             .browser_system(record)
             .await
             .expect("queue command");
-        tokio::time::sleep(PIPE_DEADLINE + Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             !writer.is_finished(),
             "a blocked pipe must not stop the session"
@@ -354,6 +359,25 @@ mod tests {
             writer.await.expect("writer task"),
             Err(CommandWriterError::QueueClosed)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_pipe_write_fails_after_thirty_seconds() {
+        let (commands, reader) = command_sink(1);
+        let (_input, output) = tokio::io::duplex(1);
+        let writer = tokio::spawn(write_commands(output, reader));
+        commands
+            .browser_system(Command::ReleaseAll(ReleaseAll))
+            .await
+            .expect("queue command");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let error = timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("writer must stop")
+            .expect("writer task")
+            .expect_err("stalled write must fail");
+        assert!(matches!(error, CommandWriterError::WriteStalled));
     }
 
     #[tokio::test]
