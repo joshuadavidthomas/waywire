@@ -121,7 +121,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
                 state.window_action(&self.window, WindowAction::Maximize);
             }
             Request::UnsetMaximized => {
-                state.window_action(&self.window, WindowAction::Restore);
+                state.set_window_expanded(&self.window, xdg_toplevel::State::Maximized, false);
             }
             Request::SetFullscreen { output: _ } => {
                 state.set_window_expanded(&self.window, xdg_toplevel::State::Fullscreen, true);
@@ -129,11 +129,15 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
             Request::UnsetFullscreen => {
                 state.set_window_expanded(&self.window, xdg_toplevel::State::Fullscreen, false);
             }
-            Request::SetMinimized | Request::UnsetMinimized => {
-                // There is no taskbar or minimized state yet. Ignoring the
-                // request keeps the protocol's only required outcome: the
-                // state event remains unchanged.
-                tracing::debug!(?self.window, "ignored foreign toplevel minimize request");
+            Request::SetMinimized => state.window_action(&self.window, WindowAction::Minimize),
+            Request::UnsetMinimized => {
+                if state
+                    .windows
+                    .get(&self.window)
+                    .is_some_and(|window| window.minimized)
+                {
+                    state.window_action(&self.window, WindowAction::Restore);
+                }
             }
             // Destroy, the rectangle hint, and any future requests are
             // passive; the generated request enum is non-exhaustive.
@@ -151,8 +155,8 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
     }
 }
 
-/// The states exposed by the protocol. Minimized is deliberately never sent.
-pub(crate) fn states(window: &Window, activated: bool) -> Vec<u32> {
+/// The states exposed by the protocol.
+pub(crate) fn states(window: &Window, activated: bool, minimized: bool) -> Vec<u32> {
     let (maximized, fullscreen) = if let Some(top) = window.toplevel() {
         top.with_pending_state(|state| {
             (
@@ -174,6 +178,9 @@ pub(crate) fn states(window: &Window, activated: bool) -> Vec<u32> {
     }
     if activated {
         states.push(zwlr_foreign_toplevel_handle_v1::State::Activated as u32);
+    }
+    if minimized {
+        states.push(zwlr_foreign_toplevel_handle_v1::State::Minimized as u32);
     }
     states
 }
@@ -351,11 +358,18 @@ impl ForeignToplevels {
     }
 
     /// Refresh the states of every published window after a focus change.
-    pub(crate) fn refresh(&mut self, focused: Option<&crate::focus::KeyboardFocus>) {
-        let windows: Vec<Window> = self.toplevels.keys().cloned().collect();
-        for window in windows {
+    pub(crate) fn refresh(
+        &mut self,
+        focused: Option<&crate::focus::KeyboardFocus>,
+        minimized: &[Window],
+    ) {
+        let published: Vec<Window> = self.toplevels.keys().cloned().collect();
+        for window in published {
             let activated = crate::focus::KeyboardFocus::window(&window).as_ref() == focused;
-            self.update_states(&window, states(&window, activated));
+            self.update_states(
+                &window,
+                states(&window, activated, minimized.contains(&window)),
+            );
         }
     }
 

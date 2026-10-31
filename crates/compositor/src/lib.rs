@@ -1264,6 +1264,7 @@ impl State {
                     if focused == focus::KeyboardFocus::window(window) {
                         self.focus_window(self.topmost_focusable(Some(window)));
                     }
+                    self.refresh_toplevel_states();
                     self.refresh_pointer_focus();
                     self.dirty = true;
                 }
@@ -1362,7 +1363,8 @@ impl State {
             .seat
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
-        self.toplevel_list.refresh_states(focused.as_ref());
+        self.toplevel_list
+            .refresh_states(focused.as_ref(), &self.minimized_order);
     }
 
     pub(crate) fn release_input(&mut self, source: KeyboardSource) {

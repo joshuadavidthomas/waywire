@@ -56,8 +56,11 @@ impl ToplevelList {
             .state
             .new_toplevel::<State>(title.clone(), app_id.clone());
         self.handles.insert(window.clone(), handle);
-        let states =
-            crate::foreign_toplevel::states(window, crate::foreign_toplevel::activated(window));
+        let states = crate::foreign_toplevel::states(
+            window,
+            crate::foreign_toplevel::activated(window),
+            false,
+        );
         self.foreign.publish(window, title, app_id, states);
     }
 
@@ -79,8 +82,12 @@ impl ToplevelList {
 
     /// Refresh the foreign-toplevel states of every window after a focus
     /// change. Commits do not call this.
-    pub(crate) fn refresh_states(&mut self, focused: Option<&crate::focus::KeyboardFocus>) {
-        self.foreign.refresh(focused);
+    pub(crate) fn refresh_states(
+        &mut self,
+        focused: Option<&crate::focus::KeyboardFocus>,
+        minimized: &[Window],
+    ) {
+        self.foreign.refresh(focused, minimized);
     }
 
     /// Close the window's handle; the entry is removed when the window unmaps
@@ -2400,6 +2407,26 @@ mod tests {
             managed_states(&app, "B").is_empty(),
             "the previously focused window is deactivated"
         );
+    }
+
+    #[test]
+    fn foreign_minimize_reports_state_and_unmaximize_keeps_it_hidden() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        let handle = managed_handle(&app, "Window");
+        handle.set_maximized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        handle.set_minimized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(managed_states(&app, "Window").contains(&(WlrState::Minimized as u32)));
+        handle.unset_maximized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(!managed_states(&app, "Window").contains(&(WlrState::Maximized as u32)));
+        handle.unset_minimized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(!state.windows.get(&window).expect("window").minimized);
+        assert!(!managed_states(&app, "Window").contains(&(WlrState::Minimized as u32)));
     }
 
     #[test]
