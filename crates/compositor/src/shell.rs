@@ -652,10 +652,16 @@ impl State {
         else {
             return;
         };
-        let (Some(mut target), Some(window_geo)) = (
-            self.space.output_geometry(&self.output),
-            self.space.element_geometry(window),
-        ) else {
+        let fullscreen = window.toplevel().is_some_and(|top| {
+            top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
+        });
+        let target = if fullscreen {
+            self.space.output_geometry(&self.output)
+        } else {
+            self.work_area()
+        };
+        let (Some(mut target), Some(window_geo)) = (target, self.space.element_geometry(window))
+        else {
             return;
         };
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));

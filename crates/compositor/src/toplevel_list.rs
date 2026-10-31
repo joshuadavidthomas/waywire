@@ -208,6 +208,14 @@ mod tests {
     use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{
         self as relative,
     };
+    use wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
+    use wayland_protocols::xdg::shell::client::xdg_popup::{
+        self,
+    };
+    use wayland_protocols::xdg::shell::client::xdg_positioner::XdgPositioner;
+    use wayland_protocols::xdg::shell::client::xdg_positioner::{
+        self,
+    };
     use wayland_protocols::xdg::shell::client::xdg_surface::XdgSurface;
     use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
     use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
@@ -249,6 +257,7 @@ mod tests {
         relative: Vec<(f64, f64)>,
         preferred_scales: Vec<i32>,
         refresh_rates: Vec<i32>,
+        popup_geometry: Option<(i32, i32, i32, i32)>,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -402,9 +411,31 @@ mod tests {
     }
 
     wayland_client::delegate_noop!(App: ignore WlSeat);
+    wayland_client::delegate_noop!(App: ignore XdgPositioner);
     wayland_client::delegate_noop!(App: ignore ZwpPointerConstraintsV1);
     wayland_client::delegate_noop!(App: ignore ZwpRelativePointerManagerV1);
     wayland_client::delegate_noop!(App: ignore wayland_client::protocol::wl_region::WlRegion);
+
+    impl Dispatch<XdgPopup, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &XdgPopup,
+            event: xdg_popup::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } = event
+            {
+                state.popup_geometry = Some((x, y, width, height));
+            }
+        }
+    }
 
     impl Dispatch<ZwpLockedPointerV1, ()> for App {
         fn event(
@@ -1206,6 +1237,48 @@ mod tests {
             state.space.element_location(&window),
             Some((1900, 1047).into())
         );
+    }
+
+    #[test]
+    fn popup_is_constrained_above_taskbar() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, parent, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "parent",
+            "parent",
+        );
+        let window = top_window(&state);
+        state.space.map_element(window, (100, 1000), true);
+        let qh = queue.handle();
+        let positioner = app
+            .wm_base
+            .as_ref()
+            .expect("wm base")
+            .create_positioner(&qh, ());
+        positioner.set_size(100, 100);
+        positioner.set_anchor_rect(0, 40, 1, 1);
+        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideY);
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("wm base")
+            .get_xdg_surface(&surface, &qh, ());
+        let _popup = xdg.get_popup(Some(&parent), &positioner, &qh, ());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, y, _, height) = app.popup_geometry.expect("popup configure");
+        assert_eq!(1000 + y + height, 1048);
     }
 
     #[test]
