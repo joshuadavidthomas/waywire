@@ -41,22 +41,10 @@ _(hypothesis)_ were traced in code but not reproduced against a real client.
 An agent session that dies mid-task is worse than one with a visual glitch.
 Each fix here is small and independent.
 
-- **Medium:** a silently dead input owner keeps control indefinitely. The
-  control socket has no read deadline, and the server sends no pings
-  (`crates/gateway/src/http/control.rs`). The client pings every second, so end
-  the socket after 5–10 s of silence.
-- **Medium:** RTP loss can freeze every viewer on a stale picture. Assembler
-  drops are only counted and never request a keyframe
-  (`crates/gateway/src/video.rs`). On a quiet desktop, `/healthz` stays `ok`.
-  Send `KeyframeReadiness::Missing` when the assembler starts recovering.
 - **Medium:** a 2 s stall in the command pipe ends the session. Browser command
   errors go through `fail()` (`crates/gateway/src/daemon/commands.rs`). Close
   only the offending socket, and make the video worker's readiness send
   non-blocking. _(The browser trigger is a hypothesis.)_
-- **Medium:** a full compositor event queue ends the session. Clipboard events
-  of up to 1 MiB are never replaced in the 4 MiB queue
-  (`crates/compositor/src/event_writer.rs`). Keep only the latest clipboard
-  event.
 - **Medium:** a client can crash the compositor with a decoration wider than
   Cairo's 32767 px limit (`crates/compositor/src/decorations.rs`). Clamp the
   width and skip a decoration that fails to paint.
@@ -64,11 +52,10 @@ Each fix here is small and independent.
   3840×2160 (`crates/gateway/web/src/sdk/resize.ts`,
   `crates/protocol/src/pipe.rs`). A rejected resize closes the input socket.
   Share the pixel cap.
-- **Low:** a video worker panic freezes video without an error. FFmpeg crash
-  loops never become fatal. Xwayland starts with SIGTERM blocked. A slow socket
-  drain can cut short process-group cleanup on shutdown.
+- **Low:** Xwayland starts with SIGTERM blocked. A slow socket drain can cut
+  short process-group cleanup on shutdown.
 - **Low:** a malformed browser record closes the whole input socket instead of
-  being dropped. Video reconnects retry every 250 ms without backoff.
+  being dropped.
 
 ## 2. Agent control plane
 
