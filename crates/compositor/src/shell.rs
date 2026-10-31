@@ -624,6 +624,7 @@ impl State {
         });
         surface.send_pending_configure();
         self.space.map_element(window, geometry.loc, true);
+        self.enforce_topmost();
         self.refresh_pointer_focus();
         self.refresh_toplevel_states();
         self.dirty = true;

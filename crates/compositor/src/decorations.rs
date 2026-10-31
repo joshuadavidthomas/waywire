@@ -596,6 +596,7 @@ pub(super) struct WindowMenu {
     pub(super) window: Window,
     location: Point<i32, Logical>,
     maximized: bool,
+    always_on_top: bool,
     painted: bool,
     hover: Option<usize>,
     buffer: MemoryRenderBuffer,
@@ -606,6 +607,7 @@ impl WindowMenu {
         window: Window,
         point: Point<f64, Logical>,
         output: Size<i32, Logical>,
+        always_on_top: bool,
     ) -> Self {
         let maximized = window_flags(&window).1;
         let point = point.to_i32_round::<i32>();
@@ -617,6 +619,7 @@ impl WindowMenu {
             )
                 .into(),
             maximized,
+            always_on_top,
             painted: false,
             hover: None,
             buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
@@ -650,6 +653,7 @@ impl WindowMenu {
             } else {
                 super::WindowAction::Maximize
             }),
+            2 => Some(super::WindowAction::ToggleAlwaysOnTop),
             3 if !self.maximized => Some(super::WindowAction::Move),
             4 if !self.maximized => Some(super::WindowAction::Resize(
                 xdg_toplevel::ResizeEdge::BottomRight,
@@ -727,6 +731,12 @@ impl WindowMenu {
                 );
                 draw_title(&context, label, MENU_WIDTH - theme.title_padding * 2, theme)?;
                 context.restore()?;
+                if index == 2 && self.always_on_top {
+                    context.move_to(f64::from(MENU_WIDTH - 20), f64::from(MENU_ROW * 2 + 13));
+                    context.line_to(f64::from(MENU_WIDTH - 17), f64::from(MENU_ROW * 2 + 16));
+                    context.line_to(f64::from(MENU_WIDTH - 11), f64::from(MENU_ROW * 2 + 9));
+                    context.stroke()?;
+                }
             }
             color(&context, theme.active.2);
             context.set_line_width(1.0);

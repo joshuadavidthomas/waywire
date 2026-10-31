@@ -1047,12 +1047,10 @@ mod tests {
     #[test]
     fn disabled_menu_items_do_nothing() {
         let (_, mut state, _, _, _, window) = action_fixture();
-        for row in [0, 2] {
-            click_menu_item(&mut state, &window, row);
-            assert!(state.window_menu.is_some());
-            assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
-            state.window_menu = None;
-        }
+        click_menu_item(&mut state, &window, 0);
+        assert!(state.window_menu.is_some());
+        assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
+        state.window_menu = None;
         state.window_action(&window, crate::WindowAction::Maximize);
         for row in [3, 4] {
             click_menu_item(&mut state, &window, row);
@@ -1060,6 +1058,33 @@ mod tests {
             assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
             state.window_menu = None;
         }
+    }
+
+    #[test]
+    fn menu_always_on_top_preserves_stacking_when_focusing_other_window() {
+        let (mut display, mut state, connection, mut queue, mut app, pinned) = action_fixture();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Other",
+            "other",
+        );
+        let other = top_window(&state);
+        click_menu_item(&mut state, &pinned, 2);
+        assert!(state.windows.get(&pinned).expect("window").always_on_top);
+        state.focus_window(Some(other.clone()));
+        assert_eq!(top_window(&state), pinned);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&other)
+        );
+        click_menu_item(&mut state, &pinned, 2);
+        assert!(!state.windows.get(&pinned).expect("window").always_on_top);
+        state.focus_window(Some(other.clone()));
+        assert_eq!(top_window(&state), other);
     }
 
     #[test]
@@ -1586,6 +1611,35 @@ mod tests {
         assert_eq!(
             state.seat.get_keyboard().expect("keyboard").current_focus(),
             KeyboardFocus::window(&child)
+        );
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        state.window_action(&parent, crate::WindowAction::ToggleAlwaysOnTop);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Other",
+            "other",
+        );
+        let other = state
+            .space
+            .elements()
+            .find(|window| *window != &parent && *window != &child)
+            .cloned()
+            .expect("other window");
+        state.focus_window(Some(other));
+        assert_eq!(
+            top_window(&state),
+            child,
+            "dialog stays above always-on-top parent and normal windows"
+        );
+        state.window_action(&parent, crate::WindowAction::Maximize);
+        assert_eq!(
+            top_window(&state),
+            child,
+            "maximizing the parent keeps its dialog above it"
         );
     }
 

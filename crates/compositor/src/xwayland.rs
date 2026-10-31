@@ -345,6 +345,7 @@ impl XwmHandler for State {
         let location = smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset));
         geometry.loc = location - window.geometry().loc;
         self.space.map_element(window.clone(), location, true);
+        self.enforce_topmost();
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);
         self.center_dialog(&window);
@@ -399,6 +400,7 @@ impl XwmHandler for State {
             && let Some(window) = self.x11_window(&surface)
         {
             self.space.raise_element(&window, false);
+            self.enforce_topmost();
             self.refresh_pointer_focus();
         }
     }
@@ -420,6 +422,7 @@ impl XwmHandler for State {
                     .cloned()
             }) {
                 self.space.raise_element_above(&window, &reference, false);
+                self.enforce_topmost();
             }
         }
         self.refresh_pointer_focus();

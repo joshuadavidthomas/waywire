@@ -35,6 +35,7 @@ use super::State;
 #[derive(Default)]
 pub(super) struct WindowState {
     pub mapped: bool,
+    pub always_on_top: bool,
     pub decoration: Option<super::decorations::Decoration>,
     pub restore: Option<Rectangle<i32, Logical>>,
     pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
@@ -277,6 +278,7 @@ impl PointerGrab<State> for WindowGrab {
         } else {
             let location = (self.initial.loc.to_f64() + delta).to_i32_round();
             state.space.map_element(self.window.clone(), location, true);
+            state.enforce_topmost();
             if let Some(surface) = self.window.x11_surface()
                 && let Err(error) = surface.configure(Some(Rectangle::new(
                     location - self.window.geometry().loc,

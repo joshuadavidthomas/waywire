@@ -167,6 +167,7 @@ pub(crate) enum WindowAction {
     Restore,
     Close,
     ShowMenu,
+    ToggleAlwaysOnTop,
 }
 
 #[expect(
@@ -674,6 +675,7 @@ impl State {
                 ))
                 .to_i32_round();
                 self.space.map_element(press.window.clone(), position, true);
+                self.enforce_topmost();
                 if let Some(surface) = press.window.x11_surface()
                     && let Err(error) = surface.configure(Some(
                         smithay::utils::Rectangle::new(position, restored_size)
@@ -953,6 +955,12 @@ impl State {
                 self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
             }
             WindowAction::Close => Self::close_window(window),
+            WindowAction::ToggleAlwaysOnTop => {
+                let state = self.windows.entry(window.clone()).or_default();
+                state.always_on_top = !state.always_on_top;
+                self.enforce_topmost();
+                self.dirty = true;
+            }
             WindowAction::ShowMenu => {
                 if let (Some(pointer), Some(output)) = (
                     self.seat.get_pointer(),
@@ -962,6 +970,9 @@ impl State {
                         window.clone(),
                         pointer.current_location(),
                         output.size,
+                        self.windows
+                            .get(window)
+                            .is_some_and(|state| state.always_on_top),
                     ));
                     self.refresh_pointer_focus();
                     self.dirty = true;
@@ -1120,6 +1131,50 @@ impl State {
             .collect()
     }
 
+    pub(crate) fn enforce_topmost(&mut self) {
+        let mut topmost: Vec<_> = self
+            .space
+            .elements()
+            .filter(|window| {
+                let mut current = Some((*window).clone());
+                let mut visited = Vec::new();
+                while let Some(target) = current {
+                    if visited.contains(&target) {
+                        break;
+                    }
+                    if self
+                        .windows
+                        .get(&target)
+                        .is_some_and(|state| state.always_on_top)
+                    {
+                        return true;
+                    }
+                    current = self.parent_window(&target);
+                    visited.push(target);
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        topmost.sort_by_key(|window| {
+            let mut depth = 0;
+            let mut current = self.parent_window(window);
+            let mut visited = vec![window.clone()];
+            while let Some(parent) = current {
+                if visited.contains(&parent) {
+                    break;
+                }
+                depth += 1;
+                current = self.parent_window(&parent);
+                visited.push(parent);
+            }
+            depth
+        });
+        for window in topmost {
+            self.space.raise_element(&window, false);
+        }
+    }
+
     pub(crate) fn center_dialog(&mut self, window: &Window) {
         let Some(parent) = self.parent_window(window) else {
             return;
@@ -1165,6 +1220,7 @@ impl State {
                     tracing::warn!(%error, "raise X11 window");
                 }
             }
+            self.enforce_topmost();
             let mut visited = Vec::new();
             while let Some(target) = &window {
                 if visited.contains(target) {
