@@ -342,7 +342,20 @@ impl XwmHandler for State {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Modulo 8.
         let offset = (self.space.elements().count() % 8) as i32 * 48;
         let window = Window::new_x11_window(surface.clone());
-        let location = smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset));
+        let hint_position = surface.size_hints().and_then(|hints| hints.position);
+        if geometry.loc == (0, 0).into()
+            && let Some((_, x, y)) = hint_position
+        {
+            geometry.loc = smithay::utils::Point::<i32, smithay::utils::Physical>::from((x, y))
+                .to_f64()
+                .to_logical(self.output.current_scale().fractional_scale().max(1.0))
+                .to_i32_round();
+        }
+        let location = if hint_position.is_some() || geometry.loc != (0, 0).into() {
+            geometry.loc + window.geometry().loc
+        } else {
+            smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset))
+        };
         geometry.loc = location - window.geometry().loc;
         self.space.map_element(window.clone(), location, true);
         self.mapped_order.push(window.clone());
@@ -382,14 +395,20 @@ impl XwmHandler for State {
         &mut self,
         _: XwmId,
         surface: X11Surface,
-        _: Option<i32>,
-        _: Option<i32>,
+        x: Option<i32>,
+        y: Option<i32>,
         width: Option<u32>,
         height: Option<u32>,
         reorder: Option<Reorder>,
     ) {
         let mut geometry = surface.last_configure();
         if !surface.is_fullscreen() && !surface.is_maximized() {
+            if let Some(x) = x {
+                geometry.loc.x = x;
+            }
+            if let Some(y) = y {
+                geometry.loc.y = y;
+            }
             if let Some(width) = width {
                 geometry.size.w = width.clamp(1, u16::MAX.into()).cast_signed();
             }
@@ -398,6 +417,11 @@ impl XwmHandler for State {
             }
         }
         self.x11_geometry(&surface, geometry);
+        if (x.is_some() || y.is_some())
+            && let Some(window) = self.x11_window(&surface)
+        {
+            self.constrain_window(&window);
+        }
         if reorder == Some(Reorder::Top)
             && let Some(window) = self.x11_window(&surface)
         {

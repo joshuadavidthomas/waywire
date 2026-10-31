@@ -234,6 +234,104 @@ fn compositor_exits_promptly_when_the_session_program_exits() {
 }
 
 #[test]
+#[ignore = "requires FFmpeg, Xwayland, xterm and xdotool"]
+fn x11_requested_position_is_honored_and_constrained() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let marker = runtime.path().join("xterm-window");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"
+                xterm -title waywire-position -geometry 40x10+120+100 &
+                app=$!
+                trap 'kill "$app" 2>/dev/null' EXIT
+                while :; do
+                    id=$(xdotool search --pid "$app" --onlyvisible 2>/dev/null | head -n 1)
+                    [ -n "$id" ] && break
+                    sleep 0.05
+                done
+                sleep 0.5
+                printf '%s %s %s' "$DISPLAY" "$WAYLAND_DISPLAY" "$id" > "$0"
+                wait "$app"
+                "#,
+            ])
+            .arg(&marker)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "xterm did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let target = fs::read_to_string(&marker).expect("xterm target");
+    let mut target = target.split_whitespace();
+    let display = target.next().expect("display");
+    let wayland = target.next().expect("Wayland display");
+    let id = target.next().expect("window id");
+    let geometry = || {
+        let output = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(["getwindowgeometry", "--shell", id])
+            .output()
+            .expect("query geometry");
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).expect("geometry UTF-8");
+        let dimension = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .expect("geometry dimension")
+                .parse::<i32>()
+                .expect("integer dimension")
+        };
+        (
+            dimension("X="),
+            dimension("Y="),
+            dimension("WIDTH="),
+            dimension("HEIGHT="),
+        )
+    };
+    let (x, y, _, _) = geometry();
+    assert_eq!((x, y), (120, 100), "initial requested position");
+    for (x, y) in [(2000, 2000), (150, 180)] {
+        let status = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(["windowmove", id, &x.to_string(), &y.to_string()])
+            .status()
+            .expect("move window");
+        assert!(status.success());
+        thread::sleep(Duration::from_millis(300));
+        let (actual_x, actual_y, width, height) = geometry();
+        if x == 2000 {
+            assert!(actual_x >= 0 && actual_x + width <= 800);
+            assert!(actual_y >= 24 && actual_y + height <= 568);
+        } else {
+            assert_eq!((actual_x, actual_y), (x, y), "requested position");
+        }
+    }
+    if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
+        let status = ProcessCommand::new("grim")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("WAYLAND_DISPLAY", wayland)
+            .arg(path)
+            .status()
+            .expect("capture screenshot");
+        assert!(status.success());
+    }
+}
+
+#[test]
 #[ignore = "requires FFmpeg, Xwayland, distro gtk3-demo and xdotool"]
 fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
     let runtime = tempfile::tempdir().expect("runtime directory");
