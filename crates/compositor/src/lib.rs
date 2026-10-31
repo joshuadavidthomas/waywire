@@ -1631,7 +1631,9 @@ impl State {
         self.refresh_pointer_focus();
         for current in self.space.elements() {
             current.set_activated(window.as_ref() == Some(current));
-            if let Some(top) = current.toplevel() {
+            if let Some(top) = current.toplevel()
+                && top.is_initial_configure_sent()
+            {
                 top.send_pending_configure();
             }
         }

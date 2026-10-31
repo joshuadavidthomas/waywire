@@ -818,6 +818,56 @@ mod tests {
             .expect("mapped window")
     }
 
+    #[test]
+    fn uncommitted_toplevel_receives_no_configure() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as TopState;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        #[derive(Debug)]
+        enum Path {
+            Decoration,
+            Focus,
+            Resize,
+            Expand,
+        }
+        let mut premature = Vec::new();
+        for path in [Path::Decoration, Path::Focus, Path::Resize, Path::Expand] {
+            let (mut display, mut state) = crate::tests::test_state();
+            let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let qh = queue.handle();
+            let surface = app
+                .compositor
+                .as_ref()
+                .expect("compositor")
+                .create_surface(&qh, ());
+            let xdg = app
+                .wm_base
+                .as_ref()
+                .expect("xdg shell")
+                .get_xdg_surface(&surface, &qh, ());
+            let _top = xdg.get_toplevel(&qh, ());
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            let window = top_window(&state);
+            let top = window.toplevel().expect("toplevel").clone();
+            match path {
+                Path::Decoration => state.request_mode(top, Mode::ServerSide),
+                Path::Focus => state.focus_window(Some(window)),
+                Path::Resize => state.output_resized(),
+                Path::Expand => state.set_expanded(&top, TopState::Maximized, true),
+            }
+            sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+            if app.last_configure.is_some() {
+                premature.push(path);
+            }
+        }
+        assert!(
+            premature.is_empty(),
+            "premature configure from {premature:?}"
+        );
+    }
+
     fn action_fixture() -> (
         smithay::reexports::wayland_server::Display<crate::State>,
         crate::State,

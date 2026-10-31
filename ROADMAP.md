@@ -256,9 +256,6 @@ trip.
 The desktop has overlapping windows, so these policies decide whether
 mainstream apps work.
 
-- **Medium:** configures can be sent before a client's initial commit (from
-  decoration negotiation, `focus_window`, `output_resized` and
-  `set_expanded`). Guard each with `is_initial_configure_sent()`.
 - **Medium:** X11 requested positions and pre-map fullscreen or maximize are
   ignored.
 - **Medium:** a re-mapped toplevel loses its server-side decoration mode and

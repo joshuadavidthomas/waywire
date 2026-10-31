@@ -561,7 +561,9 @@ impl State {
                     }
                     expanded
                 });
-                top.send_pending_configure();
+                if top.is_initial_configure_sent() {
+                    top.send_pending_configure();
+                }
                 expanded
             } else if let Some(x11) = window.x11_surface() {
                 let expanded = x11.is_maximized() || x11.is_fullscreen();
@@ -634,7 +636,9 @@ impl State {
         surface.with_pending_state(|state| {
             state.size = Some(geometry.size);
         });
-        surface.send_pending_configure();
+        if surface.is_initial_configure_sent() {
+            surface.send_pending_configure();
+        }
         self.space.map_element(window, geometry.loc, true);
         self.enforce_topmost();
         self.refresh_pointer_focus();

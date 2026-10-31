@@ -655,7 +655,9 @@ impl XdgDecorationHandler for State {
     }
     fn request_mode(&mut self, top: ToplevelSurface, mode: Mode) {
         top.with_pending_state(|state| state.decoration_mode = Some(mode));
-        top.send_pending_configure();
+        if top.is_initial_configure_sent() {
+            top.send_pending_configure();
+        }
         self.dirty = true;
     }
     fn unset_mode(&mut self, top: ToplevelSurface) {
