@@ -612,6 +612,18 @@ impl State {
                 self.constrain_window(&window);
             }
         }
+        for popup in self.xdg_shell_state.popup_surfaces() {
+            if !popup.is_initial_configure_sent() {
+                self.unconstrain_popup(popup);
+            } else if popup
+                .with_committed_state(|state| state.is_some_and(|state| state.positioner.reactive))
+            {
+                self.unconstrain_popup(popup);
+                if let Err(error) = popup.send_pending_configure() {
+                    tracing::warn!(%error, "reconfigure popup after output resize");
+                }
+            }
+        }
         if let Some(pointer) = self.seat.get_pointer() {
             self.pointer_motion(KeyboardSource::MAIN, pointer.current_location());
         }

@@ -1597,6 +1597,65 @@ mod tests {
     }
 
     #[test]
+    fn reactive_popup_is_reconstrained_after_output_resize() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, parent, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "parent",
+            "parent",
+        );
+        let window = top_window(&state);
+        state.space.map_element(window, (100, 400), true);
+        let qh = queue.handle();
+        let positioner = app
+            .wm_base
+            .as_ref()
+            .expect("wm base")
+            .create_positioner(&qh, ());
+        positioner.set_size(100, 100);
+        positioner.set_anchor_rect(0, 150, 1, 1);
+        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideY);
+        positioner.set_reactive();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("wm base")
+            .get_xdg_surface(&surface, &qh, ());
+        let _popup = xdg.get_popup(Some(&parent), &positioner, &qh, ());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("popup configure"));
+        attach_buffer(&surface, &app, &qh, 100);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        app.popup_geometry = None;
+        state.output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (800, 600).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        state.output_resized();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, y, _, height) = app.popup_geometry.expect("updated popup configure");
+        assert_eq!(400 + y + height, 568);
+    }
+
+    #[test]
     fn fullscreen_and_menu_render_above_taskbar() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
