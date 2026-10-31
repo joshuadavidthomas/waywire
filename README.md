@@ -100,24 +100,24 @@ missing comparison.
 Both runs below used 1280×720 at 30 Hz and a 30 fps, 12,000 kbps encoder
 target, with xterm and Debian Chromium 156.0.8078.73 as the applications.
 Waywire (0.1.0-rc.1) was built from
-`7336ebd36348a44d9751932bd409527237de7e9b` plus the idle-wakeup changes that
-recorded these runs. Waymote gateway and streamd were 0.1.7 (protocol 2), with
-labwc 0.9.8. The packaged Waymote binaries did not report a source commit.
-Hardware: 2 vCPUs, Intel Xeon @ 2.60 GHz, 4,025,412 kB RAM. Date: 2026-10-30.
+`e72dd7192b31d8226c8a80f4f218e1cbb512bd4c`. Waymote gateway and streamd were
+0.1.7 (protocol 2), with labwc 0.9.8. The packaged Waymote binaries did not
+report a source commit. Hardware: 2 vCPUs, Intel Xeon @ 2.60 GHz, 4,025,412 kB
+RAM. Date: 2026-10-31.
 
 | Metric                             | Run 1 waywire | Run 1 Waymote | Run 2 waywire | Run 2 Waymote |
 | ---------------------------------- | ------------: | ------------: | ------------: | ------------: |
-| Launch to first decoded frame (ms) |           808 |          5471 |           561 |           476 |
+| Launch to first decoded frame (ms) |           726 |          1673 |           613 |           354 |
 | Idle CPU (% of one core)           |           0.0 |           0.0 |           0.0 |           0.0 |
-| Idle RSS (MiB)                     |         142.7 |         154.0 |         142.9 |         153.7 |
-| Typing CPU (%)                     |          17.6 |          18.1 |          17.8 |          19.4 |
-| Typing RSS (MiB)                   |         143.8 |         154.4 |         144.0 |         153.9 |
-| Typing stream (kbps)               |         135.2 |         123.6 |         134.4 |         123.6 |
-| Scrolling CPU (%)                  |          52.8 |          49.4 |          53.9 |          50.8 |
-| Scrolling RSS (MiB)                |        1066.5 |        1072.9 |        1072.9 |        1075.7 |
-| Scrolling stream (kbps)            |        2251.6 |        2408.2 |        2348.5 |        2409.6 |
-| Input-to-screen median (ms)        |          66.5 |          66.6 |          67.6 |          68.4 |
-| Input-to-screen p95 (ms)           |          74.1 |         120.4 |          74.9 |         125.8 |
+| Idle RSS (MiB)                     |         143.6 |         154.1 |         142.2 |         154.1 |
+| Typing CPU (%)                     |          17.0 |          15.4 |          16.5 |          17.0 |
+| Typing RSS (MiB)                   |         144.9 |         154.7 |         143.2 |         154.8 |
+| Typing stream (kbps)               |         133.0 |         122.7 |         132.9 |         124.6 |
+| Scrolling CPU (%)                  |          48.6 |          45.6 |          53.2 |          47.0 |
+| Scrolling RSS (MiB)                |        1069.9 |        1071.5 |        1070.5 |        1073.2 |
+| Scrolling stream (kbps)            |        2318.8 |        2151.5 |        2324.9 |        2105.1 |
+| Input-to-screen median (ms)        |          70.2 |          68.2 |          66.7 |          67.9 |
+| Input-to-screen p95 (ms)           |          75.9 |         118.7 |          78.0 |         122.3 |
 | xdotool XTest                      |          pass |          pass |          pass |          pass |
 | Anthropic ComputerTool + grim      |          pass |          pass |          pass |          pass |
 
