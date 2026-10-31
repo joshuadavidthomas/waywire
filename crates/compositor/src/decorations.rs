@@ -654,17 +654,24 @@ impl XdgDecorationHandler for State {
         self.request_mode(top, Mode::ServerSide);
     }
     fn request_mode(&mut self, top: ToplevelSurface, mode: Mode) {
-        if let Some(window) = self
+        let window = self
             .space
             .elements()
             .find(|window| window.toplevel() == Some(&top))
-        {
+            .cloned();
+        if let Some(window) = &window {
             self.windows
                 .entry(window.clone())
                 .or_default()
                 .decoration_mode = Some(mode);
         }
         top.with_pending_state(|state| state.decoration_mode = Some(mode));
+        if let Some(bounds) = window
+            .as_ref()
+            .and_then(|window| self.window_output_geometry(window))
+        {
+            top.with_pending_state(|state| state.bounds = Some(bounds.size));
+        }
         if top.is_initial_configure_sent() {
             top.send_pending_configure();
         }

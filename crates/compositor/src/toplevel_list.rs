@@ -249,6 +249,7 @@ mod tests {
         seat: Option<WlSeat>,
         manager: Option<ZwlrForeignToplevelManagerV1>,
         last_configure: Option<u32>,
+        bounds: Option<(i32, i32)>,
         last_surface: Option<WlSurface>,
         last_xdg: Option<XdgSurface>,
         handles: Vec<ToplevelHandleEvents>,
@@ -316,7 +317,7 @@ mod tests {
                         let _: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
                     }
                     "xdg_wm_base" => {
-                        state.wm_base = Some(registry.bind(name, version.min(1), qh, ()));
+                        state.wm_base = Some(registry.bind(name, version.min(4), qh, ()));
                     }
                     "ext_foreign_toplevel_list_v1" => {
                         state.list = Some(registry.bind(name, version.min(1), qh, ()));
@@ -588,6 +589,13 @@ mod tests {
         ) {
             if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::Close = event {
                 state.close_requests += 1;
+            }
+            if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::ConfigureBounds {
+                width,
+                height,
+            } = event
+            {
+                state.bounds = Some((width, height));
             }
         }
     }
@@ -903,6 +911,41 @@ mod tests {
     }
 
     #[test]
+    fn initial_bounds_leave_room_for_server_titlebar() {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg.get_toplevel(&qh, ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let window = top_window(&state);
+        state.request_mode(
+            window.toplevel().expect("toplevel").clone(),
+            Mode::ServerSide,
+        );
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.bounds, Some((1920, 1020)));
+        let top = window.toplevel().expect("toplevel").clone();
+        state.request_mode(top, Mode::ClientSide);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.bounds, Some((1920, 1048)));
+    }
+
+    #[test]
     fn remapped_toplevel_retains_decoration_and_bounds() {
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
         use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
@@ -935,7 +978,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         top.with_pending_state(|pending| {
             assert_eq!(pending.decoration_mode, Some(Mode::ServerSide));
-            assert_eq!(pending.bounds, Some((1920, 1048).into()));
+            assert_eq!(pending.bounds, Some((1920, 1020).into()));
         });
         xdg.ack_configure(app.last_configure.expect("remap configure"));
         attach_buffer(&surface, &app, &queue.handle(), 1);

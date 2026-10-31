@@ -168,11 +168,9 @@ impl CompositorHandler for State {
                         .windows
                         .get(&window)
                         .and_then(|state| state.decoration_mode);
-                    let bounds = self.work_area().map(|area| area.size);
-                    top.with_pending_state(|state| {
-                        state.decoration_mode = mode;
-                        state.bounds = bounds;
-                    });
+                    top.with_pending_state(|state| state.decoration_mode = mode);
+                    let bounds = self.window_output_geometry(&window).map(|area| area.size);
+                    top.with_pending_state(|state| state.bounds = bounds);
                     top.send_configure();
                 }
             }
