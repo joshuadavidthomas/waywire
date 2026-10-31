@@ -42,6 +42,7 @@ struct Theme {
     active: (u32, u32, u32),
     inactive: (u32, u32, u32),
     accent: u32,
+    dim: u32,
     close_hover: u32,
     close_pressed: u32,
     close_hover_foreground: u32,
@@ -59,6 +60,7 @@ impl Theme {
             active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
             inactive: (0x20_25_2d, 0x98_a2_b2, 0x30_37_43),
             accent: 0x36_6e_a8,
+            dim: 0x60_69_78,
             close_hover: 0xb8_32_45,
             close_pressed: 0x85_29_36,
             close_hover_foreground: 0xff_ff_ff,
@@ -392,6 +394,8 @@ fn paint_taskbar(
             &context,
             if chip.focused {
                 theme.active.1
+            } else if !chip.running {
+                theme.dim
             } else {
                 theme.inactive.1
             },
@@ -403,6 +407,19 @@ fn paint_taskbar(
             theme,
         )?;
         context.restore()?;
+    }
+    let pin_count = chips.iter().take_while(|chip| chip.pin.is_some()).count();
+    if pin_count > 0
+        && let Some(rect) = chip_rectangle(size.w, chips.len(), pin_count - 1)
+    {
+        color(&context, theme.inactive.2);
+        context.rectangle(
+            f64::from(rect.loc.x + rect.size.w - 1),
+            5.0,
+            1.0,
+            f64::from(size.h - 10),
+        );
+        context.fill()?;
     }
     Ok(surface)
 }
@@ -1143,11 +1160,7 @@ impl State {
         }
         elements.extend(upper);
         if let Some(output) = self.space.output_geometry(&self.output) {
-            let chips = self
-                .taskbar_chips()
-                .into_iter()
-                .filter(|chip| chip.window.is_some())
-                .collect();
+            let chips = self.taskbar_chips();
             match self.taskbar.element(renderer, output, scale, chips) {
                 Ok(bar) => elements.push(bar.into()),
                 Err(error) => tracing::warn!(%error, "taskbar rendering failed"),

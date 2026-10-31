@@ -177,6 +177,7 @@ pub(crate) enum WindowAction {
 struct TaskbarChip {
     window: Option<Window>,
     pin: Option<usize>,
+    running: bool,
     title: String,
     minimized: bool,
     focused: bool,
@@ -185,6 +186,14 @@ struct TaskbarChip {
 struct Pin {
     command: Vec<String>,
     pid: Option<u32>,
+    child: Option<Child>,
+}
+
+struct LaunchEnvironment {
+    socket: std::path::PathBuf,
+    runtime: std::path::PathBuf,
+    eis: std::path::PathBuf,
+    portal: Option<Vec<(String, String)>>,
 }
 
 #[expect(
@@ -222,6 +231,8 @@ pub(crate) struct State {
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     pins: Vec<Pin>,
+    launch_environment: Option<LaunchEnvironment>,
+    loop_handle: Option<calloop::LoopHandle<'static, State>>,
     mapped_order: Vec<Window>,
     minimized_order: Vec<Window>,
     restore_key_source: Option<KeyboardSource>,
@@ -366,8 +377,11 @@ impl State {
                 .map(|command| Pin {
                     command: command.clone(),
                     pid: None,
+                    child: None,
                 })
                 .collect(),
+            launch_environment: None,
+            loop_handle: None,
             mapped_order: Vec::new(),
             minimized_order: Vec::new(),
             restore_key_source: None,
@@ -523,6 +537,8 @@ impl State {
                 .and_then(toplevel_list::metadata)
                 .map_or(fallback, |metadata| metadata.0);
             TaskbarChip {
+                running: window.is_some()
+                    || pin.is_some_and(|index| self.pins[index].child.is_some()),
                 minimized: window
                     .as_ref()
                     .and_then(|window| self.windows.get(window))
@@ -543,7 +559,12 @@ impl State {
                 make_chip(
                     matches[index].clone(),
                     Some(index),
-                    pin.command.first().cloned().unwrap_or_default(),
+                    pin.command
+                        .first()
+                        .and_then(|command| std::path::Path::new(command).file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_owned(),
                 )
             })
             .collect();
@@ -566,6 +587,60 @@ impl State {
             .get_credentials(&self.display_handle)
             .ok()?;
         u32::try_from(credentials.pid).ok()
+    }
+
+    fn launch_pin(&mut self, index: usize) {
+        let Some(pin) = self.pins.get(index) else {
+            return;
+        };
+        if pin.child.is_some() {
+            return;
+        }
+        let Some(program) = pin.command.first() else {
+            return;
+        };
+        let mut command = match application_command(
+            program,
+            &pin.command[1..],
+            self.launch_environment.as_ref(),
+            self.xdisplay,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                tracing::warn!(%error, "prepare pinned application");
+                return;
+            }
+        };
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                if let Some(handle) = &self.loop_handle
+                    && let Err(error) = wake_on_exit(handle, pid)
+                {
+                    tracing::warn!(%error, "watch pinned application");
+                }
+                self.pins[index].pid = Some(pid);
+                self.pins[index].child = Some(child);
+                self.dirty = true;
+            }
+            Err(error) => tracing::warn!(%error, "start pinned application"),
+        }
+    }
+
+    fn reap_pins(&mut self) {
+        for pin in &mut self.pins {
+            if let Some(child) = &mut pin.child {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        pin.child = None;
+                        pin.pid = None;
+                        self.dirty = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "wait for pinned application"),
+                }
+            }
+        }
     }
 
     /// Gate every seat input entry point. Browser input always passes. Agent
@@ -976,11 +1051,7 @@ impl State {
                 .element_under(position)
                 .is_some_and(|(window, _)| decorations::above_taskbar(window));
             if !covered && let Some(output) = self.space.output_geometry(&self.output) {
-                let chips: Vec<_> = self
-                    .taskbar_chips()
-                    .into_iter()
-                    .filter(|chip| chip.window.is_some())
-                    .collect();
+                let chips = self.taskbar_chips();
                 let relative = position
                     - (output.loc + Point::from((0, output.size.h - decorations::TASKBAR)))
                         .to_f64();
@@ -997,6 +1068,8 @@ impl State {
                     };
                     if let Some(window) = &chip.window {
                         self.window_action(window, action);
+                    } else if let Some(pin) = chip.pin {
+                        self.launch_pin(pin);
                     }
                     self.menu_button = Some((source, button));
                     return;
@@ -1957,6 +2030,13 @@ pub fn run(mut options: Config) -> Result<()> {
         (Some(dirs), Some(bus)) => Some(crate::portal::portal_environment(dirs, bus.address())),
         _ => None,
     };
+    state.launch_environment = Some(LaunchEnvironment {
+        socket: socket_path.clone(),
+        runtime: runtime.path().to_path_buf(),
+        eis: eis_path.clone(),
+        portal: session_environment,
+    });
+    state.loop_handle = Some(handle.clone());
     let mut tracker = OutputDamageTracker::from_output(&state.output);
     let mut next_frame = Instant::now();
     let mut next_housekeeping = Instant::now() + Duration::from_secs(2);
@@ -1966,37 +2046,12 @@ pub fn run(mut options: Config) -> Result<()> {
             && let Some(display) = state.xdisplay
             && let Some(program) = options.session.first()
         {
-            let mut command = std::process::Command::new(program);
-            command
-                .args(&options.session[1..])
-                .env("WAYLAND_DISPLAY", &socket_path)
-                .env("XDG_RUNTIME_DIR", runtime.path())
-                .env("DISPLAY", format!(":{display}"))
-                .env("LIBEI_SOCKET", &eis_path)
-                .env_remove("DBUS_SESSION_BUS_ADDRESS")
-                .env_remove("WAYLAND_SOCKET");
-            // The session program and its portal clients discover the desktop
-            // and its private bus the same way the bus-activated frontend does.
-            if let Some(environment) = &session_environment {
-                for (key, value) in environment {
-                    command.env(key, value);
-                }
-            }
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
-                .stderr(Stdio::inherit());
-            // SAFETY: this hook only invokes pthread_sigmask before exec, without allocation.
-            unsafe {
-                command.pre_exec(|| {
-                    nix::sys::signal::pthread_sigmask(
-                        nix::sys::signal::SigmaskHow::SIG_SETMASK,
-                        Some(&nix::sys::signal::SigSet::empty()),
-                        None,
-                    )
-                    .map_err(std::io::Error::from)
-                });
-            }
+            let mut command = application_command(
+                program,
+                &options.session[1..],
+                state.launch_environment.as_ref(),
+                Some(display),
+            )?;
             match command.spawn() {
                 Ok(process) => {
                     if let Err(error) = wake_on_exit(&handle, process.id()) {
@@ -2020,6 +2075,7 @@ pub fn run(mut options: Config) -> Result<()> {
         {
             state.fail(error.into());
         }
+        state.reap_pins();
         state.space.refresh();
         crate::xwayland::sync_stacking(&mut state);
         if (state.dirty || state.frame_pending == FrameRequest::Pending)
@@ -2105,6 +2161,51 @@ pub(crate) fn pidfd(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
     let fd = i32::try_from(fd).map_err(std::io::Error::other)?;
     // SAFETY: the successful syscall returned a new descriptor we now own.
     Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+}
+
+fn application_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    environment: Option<&LaunchEnvironment>,
+    display: Option<u32>,
+) -> Result<std::process::Command> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("WAYLAND_SOCKET");
+    if let Some(environment) = environment {
+        command
+            .env("WAYLAND_DISPLAY", &environment.socket)
+            .env("XDG_RUNTIME_DIR", &environment.runtime)
+            .env("LIBEI_SOCKET", &environment.eis);
+        if let Some(display) = display {
+            command.env("DISPLAY", format!(":{display}"));
+        } else {
+            command.env_remove("DISPLAY");
+        }
+        if let Some(portal) = &environment.portal {
+            for (key, value) in portal {
+                command.env(key, value);
+            }
+        }
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
+        .stderr(Stdio::inherit());
+    // SAFETY: this hook only invokes pthread_sigmask before exec, without allocation.
+    unsafe {
+        command.pre_exec(|| {
+            nix::sys::signal::pthread_sigmask(
+                nix::sys::signal::SigmaskHow::SIG_SETMASK,
+                Some(&nix::sys::signal::SigSet::empty()),
+                None,
+            )
+            .map_err(std::io::Error::from)
+        });
+    }
+    Ok(command)
 }
 
 /// Wake the event loop once `pid` exits so the checks after dispatch see it

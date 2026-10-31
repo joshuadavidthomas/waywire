@@ -937,14 +937,17 @@ mod tests {
             crate::Pin {
                 command: vec!["/usr/bin/beta".into()],
                 pid: None,
+                child: None,
             },
             crate::Pin {
                 command: vec!["different-name".into()],
                 pid: state.window_pid(&first),
+                child: None,
             },
             crate::Pin {
                 command: vec!["absent".into()],
                 pid: None,
+                child: None,
             },
         ];
         let chips = state.taskbar_chips();
@@ -962,6 +965,42 @@ mod tests {
     #[test]
     fn chip_click_minimizes_focused_window() {
         let (_, mut state, _, _, _, window) = action_fixture();
+        state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        assert!(state.windows.get(&window).expect("window").minimized);
+    }
+
+    #[test]
+    fn clicking_unmatched_pin_spawns_and_reaps_process() {
+        let (_, mut state, _, _, _, _) = action_fixture();
+        state.pins.push(crate::Pin {
+            command: vec!["sleep".into(), "5".into()],
+            pid: None,
+            child: None,
+        });
+        state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        let pin = &mut state.pins[0];
+        let child = pin.child.as_mut().expect("spawned process");
+        assert_eq!(pin.pid, Some(child.id()));
+        child.kill().expect("stop child");
+        child.wait().expect("wait child");
+        state.reap_pins();
+        assert!(state.pins[0].pid.is_none());
+        assert!(!state.taskbar_chips()[0].running);
+    }
+
+    #[test]
+    fn clicking_running_pin_minimizes_its_window() {
+        let (_, mut state, _, _, _, window) = action_fixture();
+        state.pins.push(crate::Pin {
+            command: vec!["window".into()],
+            pid: None,
+            child: None,
+        });
+        assert_eq!(state.taskbar_chips()[0].window, Some(window.clone()));
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);

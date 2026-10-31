@@ -76,7 +76,8 @@ shell parsing. `WAYWIRE_SESSION` is a fallback for a single executable path.
 
 The gateway and compositor accept repeated `--pin 'COMMAND ARG...'` options
 for taskbar application commands. Pin arguments use shell-style quoting, without
-shell expansion or execution. Taskbar pin display and launching are in progress.
+shell expansion. Clicking a pin launches its command, or focuses or minimizes
+its window.
 
 ## Local checks
 
