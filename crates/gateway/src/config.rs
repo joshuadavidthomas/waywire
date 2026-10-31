@@ -12,17 +12,12 @@ struct FileConfig {
     pins: Vec<String>,
 }
 
-fn default_path(xdg: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
-    let directory = if let Some(xdg) = xdg.filter(|value| !value.is_empty()) {
-        PathBuf::from(xdg)
-    } else {
-        PathBuf::from(
-            home.filter(|value| !value.is_empty())
-                .context("HOME is not set; cannot locate the default config file")?,
-        )
-        .join(".config")
+fn default_path(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let directory = match xdg.filter(|value| !value.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg),
+        None => PathBuf::from(home.filter(|value| !value.is_empty())?).join(".config"),
     };
-    Ok(directory.join("waywire/config.toml"))
+    Some(directory.join("waywire/config.toml"))
 }
 
 fn load_pins(path: &Path, explicit: bool, flags: Vec<String>) -> Result<Vec<String>> {
@@ -40,14 +35,17 @@ fn load_pins(path: &Path, explicit: bool, flags: Vec<String>) -> Result<Vec<Stri
 }
 
 pub(super) fn pins(explicit: Option<&Path>, flags: Vec<String>) -> Result<Vec<String>> {
-    let path = match explicit {
-        Some(path) => path.to_path_buf(),
-        None => default_path(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            std::env::var_os("HOME"),
-        )?,
-    };
-    load_pins(&path, explicit.is_some(), flags)
+    if let Some(path) = explicit {
+        return load_pins(path, true, flags);
+    }
+    // Without XDG_CONFIG_HOME or HOME there is no default file to read.
+    match default_path(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    ) {
+        Some(path) => load_pins(&path, false, flags),
+        None => Ok(flags),
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +101,7 @@ mod tests {
             default_path(None, Some("/home/user".into())).expect("home"),
             PathBuf::from("/home/user/.config/waywire/config.toml")
         );
+        assert_eq!(default_path(None, None), None);
+        assert_eq!(default_path(Some("".into()), Some("".into())), None);
     }
 }
