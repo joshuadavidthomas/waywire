@@ -20,7 +20,7 @@ use waywire_protocol::pipe::CursorShape;
 
 use super::State;
 
-pub(super) const BAR: i32 = 32;
+pub(super) const BAR: i32 = Theme::dark().bar;
 pub(super) const STRIP: i32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +52,7 @@ struct Theme {
 impl Theme {
     const fn dark() -> Self {
         Self {
-            bar: BAR,
+            bar: 28,
             strip: STRIP,
             grip: 24,
             active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
@@ -414,11 +414,7 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
         );
         context.set_line_width(1.5);
         context.set_line_cap(cairo::LineCap::Round);
-        context.move_to(x - 4.0, 12.0);
-        context.line_to(x + 4.0, 20.0);
-        context.move_to(x + 4.0, 12.0);
-        context.line_to(x - 4.0, 20.0);
-        context.stroke()?;
+        draw_close(&context, x, theme)?;
         context.restore()?;
         draw_buttons(&context, nodes, foreground, theme)?;
     } else {
@@ -429,6 +425,16 @@ fn paint_nodes(nodes: &[Node], height: i32) -> Result<cairo::ImageSurface> {
     context.fill()?;
     context.status()?;
     Ok(surface)
+}
+
+fn draw_close(context: &cairo::Context, x: f64, theme: Theme) -> Result<()> {
+    let y = f64::from(theme.bar) / 2.0;
+    context.move_to(x - 4.0, y - 4.0);
+    context.line_to(x + 4.0, y + 4.0);
+    context.move_to(x + 4.0, y - 4.0);
+    context.line_to(x - 4.0, y + 4.0);
+    context.stroke()?;
+    Ok(())
 }
 
 fn draw_buttons(
@@ -456,17 +462,18 @@ fn draw_buttons(
         context.clip();
         color(context, foreground);
         context.set_line_width(1.0);
+        let y = f64::from(theme.bar) / 2.0;
         match button.action {
             Some(DecorationAction::Minimize) => {
-                context.move_to(x - 4.0, 17.0);
-                context.line_to(x + 4.0, 17.0);
+                context.move_to(x - 4.0, y + 1.0);
+                context.line_to(x + 4.0, y + 1.0);
             }
-            Some(DecorationAction::Maximize) => context.rectangle(x - 4.0, 12.0, 8.0, 8.0),
+            Some(DecorationAction::Maximize) => context.rectangle(x - 4.0, y - 4.0, 8.0, 8.0),
             Some(DecorationAction::Restore) => {
-                context.rectangle(x - 4.0, 13.0, 7.0, 7.0);
-                context.move_to(x - 2.0, 11.0);
-                context.line_to(x + 4.0, 11.0);
-                context.line_to(x + 4.0, 17.0);
+                context.rectangle(x - 4.0, y - 3.0, 7.0, 7.0);
+                context.move_to(x - 2.0, y - 5.0);
+                context.line_to(x + 4.0, y - 5.0);
+                context.line_to(x + 4.0, y + 1.0);
             }
             _ => {}
         }
@@ -767,7 +774,7 @@ mod tests {
         for (index, rect, action, point) in [
             (
                 1,
-                Rectangle::new((69, -32).into(), (32, 32).into()),
+                Rectangle::new((73, -28).into(), (28, 28).into()),
                 DecorationAction::Close,
                 (80.0, -10.0),
             ),
@@ -897,10 +904,10 @@ mod tests {
         let layout = nodes((101, 57).into(), &appearance(1.0), Theme::dark());
         for (point, expected) in [
             ((-0.1, -1.0), None),
-            ((0.0, -32.1), None),
-            ((0.0, -32.0), Some(DecorationAction::Move)),
-            ((68.9, -0.1), Some(DecorationAction::Maximize)),
-            ((69.0, -32.0), Some(DecorationAction::Close)),
+            ((0.0, -28.1), None),
+            ((0.0, -28.0), Some(DecorationAction::Move)),
+            ((72.9, -0.1), Some(DecorationAction::Maximize)),
+            ((73.0, -28.0), Some(DecorationAction::Close)),
             ((100.9, -0.1), Some(DecorationAction::Close)),
             ((101.0, -1.0), None),
             ((99.0, 0.0), None),
@@ -979,9 +986,9 @@ mod tests {
     #[test]
     fn cached_buffers_map_full_fractional_raster_and_leave_idle_output_undamaged() {
         for (scale, widths, bar_height, grip_width) in [
-            (1.0, [501.0, 533.0], 32.0, 24.0),
-            (1.25, [626.0, 666.0], 40.0, 30.0),
-            (2.0, [1002.0, 1066.0], 64.0, 48.0),
+            (1.0, [501.0, 533.0], 28.0, 24.0),
+            (1.25, [626.0, 666.0], 35.0, 30.0),
+            (2.0, [1002.0, 1066.0], 56.0, 48.0),
         ] {
             let mut renderer = PixmanRenderer::new().expect("renderer");
             let mut image = renderer
@@ -1045,7 +1052,7 @@ mod tests {
                     parts[0].src().size,
                     (widths[usize::from(step == 6)], bar_height).into()
                 );
-                assert_eq!(parts[1].src().size, (grip_width, bar_height / 4.0).into());
+                assert_eq!(parts[1].src().size, (grip_width, 8.0 * scale).into());
                 let mut target = renderer.bind(&mut image).expect("bind");
                 assert!(
                     tracker

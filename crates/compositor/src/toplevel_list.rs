@@ -934,7 +934,7 @@ mod tests {
         assert!(!window.toplevel().expect("top").with_pending_state(|state| state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
         assert_eq!(
             state.space.element_location(&window).expect("location"),
-            (390, 42).into()
+            (390, 38).into()
         );
         assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
