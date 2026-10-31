@@ -168,6 +168,16 @@ impl EventSink {
             return Err(EventWriterError::Stopped);
         }
 
+        if matches!(event, Event::CursorClick(_))
+            && let Some(index) = queue
+                .records
+                .iter()
+                .rposition(|record| record.replacement == Some(Replacement::Position))
+            && let Some(position) = queue.records.remove(index)
+        {
+            queue.bytes -= position.bytes.len();
+        }
+
         if let Some(replacement) = replacement
             && let Some(index) = queue
                 .records
@@ -374,6 +384,28 @@ mod tests {
         assert_eq!(queue.records[0].bytes, shape.encode());
         assert_eq!(queue.records[1].replacement, Some(Replacement::Visibility));
         assert_eq!(queue.records[2].bytes, position.encode());
+    }
+
+    #[test]
+    fn cursor_click_keeps_later_motion_after_the_click() {
+        let sink = EventSink::for_test();
+        let position = |x| CursorPosition {
+            x: waywire_protocol::pipe::PointerCoordinate::new(x).expect("coordinate"),
+            y: waywire_protocol::pipe::PointerCoordinate::new(0).expect("coordinate"),
+            source: waywire_protocol::pipe::CursorSource::Agent,
+        };
+        sink.send(&Event::CursorPosition(position(1)))
+            .expect("position");
+        sink.send(&Event::CursorClick(position(1))).expect("click");
+        sink.send(&Event::CursorPosition(position(2)))
+            .expect("later position");
+        assert_eq!(
+            sink.take_events(),
+            vec![
+                Event::CursorClick(position(1)),
+                Event::CursorPosition(position(2))
+            ]
+        );
     }
 
     fn clipboard(text: &str) -> Event {

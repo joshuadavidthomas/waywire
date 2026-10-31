@@ -96,6 +96,7 @@ pub struct CursorState {
     /// `None` until the compositor has reported a position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<CursorPosition>,
+    pub click: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -125,6 +126,7 @@ impl Default for CursorState {
             shape: CursorShape::Default,
             image: None,
             position: None,
+            click: false,
         }
     }
 }
@@ -484,10 +486,11 @@ mod tests {
                 y: value(pipe::PointerCoordinate::new(20)),
                 source: pipe::CursorSource::Browser,
             }),
+            click: false,
         };
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
-            r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20,"source":"browser"}}"#
+            r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20,"source":"browser"},"click":false}"#
         );
     }
 
@@ -506,7 +509,7 @@ mod tests {
         };
         assert_eq!(
             json(&ClientEvent::Cursor(cursor)),
-            r#"{"type":"cursor","visible":true,"shape":"default","image":{"url":"data:image/png;base64,iVBORw0KGgo=","width":16,"height":24,"hotspotX":2,"hotspotY":3,"outputWidth":1600}}"#
+            r#"{"type":"cursor","visible":true,"shape":"default","image":{"url":"data:image/png;base64,iVBORw0KGgo=","width":16,"height":24,"hotspotX":2,"hotspotY":3,"outputWidth":1600},"click":false}"#
         );
     }
 
@@ -514,7 +517,7 @@ mod tests {
     fn cursor_without_a_position_json_is_exact() {
         assert_eq!(
             json(&ClientEvent::Cursor(CursorState::default())),
-            r#"{"type":"cursor","visible":true,"shape":"default"}"#
+            r#"{"type":"cursor","visible":true,"shape":"default","click":false}"#
         );
     }
 

@@ -207,7 +207,10 @@ pub(super) async fn read_events(
                             publish_cursor(&events, |cursor| cursor.position = Some(position));
                         }
                     }
-                    Event::CursorClick(_) => {}
+                    Event::CursorClick(position) => {
+                        position_gate = CursorPositionGate::Open;
+                        publish_cursor_click(&events, position);
+                    }
                     Event::AgentInput(agent) => {
                         *events
                             .latest_agent
@@ -245,6 +248,20 @@ where
             .unwrap_or_else(PoisonError::into_inner);
         update(&mut cursor);
         ClientEvent::Cursor(cursor.clone())
+    };
+    events.publish(event);
+}
+
+fn publish_cursor_click(events: &AppEvents, position: CursorPosition) {
+    let event = {
+        let mut cursor = events
+            .latest_cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cursor.position = Some(position);
+        let mut click = cursor.clone();
+        click.click = true;
+        ClientEvent::Cursor(click)
     };
     events.publish(event);
 }
@@ -552,5 +569,26 @@ mod tests {
             .expect("rearmed gate should have a deadline");
         assert_eq!(gate.flush(final_deadline), None);
         assert_eq!(gate.deadline(), None);
+    }
+
+    #[test]
+    fn cursor_click_is_forwarded_once_and_not_replayed_in_snapshots() {
+        let events = AppEvents::new();
+        let (_, mut receiver) = events.subscribe();
+        let position = CursorPosition {
+            x: PointerCoordinate::new(120).expect("valid position"),
+            y: PointerCoordinate::new(240).expect("valid position"),
+            source: waywire_protocol::pipe::CursorSource::Agent,
+        };
+        publish_cursor_click(&events, position);
+        let event = receiver.try_recv().expect("click event");
+        assert_eq!(
+            serde_json::to_string(&event).expect("cursor json"),
+            r#"{"type":"cursor","visible":true,"shape":"default","position":{"x":120,"y":240,"source":"agent"},"click":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&events.snapshot()[0]).expect("snapshot json"),
+            r#"{"type":"cursor","visible":true,"shape":"default","position":{"x":120,"y":240,"source":"agent"},"click":false}"#
+        );
     }
 }

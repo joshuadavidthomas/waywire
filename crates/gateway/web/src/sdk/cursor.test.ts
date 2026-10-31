@@ -66,7 +66,8 @@ function fixture() {
     type: "cursor" as const,
     visible: true,
     shape: "pointer" as const,
-    position: { x: 10, y: 20 },
+    position: { x: 10, y: 20, source: "browser" as const },
+    click: false,
   };
   return {
     cursor,
@@ -93,19 +94,40 @@ test("cursor parser accepts every shape the Rust protocol can send", () => {
   assert.equal(rustCursorShapes.length, 36);
   for (const shape of rustCursorShapes) {
     assert.deepEqual(
-      parseControlMessage({ type: "cursor", visible: true, shape }),
-      { type: "cursor", visible: true, shape, position: null },
+      parseControlMessage({
+        type: "cursor",
+        visible: true,
+        shape,
+        click: false,
+      }),
+      { type: "cursor", visible: true, shape, position: null, click: false },
     );
   }
 });
 
 test("cursor parser accepts known shapes and rejects unknown ones", () => {
   assert.deepEqual(
-    parseControlMessage({ type: "cursor", visible: true, shape: "pointer" }),
-    { type: "cursor", visible: true, shape: "pointer", position: null },
+    parseControlMessage({
+      type: "cursor",
+      visible: true,
+      shape: "pointer",
+      click: false,
+    }),
+    {
+      type: "cursor",
+      visible: true,
+      shape: "pointer",
+      position: null,
+      click: false,
+    },
   );
   assert.equal(
-    parseControlMessage({ type: "cursor", visible: true, shape: "magic" }),
+    parseControlMessage({
+      type: "cursor",
+      visible: true,
+      shape: "magic",
+      click: false,
+    }),
     null,
   );
 });
@@ -119,7 +141,13 @@ test("cursor parser preserves a validated image and rejects unsafe URLs", () => 
     hotspotY: 3,
     outputWidth: 1600,
   };
-  const cursor = { type: "cursor", visible: true, shape: "default", image };
+  const cursor = {
+    type: "cursor",
+    visible: true,
+    shape: "default",
+    image,
+    click: false,
+  };
   assert.deepEqual(parseControlMessage(cursor), { ...cursor, position: null });
   assert.equal(
     parseControlMessage({
@@ -136,15 +164,16 @@ test("cursor parser preserves a validated image and rejects unsafe URLs", () => 
 
 test("cursor parser requires normalized integer coordinates", () => {
   for (const position of [
-    { x: -1, y: 0 },
-    { x: 0, y: 65_536 },
-    { x: 1.5, y: 2 },
+    { x: -1, y: 0, source: "browser" },
+    { x: 0, y: 65_536, source: "agent" },
+    { x: 1.5, y: 2, source: "agent" },
   ]) {
     assert.equal(
       parseControlMessage({
         type: "cursor",
         visible: true,
         shape: "default",
+        click: false,
         position,
       }),
       null,
@@ -155,13 +184,15 @@ test("cursor parser requires normalized integer coordinates", () => {
       type: "cursor",
       visible: true,
       shape: "default",
-      position: { x: 0, y: 65_535 },
+      click: true,
+      position: { x: 0, y: 65_535, source: "agent" },
     }),
     {
       type: "cursor",
       visible: true,
       shape: "default",
-      position: { x: 0, y: 65_535 },
+      click: true,
+      position: { x: 0, y: 65_535, source: "agent" },
     },
   );
 });
@@ -176,7 +207,7 @@ test("observer, absolute control, pointer lock, and hidden states choose one rem
   cursor.setActive(true);
   assert.equal(element.style.cursor, "pointer");
   assert.equal(overlay.style.display, "none");
-  assert.deepEqual(cursor.position(), { x: 10, y: 20 });
+  assert.deepEqual(cursor.position(), { x: 10, y: 20, source: "browser" });
 
   cursor.setPointerLocked(true);
   assert.equal(element.style.cursor, "none");
@@ -185,7 +216,7 @@ test("observer, absolute control, pointer lock, and hidden states choose one rem
   cursor.update({ ...state, visible: false });
   assert.equal(element.style.cursor, "none");
   assert.equal(overlay.style.display, "none");
-  assert.deepEqual(cursor.position(), { x: 10, y: 20 });
+  assert.deepEqual(cursor.position(), { x: 10, y: 20, source: "browser" });
 
   cursor.update(state);
   cursor.setPointerLocked(false);
@@ -200,7 +231,7 @@ test("observer, absolute control, pointer lock, and hidden states choose one rem
 
 test("overlay maps asymmetric normalized coordinates through letterbox and pillarbox bounds", () => {
   const { cursor, display, overlay, state } = fixture();
-  const position = { x: 16_384, y: 49_151 };
+  const position = { x: 16_384, y: 49_151, source: "browser" as const };
   const located = { ...state, position };
   const xFraction = position.x / 65_535;
   const yFraction = position.y / 65_535;

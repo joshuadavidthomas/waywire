@@ -73,7 +73,12 @@ export type CursorState = {
     readonly outputWidth: number;
   };
   // Null until the server has sent its first normalized 0..65535 position.
-  readonly position: { readonly x: number; readonly y: number } | null;
+  readonly position: {
+    readonly x: number;
+    readonly y: number;
+    readonly source: "browser" | "agent";
+  } | null;
+  readonly click: boolean;
 };
 
 function isPointerCoordinate(value: unknown): value is number {
@@ -195,7 +200,11 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
         ? { type: value.type, reason: value.reason }
         : null;
     case "cursor": {
-      if (typeof value.visible !== "boolean" || !isCursorShape(value.shape))
+      if (
+        typeof value.visible !== "boolean" ||
+        typeof value.click !== "boolean" ||
+        !isCursorShape(value.shape)
+      )
         return null;
       let image: CursorState["image"];
       if (value.image !== undefined) {
@@ -233,17 +242,25 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
           shape: value.shape,
           ...(image ? { image } : {}),
           position: null,
+          click: value.click,
         };
       }
       return isRecord(value.position) &&
         isPointerCoordinate(value.position.x) &&
-        isPointerCoordinate(value.position.y)
+        isPointerCoordinate(value.position.y) &&
+        (value.position.source === "browser" ||
+          value.position.source === "agent")
         ? {
             type: value.type,
             visible: value.visible,
             shape: value.shape,
             ...(image ? { image } : {}),
-            position: { x: value.position.x, y: value.position.y },
+            position: {
+              x: value.position.x,
+              y: value.position.y,
+              source: value.position.source,
+            },
+            click: value.click,
           }
         : null;
     }
