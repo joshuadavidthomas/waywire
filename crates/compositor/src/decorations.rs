@@ -42,6 +42,7 @@ struct Theme {
     active: (u32, u32, u32),
     inactive: (u32, u32, u32),
     accent: u32,
+    attention: u32,
     dim: u32,
     close_hover: u32,
     close_pressed: u32,
@@ -60,6 +61,7 @@ impl Theme {
             active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
             inactive: (0x20_25_2d, 0x98_a2_b2, 0x30_37_43),
             accent: 0x36_6e_a8,
+            attention: 0x008a_5a16,
             dim: 0x60_69_78,
             close_hover: 0xb8_32_45,
             close_pressed: 0x85_29_36,
@@ -382,8 +384,15 @@ fn paint_taskbar(
         let Some(rect) = chip_rectangle(size.w, chips.len(), index) else {
             continue;
         };
-        if chip.focused {
-            color(&context, theme.accent);
+        if chip.focused || chip.urgent {
+            color(
+                &context,
+                if chip.focused {
+                    theme.accent
+                } else {
+                    theme.attention
+                },
+            );
             context.rectangle(
                 f64::from(rect.loc.x),
                 2.0,
@@ -396,7 +405,7 @@ fn paint_taskbar(
         context.translate(f64::from(rect.loc.x), 2.0);
         color(
             &context,
-            if chip.focused {
+            if chip.focused || chip.urgent {
                 theme.active.1
             } else if !chip.running {
                 theme.dim

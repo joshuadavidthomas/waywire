@@ -315,7 +315,7 @@ Remaining:
 - Audio, which the Amp orb Desktop already streams.
 - ext-data-control, for clipboard managers and agents. Without it, wl-clipboard
   maps a window to take keyboard focus for each copy and paste.
-- xdg-activation.
+- xdg-activation is served, with the focus policy under Decisions.
 
 Layer-shell, idle-inhibit and keyboard-shortcuts-inhibit can wait.
 
@@ -394,3 +394,18 @@ Add these alongside the phases above:
   Conversions and viewer reads are capped at 1 MiB and three seconds, and each
   dropped transfer is logged as a warning. Transfers between apps that share a
   type pass through unchanged and uncapped.
+- **Activation.** An xdg-activation token raises and focuses its window when
+  the compositor issued it for a pin launch, or when the client that holds
+  keyboard focus created it with a serial from this seat's input no older than
+  that focus. Browser, EIS, XTest, virtual-pointer and virtual-keyboard input
+  all produce seat serials, so agent input grants tokens the same way human
+  input does. Tokens last 30 seconds and are used once. Any other request,
+  such as a token without a serial or one from a background client, only marks
+  the window urgent: its taskbar chip turns amber until it gains focus. Unknown
+  tokens do nothing. A browser takeover or handback voids every outstanding
+  token, so activations requested under the previous driver cannot move focus
+  afterwards; the same lease rule already drops foreign-toplevel requests
+  during a takeover. Granted activations and foreign-toplevel activation share
+  one path, which restores a minimized window or raises and focuses it.
+  Launched apps never inherit `XDG_ACTIVATION_TOKEN` or `DESKTOP_STARTUP_ID`
+  from the compositor's environment.

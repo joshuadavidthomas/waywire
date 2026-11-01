@@ -226,6 +226,11 @@ mod tests {
     use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{
         self as relative,
     };
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::XdgActivationTokenV1;
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::{
+        self as activation_token,
+    };
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
     use wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
     use wayland_protocols::xdg::shell::client::xdg_popup::{
         self,
@@ -283,6 +288,8 @@ mod tests {
         data_device_manager: Option<WlDataDeviceManager>,
         data_device: Option<WlDataDevice>,
         dnd: DndEvents,
+        activation: Option<XdgActivationV1>,
+        activation_token: Option<String>,
     }
 
     /// Drag-and-drop events seen by a source or target client.
@@ -364,6 +371,9 @@ mod tests {
                     "wl_data_device_manager" => {
                         state.data_device_manager =
                             Some(registry.bind(name, version.min(3), qh, ()));
+                    }
+                    "xdg_activation_v1" => {
+                        state.activation = Some(registry.bind(name, 1, qh, ()));
                     }
                     _ => {}
                 }
@@ -653,6 +663,33 @@ mod tests {
                 data_source::Event::DndDropPerformed => state.dnd.drop_performed = true,
                 data_source::Event::DndFinished => state.dnd.finished = true,
                 data_source::Event::Target { .. } | data_source::Event::Action { .. } | _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<XdgActivationV1, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &XdgActivationV1,
+            _: wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<XdgActivationTokenV1, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &XdgActivationTokenV1,
+            event: activation_token::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let activation_token::Event::Done { token } = event {
+                state.activation_token = Some(token);
             }
         }
     }
@@ -3589,5 +3626,179 @@ mod tests {
         );
         sync_peer(&mut display, &mut state, &mut target);
         assert_eq!(target.2.dnd.drops, 0, "the release drops nothing");
+    }
+
+    /// Ask the compositor for an activation token for `surface`, optionally
+    /// carrying an input serial.
+    fn request_token(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        peer: &mut Peer,
+        serial: Option<u32>,
+        surface: &WlSurface,
+    ) -> String {
+        let qh = peer.1.handle();
+        let token = peer
+            .2
+            .activation
+            .as_ref()
+            .expect("xdg_activation_v1")
+            .get_activation_token(&qh, ());
+        if let Some(serial) = serial {
+            token.set_serial(serial, peer.2.seat.as_ref().expect("seat"));
+        }
+        token.set_surface(surface);
+        token.commit();
+        sync_peer(display, state, peer);
+        peer.2.activation_token.take().expect("token issued")
+    }
+
+    fn activate(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        peer: &mut Peer,
+        token: String,
+        surface: &WlSurface,
+    ) {
+        peer.2
+            .activation
+            .as_ref()
+            .expect("xdg_activation_v1")
+            .activate(token, surface);
+        sync_peer(display, state, peer);
+    }
+
+    /// The target window at (400, 0), then the source window at (0, 0) that
+    /// holds focus after a click.
+    fn activation_fixture(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+    ) -> (Peer, WlSurface, Window, Peer, WlSurface, Window) {
+        use smithay::input::keyboard::KeyboardSource;
+        let (target, target_surface, target_window) =
+            peer_window(display, state, "Target", (400, 0));
+        let (mut source, source_surface, source_window) =
+            peer_window(display, state, "Source", (0, 0));
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        sync_peer(display, state, &mut source);
+        assert_eq!(focused(state), KeyboardFocus::window(&source_window));
+        (
+            target,
+            target_surface,
+            target_window,
+            source,
+            source_surface,
+            source_window,
+        )
+    }
+
+    fn focused(state: &crate::State) -> Option<KeyboardFocus> {
+        state
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+    }
+
+    fn urgent(state: &crate::State, window: &Window) -> bool {
+        state
+            .windows
+            .get(window)
+            .is_some_and(|window| window.urgent)
+    }
+
+    #[test]
+    fn activation_token_from_focused_input_raises_its_window() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (mut target, target_surface, target_window, mut source, source_surface, source_window) =
+            activation_fixture(&mut display, &mut state);
+        let serial = source.2.button_serial;
+        let token = request_token(
+            &mut display,
+            &mut state,
+            &mut source,
+            serial,
+            &source_surface,
+        );
+        activate(
+            &mut display,
+            &mut state,
+            &mut target,
+            token,
+            &target_surface,
+        );
+        assert_eq!(focused(&state), KeyboardFocus::window(&target_window));
+        assert_eq!(
+            state.space.elements().last(),
+            Some(&target_window),
+            "raised"
+        );
+        assert!(!urgent(&state, &target_window));
+
+        // A launch token from a pin click raises the launched window too.
+        state.focus_window(Some(source_window.clone()));
+        let token = state.launch_token();
+        activate(
+            &mut display,
+            &mut state,
+            &mut target,
+            token,
+            &target_surface,
+        );
+        assert_eq!(focused(&state), KeyboardFocus::window(&target_window));
+    }
+
+    #[test]
+    fn activation_token_without_input_only_marks_its_window_urgent() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (mut target, target_surface, target_window, mut source, source_surface, source_window) =
+            activation_fixture(&mut display, &mut state);
+
+        let token = request_token(&mut display, &mut state, &mut source, None, &source_surface);
+        activate(
+            &mut display,
+            &mut state,
+            &mut target,
+            token,
+            &target_surface,
+        );
+        assert_eq!(focused(&state), KeyboardFocus::window(&source_window));
+        assert!(
+            urgent(&state, &target_window),
+            "the window asks for attention"
+        );
+
+        activate(
+            &mut display,
+            &mut state,
+            &mut target,
+            "not-a-token".to_owned(),
+            &target_surface,
+        );
+        assert_eq!(focused(&state), KeyboardFocus::window(&source_window));
+
+        // A takeover voids tokens granted to the previous driver's input.
+        let serial = source.2.button_serial;
+        let token = request_token(
+            &mut display,
+            &mut state,
+            &mut source,
+            serial,
+            &source_surface,
+        );
+        state.set_browser_lease(true);
+        state.set_browser_lease(false);
+        activate(
+            &mut display,
+            &mut state,
+            &mut target,
+            token,
+            &target_surface,
+        );
+        assert_eq!(focused(&state), KeyboardFocus::window(&source_window));
+
+        state.focus_window(Some(target_window.clone()));
+        assert!(!urgent(&state, &target_window), "focus clears attention");
     }
 }

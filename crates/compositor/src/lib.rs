@@ -1,5 +1,6 @@
 //! Headless Wayland compositor streaming H.264 RTP.
 
+mod activation;
 mod capture;
 mod clipboard;
 mod cursor;
@@ -109,6 +110,7 @@ use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_pointer::VirtualPointerDevice;
+use smithay::wayland::xdg_activation::XdgActivationState;
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
@@ -180,6 +182,10 @@ pub(crate) enum WindowAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent chip state the taskbar paints"
+)]
 struct TaskbarChip {
     window: Option<Window>,
     pin: Option<usize>,
@@ -187,6 +193,7 @@ struct TaskbarChip {
     title: String,
     minimized: bool,
     focused: bool,
+    urgent: bool,
 }
 
 struct Pin {
@@ -229,6 +236,7 @@ pub(crate) struct State {
     pub(crate) seat_state: SeatState<Self>,
     pub(crate) data_device_state: DataDeviceState,
     pub(crate) drag: Option<dnd::Drag>,
+    pub(crate) activation: XdgActivationState,
     pub(crate) popups: PopupManager,
     pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
     /// Last X11 stacking order sent to the XWM; `None` forces the next sync,
@@ -320,6 +328,7 @@ impl State {
         ]);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let clipboard = clipboard::Clipboard::new(&display_handle);
+        let activation = XdgActivationState::new::<Self>(&display_handle);
         let xwayland_shell_state =
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&display_handle);
         install_globals(&display_handle);
@@ -380,6 +389,7 @@ impl State {
             seat_state,
             data_device_state,
             drag: None,
+            activation,
             popups: PopupManager::default(),
             xwm: None,
             x11_stacking: None,
@@ -597,6 +607,10 @@ impl State {
                 focused: window.as_ref().is_some_and(|window| {
                     focus.is_some() && focus == focus::KeyboardFocus::window(window)
                 }),
+                urgent: window
+                    .as_ref()
+                    .and_then(|window| self.windows.get(window))
+                    .is_some_and(|state| state.urgent),
                 window,
                 pin,
                 title,
@@ -662,6 +676,9 @@ impl State {
                 return;
             }
         };
+        // The pin click is the user's request: a single-instance app that
+        // forwards this launch to its running instance may raise it.
+        command.env("XDG_ACTIVATION_TOKEN", self.launch_token());
         match command.spawn() {
             Ok(child) => {
                 let pid = child.id();
@@ -772,6 +789,7 @@ impl State {
         }
         self.browser_holds_input = held;
         self.dirty = true;
+        self.void_activation_tokens();
         if held {
             let sources: Vec<_> = self.agent_sources.iter().copied().collect();
             for source in sources {
@@ -1416,6 +1434,12 @@ impl State {
         if Seat::<Self>::from_resource(seat).as_ref() != Some(&self.seat) {
             return;
         }
+        self.activate_window(window);
+    }
+
+    /// Restore a minimized window, or raise and focus it. Foreign-toplevel
+    /// and xdg-activation requests both use this path.
+    pub(crate) fn activate_window(&mut self, window: &Window) {
         if self
             .windows
             .get(window)
@@ -1708,6 +1732,12 @@ impl State {
                 self.dirty = true;
                 return;
             }
+        }
+        if let Some(state) = window
+            .as_ref()
+            .and_then(|window| self.windows.get_mut(window))
+        {
+            state.urgent = false;
         }
         self.refresh_pointer_focus();
         for current in self.space.elements() {
@@ -2393,7 +2423,9 @@ fn application_command(
     command
         .args(args)
         .env_remove("DBUS_SESSION_BUS_ADDRESS")
-        .env_remove("WAYLAND_SOCKET");
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("XDG_ACTIVATION_TOKEN")
+        .env_remove("DESKTOP_STARTUP_ID");
     if let Some(environment) = environment {
         command
             .env("WAYLAND_DISPLAY", &environment.socket)
