@@ -185,8 +185,11 @@ test("a frame answering this viewer's input skips the playout delay", async (con
     assert.deepEqual(h.draws, [], "a frame without new input waits");
     h.advance(10);
     await h.feed(20_000, { inputSequence: 1 });
-    h.paint();
-    assert.deepEqual(h.draws, [{ timestamp: 20_000, at: 20 }]);
+    assert.deepEqual(
+      h.draws,
+      [{ timestamp: 20_000, at: 20 }],
+      "drawn on decode, not at the next animation frame",
+    );
     h.advance(10);
     await h.feed(30_000, { inputSequence: 1 });
     h.advance(10);
@@ -269,7 +272,6 @@ test("a striped frame answering this viewer's input skips the playout delay", as
     assert.deepEqual(h.draws, [], "a frame without new input waits");
     h.advance(10);
     await h.feedRaw(striped(20_000, false, 1));
-    h.paint();
     assert.deepEqual(h.draws, [{ timestamp: 20_000, at: 20 }]);
   } finally {
     h.video.disconnect();

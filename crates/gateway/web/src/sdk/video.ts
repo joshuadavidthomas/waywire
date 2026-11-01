@@ -760,6 +760,12 @@ export class VideoRuntime {
       );
       return;
     }
+    // After idle, the first animation frame can take a vsync or more to
+    // arrive. The canvas commits with the next frame either way.
+    if (answersInput) {
+      this.renderFrame();
+      return;
+    }
     this.animationPending = true;
     this.animationFrame = requestAnimationFrame(() => this.renderFrame());
   }
