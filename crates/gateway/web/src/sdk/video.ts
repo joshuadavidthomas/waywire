@@ -118,7 +118,7 @@ export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
 
 type FrameMetadata = Pick<
   VideoPacket,
-  "generation" | "width" | "height" | "fps"
+  "generation" | "width" | "height" | "fps" | "latestAppliedInput"
 >;
 type PendingVideoFrame = Readonly<{
   frame: VideoFrame;
@@ -173,6 +173,7 @@ export class VideoRuntime {
   private lastSequence: number | null = null;
   private decoderResets = 0;
   private lastDrawStats: WaywireStats | null = null;
+  private presentedInput = 0;
 
   constructor(
     private readonly owner: VideoOwner,
@@ -660,6 +661,7 @@ export class VideoRuntime {
       width: packet.width,
       height: packet.height,
       fps: packet.fps,
+      latestAppliedInput: packet.latestAppliedInput,
     };
     const entries = this.decodingFrames.get(packet.timestamp);
     if (entries) entries.push(metadata);
@@ -729,19 +731,22 @@ export class VideoRuntime {
   }
 
   private schedulePresentation(): void {
-    if (
-      this.pendingFrames.length === 0 ||
-      this.animationPending ||
-      this.presentationTimer !== null
-    )
-      return;
     const next = this.pendingFrames[0];
-    if (!next) return;
+    if (!next || this.animationPending) return;
+    const answersInput = this.pendingFrames.some(this.answersInput);
+    if (this.presentationTimer !== null) {
+      if (!answersInput) return;
+      clearTimeout(this.presentationTimer);
+      this.presentationTimer = null;
+    }
     const presentation = this.owner.expectedPresentationTime(
       next.frame.timestamp,
       this.targetLatencyMilliseconds,
     );
-    const delay = presentation === null ? 0 : presentation - performance.now();
+    const delay =
+      presentation === null || answersInput
+        ? 0
+        : presentation - performance.now();
     if (delay > presentationLeadMilliseconds) {
       this.presentationTimer = setTimeout(
         () => {
@@ -779,17 +784,19 @@ export class VideoRuntime {
         this.recordOverdueDrop();
       }
     } else {
+      // The playout delay smooths a stream, but a frame that applied newer
+      // input than the screen shows answers this viewer: it and every older
+      // frame are due now, not after the delay.
       let due = 0;
-      while (due < this.pendingFrames.length) {
-        const candidate = this.pendingFrames[due];
-        if (!candidate) break;
+      this.pendingFrames.forEach((candidate, index) => {
         const presentation = this.owner.expectedPresentationTime(
           candidate.frame.timestamp,
           this.targetLatencyMilliseconds,
         );
-        if (presentation !== null && presentation > now) break;
-        due += 1;
-      }
+        const onTime =
+          due === index && (presentation === null || presentation <= now);
+        if (onTime || this.answersInput(candidate)) due = index + 1;
+      });
       if (due === 0) {
         this.schedulePresentation();
         return;
@@ -803,6 +810,7 @@ export class VideoRuntime {
     }
     if (!pending) return;
     const { frame, metadata } = pending;
+    this.presentedInput = metadata.latestAppliedInput;
     const dimensionsChanged =
       display.width !== frame.displayWidth ||
       display.height !== frame.displayHeight;
@@ -847,6 +855,9 @@ export class VideoRuntime {
     }
     this.schedulePresentation();
   }
+
+  private readonly answersInput = ({ metadata }: PendingVideoFrame): boolean =>
+    metadata.latestAppliedInput !== this.presentedInput;
 
   private recordOverdueDrop(): void {
     this.droppedFrames += 1;

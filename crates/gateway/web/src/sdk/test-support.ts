@@ -253,6 +253,8 @@ export function videoPacket(
     readonly height?: number;
     readonly fps?: number;
     readonly chroma?: Chroma;
+    readonly inputSequence?: number;
+    readonly data?: Uint8Array;
   } = {},
 ): ArrayBuffer {
   return videoFrame(
@@ -264,11 +266,11 @@ export function videoPacket(
       height: options.height ?? 720,
       captureNanos: BigInt(timestamp) * 1000n,
       sequence: BigInt(options.sequence ?? 0),
-      inputSequence: 0,
+      inputSequence: options.inputSequence ?? 0,
       fps: options.fps ?? 60,
       chroma: options.chroma ?? 0,
     },
-    new Uint8Array([0]),
+    options.data ?? new Uint8Array([0]),
   );
 }
 

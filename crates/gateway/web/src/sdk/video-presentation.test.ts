@@ -94,6 +94,11 @@ async function presentation(context: TestContext, latency: number) {
       await flush();
       installed.decoder()?.outputAll();
     },
+    async feedRaw(data: ArrayBuffer) {
+      stream.dispatch("message", { data });
+      await flush();
+      installed.decoder()?.outputAll();
+    },
     advance(milliseconds: number) {
       now += milliseconds;
       context.mock.timers.tick(milliseconds);
@@ -169,6 +174,107 @@ for (const [fps, latency] of [
     assert.equal(new Set(h.closed).size, h.closed.length);
   });
 }
+
+test("a frame answering this viewer's input skips the playout delay", async (context) => {
+  const h = await presentation(context, 300);
+  try {
+    await h.feed(0, { keyframe: true });
+    h.advance(10);
+    await h.feed(10_000);
+    h.paint();
+    assert.deepEqual(h.draws, [], "a frame without new input waits");
+    h.advance(10);
+    await h.feed(20_000, { inputSequence: 1 });
+    h.paint();
+    assert.deepEqual(h.draws, [{ timestamp: 20_000, at: 20 }]);
+    h.advance(10);
+    await h.feed(30_000, { inputSequence: 1 });
+    h.advance(10);
+    h.paint();
+    assert.equal(h.draws.length, 1, "the same input does not answer twice");
+    h.advance(300);
+    h.paint();
+    assert.deepEqual(h.draws.at(-1), { timestamp: 30_000, at: 340 });
+  } finally {
+    h.video.disconnect();
+  }
+  assert.equal(h.closed.length, 4);
+});
+
+test("a striped frame answering this viewer's input skips the playout delay", async (context) => {
+  installGlobal(
+    "OffscreenCanvas",
+    class {
+      constructor(
+        readonly width: number,
+        readonly height: number,
+      ) {}
+      getContext() {
+        return { drawImage() {} };
+      }
+    },
+  );
+  installGlobal(
+    "VideoFrame",
+    class {
+      readonly displayWidth = 1280;
+      readonly displayHeight = 720;
+      readonly timestamp: number;
+      constructor(_source: unknown, init: { timestamp: number }) {
+        this.timestamp = init.timestamp;
+      }
+      close() {}
+    },
+  );
+  // One full-height stripe: y u16, height u16, key flag u8, length u32, then
+  // an access unit whose sequence parameter set names the codec.
+  const stripe = (key: boolean) =>
+    new Uint8Array([
+      0,
+      0,
+      208,
+      2,
+      key ? 1 : 0,
+      9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0x67,
+      0x42,
+      0xc0,
+      0x1f,
+      0xda,
+    ]);
+  const striped = (timestamp: number, key: boolean, inputSequence = 0) => {
+    const data = new Uint8Array(
+      videoPacket(timestamp, {
+        keyframe: key,
+        inputSequence,
+        data: stripe(key),
+      }),
+    );
+    data[1] = 2;
+    return data.buffer;
+  };
+  const h = await presentation(context, 300);
+  try {
+    await h.feedRaw(striped(0, true));
+    h.advance(10);
+    await h.feedRaw(striped(10_000, false));
+    h.paint();
+    assert.deepEqual(h.draws, [], "a frame without new input waits");
+    h.advance(10);
+    await h.feedRaw(striped(20_000, false, 1));
+    h.paint();
+    assert.deepEqual(h.draws, [{ timestamp: 20_000, at: 20 }]);
+  } finally {
+    h.video.disconnect();
+  }
+});
 
 test("stalled presentation exposes live loss without publishing imaginary draws", async (context) => {
   const h = await presentation(context, 0);
