@@ -301,11 +301,21 @@ Remaining:
 
 ## 6. Parity and missing protocols
 
-- Drag-and-drop: every drag is cancelled today.
+- Drag-and-drop works between Wayland clients, between X11 clients, and in
+  both directions between them through Smithay's XWM XDND bridge. The browser
+  viewer, EIS and XTest agents and the virtual pointer all drive it, and a
+  Wayland source's drag icon is drawn into the picture under the pointer. A
+  browser takeover or handback, a disconnected agent device, or the source
+  client exiting cancels the drag without a drop. Still missing:
+  xdg-toplevel-drag, which Smithay `f581531` does not implement, so a Chromium
+  tab dragged on `--ozone-platform=wayland` detaches into a new window where
+  it is released instead of following the pointer; touch drags, since the
+  seat has no touch device; and dropping files from the viewer's own machine
+  onto the remote desktop.
 - Audio, which the Amp orb Desktop already streams.
 - ext-data-control, for clipboard managers and agents. Without it, wl-clipboard
   maps a window to take keyboard focus for each copy and paste.
-- xdg-dialog and xdg-activation.
+- xdg-activation.
 
 Layer-shell, idle-inhibit and keyboard-shortcuts-inhibit can wait.
 

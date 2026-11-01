@@ -108,7 +108,10 @@ impl State {
         let Some((surface, origin)) = self.surface_under(position) else {
             return;
         };
-        if pointer.current_focus().as_ref() != Some(&surface) {
+        if !pointer
+            .current_focus()
+            .is_some_and(|focus| focus.is(&surface))
+        {
             return;
         }
         let local = position - origin;
@@ -132,7 +135,10 @@ impl State {
         let Some((surface, origin)) = self.surface_under(current) else {
             return (target, false);
         };
-        if pointer.current_focus().as_ref() != Some(&surface) {
+        if !pointer
+            .current_focus()
+            .is_some_and(|focus| focus.is(&surface))
+        {
             return (target, false);
         }
         let active = with_pointer_constraint(&surface, pointer, |constraint| {
@@ -183,7 +189,10 @@ impl State {
 
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        if pointer.current_focus().as_ref() == Some(surface) {
+        if pointer
+            .current_focus()
+            .is_some_and(|focus| focus.is(surface))
+        {
             self.activate_focused_constraint(pointer);
         }
     }

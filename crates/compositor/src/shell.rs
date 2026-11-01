@@ -6,9 +6,6 @@ use smithay::desktop::get_popup_toplevel_coords;
 use smithay::input::Seat;
 use smithay::input::SeatHandler;
 use smithay::input::SeatState;
-use smithay::input::dnd::DndGrabHandler;
-use smithay::input::dnd::GrabType;
-use smithay::input::dnd::Source;
 use smithay::input::keyboard::KeyboardSource;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -33,7 +30,6 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::DataDeviceHandler;
 use smithay::wayland::selection::data_device::DataDeviceState;
-use smithay::wayland::selection::data_device::WaylandDndGrabHandler;
 use smithay::wayland::selection::data_device::set_data_device_focus;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::PositionerState;
@@ -100,6 +96,7 @@ impl CompositorHandler for State {
             self.end_window_grab(&window);
         }
         self.surfaces.retain(|item| item != surface);
+        self.drag_surface_destroyed(Some(surface));
         if self.cursor_surface.as_ref() == Some(surface) {
             self.cursor_surface = None;
             self.cursor_image = None;
@@ -110,6 +107,20 @@ impl CompositorHandler for State {
         on_commit_buffer_handler::<Self>(surface);
         if self.cursor_surface.as_ref() == Some(surface) {
             self.update_cursor_image();
+        }
+        if let Some(drag) = &mut self.drag
+            && drag.icon.as_ref() == Some(surface)
+        {
+            // Icons move by their attach offsets, as cursor hotspots do.
+            drag.offset += smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                    .current()
+                    .buffer_delta
+                    .take()
+                    .unwrap_or_default()
+            });
         }
         self.frame_pending = crate::FrameRequest::Pending;
         if !is_sync_subsurface(surface) {
@@ -208,7 +219,7 @@ impl FractionalScaleHandler for State {
 }
 impl SeatHandler for State {
     type KeyboardFocus = super::focus::KeyboardFocus;
-    type PointerFocus = WlSurface;
+    type PointerFocus = super::focus::PointerFocus;
     type TouchFocus = WlSurface;
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
@@ -252,19 +263,6 @@ impl smithay::wayland::text_input::TextInputActivation for State {}
 impl DataDeviceHandler for State {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
-    }
-}
-impl DndGrabHandler for State {}
-impl WaylandDndGrabHandler for State {
-    fn dnd_requested<S: Source>(
-        &mut self,
-        source: S,
-        _: Option<WlSurface>,
-        _: Seat<Self>,
-        _: Serial,
-        _: GrabType,
-    ) {
-        source.cancel();
     }
 }
 impl XdgShellHandler for State {

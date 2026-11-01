@@ -1750,3 +1750,143 @@ fn clipboard_outlives_its_wayland_and_x11_owners() {
     );
     assert_eq!(desktop.paste(&x11_paste, b"from x11"), b"from x11");
 }
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland and GTK3 Python bindings"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the drag scenario keeps both clients, the input and the checks together"
+)]
+fn drags_cross_between_wayland_and_x11_clients() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let script = runtime.path().join("dnd.py");
+    fs::write(
+        &script,
+        r"#!/usr/bin/python3
+import os, sys
+import gi
+gi.require_version('Gdk', '3.0')
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gdk, GLib, Gtk
+backend, directory = sys.argv[1], sys.argv[2]
+window = Gtk.Window(title='waywire-dnd-' + backend)
+window.set_default_size(300, 300)
+if backend == 'x11':
+    window.move(450, 150)
+box = Gtk.EventBox()
+box.add(Gtk.Label(label=backend))
+box.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, [], Gdk.DragAction.COPY)
+box.drag_source_add_text_targets()
+box.connect('drag-data-get', lambda *args: args[2].set_text('from-' + backend, -1))
+box.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
+box.drag_dest_add_text_targets()
+def received(widget, context, x, y, data, info, time):
+    with open(os.path.join(directory, backend + '-received'), 'w') as output:
+        output.write(data.get_text())
+box.connect('drag-data-received', received)
+window.add(box)
+window.connect('destroy', Gtk.main_quit)
+window.show_all()
+GLib.timeout_add(500, lambda: open(os.path.join(directory, backend + '-ready'), 'w').close())
+Gtk.main()
+",
+    )
+    .expect("write GTK script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    // The Wayland window is placed at (32, 32); the X11 window asks for
+    // (450, 150). Each is a drag source and a drop target for text.
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"
+                GDK_BACKEND=wayland "$0" wayland "$1" &
+                while [ ! -e "$1/wayland-ready" ]; do sleep 0.05; done
+                GDK_BACKEND=x11 "$0" x11 "$1" &
+                wait
+                "#,
+            ])
+            .arg(&script)
+            .arg(runtime.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !runtime.path().join("x11-ready").exists() {
+        assert!(Instant::now() < deadline, "GTK windows did not map");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(500));
+    let stdin = compositor.0.stdin.as_mut().expect("command pipe");
+    let mut sequence = 0;
+    let mut send = |input: &dyn Fn(InputSequence) -> Command| {
+        sequence += 1;
+        stdin
+            .write_all(&input(InputSequence::new(sequence).expect("sequence")).encode())
+            .expect("send input");
+    };
+    let point = |x: u32, y: u32| {
+        move |sequence| {
+            Command::PointerAbsolute(PointerAbsolute {
+                x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
+                y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
+                sequence,
+            })
+        }
+    };
+    let left = |state| {
+        move |sequence| {
+            Command::PointerButton(PointerButton {
+                button: Button::Left,
+                state,
+                sequence,
+            })
+        }
+    };
+    for ((from_x, to_x), received, expected) in [
+        ((180, 600), "x11-received", "from-wayland"),
+        ((600, 180), "wayland-received", "from-x11"),
+    ] {
+        send(&point(from_x, 250));
+        thread::sleep(Duration::from_millis(200));
+        send(&left(ButtonState::Pressed));
+        // Small steps pass GTK's drag threshold, then cross to the target.
+        for step in 1..=30 {
+            let x = if to_x > from_x {
+                from_x + (to_x - from_x) * step / 30
+            } else {
+                from_x - (from_x - to_x) * step / 30
+            };
+            send(&point(x, 250));
+            thread::sleep(Duration::from_millis(30));
+        }
+        // XDND answers positions asynchronously; let the target accept.
+        for wiggle in [251, 250, 251, 250] {
+            thread::sleep(Duration::from_millis(150));
+            send(&point(to_x, wiggle));
+        }
+        thread::sleep(Duration::from_millis(300));
+        send(&left(ButtonState::Released));
+        let path = runtime.path().join(received);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(&path).ok().as_deref() != Some(expected) {
+            assert!(
+                Instant::now() < deadline,
+                "{received} is {:?}, expected {expected}",
+                fs::read_to_string(&path).ok()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}

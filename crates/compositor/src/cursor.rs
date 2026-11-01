@@ -125,8 +125,10 @@ impl State {
         self.emit(Event::CursorVisibility(CursorVisibility::Visible));
     }
 
+    /// Frame callbacks for the pointer's surfaces: the cursor and any drag icon.
     pub(crate) fn send_cursor_frame(&self) {
-        if let Some(surface) = &self.cursor_surface {
+        let icon = self.drag.as_ref().and_then(|drag| drag.icon.as_ref());
+        for surface in self.cursor_surface.iter().chain(icon) {
             smithay::desktop::utils::send_frames_surface_tree(
                 surface,
                 &self.output,

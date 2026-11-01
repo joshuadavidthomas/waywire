@@ -19,7 +19,6 @@ use smithay::input::pointer::PointerInnerHandle;
 use smithay::input::pointer::RelativeMotionEvent;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Logical;
 use smithay::utils::Point;
 use smithay::utils::Rectangle;
@@ -107,7 +106,10 @@ impl State {
         let Some(surface) = window.wl_surface() else {
             return;
         };
-        if !focus.id().same_client_as(&surface.id()) {
+        if !focus
+            .wl_surface()
+            .is_some_and(|focus| focus.id().same_client_as(&surface.id()))
+        {
             return;
         }
         self.install_window_grab(window, serial, edges, start);
@@ -304,7 +306,7 @@ impl PointerGrab<State> for WindowGrab {
         &mut self,
         state: &mut State,
         handle: &mut PointerInnerHandle<'_, State>,
-        _: Option<(WlSurface, Point<f64, Logical>)>,
+        _: Option<(super::focus::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         if state.pointer_motion_kind == super::PointerMotionKind::RefreshGrabFocus {
@@ -436,7 +438,7 @@ impl PointerGrab<State> for WindowGrab {
         &mut self,
         state: &mut State,
         handle: &mut PointerInnerHandle<'_, State>,
-        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        focus: Option<(super::focus::PointerFocus, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(state, focus, event);

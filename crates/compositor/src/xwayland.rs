@@ -484,6 +484,7 @@ impl XwmHandler for State {
 
     fn destroyed_window(&mut self, xwm: XwmId, surface: X11Surface) {
         self.unmapped_window(xwm, surface);
+        self.drag_surface_destroyed(None);
     }
 
     fn configure_request(

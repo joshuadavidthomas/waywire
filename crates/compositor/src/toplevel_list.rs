@@ -190,6 +190,17 @@ mod tests {
     use wayland_client::EventQueue;
     use wayland_client::QueueHandle;
     use wayland_client::protocol::wl_compositor::WlCompositor;
+    use wayland_client::protocol::wl_data_device::WlDataDevice;
+    use wayland_client::protocol::wl_data_device::{
+        self as data_device,
+    };
+    use wayland_client::protocol::wl_data_device_manager::DndAction;
+    use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
+    use wayland_client::protocol::wl_data_offer::WlDataOffer;
+    use wayland_client::protocol::wl_data_source::WlDataSource;
+    use wayland_client::protocol::wl_data_source::{
+        self as data_source,
+    };
     use wayland_client::protocol::wl_output;
     use wayland_client::protocol::wl_registry;
     use wayland_client::protocol::wl_seat::WlSeat;
@@ -268,6 +279,22 @@ mod tests {
         preferred_scales: Vec<i32>,
         refresh_rates: Vec<i32>,
         popup_geometry: Option<(i32, i32, i32, i32)>,
+        button_serial: Option<u32>,
+        data_device_manager: Option<WlDataDeviceManager>,
+        data_device: Option<WlDataDevice>,
+        dnd: DndEvents,
+    }
+
+    /// Drag-and-drop events seen by a source or target client.
+    #[derive(Default)]
+    struct DndEvents {
+        offer: Option<WlDataOffer>,
+        enter_serial: Option<u32>,
+        leaves: usize,
+        drops: usize,
+        cancelled: bool,
+        drop_performed: bool,
+        finished: bool,
     }
 
     #[derive(Default, Clone, PartialEq)]
@@ -333,6 +360,10 @@ mod tests {
                     }
                     "zwlr_foreign_toplevel_manager_v1" => {
                         state.manager = Some(registry.bind(name, version.min(3), qh, ()));
+                    }
+                    "wl_data_device_manager" => {
+                        state.data_device_manager =
+                            Some(registry.bind(name, version.min(3), qh, ()));
                     }
                     _ => {}
                 }
@@ -528,7 +559,8 @@ mod tests {
                 wayland_client::protocol::wl_pointer::Event::Leave { .. } => {
                     state.pointer_focus = None;
                 }
-                wayland_client::protocol::wl_pointer::Event::Button { .. } => {
+                wayland_client::protocol::wl_pointer::Event::Button { serial, .. } => {
+                    state.button_serial = Some(serial);
                     if let Some(surface) = &state.pointer_focus {
                         state.button_targets.push(surface.clone());
                     }
@@ -545,6 +577,82 @@ mod tests {
                 | wayland_client::protocol::wl_pointer::Event::AxisRelativeDirection { .. }
                 | wayland_client::protocol::wl_pointer::Event::Warp { .. }
                 | _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<WlDataDeviceManager, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &WlDataDeviceManager,
+            _: wayland_client::protocol::wl_data_device_manager::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlDataDevice, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &WlDataDevice,
+            event: data_device::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                data_device::Event::Enter { serial, id, .. } => {
+                    state.dnd.enter_serial = Some(serial);
+                    state.dnd.offer = id;
+                }
+                data_device::Event::Leave => state.dnd.leaves += 1,
+                data_device::Event::Drop => state.dnd.drops += 1,
+                data_device::Event::DataOffer { .. }
+                | data_device::Event::Motion { .. }
+                | data_device::Event::Selection { .. }
+                | _ => {}
+            }
+        }
+
+        wayland_client::event_created_child!(App, WlDataDevice, [
+            data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+        ]);
+    }
+
+    impl Dispatch<WlDataOffer, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &WlDataOffer,
+            _: wayland_client::protocol::wl_data_offer::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlDataSource, ()> for App {
+        fn event(
+            state: &mut Self,
+            _: &WlDataSource,
+            event: data_source::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                data_source::Event::Send { fd, .. } => {
+                    use std::io::Write;
+                    std::fs::File::from(fd)
+                        .write_all(b"dragged text")
+                        .expect("write drag data");
+                }
+                data_source::Event::Cancelled => state.dnd.cancelled = true,
+                data_source::Event::DndDropPerformed => state.dnd.drop_performed = true,
+                data_source::Event::DndFinished => state.dnd.finished = true,
+                data_source::Event::Target { .. } | data_source::Event::Action { .. } | _ => {}
             }
         }
     }
@@ -2650,10 +2758,12 @@ mod tests {
             (80.0, 80.0).into(),
         );
         let pointer = state.seat.get_pointer().expect("pointer");
-        assert_eq!(
-            pointer.current_focus(),
-            first.wl_surface().map(std::borrow::Cow::into_owned)
-        );
+        let focus_of = |window: &Window| {
+            window
+                .wl_surface()
+                .map(|surface| crate::focus::PointerFocus::Wayland(surface.into_owned()))
+        };
+        assert_eq!(pointer.current_focus(), focus_of(&first));
         state.start_decoration_grab(
             first.clone(),
             smithay::utils::SERIAL_COUNTER.next_serial(),
@@ -2676,10 +2786,7 @@ mod tests {
             smithay::utils::SERIAL_COUNTER.next_serial(),
             smithay::backend::input::InputTime::now(),
         );
-        assert_eq!(
-            pointer.current_focus(),
-            second.wl_surface().map(std::borrow::Cow::into_owned)
-        );
+        assert_eq!(pointer.current_focus(), focus_of(&second));
         state.pointer_button(
             smithay::input::keyboard::KeyboardSource::MAIN,
             0x110,
@@ -2706,22 +2813,13 @@ mod tests {
             smithay::utils::SERIAL_COUNTER.next_serial(),
             smithay::backend::input::InputTime::now(),
         );
-        assert_eq!(
-            pointer.current_focus(),
-            first.wl_surface().map(std::borrow::Cow::into_owned)
-        );
+        assert_eq!(pointer.current_focus(), focus_of(&first));
         state.focus_window(Some(second.clone()));
-        assert_eq!(
-            pointer.current_focus(),
-            second.wl_surface().map(std::borrow::Cow::into_owned)
-        );
+        assert_eq!(pointer.current_focus(), focus_of(&second));
         second_surface.attach(None, 0, 0);
         second_surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert_eq!(
-            pointer.current_focus(),
-            first.wl_surface().map(std::borrow::Cow::into_owned)
-        );
+        assert_eq!(pointer.current_focus(), focus_of(&first));
     }
 
     fn assert_modal_child_focus(state: &mut crate::State, parent: &Window, child: &Window) {
@@ -3323,5 +3421,173 @@ mod tests {
         assert_eq!(app.handles[0].title, "New title");
         assert_eq!(app.handles[0].app_id, "foot");
         assert!(!app.handles[0].closed);
+    }
+
+    type Peer = (Connection, EventQueue<App>, App);
+
+    fn sync_peer(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        peer: &mut Peer,
+    ) {
+        let (connection, queue, app) = peer;
+        sync(display, state, connection, queue, app);
+    }
+
+    /// A client with a pointer and a data device, showing one 200x200 window
+    /// at `location`.
+    fn peer_window(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        title: &str,
+        location: (i32, i32),
+    ) -> (Peer, WlSurface, Window) {
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(display, state, &connection, &mut queue, &mut app);
+        sync(display, state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let seat = app.seat.clone().expect("seat");
+        seat.get_pointer(&qh, ());
+        app.data_device = Some(
+            app.data_device_manager
+                .as_ref()
+                .expect("data device manager")
+                .get_data_device(&seat, &qh, ()),
+        );
+        let (surface, _, _) = map_toplevel(
+            display,
+            state,
+            &connection,
+            &mut queue,
+            &mut app,
+            title,
+            &title.to_lowercase(),
+        );
+        attach_rectangle_buffer(&surface, &app, &qh, 200, 200);
+        sync(display, state, &connection, &mut queue, &mut app);
+        let window = top_window(state);
+        state.space.map_element(window.clone(), location, true);
+        ((connection, queue, app), surface, window)
+    }
+
+    const DRAG_MIME: &str = "text/plain;charset=utf-8";
+
+    /// A window at (0, 0) starts a text drag from a button press, and the
+    /// pointer carries it into another client's window at (400, 0), which
+    /// accepts it.
+    fn drag_into_target(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+    ) -> (Peer, Peer, WlDataSource) {
+        use smithay::input::keyboard::KeyboardSource;
+        let (mut source, source_surface, _) = peer_window(display, state, "Source", (0, 0));
+        let (mut target, _, _) = peer_window(display, state, "Target", (400, 0));
+        state.pointer_motion(KeyboardSource::MAIN, (100.0, 100.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        sync_peer(display, state, &mut source);
+        let qh = source.1.handle();
+        let data = source
+            .2
+            .data_device_manager
+            .as_ref()
+            .expect("data device manager")
+            .create_data_source(&qh, ());
+        data.offer(DRAG_MIME.to_owned());
+        data.set_actions(DndAction::Copy);
+        source
+            .2
+            .data_device
+            .as_ref()
+            .expect("data device")
+            .start_drag(
+                Some(&data),
+                &source_surface,
+                None,
+                source.2.button_serial.expect("button serial"),
+            );
+        sync_peer(display, state, &mut source);
+        assert!(state.drag.is_some(), "the drag starts");
+        assert!(state.dnd_grab_active(), "the drag holds the pointer");
+        state.pointer_motion(KeyboardSource::MAIN, (500.0, 100.0).into());
+        sync_peer(display, state, &mut target);
+        let offer = target
+            .2
+            .dnd
+            .offer
+            .clone()
+            .expect("the target gets an offer");
+        offer.accept(
+            target.2.dnd.enter_serial.expect("enter serial"),
+            Some(DRAG_MIME.to_owned()),
+        );
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+        sync_peer(display, state, &mut target);
+        sync_peer(display, state, &mut source);
+        (source, target, data)
+    }
+
+    #[test]
+    fn drag_delivers_its_data_to_the_target_window() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (mut source, mut target, _data) = drag_into_target(&mut display, &mut state);
+        state.pointer_button(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            0x110,
+            ButtonState::Released,
+        );
+        sync_peer(&mut display, &mut state, &mut target);
+        assert_eq!(target.2.dnd.drops, 1, "the release drops on the target");
+        assert!(state.drag.is_none());
+        assert!(!state.dnd_grab_active());
+
+        let offer = target.2.dnd.offer.clone().expect("offer");
+        let (read, write) = nix::unistd::pipe().expect("pipe");
+        offer.receive(DRAG_MIME.to_owned(), write.as_fd());
+        sync_peer(&mut display, &mut state, &mut target);
+        drop(write);
+        sync_peer(&mut display, &mut state, &mut source);
+        let mut received = [0; 64];
+        let length = nix::unistd::read(&read, &mut received).expect("read drag data");
+        assert_eq!(&received[..length], b"dragged text");
+
+        offer.finish();
+        sync_peer(&mut display, &mut state, &mut target);
+        sync_peer(&mut display, &mut state, &mut source);
+        assert!(source.2.dnd.drop_performed);
+        assert!(source.2.dnd.finished);
+        assert!(!source.2.dnd.cancelled);
+    }
+
+    #[test]
+    fn takeover_cancels_a_drag_without_dropping() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (mut source, mut target, _data) = drag_into_target(&mut display, &mut state);
+        state.set_browser_lease(true);
+        sync_peer(&mut display, &mut state, &mut target);
+        sync_peer(&mut display, &mut state, &mut source);
+        assert!(source.2.dnd.cancelled, "the source learns the drag ended");
+        assert_eq!(target.2.dnd.leaves, 1, "the offer leaves the target");
+        assert_eq!(target.2.dnd.drops, 0);
+        assert!(state.drag.is_none());
+        assert!(!state.dnd_grab_active(), "the pointer is free again");
+    }
+
+    #[test]
+    fn source_client_exit_cancels_its_drag() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (source, mut target, data) = drag_into_target(&mut display, &mut state);
+        drop(data);
+        drop(source);
+        sync_peer(&mut display, &mut state, &mut target);
+        assert!(state.drag.is_none());
+        assert!(!state.dnd_grab_active(), "the pointer is free again");
+        assert_eq!(target.2.dnd.leaves, 1, "the offer leaves the target");
+        state.pointer_button(
+            smithay::input::keyboard::KeyboardSource::MAIN,
+            0x110,
+            ButtonState::Released,
+        );
+        sync_peer(&mut display, &mut state, &mut target);
+        assert_eq!(target.2.dnd.drops, 0, "the release drops nothing");
     }
 }

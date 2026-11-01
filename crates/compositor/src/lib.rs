@@ -4,6 +4,7 @@ mod capture;
 mod clipboard;
 mod cursor;
 mod decorations;
+mod dnd;
 mod eis;
 mod event_writer;
 mod focus;
@@ -227,6 +228,7 @@ pub(crate) struct State {
     pub(crate) xdg_shell_state: XdgShellState,
     pub(crate) seat_state: SeatState<Self>,
     pub(crate) data_device_state: DataDeviceState,
+    pub(crate) drag: Option<dnd::Drag>,
     pub(crate) popups: PopupManager,
     pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
     /// Last X11 stacking order sent to the XWM; `None` forces the next sync,
@@ -377,6 +379,7 @@ impl State {
             xdg_shell_state,
             seat_state,
             data_device_state,
+            drag: None,
             popups: PopupManager::default(),
             xwm: None,
             x11_stacking: None,
@@ -481,13 +484,33 @@ impl State {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.under(pos)
+            .map(|(_, surface, location)| (surface, location))
+    }
+
+    /// The pointer target at `pos`: X11 windows as themselves, so drags reach
+    /// them through XDND, and Wayland surfaces as the surface hit.
+    pub(crate) fn pointer_focus_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(focus::PointerFocus, Point<f64, Logical>)> {
+        self.under(pos).map(|(window, surface, location)| {
+            let focus = match window.x11_surface() {
+                Some(x11) => focus::PointerFocus::X11(x11.clone()),
+                None => focus::PointerFocus::Wayland(surface),
+            };
+            (focus, location)
+        })
+    }
+
+    fn under(&self, pos: Point<f64, Logical>) -> Option<(&Window, WlSurface, Point<f64, Logical>)> {
         if self.window_menu.is_some() || self.decoration_under(pos).is_some() {
             return None;
         }
         self.element_under(pos).and_then(|(window, location)| {
             window
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|(surface, offset)| (surface, (offset + location).to_f64()))
+                .map(|(surface, offset)| (window, surface, (offset + location).to_f64()))
         })
     }
 
@@ -887,7 +910,7 @@ impl State {
             if !locked {
                 pointer.motion(
                     self,
-                    self.surface_under(location),
+                    self.pointer_focus_under(location),
                     &MotionEvent {
                         location,
                         serial: SERIAL_COUNTER.next_serial(),
@@ -898,7 +921,7 @@ impl State {
             if let Some(delta) = delta {
                 pointer.relative_motion(
                     self,
-                    self.surface_under(location),
+                    self.pointer_focus_under(location),
                     &RelativeMotionEvent {
                         delta,
                         delta_unaccel: delta,
@@ -918,7 +941,10 @@ impl State {
         }) {
             self.decoration_press = None;
         }
-        if let Some(shape) = self.decoration_cursor_under(location) {
+        if self.drag.is_some() {
+            // The drag icon follows the pointer, and the drag keeps its cursor.
+            self.frame_pending = FrameRequest::Pending;
+        } else if let Some(shape) = self.decoration_cursor_under(location) {
             self.emit(Event::CursorShape(shape));
         } else if self.surface_under(location).is_none() {
             self.emit(Event::CursorShape(pipe::CursorShape::Default));
@@ -1182,6 +1208,9 @@ impl State {
                 .map(|(window, _)| window.clone())
         {
             self.focus_window(Some(window));
+        }
+        if state == ButtonState::Released {
+            self.refresh_drag_target();
         }
         pointer.button(
             self,
@@ -1460,6 +1489,10 @@ impl State {
             }
         }
         let buttons = self.buttons.get(&source).cloned().unwrap_or_default();
+        if !buttons.is_empty() {
+            // Losing a source is not a drop: its drag ends without one.
+            self.cancel_drag();
+        }
         for button in buttons {
             self.pointer_button_inner(source, button, ButtonState::Released);
         }

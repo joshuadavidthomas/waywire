@@ -1096,6 +1096,24 @@ impl State {
     ) -> Vec<SceneElement<PixmanRenderer>> {
         let mut elements = Vec::new();
         let scale = self.output.current_scale().fractional_scale();
+        if let (Some(drag), Some(pointer)) = (&self.drag, self.seat.get_pointer())
+            && let Some(icon) = &drag.icon
+        {
+            // The icon is part of the picture, unlike the cursor, which the
+            // viewer draws itself.
+            let location = (pointer.current_location() + drag.offset.to_f64())
+                .to_physical_precise_round(scale);
+            elements.extend(
+                smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                    renderer,
+                    icon,
+                    location,
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                ),
+            );
+        }
         if let Some(menu) = self.window_menu.as_mut() {
             match menu.element(renderer, scale) {
                 Ok(element) => elements.push(element.into()),
