@@ -260,12 +260,77 @@ sleeps.
 
 ### Pass 2: remote
 
-Design with what pass 1 teaches. Following the WPRS idea in the original spec,
-the remote side should understand windows and surfaces, not just receive
-pictures and inject coordinates. Candidates: a network agent endpoint with its
-own authentication, window-aware or per-window streaming, and agent
-observations taken from the rendered scene without an encode and decode round
-trip.
+Pass 2 is ranked by a dogfood run on November 1, 2026 at `0548b28`. An agent drove six tasks
+through five drivers and recorded every call:
+
+- **Drivers:** cua-driver 0.38.0, computer-use-linux 0.7.35 stock and with PRs #359 and #360,
+  an xdotool + grim/scrot loop in the shape of Anthropic's demo, and agent-desktop 1.0.2.
+- **Tasks:** a web form, editing a file through the GTK file chooser, terminal-to-browser
+  paste, file-manager drag, switching windows by title, and recovery from a surprise dialog or
+  a moved window.
+- **Desktops:** waywire, Waymote, Xvfb with noVNC, and Selkies (linuxserver Webtop, CPU
+  encoding).
+
+The report, call log and harness are kept outside the repository. Each item below names the
+measured cost behind it.
+
+Backed, most important first:
+
+1. **Input delivery receipts and focus events.**
+   - **Measured cost.** A dialog that opened mid-task swallowed typed input in 16 of 24 runs,
+     on every desktop and every pixel driver, while every call reported success. One run
+     submitted a corrupted phone number.
+   - **What to build.** The compositor knows which surface received each key and button
+     event, and when keyboard focus moves to a newly mapped window. Report both to the agent,
+     per input and as events.
+   - **Why it wins.** None of the compared desktops or drivers offers this, so it is the item
+     that would make waywire clearly better than X11 desktops, not just level with them.
+2. **A window query with stable ids, geometry, stacking, pid and focus.**
+   - **Measured cost.** On waywire no tool gives screen-space window bounds: foreign-toplevel
+     has none, and cua and agent-desktop report AT-SPI window-relative bounds as screen
+     positions. Every window-scoped click therefore had to be read off a full-desktop
+     screenshot. On Xvfb and Selkies, xdotool and wmctrl report real geometry.
+   - After a window moved, clicks at old coordinates hit the wrong window in 11 of 24 runs.
+     Recovery by identity worked every time.
+   - This is the window half of the agent query API in section 4. Control identity inside
+     windows stays with AT-SPI, which worked on the session bus for cua and
+     computer-use-linux.
+3. **A per-input settle signal:** no damage for N ms since input X.
+   - **Measured cost.** 7.7% of waywire screenshots (12 of 156) were taken before the screen
+     settled. waywire itself settles quickly: the file chooser settles in 288 ms at p50, against
+     622–683 ms elsewhere. The early screenshots came from cua returning in 96 ms on waywire,
+     against 466 ms on Xvfb.
+   - **What it replaces.** Fixed sleeps of 400–800 ms; 67 sleeps in the waywire runs.
+   - **Limit.** It cannot see app timers: an alert behind a 300 ms page timer settled at about
+     600 ms after a quiet screen.
+4. **Text input through the compositor's keymap.**
+   - **Measured cost.** wtype and cua type through per-string virtual keyboards, and Chromium
+     drops characters from them. A punctuation-heavy line came back wrong 10 times out of 10 on
+     waywire and on Waymote, and correct 10 times out of 10 with xdotool on X11.
+   - **What already works.** waywire's RemoteDesktop `NotifyKeyboardKeysym` typed the same
+     line correctly 5 times out of 5. Drivers should use that path or EIS for text. The agent
+     endpoint should offer only that path.
+
+Not a goal on its own:
+
+- **A network agent endpoint with its own authentication** is the transport for items 1–4.
+  Ship them first where on-box drivers can read them. Every run here was on the box, so nothing
+  measured a need for remote access yet.
+
+Dropped:
+
+- **Window-aware or per-window streaming.** No driver read the stream. Switching by title
+  worked in every run: patched computer-use-linux and cua through foreign-toplevel, and
+  xdotool through Xwayland.
+- **Observations taken from the rendered scene without an encode and decode round trip.**
+  Agent screenshots never pass through the encoder. They come from screencopy or the portal:
+  the driver call takes 45–76 ms at p50, of which grim's raw capture is 13 ms. Most of the cost
+  is PNG encoding and transfer in the driver, not the compositor.
+
+One gap outside these items: browser input-to-pixel in the viewer is 92 ms at p50 on waywire,
+against 20 ms on Selkies (x264 at 30 fps, CPU only). Until it is closed, Selkies is the
+better desktop for a person watching or taking over. The next step is a per-stage timestamp
+breakdown in the Waymote comparison benchmark.
 
 ## 3. Window-management policy
 
