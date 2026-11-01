@@ -189,8 +189,10 @@ The compositor still renders RGB pixels; FFmpeg converts them to YUV for encodin
 Chroma subsampling can soften small colored text.
 
 Adaptation lowers encoded scale, then bitrate, then FPS under sustained pressure,
-and recovers in reverse order without switching away from 4:2:0. These changes
-restart the encoder; changing encoded scale does not resize the desktop itself.
+and recovers in reverse order without switching away from 4:2:0. Frames the
+gateway drops because a viewer's link falls behind count as pressure. These
+changes restart the encoder; changing encoded scale does not resize the desktop
+itself.
 The existing bitrate cap and low-latency settings are unchanged; short measurements
 can exceed the cap while the encoder's two-second VBV buffer fills.
 

@@ -198,3 +198,36 @@ test("stalled presentation exposes live loss without publishing imaginary draws"
   }
   assert.equal(h.closed.length, 50);
 });
+
+test("frames the gateway dropped on a slow link count as loss in feedback", async (context) => {
+  const h = await presentation(context, 0);
+  const feed = async (
+    timestamp: number,
+    options: Parameters<typeof h.feed>[1],
+  ) => {
+    await h.feed(timestamp, options);
+    // Present each frame before the next, so only link loss is counted.
+    h.advance(1_000);
+    h.paint();
+  };
+  try {
+    await feed(1_000, { keyframe: true, sequence: 10 });
+    await feed(2_000, { sequence: 11 });
+    // The gateway's queue overflowed: it dropped 12..18 and resumed at a key frame.
+    await feed(9_000, { keyframe: true, discontinuity: true, sequence: 19 });
+    // Without a discontinuity a gap is a frame the compositor never sent.
+    await feed(10_000, { sequence: 23 });
+    // A new generation restarts the sequence space; its gap is not loss.
+    await feed(11_000, {
+      keyframe: true,
+      discontinuity: true,
+      generation: 2,
+      sequence: 40,
+    });
+    assert.equal(h.video.stats.linkDroppedFrames, 7);
+    assert.equal(h.video.stats.decoderResetDroppedFrames, 0);
+    assert.equal(h.video.takeFeedback()?.dropped, 7);
+  } finally {
+    h.video.disconnect();
+  }
+});

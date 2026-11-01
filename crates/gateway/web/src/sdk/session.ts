@@ -85,6 +85,8 @@ export interface WaywireStats {
   readonly overdueDroppedFrames: number;
   readonly decodedOverflowDroppedFrames: number;
   readonly decoderResetDroppedFrames: number;
+  /** Frames the gateway dropped before sending because the link fell behind. */
+  readonly linkDroppedFrames: number;
   readonly decoderResets: number;
   readonly resizeState: "idle" | "requested" | "applied" | "presented";
 }

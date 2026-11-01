@@ -76,6 +76,7 @@ export type VideoPacket = Readonly<{
   discontinuity: boolean;
   timestamp: number;
   generation: number;
+  sequence: number;
   latestAppliedInput: number;
   width: number;
   height: number;
@@ -104,6 +105,7 @@ export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
       discontinuity: continuity === 1,
       timestamp: Number(metadata.captureNanos / 1000n),
       generation: metadata.generation,
+      sequence: Number(metadata.sequence),
       latestAppliedInput: metadata.inputSequence,
       width: metadata.width,
       height: metadata.height,
@@ -167,6 +169,8 @@ export class VideoRuntime {
   private overdueDroppedFrames = 0;
   private decodedOverflowDroppedFrames = 0;
   private decoderResetDroppedFrames = 0;
+  private linkDroppedFrames = 0;
+  private lastSequence: number | null = null;
   private decoderResets = 0;
   private lastDrawStats: WaywireStats | null = null;
 
@@ -226,6 +230,7 @@ export class VideoRuntime {
       overdueDroppedFrames: this.overdueDroppedFrames,
       decodedOverflowDroppedFrames: this.decodedOverflowDroppedFrames,
       decoderResetDroppedFrames: this.decoderResetDroppedFrames,
+      linkDroppedFrames: this.linkDroppedFrames,
       decoderResets: this.decoderResets,
     };
   }
@@ -459,7 +464,8 @@ export class VideoRuntime {
             queuePeak: this.queuePeak,
             queueBusyMs,
             sampleMs,
-            dropped: this.intervalDroppedFrames,
+            // A long link stall can drop more frames than the gateway accepts.
+            dropped: Math.min(this.intervalDroppedFrames, 10_000),
           }
         : null;
     this.resetFeedbackInterval(now);
@@ -610,6 +616,19 @@ export class VideoRuntime {
     const generationChanged = packet.generation !== this.currentGeneration;
     const previousGeneration = this.currentGeneration;
     if (generationChanged) this.currentGeneration = packet.generation;
+    // The gateway drops frames a slow link cannot carry and marks the next one
+    // it sends. Only the sequence gap shows how many it dropped.
+    if (
+      packet.discontinuity &&
+      !generationChanged &&
+      this.lastSequence !== null
+    ) {
+      const lost = Math.max(0, packet.sequence - this.lastSequence - 1);
+      this.droppedFrames += lost;
+      this.intervalDroppedFrames += lost;
+      this.linkDroppedFrames += lost;
+    }
+    this.lastSequence = packet.sequence;
     const queuedBeforeDecode = packet.striped
       ? (this.stripes?.decodeQueueSize ?? 0)
       : decoder.decodeQueueSize;

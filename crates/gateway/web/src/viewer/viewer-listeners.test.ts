@@ -402,6 +402,7 @@ function stats(width: number, height: number): WaywireStats {
     overdueDroppedFrames: 0,
     decodedOverflowDroppedFrames: 0,
     decoderResetDroppedFrames: 0,
+    linkDroppedFrames: 0,
     decoderResets: 0,
     resizeState: "idle",
   };

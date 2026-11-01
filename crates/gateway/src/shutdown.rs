@@ -4,6 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use axum::serve::ListenerExt;
+use socket2::SockRef;
 use tokio::net::TcpListener;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
@@ -117,6 +118,11 @@ pub(super) async fn shutdown_signal() -> Result<()> {
     }
 }
 
+/// Unsent bytes a connection may queue in the kernel. A slow viewer's backlog then
+/// stays in the gateway's per-viewer queue, which drops frames the viewer reports as
+/// loss, instead of seconds of video hiding in an autotuned send buffer.
+const UNSENT_BYTES: u32 = 64 << 10;
+
 pub(super) async fn http_listener(
     address: &str,
 ) -> Result<impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr>> {
@@ -126,6 +132,9 @@ pub(super) async fn http_listener(
         .tap_io(|stream| {
             if let Err(error) = stream.set_nodelay(true) {
                 warn!(%error, "failed to set TCP_NODELAY on accepted HTTP connection");
+            }
+            if let Err(error) = SockRef::from(&*stream).set_tcp_notsent_lowat(UNSENT_BYTES) {
+                warn!(%error, "failed to set TCP_NOTSENT_LOWAT on accepted HTTP connection");
             }
         }))
 }

@@ -55,7 +55,7 @@ proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rust-embed = { version = "8.13.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-socket2 = "0.6.5"
+socket2 = { version = "0.6.5", features = ["all"] }
 smithay = { git = "https://github.com/Smithay/smithay", rev = "f581531d479cf2e3307bafb913c5d2bb12860bb3", default-features = false, features = ["desktop", "wayland_frontend", "renderer_pixman", "xwayland", "backend_libei"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"

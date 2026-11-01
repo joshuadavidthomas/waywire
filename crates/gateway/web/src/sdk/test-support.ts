@@ -248,6 +248,7 @@ export function videoPacket(
     readonly keyframe?: boolean;
     readonly discontinuity?: boolean;
     readonly generation?: number;
+    readonly sequence?: number;
     readonly width?: number;
     readonly height?: number;
     readonly fps?: number;
@@ -262,7 +263,7 @@ export function videoPacket(
       width: options.width ?? 1280,
       height: options.height ?? 720,
       captureNanos: BigInt(timestamp) * 1000n,
-      sequence: 0n,
+      sequence: BigInt(options.sequence ?? 0),
       inputSequence: 0,
       fps: options.fps ?? 60,
       chroma: options.chroma ?? 0,
