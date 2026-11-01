@@ -379,18 +379,22 @@ impl Wire for Continuity {
 #[repr(u8)]
 pub enum BrowserKind {
     Frame = 1,
+    /// A frame whose data is the stripe container ([`push_stripe`]).
+    StripedFrame = 2,
 }
 
 impl RecordKind for BrowserKind {
     fn wire(self) -> u8 {
         match self {
             Self::Frame => 1,
+            Self::StripedFrame => 2,
         }
     }
 
     fn from_wire(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::Frame),
+            2 => Some(Self::StripedFrame),
             _ => None,
         }
     }
@@ -398,14 +402,39 @@ impl RecordKind for BrowserKind {
     fn max_payload(self) -> usize {
         match self {
             // Frame kind u8, continuity u8, 33-byte metadata, then the encoded access unit.
-            Self::Frame => 35 + MAX_VIDEO_DATA_BYTES,
+            Self::Frame | Self::StripedFrame => 35 + MAX_VIDEO_DATA_BYTES,
         }
     }
+}
+
+/// Bytes before each stripe's access unit in a video payload.
+pub const STRIPE_HEADER_BYTES: usize = 9;
+
+/// Append one stripe to a video payload. A payload carries one or more horizontal
+/// stripes of the frame, each its own H.264 stream: the stripe's top row and height
+/// (u16 LE each), flags (u8, bit 0 set for a key frame), the access unit's length
+/// (u32 LE), then the Annex-B access unit.
+pub fn push_stripe(out: &mut Vec<u8>, y: u16, height: u16, key: bool, unit: &[u8]) {
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.push(u8::from(key));
+    out.extend_from_slice(&u32::try_from(unit.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(unit);
+}
+
+/// How a sample's data carries the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// One Annex-B access unit of the whole frame.
+    Whole,
+    /// The stripe container of the stripes that changed ([`push_stripe`]).
+    Stripes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSample {
     pub data: Arc<[u8]>,
+    pub layout: Layout,
     pub kind: FrameKind,
     pub continuity: Continuity,
     pub metadata: FrameMetadata,
@@ -415,7 +444,10 @@ impl Record for VideoSample {
     type Kind = BrowserKind;
 
     fn kind(&self) -> Self::Kind {
-        BrowserKind::Frame
+        match self.layout {
+            Layout::Whole => BrowserKind::Frame,
+            Layout::Stripes => BrowserKind::StripedFrame,
+        }
     }
 
     fn write_payload(&self, out: &mut Writer) {
@@ -426,14 +458,16 @@ impl Record for VideoSample {
     }
 
     fn read_payload(kind: Self::Kind, input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
-        match kind {
-            BrowserKind::Frame => Ok(Self {
-                kind: input.get()?,
-                continuity: input.get()?,
-                metadata: input.get()?,
-                data: Arc::from(input.rest()),
-            }),
-        }
+        Ok(Self {
+            layout: match kind {
+                BrowserKind::Frame => Layout::Whole,
+                BrowserKind::StripedFrame => Layout::Stripes,
+            },
+            kind: input.get()?,
+            continuity: input.get()?,
+            metadata: input.get()?,
+            data: Arc::from(input.rest()),
+        })
     }
 }
 
@@ -844,8 +878,9 @@ mod tests {
 
     #[test]
     fn video_frame_header_is_exact() {
-        let sample = VideoSample {
+        let mut sample = VideoSample {
             data: vec![1, 2].into(),
+            layout: Layout::Whole,
             kind: FrameKind::Key,
             continuity: Continuity::AfterGap,
             metadata: FrameMetadata {
@@ -864,6 +899,19 @@ mod tests {
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);
-        assert_eq!(VideoSample::decode(&bytes), Ok(sample));
+        assert_eq!(VideoSample::decode(&bytes), Ok(sample.clone()));
+        sample.layout = Layout::Stripes;
+        let mut striped = bytes;
+        striped[1] = 2;
+        assert_eq!(sample.encode(), striped);
+        assert_eq!(VideoSample::decode(&striped), Ok(sample));
+    }
+
+    #[test]
+    fn stripe_header_is_exact() {
+        let mut out = Vec::new();
+        push_stripe(&mut out, 90, 180, true, &[0, 0, 0, 1, 0x65]);
+        assert_eq!(out, [90, 0, 180, 0, 1, 5, 0, 0, 0, 0, 0, 0, 1, 0x65]);
+        assert_eq!(out.len() - 5, STRIPE_HEADER_BYTES);
     }
 }

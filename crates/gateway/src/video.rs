@@ -17,16 +17,15 @@ use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tracing::debug;
 use tracing::warn;
-#[cfg(test)]
 use waywire_protocol::browser::Continuity;
-#[cfg(test)]
 use waywire_protocol::browser::FrameKind;
+use waywire_protocol::browser::Layout;
 use waywire_protocol::browser::MAX_VIDEO_DATA_BYTES;
-#[cfg(test)]
 use waywire_protocol::browser::VideoSample;
 #[cfg(test)]
 use waywire_protocol::pipe::Chroma;
 use waywire_protocol::pipe::Command;
+use waywire_protocol::pipe::EncodedFrame;
 #[cfg(test)]
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameMetadata;
@@ -40,6 +39,7 @@ use self::assembler::AssemblyDrop;
 use self::assembler::AssemblyOutcome;
 use self::assembler::PacketFailure;
 use self::assembler::Unit;
+use self::correlator::Correlation;
 use self::correlator::CorrelationOutcome;
 use self::correlator::Correlator;
 use self::correlator::MAX_PENDING_UNIT_BYTES;
@@ -75,6 +75,8 @@ enum GopState {
 enum PipelineMessage {
     Metadata(FrameMetadata),
     Unit(PendingUnit),
+    /// A frame the compositor encoded in process; it needs no RTP correlation.
+    Encoded(EncodedFrame),
     /// The assembler dropped RTP and entered recovery: it awaits the next IDR
     /// before the stream can resume.
     Recovery,
@@ -82,6 +84,7 @@ enum PipelineMessage {
 
 enum WorkerWake {
     Message(PipelineMessage),
+    KeyWanted,
     PipelineClosed,
     CorrelatorDeadline,
     MetadataReportDeadline,
@@ -226,6 +229,14 @@ impl VideoPipeline {
             .context("video pipeline stopped")
     }
 
+    pub(crate) async fn encoded(&self, value: EncodedFrame) -> anyhow::Result<()> {
+        self.sessions.submitted(&value.metadata);
+        self.tx
+            .send(PipelineMessage::Encoded(value))
+            .await
+            .context("video pipeline stopped")
+    }
+
     async fn unit(&self, value: Unit) -> anyhow::Result<()> {
         let bytes = u32::try_from(value.data.len()).context("access unit size overflow")?;
         let permit = Arc::clone(&self.unit_budget)
@@ -338,6 +349,7 @@ impl VideoWorker {
         let mut correlator = Correlator::new();
         let mut metadata_summary = MetadataDropSummary::new();
         let mut ready_generation = None;
+        let key_wanted = self.hub.key_wanted();
         loop {
             let correlation = if correlator
                 .deadline()
@@ -369,15 +381,20 @@ impl VideoWorker {
                     tokio::select! {
                         biased;
                         () = sleep_until(deadline) => timer_wake,
+                        () = key_wanted.notified() => WorkerWake::KeyWanted,
                         value = self.rx.recv() => match value {
                             Some(message) => WorkerWake::Message(message),
                             None => WorkerWake::PipelineClosed,
                         },
                     }
                 } else {
-                    match self.rx.recv().await {
-                        Some(message) => WorkerWake::Message(message),
-                        None => WorkerWake::PipelineClosed,
+                    tokio::select! {
+                        biased;
+                        () = key_wanted.notified() => WorkerWake::KeyWanted,
+                        value = self.rx.recv() => match value {
+                            Some(message) => WorkerWake::Message(message),
+                            None => WorkerWake::PipelineClosed,
+                        },
                     }
                 };
                 match wake {
@@ -386,6 +403,36 @@ impl VideoWorker {
                     }
                     WorkerWake::Message(PipelineMessage::Unit(value)) => {
                         correlator.push_unit(value)
+                    }
+                    // A frame in which no stripe changed counted as submitted; it has
+                    // nothing for a viewer.
+                    WorkerWake::Message(PipelineMessage::Encoded(frame))
+                        if frame.data.is_empty() =>
+                    {
+                        continue;
+                    }
+                    WorkerWake::Message(PipelineMessage::Encoded(frame)) => Correlation {
+                        outcome: CorrelationOutcome::Frames(vec![VideoSample {
+                            data: frame.data.into(),
+                            layout: Layout::Stripes,
+                            kind: if frame.key {
+                                FrameKind::Key
+                            } else {
+                                FrameKind::Delta
+                            },
+                            continuity: Continuity::Continuous,
+                            metadata: frame.metadata,
+                        }]),
+                        unmatched_metadata: 0,
+                    },
+                    WorkerWake::KeyWanted => {
+                        // Readiness stays as it is: existing viewers still play. Only
+                        // the compositor's next frame becomes a key frame.
+                        self.send_keyframe_readiness(
+                            ready_generation.take(),
+                            KeyframeState::Missing,
+                        );
+                        continue;
                     }
                     WorkerWake::Message(PipelineMessage::Recovery) => {
                         // The assembler lost RTP and awaits a fresh keyframe;
@@ -512,6 +559,7 @@ mod tests {
     pub(super) fn sample(sequence: u64, bytes: usize, kind: FrameKind) -> VideoSample {
         VideoSample {
             data: vec![1; bytes].into(),
+            layout: Layout::Whole,
             kind,
             continuity: Continuity::Continuous,
             metadata: metadata(sequence, 1),

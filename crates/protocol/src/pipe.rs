@@ -1539,10 +1539,42 @@ impl Wire for CursorImage {
     }
 }
 
+/// A frame the compositor encoded in process: the browser stripe container
+/// ([`crate::browser::push_stripe`]) of the stripes that changed, and whether every
+/// stripe of the frame is a key frame, so a viewer can start from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedFrame {
+    pub key: bool,
+    pub metadata: FrameMetadata,
+    pub data: Vec<u8>,
+}
+
+impl Wire for EncodedFrame {
+    fn write(&self, out: &mut Writer) {
+        out.put(&u8::from(self.key));
+        out.put(&self.metadata);
+        out.bytes(&self.data);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let key = match input.get()? {
+            0_u8 => false,
+            1 => true,
+            _ => return Err(InvalidValue("encoded frame key flag must be zero or one")),
+        };
+        Ok(Self {
+            key,
+            metadata: input.get()?,
+            data: input.rest().to_vec(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Clipboard(ClipboardText),
     Frame(FrameMetadata),
+    EncodedFrame(EncodedFrame),
     ResizeApplied(ResizeApplied),
     CursorShape(CursorShape),
     CursorImage(CursorImage),
@@ -1566,6 +1598,7 @@ pub enum EventKind {
     AgentInput = 8,
     CursorImage = 9,
     CursorClick = 10,
+    EncodedFrame = 11,
 }
 
 impl RecordKind for EventKind {
@@ -1581,6 +1614,7 @@ impl RecordKind for EventKind {
             Self::AgentInput => 8,
             Self::CursorImage => 9,
             Self::CursorClick => 10,
+            Self::EncodedFrame => 11,
         }
     }
 
@@ -1596,6 +1630,7 @@ impl RecordKind for EventKind {
             8 => Some(Self::AgentInput),
             9 => Some(Self::CursorImage),
             10 => Some(Self::CursorClick),
+            11 => Some(Self::EncodedFrame),
             _ => None,
         }
     }
@@ -1609,6 +1644,8 @@ impl RecordKind for EventKind {
             Self::CursorPosition | Self::CursorClick => 9,
             Self::AgentInput => 2,
             Self::CursorImage => 128 * 128 * 8 + 6,
+            // Key flag u8, 33-byte metadata, then the stripe container.
+            Self::EncodedFrame => 34 + crate::browser::MAX_VIDEO_DATA_BYTES,
         }
     }
 }
@@ -1618,6 +1655,7 @@ impl Event {
         match self {
             Self::Clipboard(_) => EventKind::Clipboard,
             Self::Frame(_) => EventKind::Frame,
+            Self::EncodedFrame(_) => EventKind::EncodedFrame,
             Self::ResizeApplied(_) => EventKind::ResizeApplied,
             Self::CursorShape(_) => EventKind::CursorShape,
             Self::CursorImage(_) => EventKind::CursorImage,
@@ -1641,6 +1679,7 @@ impl Record for Event {
         match self {
             Self::Clipboard(payload) => out.put(payload),
             Self::Frame(payload) => out.put(payload),
+            Self::EncodedFrame(payload) => out.put(payload),
             Self::ResizeApplied(payload) => out.put(payload),
             Self::CursorShape(payload) => out.put(payload),
             Self::CursorImage(payload) => out.put(payload),
@@ -1655,6 +1694,7 @@ impl Record for Event {
         match kind {
             EventKind::Clipboard => Ok(Self::Clipboard(input.get()?)),
             EventKind::Frame => Ok(Self::Frame(input.get()?)),
+            EventKind::EncodedFrame => Ok(Self::EncodedFrame(input.get()?)),
             EventKind::ResizeApplied => Ok(Self::ResizeApplied(input.get()?)),
             EventKind::CursorShape => Ok(Self::CursorShape(input.get()?)),
             EventKind::CursorImage => Ok(Self::CursorImage(input.get()?)),
@@ -1857,6 +1897,27 @@ mod tests {
                 vec![
                     11, 2, 0, 0, 33, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
                     0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0, 1,
+                ],
+            ),
+            (
+                "encoded frame",
+                Event::EncodedFrame(EncodedFrame {
+                    key: true,
+                    metadata: FrameMetadata {
+                        generation: value(Generation::new(1)),
+                        width: value(FrameDimension::new(1280)),
+                        height: value(FrameDimension::new(720)),
+                        capture_nanos: 2,
+                        sequence: 3,
+                        input_sequence: Some(value(InputSequence::new(4))),
+                        fps: value(Fps::new(60)),
+                        chroma: Chroma::Yuv420,
+                    },
+                    data: vec![0xaa, 0xbb],
+                }),
+                vec![
+                    11, 11, 0, 0, 36, 0, 0, 0, 1, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0,
+                    3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0, 1, 0xaa, 0xbb,
                 ],
             ),
             (
@@ -2317,9 +2378,10 @@ mod tests {
 
     /// The same for events. A cursor image is a six-byte header and a PNG of
     /// at most 8 bytes per pixel of a 128x128 cursor.
-    const EVENT_LIMITS: [(u8, u32); 10] = [
+    const EVENT_LIMITS: [(u8, u32); 11] = [
         (1, 1 << 20),           // clipboard
         (2, 33),                // frame metadata
+        (11, 34 + (16 << 20)),  // encoded frame: key flag, metadata, stripes
         (3, 16),                // resize applied: request, size, scale, generation
         (4, 1),                 // cursor shape
         (5, 1),                 // cursor visibility

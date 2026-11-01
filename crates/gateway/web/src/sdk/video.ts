@@ -6,6 +6,7 @@ import {
   type VideoConfiguration,
 } from "./messages.ts";
 import type { WaywireStats } from "./session.ts";
+import { StripeCompositor } from "./stripes.ts";
 import { decodeRecord, readFrameMetadata } from "./wire.ts";
 export const maximumVideoDecodeQueueSize = 24;
 const busyDecodeQueueSize = 5;
@@ -66,6 +67,8 @@ export interface VideoOwner {
 
 export type VideoPacket = Readonly<{
   data: Uint8Array;
+  /** The data is the stripe container of an in-process striped encoder. */
+  striped: boolean;
   keyframe: boolean;
   discontinuity: boolean;
   timestamp: number;
@@ -79,7 +82,7 @@ export type VideoPacket = Readonly<{
 export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
   try {
     const { kind, payload } = decodeRecord(buffer);
-    if (kind !== 1) return null;
+    if (kind !== 1 && kind !== 2) return null;
     const frameKind = payload.u8();
     const continuity = payload.u8();
     if (
@@ -93,6 +96,7 @@ export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
     payload.finish();
     return {
       data,
+      striped: kind === 2,
       keyframe: frameKind === 1,
       discontinuity: continuity === 1,
       timestamp: Number(metadata.captureNanos / 1000n),
@@ -120,6 +124,7 @@ export class VideoRuntime {
   private display: HTMLCanvasElement | null = null;
   private context: CanvasRenderingContext2D | null = null;
   private decoder: VideoDecoder | null = null;
+  private stripes: StripeCompositor | null = null;
   private socket: WebSocket | null = null;
   private readonly pendingFrames: PendingVideoFrame[] = [];
   // WebCodecs returns the chunk timestamp with each decoded frame. Keep packet
@@ -371,6 +376,7 @@ export class VideoRuntime {
     }
     this.decoderGeneration += 1;
     this.decoder?.close();
+    this.stripes?.reset();
     this.decoder = null;
     this.decodingFrames.clear();
     for (const { frame } of this.pendingFrames.splice(0)) frame.close();
@@ -401,6 +407,7 @@ export class VideoRuntime {
     this.socket = null;
     this.decoderGeneration += 1;
     this.decoder?.close();
+    this.stripes?.reset();
     this.decoder = null;
     this.resetFeedbackInterval();
     this.decodingFrames.clear();
@@ -466,6 +473,7 @@ export class VideoRuntime {
       pendingVideoFrames: this.pendingFrames.length,
     });
     this.decoder?.close();
+    this.stripes?.reset();
     this.decoder = null;
     this.decodingFrames.clear();
     this.cancelPresentation();
@@ -505,29 +513,7 @@ export class VideoRuntime {
           frame.close();
           return;
         }
-        const entries = this.decodingFrames.get(frame.timestamp);
-        const metadata = entries?.shift();
-        if (entries?.length === 0) this.decodingFrames.delete(frame.timestamp);
-        if (!metadata) {
-          frame.close();
-          return;
-        }
-        this.decodedFrames += 1;
-        this.pendingFrames.push({ frame, metadata });
-        // The playout buffer must cover its delay AND one bounded decoder batch
-        // before the next animation frame. A fixed 24-frame cap evicts future-due
-        // frames forever at 90/120 FPS with a 300ms target. This does not relax
-        // the decoder-backlog limit or preallocate frames.
-        const capacity =
-          maximumVideoDecodeQueueSize +
-          Math.ceil((metadata.fps * this.targetLatencyMilliseconds) / 1000);
-        while (this.pendingFrames.length > capacity) {
-          this.pendingFrames.shift()?.frame.close();
-          this.droppedFrames += 1;
-          this.intervalDroppedFrames += 1;
-          this.decodedOverflowDroppedFrames += 1;
-        }
-        this.schedulePresentation();
+        this.acceptDecodedFrame(frame);
       },
       error: (error) => {
         console.error("video decoder error", error);
@@ -540,6 +526,21 @@ export class VideoRuntime {
         }
       },
     });
+    this.stripes = new StripeCompositor(
+      (frame) => {
+        if (this.decoder !== decoder) {
+          frame.close();
+          return;
+        }
+        this.acceptDecodedFrame(frame, true);
+      },
+      (error) => {
+        console.error("stripe decoder error", error);
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.socket.close(4001, "video decoder error");
+        }
+      },
+    );
     decoder.addEventListener("dequeue", () => {
       if (this.decoder === decoder && !this.owner.disposed()) {
         this.observeDecodeQueue(decoder.decodeQueueSize);
@@ -553,6 +554,39 @@ export class VideoRuntime {
       message: "Connected",
       codec: configuration.codec,
     });
+  }
+
+  private acceptDecodedFrame(frame: VideoFrame, supersedes = false): void {
+    const entries = this.decodingFrames.get(frame.timestamp);
+    const metadata = entries?.shift();
+    if (entries?.length === 0) this.decodingFrames.delete(frame.timestamp);
+    if (supersedes) {
+      // A striped picture already holds every older frame still waiting
+      // for a stripe, so their metadata will never be claimed.
+      for (const timestamp of this.decodingFrames.keys()) {
+        if (timestamp < frame.timestamp) this.decodingFrames.delete(timestamp);
+      }
+    }
+    if (!metadata) {
+      frame.close();
+      return;
+    }
+    this.decodedFrames += 1;
+    this.pendingFrames.push({ frame, metadata });
+    // The playout buffer must cover its delay AND one bounded decoder batch
+    // before the next animation frame. A fixed 24-frame cap evicts future-due
+    // frames forever at 90/120 FPS with a 300ms target. This does not relax
+    // the decoder-backlog limit or preallocate frames.
+    const capacity =
+      maximumVideoDecodeQueueSize +
+      Math.ceil((metadata.fps * this.targetLatencyMilliseconds) / 1000);
+    while (this.pendingFrames.length > capacity) {
+      this.pendingFrames.shift()?.frame.close();
+      this.droppedFrames += 1;
+      this.intervalDroppedFrames += 1;
+      this.decodedOverflowDroppedFrames += 1;
+    }
+    this.schedulePresentation();
   }
 
   private decodeMessage(buffer: ArrayBuffer): void {
@@ -572,7 +606,9 @@ export class VideoRuntime {
     const generationChanged = packet.generation !== this.currentGeneration;
     const previousGeneration = this.currentGeneration;
     if (generationChanged) this.currentGeneration = packet.generation;
-    const queuedBeforeDecode = decoder.decodeQueueSize;
+    const queuedBeforeDecode = packet.striped
+      ? (this.stripes?.decodeQueueSize ?? 0)
+      : decoder.decodeQueueSize;
     this.observeDecodeQueue(queuedBeforeDecode);
     if (
       generationChanged ||
@@ -606,6 +642,20 @@ export class VideoRuntime {
     const entries = this.decodingFrames.get(packet.timestamp);
     if (entries) entries.push(metadata);
     else this.decodingFrames.set(packet.timestamp, [metadata]);
+    if (packet.striped) {
+      if (
+        !this.stripes?.decode(
+          packet.data,
+          packet.timestamp,
+          packet.width,
+          packet.height,
+        )
+      ) {
+        entries?.pop();
+        this.waitingForKeyframe = true;
+      }
+      return;
+    }
     decoder.decode(
       new EncodedVideoChunk({
         type: packet.keyframe ? "key" : "delta",
@@ -637,6 +687,7 @@ export class VideoRuntime {
     this.decodingFrames.clear();
     this.waitingForKeyframe = true;
     decoder.reset();
+    this.stripes?.reset();
     this.observeDecodeQueue(decoder.decodeQueueSize);
     if (this.decoderConfiguration) decoder.configure(this.decoderConfiguration);
   }

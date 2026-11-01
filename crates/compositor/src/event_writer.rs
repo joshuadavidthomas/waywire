@@ -50,6 +50,7 @@ impl Replacement {
             // replacement, 1 MiB clipboards would fill the 4 MiB queue.
             Event::Clipboard(_) => Some(Self::Clipboard),
             Event::Frame(_)
+            | Event::EncodedFrame(_)
             | Event::ResizeApplied(_)
             | Event::ResetVideoRefused(_)
             | Event::CursorClick(_) => None,
@@ -262,22 +263,34 @@ fn writer_main(shared: &Shared) {
 
 fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     let started = Instant::now();
+    let retry = |error: io::Error| {
+        if error.kind() == io::ErrorKind::Interrupted {
+            Ok(())
+        } else if error.kind() != io::ErrorKind::WouldBlock {
+            Err(error)
+        } else if started.elapsed() >= WRITE_STALL_LIMIT {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "stdout stalled"))
+        } else {
+            thread::sleep(Duration::from_millis(5));
+            Ok(())
+        }
+    };
     let mut offset = 0;
     while offset < bytes.len() {
         match output.write(&bytes[offset..]) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed")),
             Ok(count) => offset += count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if started.elapsed() >= WRITE_STALL_LIMIT {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "stdout stalled"));
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(error),
+            Err(error) => retry(error)?,
         }
     }
-    output.flush()
+    // Stdout is line buffered: a binary record's tail after its last newline byte
+    // sits in the buffer until this flush, which a full pipe also refuses.
+    loop {
+        match output.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) => retry(error)?,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +454,34 @@ mod tests {
         assert_eq!(queue.records[0].bytes, latest.encode());
         assert_eq!(queue.records[0].replacement, Some(Replacement::Clipboard));
         assert_eq!(queue.records[1].replacement, None);
+    }
+
+    #[test]
+    fn a_full_pipe_during_the_flush_delays_the_record_instead_of_failing() {
+        struct FullOnce {
+            written: Vec<u8>,
+            refusals: usize,
+        }
+        impl Write for FullOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.refusals == 0 {
+                    return Ok(());
+                }
+                self.refusals -= 1;
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let mut output = FullOnce {
+            written: Vec::new(),
+            refusals: 2,
+        };
+        write_with_deadline(&mut output, b"stripe\ntail").expect("flush should retry");
+        assert_eq!(output.written, b"stripe\ntail");
+        assert_eq!(output.refusals, 0);
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub(super) async fn read_events(
                 let event = event?;
                 match event {
                     Event::Frame(metadata) => pipeline.metadata(metadata).await?,
+                    Event::EncodedFrame(frame) => pipeline.encoded(frame).await?,
                     Event::Clipboard(text) => {
                         *events
                             .latest_clipboard

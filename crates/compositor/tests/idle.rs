@@ -263,6 +263,75 @@ fn idle_compositor_stops_rendering_and_emitting_frames() {
 }
 
 #[test]
+#[ignore = "requires a working Xwayland on PATH"]
+fn in_process_encoder_starts_with_a_key_frame_whose_stripes_tile_the_output() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let mut compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args([
+                "--rtp-port",
+                "9",
+                "--encoder",
+                "openh264",
+                "--stripes",
+                "3",
+                "--resolution",
+                "800x600",
+            ])
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
+    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
+    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking events");
+    let mut decoder = Decoder::<Event>::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let frame = loop {
+        if let Some(frame) = events(&mut compositor.0, &mut decoder)
+            .into_iter()
+            .find_map(|event| {
+                if let Event::EncodedFrame(frame) = event {
+                    Some(frame)
+                } else {
+                    None
+                }
+            })
+        {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "first frame deadline");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(frame.key, "first frame is not a key frame");
+    assert_eq!(
+        (frame.metadata.width.get(), frame.metadata.height.get()),
+        (800, 600)
+    );
+    // Stripe container: y and height (u16 LE), flags, length (u32 LE), access unit.
+    let mut rows = Vec::new();
+    let mut data = &frame.data[..];
+    while !data.is_empty() {
+        let y = u16::from_le_bytes([data[0], data[1]]);
+        let height = u16::from_le_bytes([data[2], data[3]]);
+        let length = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+        assert_eq!(data[4], 1, "stripe at {y} is not a key frame");
+        assert!(
+            data[9..9 + length].starts_with(&[0, 0, 0, 1]),
+            "stripe at {y} is not Annex-B"
+        );
+        rows.push((y, height));
+        data = &data[9 + length..];
+    }
+    assert_eq!(rows, [(0, 200), (200, 200), (400, 200)]);
+}
+
+#[test]
 #[ignore = "requires FFmpeg and a working Xwayland on PATH"]
 fn compositor_exits_promptly_when_the_session_program_exits() {
     let runtime = tempfile::tempdir().expect("runtime directory");
@@ -2095,6 +2164,7 @@ fn data_control_copies_reach_x11_and_the_viewer_without_taking_focus() {
         .filter_map(|event| match event {
             Event::Clipboard(text) => Some(text.as_str().to_owned()),
             Event::Frame(_)
+            | Event::EncodedFrame(_)
             | Event::ResizeApplied(_)
             | Event::CursorShape(_)
             | Event::CursorImage(_)

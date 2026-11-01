@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use waywire_compositor::Config;
+use waywire_compositor::EncoderChoice;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Kbps;
@@ -17,6 +18,13 @@ use waywire_protocol::pipe::Kbps;
 struct Options {
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: String,
+    /// `ffmpeg` runs libx264 or libopenh264 in an `FFmpeg` process; `openh264` encodes
+    /// horizontal stripes in process.
+    #[arg(long, env = "WAYWIRE_ENCODER", default_value = "ffmpeg", value_parser = parse_encoder)]
+    encoder: EncoderChoice,
+    /// Stripes for the in-process encoder; 0 picks one a core.
+    #[arg(long, env = "WAYWIRE_STRIPES", default_value = "0")]
+    stripes: usize,
     #[arg(long, default_value = "60", value_parser = parse_fps)]
     frame_rate: Fps,
     #[arg(long, default_value = "8000", value_parser = parse_kbps)]
@@ -50,6 +58,14 @@ fn parse_pin(value: &str) -> Result<PinCommand, String> {
         return Err("pin command must name an executable".into());
     }
     Ok(PinCommand(argv))
+}
+
+fn parse_encoder(value: &str) -> Result<EncoderChoice, String> {
+    match value {
+        "ffmpeg" => Ok(EncoderChoice::Ffmpeg),
+        "openh264" => Ok(EncoderChoice::OpenH264),
+        _ => Err("encoder must be ffmpeg or openh264".into()),
+    }
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {
@@ -107,6 +123,8 @@ fn main() -> Result<()> {
     let options = Options::parse();
     waywire_compositor::run(Config {
         ffmpeg: options.ffmpeg,
+        encoder: options.encoder,
+        stripes: options.stripes,
         frame_rate: options.frame_rate,
         bitrate: options.bitrate,
         rtp_port: options.rtp_port,

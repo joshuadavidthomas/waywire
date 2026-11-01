@@ -17,6 +17,7 @@ mod portal;
 mod screencopy;
 mod session_bus;
 mod shell;
+mod striped;
 mod text_keyboard;
 mod toplevel_list;
 mod video;
@@ -94,7 +95,9 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Logical;
+use smithay::utils::Physical;
 use smithay::utils::Point;
+use smithay::utils::Rectangle;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
@@ -130,6 +133,8 @@ use waywire_protocol::pipe::{
 
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
+use crate::striped::StripedEncoder;
+use crate::striped::StripedFrame;
 use crate::video::CapturedFrame;
 use crate::video::EncoderConfig;
 use crate::video::Notification;
@@ -140,6 +145,9 @@ use crate::video::encoded_dimensions;
 #[derive(Debug)]
 pub struct Config {
     pub ffmpeg: String,
+    pub encoder: EncoderChoice,
+    /// Horizontal stripes for the in-process encoder; 0 picks one a core.
+    pub stripes: usize,
     pub frame_rate: Fps,
     pub bitrate: Kbps,
     pub rtp_port: u16,
@@ -148,6 +156,61 @@ pub struct Config {
     pub pins: Vec<Vec<String>>,
     /// Application argv. When empty, `WAYWIRE_SESSION` names one executable.
     pub session: Vec<OsString>,
+}
+
+/// Which H.264 encoder produces the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderChoice {
+    /// libx264 or libopenh264 in an `FFmpeg` child process, delivered over RTP.
+    Ffmpeg,
+    /// `OpenH264` in process, in horizontal stripes, delivered as encoded-frame events.
+    OpenH264,
+}
+
+/// The running encoder.
+pub(crate) enum Video {
+    Ffmpeg(VideoEncoder),
+    Striped(StripedEncoder),
+}
+
+impl Video {
+    fn set_generation(&self, generation: Generation) -> Result<(), video::VideoError> {
+        match self {
+            Self::Ffmpeg(video) => video.set_generation(generation),
+            Self::Striped(video) => video.set_generation(generation),
+        }
+    }
+
+    fn try_notification(&self) -> Option<Notification> {
+        match self {
+            Self::Ffmpeg(video) => video.try_notification(),
+            Self::Striped(_) => None,
+        }
+    }
+
+    fn take_notification_source(&mut self) -> Option<calloop::ping::PingSource> {
+        match self {
+            Self::Ffmpeg(video) => video.take_notification_source(),
+            Self::Striped(video) => video.take_notification_source(),
+        }
+    }
+
+    fn stop(self) {
+        match self {
+            Self::Ffmpeg(video) => video.stop(),
+            Self::Striped(video) => video.stop(),
+        }
+    }
+
+    /// Frames a still screen is refreshed over: x264 refines a repeated frame a little
+    /// each pass, and the striped encoder spreads its stripes' refreshes.
+    const fn refresh_frames(&self) -> u8 {
+        match self {
+            Self::Ffmpeg(_) => REFRESH_FRAMES,
+            #[expect(clippy::cast_possible_truncation, reason = "a small constant")]
+            Self::Striped(_) => striped::REFRESH_FRAMES as u8,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -282,7 +345,7 @@ pub(crate) struct State {
     running: bool,
     failure: Option<anyhow::Error>,
     event_sink: EventSink,
-    video: Option<VideoEncoder>,
+    video: Option<Video>,
     quality: Quality,
     size: FrameSize,
     generation: Generation,
@@ -339,7 +402,7 @@ impl State {
         display_handle: DisplayHandle,
         options: &Config,
         event_sink: EventSink,
-        video: VideoEncoder,
+        video: Video,
     ) -> Result<Self> {
         let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -496,6 +559,14 @@ impl State {
     fn emit(&mut self, event: Event) {
         if let Err(error) = self.event_sink.send(&event) {
             self.fail(error.into());
+        }
+    }
+
+    /// The gateway lost its key frame: the in-process encoder codes the next frame as one.
+    /// The `FFmpeg` encoder's periodic key frames need no request.
+    fn request_key(&self) {
+        if let Some(Video::Striped(video)) = &self.video {
+            video.request_key();
         }
     }
 
@@ -1944,6 +2015,7 @@ impl State {
                         pipe::KeyframeState::Cached => Some(p.generation),
                         pipe::KeyframeState::Missing => {
                             self.frame_pending = FrameRequest::Pending;
+                            self.request_key();
                             None
                         }
                     };
@@ -1979,8 +2051,25 @@ impl State {
     }
 
     fn drain_video(&mut self) {
-        while let Some(notification) = self.video.as_ref().and_then(VideoEncoder::try_notification)
-        {
+        while let Some(frame) = match &self.video {
+            Some(Video::Striped(video)) => video.try_frame(),
+            _ => None,
+        } {
+            match frame {
+                // A full stdout queue drops this frame rather than the session. The
+                // stripes it carried are now out of step, so code a key frame next.
+                Ok(frame) => match self.event_sink.send(&Event::EncodedFrame(frame)) {
+                    Ok(()) => {}
+                    Err(event_writer::EventWriterError::QueueFull) => {
+                        self.request_key();
+                        self.frame_pending = FrameRequest::Pending;
+                    }
+                    Err(error) => self.fail(error.into()),
+                },
+                Err(error) => self.fail(anyhow!(error)),
+            }
+        }
+        while let Some(notification) = self.video.as_ref().and_then(Video::try_notification) {
             match notification {
                 Notification::Submitted(metadata) => self.emit(Event::Frame(metadata)),
                 Notification::RestartRequired { generation } if generation == self.generation => {
@@ -2027,7 +2116,7 @@ impl State {
         }
         let elements = self.scene_elements(renderer);
         let forced = self.dirty || self.acknowledged != Some(self.generation);
-        let damaged = {
+        let damage = {
             let mut target = renderer.bind(image)?;
             tracker
                 .render_output(
@@ -2038,9 +2127,21 @@ impl State {
                     [0.08, 0.09, 0.12, 1.0],
                 )?
                 .damage
-                .is_some()
+                .cloned()
         };
-        if damaged || forced {
+        if damage.is_some() || forced {
+            let full = [Rectangle::<i32, Physical>::from_size(
+                (
+                    i32::try_from(self.size.width())?,
+                    i32::try_from(self.size.height())?,
+                )
+                    .into(),
+            )];
+            let damage = if forced {
+                &full[..]
+            } else {
+                damage.as_deref().unwrap_or(&full)
+            };
             // A forced redraw reports the whole output damaged. Hash only those, so
             // a redraw that changed no pixel is not encoded again.
             let hash = forced.then(|| xxhash_rust::xxh3::xxh3_64(image_pixels(image)));
@@ -2049,10 +2150,10 @@ impl State {
                 && self.acknowledged == Some(self.generation);
             self.forced_frame_hash = hash;
             if !unchanged {
-                self.submit_video(image)?;
+                self.submit_video(image, damage, false)?;
                 self.refresh = Refresh::Due {
                     at: Instant::now() + REFRESH_DELAY,
-                    left: REFRESH_FRAMES,
+                    left: self.video.as_ref().map_or(0, Video::refresh_frames),
                 };
                 if let Some(screencast) = &self.screencast {
                     screencast.frame(image);
@@ -2084,7 +2185,7 @@ impl State {
         if now < at {
             return Ok(());
         }
-        self.submit_video(image)?;
+        self.submit_video(image, &[], true)?;
         self.refresh = match left.checked_sub(1) {
             Some(left @ 1..) => Refresh::Due {
                 at: now + Duration::from_secs_f64(1.0 / f64::from(self.quality.fps.get())),
@@ -2095,7 +2196,12 @@ impl State {
         Ok(())
     }
 
-    fn submit_video(&mut self, image: &Image<'static, 'static>) -> Result<()> {
+    fn submit_video(
+        &mut self,
+        image: &Image<'static, 'static>,
+        damage: &[Rectangle<i32, Physical>],
+        refresh: bool,
+    ) -> Result<()> {
         let (width, height) = encoded_dimensions(
             self.size.width(),
             self.size.height(),
@@ -2129,8 +2235,26 @@ impl State {
             .checked_add(1)
             .context("frame sequence exhausted")?;
         // ARGB8888 on little-endian hosts is packed BGRA; four-byte pixels have no row padding.
-        if let Some(video) = &self.video {
-            video.submit(CapturedFrame::new(image_pixels(image), metadata, config))?;
+        match &self.video {
+            Some(Video::Ffmpeg(video)) => {
+                video.submit(CapturedFrame::new(image_pixels(image), metadata, config))?;
+            }
+            Some(Video::Striped(video)) => {
+                // The in-process encoder codes the output at its own size.
+                let mut metadata = metadata;
+                metadata.width = config.raw_width;
+                metadata.height = config.raw_height;
+                video.submit(&StripedFrame {
+                    pixels: image_pixels(image),
+                    width: image.width(),
+                    height: image.height(),
+                    damage,
+                    metadata,
+                    crf: self.quality.crf,
+                    refresh,
+                })?;
+            }
+            None => {}
         }
         Ok(())
     }
@@ -2190,7 +2314,15 @@ pub fn run(mut options: Config) -> Result<()> {
     let handle = event_loop.handle();
     let display = Display::<State>::new()?;
     let (event_writer, sink) = EventWriter::start()?;
-    let mut video = VideoEncoder::start(options.ffmpeg.clone(), options.rtp_port)?;
+    let mut video = match options.encoder {
+        EncoderChoice::Ffmpeg => Video::Ffmpeg(VideoEncoder::start(
+            options.ffmpeg.clone(),
+            options.rtp_port,
+        )?),
+        EncoderChoice::OpenH264 => {
+            Video::Striped(StripedEncoder::start(options.stripes, Generation::new(1)?)?)
+        }
+    };
     let notifications = video
         .take_notification_source()
         .context("encoder notification source missing")?;
@@ -2586,6 +2718,8 @@ mod tests {
         let display = Display::new().expect("test display");
         let options = Config {
             ffmpeg: String::new(),
+            encoder: EncoderChoice::Ffmpeg,
+            stripes: 0,
             frame_rate: Fps::new(60).expect("test frame rate"),
             bitrate: Kbps::new(16000).expect("test bitrate"),
             rtp_port: 0,
@@ -2594,7 +2728,7 @@ mod tests {
             pins: Vec::new(),
             session: Vec::new(),
         };
-        let video = VideoEncoder::idle_for_test().expect("idle encoder");
+        let video = Video::Ffmpeg(VideoEncoder::idle_for_test().expect("idle encoder"));
         let mut state = State::new(display.handle(), &options, EventSink::for_test(), video)
             .expect("test compositor");
         state.video.take().expect("new encoder").stop();

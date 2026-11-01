@@ -19,6 +19,12 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# In-process striped H.264 (BSD-2-Clause Cisco OpenH264, built from vendored source).
+# Its x86 assembly builds only when nasm is on PATH; without it the encoder silently
+# falls back to C and the benchmark scroll costs about 50% more CPU.
+openh264 = "0.9.9"
+rayon = "1.11.0"
+yuv = { version = "0.8.20", features = ["fast_mode"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wayland-protocols-wlr = { workspace = true }

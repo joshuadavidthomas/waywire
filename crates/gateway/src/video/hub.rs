@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 use tracing::debug;
 use waywire_protocol::browser::Continuity;
 use waywire_protocol::browser::FrameKind;
+use waywire_protocol::browser::Layout;
 use waywire_protocol::browser::VideoSample;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::Generation;
@@ -23,6 +24,9 @@ const VIEWER_BYTES: usize = 32 << 20;
 #[derive(Clone)]
 pub(crate) struct VideoHub {
     inner: Arc<Mutex<Hub>>,
+    /// A striped stream has no periodic key frames, so a viewer that starts or falls
+    /// behind mid-GOP asks the video worker for one.
+    key_wanted: Arc<Notify>,
 }
 
 struct Hub {
@@ -188,7 +192,13 @@ impl VideoHub {
                 generation: None,
                 viewer_bounds: ViewerBounds::for_max_fps(max_fps),
             })),
+            key_wanted: Arc::new(Notify::new()),
         }
+    }
+
+    /// Notified when a viewer of a striped stream waits for a key frame.
+    pub(crate) fn key_wanted(&self) -> Arc<Notify> {
+        Arc::clone(&self.key_wanted)
     }
 
     pub(crate) fn subscribe(&self) -> VideoSubscription {
@@ -204,6 +214,9 @@ impl VideoHub {
             match viewer_queue.push(frame.clone()) {
                 Pushed::Queued => {}
                 Pushed::Dropped => {
+                    if frame.layout == Layout::Stripes {
+                        self.key_wanted.notify_one();
+                    }
                     debug!(
                         gop_frames = hub.gop.len(),
                         gop_bytes = hub.gop_bytes,
@@ -297,6 +310,9 @@ impl VideoHub {
                 .push(outgoing);
             match pushed {
                 Pushed::Queued => handle.notify.notify_one(),
+                Pushed::Dropped if sample.layout == Layout::Stripes => {
+                    self.key_wanted.notify_one();
+                }
                 Pushed::Dropped => {}
             }
         }
@@ -504,6 +520,7 @@ mod tests {
         for sequence in 0..10 {
             let _ = hub.broadcast(&VideoSample {
                 data: vec![1].into(),
+                layout: Layout::Whole,
                 kind: FrameKind::Delta,
                 continuity: Continuity::Continuous,
                 metadata: metadata(sequence, 1),
@@ -511,6 +528,7 @@ mod tests {
         }
         let _ = hub.broadcast(&VideoSample {
             data: vec![1].into(),
+            layout: Layout::Whole,
             kind: FrameKind::Key,
             continuity: Continuity::Continuous,
             metadata: metadata(11, 1),

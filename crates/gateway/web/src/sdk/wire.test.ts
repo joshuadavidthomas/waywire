@@ -80,7 +80,7 @@ test("video parser rejects every truncated, extended or mislabeled frame", () =>
   // reserved bytes.
   for (const [index, value] of [
     [0, 12],
-    [1, 2],
+    [1, 3],
     [2, 1],
     [3, 1],
   ] as const) {
@@ -88,6 +88,11 @@ test("video parser rejects every truncated, extended or mislabeled frame", () =>
     changed[index] = value;
     assert.equal(parse(changed), null, `header byte ${index} = ${value}`);
   }
+  // Kind 2 is the same frame carrying the stripe container.
+  const striped = [...frame];
+  striped[1] = 2;
+  assert.equal(parse(striped)?.striped, true);
+  assert.equal(parse(frame)?.striped, false);
   // Frame kind and continuity are booleans on the wire.
   for (const index of [8, 9]) {
     const changed = [...frame];

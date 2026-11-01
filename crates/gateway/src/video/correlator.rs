@@ -6,6 +6,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 use waywire_protocol::browser::Continuity;
 use waywire_protocol::browser::FrameKind;
+use waywire_protocol::browser::Layout;
 use waywire_protocol::browser::VideoSample;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameMetadata;
@@ -189,6 +190,7 @@ impl Correlator {
             }
             samples.push(VideoSample {
                 data: unit.data,
+                layout: Layout::Whole,
                 kind: unit.kind,
                 continuity,
                 metadata,
