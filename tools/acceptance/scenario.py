@@ -112,6 +112,17 @@ def title(record, key="window"):
     return (record.get(key) or {}).get("title", "")
 
 
+def named(records, prefix):
+    """Ids of windows that any record has shown with a title starting with
+    `prefix`. Records are snapshots, and Chromium can focus a field before
+    it sets the page title, so a window is joined by id, not by title."""
+    return {
+        record["window"]["id"]
+        for record in records
+        if title(record).startswith(prefix) and record["window"].get("id")
+    }
+
+
 def keys(records):
     return [
         record
@@ -153,11 +164,13 @@ def t6a(variant, action):
     try:
 
         def form_ready():
+            records = receipts()[start:]
+            forms = named(records, "Registration form")
             return any(
                 record["signal"] == "TextFieldChanged"
-                and title(record).startswith("Registration form")
+                and record["window"].get("id") in forms
                 and record["text_field"] == "focused"
-                for record in receipts()[start:]
+                for record in records
             )
 
         wait_for(form_ready, f"{variant}: the form never focused its Name field")
@@ -174,12 +187,13 @@ def t6a(variant, action):
         chromium.wait(timeout=20)
     before, after = records[start:mark], records[mark:]
     failures = []
+    forms = named(before, "Registration form")
     form = next(
         (
             record["window"]
             for record in before
             if record["signal"] == "FocusChanged"
-            and title(record).startswith("Registration form")
+            and record["window"].get("id") in forms
         ),
         None,
     )
