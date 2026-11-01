@@ -317,6 +317,7 @@ impl State {
             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Fullscreen,
         ]);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let clipboard = clipboard::Clipboard::new(&display_handle);
         let xwayland_shell_state =
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&display_handle);
         install_globals(&display_handle);
@@ -390,7 +391,7 @@ impl State {
             screencopy,
             screencast: None,
             toplevel_list,
-            clipboard: clipboard::Clipboard::default(),
+            clipboard,
             windows: HashMap::new(),
             pins: options
                 .pins

@@ -1,19 +1,42 @@
-//! Nonblocking, bounded clipboard transfers. Replacing an offer drops its read FD,
-//! so an obsolete producer can never overwrite a newer browser/client selection.
+//! The desktop clipboard and primary selection, bridged between Wayland and
+//! X11. Clipboard text also syncs with the browser viewer and outlives the app
+//! that copied it; the primary selection stays on the desktop and ends with its
+//! owner. The compositor converts between UTF-8 types and X11 `STRING`
+//! (ISO 8859-1) for clients that only know one of them.
+//!
+//! Transfers through the compositor are nonblocking, bounded by
+//! `MAX_CLIPBOARD_BYTES` and a timeout, and logged when dropped. Replacing an
+//! offer drops its read FD, so an obsolete producer can never overwrite a newer
+//! browser/client selection.
 use std::fs::File;
-use std::io::Read;
-use std::io::Write;
+use std::io::Read as _;
+use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
+use smithay::input::Seat;
+use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::SelectionSource;
+use smithay::wayland::selection::SelectionTarget;
+use smithay::wayland::selection::data_device;
+use smithay::wayland::selection::data_device::clear_data_device_selection;
+use smithay::wayland::selection::data_device::current_data_device_selection_userdata;
 use smithay::wayland::selection::data_device::request_data_device_client_selection;
 use smithay::wayland::selection::data_device::set_data_device_selection;
+use smithay::wayland::selection::primary_selection;
+use smithay::wayland::selection::primary_selection::PrimarySelectionHandler;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::selection::primary_selection::clear_primary_selection;
+use smithay::wayland::selection::primary_selection::current_primary_selection_userdata;
+use smithay::wayland::selection::primary_selection::request_primary_client_selection;
+use smithay::wayland::selection::primary_selection::set_primary_selection;
 use waywire_protocol::pipe::ClipboardText;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::MAX_CLIPBOARD_BYTES;
@@ -21,113 +44,446 @@ use waywire_protocol::pipe::MAX_CLIPBOARD_BYTES;
 use super::State;
 
 const MIME: &str = "text/plain;charset=utf-8";
+/// Text types, in the order the compositor reads them.
+const TEXT: [&str; 4] = [MIME, "UTF8_STRING", "STRING", "text/plain"];
+/// Text types the compositor offers to Wayland clients.
+const WAYLAND_TEXT: [&str; 2] = [MIME, "text/plain"];
+/// Text types offered to X11 clients: Smithay's XWM maps the first two to
+/// `UTF8_STRING` and `TEXT`; `STRING` is the X11 atom's own name.
+const X11_TEXT: [&str; 3] = [MIME, "text/plain", "STRING"];
 const TIMEOUT: Duration = Duration::from_secs(3);
+/// Transfers of each kind the compositor relays at once.
+const MAX_TRANSFERS: usize = 8;
+
+/// Set when a Wayland client disconnects. Smithay drops a dead client's
+/// selection without calling `new_selection`, so the next tick checks.
+pub(crate) static CLIENT_LEFT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub(crate) enum SelectionData {
+    /// Text the compositor serves itself: browser writes and kept clipboards.
     Text(Arc<str>),
     X11,
 }
 
+/// The client owning a selection and the types it offers.
 #[derive(Default)]
+struct Owner {
+    types: Vec<String>,
+    wayland: bool,
+}
+
+struct Read {
+    fd: File,
+    bytes: Vec<u8>,
+    latin1: bool,
+    deadline: Instant,
+    purpose: &'static str,
+}
+
+enum Progress {
+    Pending,
+    Done(String),
+    Failed,
+}
+
+struct Write {
+    fd: File,
+    bytes: Arc<[u8]>,
+    offset: usize,
+    deadline: Instant,
+}
+
 pub(super) struct Clipboard {
+    primary_state: PrimarySelectionState,
+    /// Owners of the clipboard and the primary selection.
+    owners: [Owner; 2],
     pending_offer: Option<Vec<String>>,
-    read: Option<(File, Vec<u8>, Instant)>,
-    writes: Vec<(File, Arc<str>, usize, Instant)>,
+    /// The viewer's read of the current clipboard selection.
+    read: Option<Read>,
+    /// Reads converted into another encoding for a requesting client.
+    conversions: Vec<(Read, OwnedFd, bool)>,
+    writes: Vec<Write>,
+    /// Text of the current clipboard selection, kept after its owner exits.
+    kept: Option<Arc<str>>,
+    /// The clipboard owner exited; keep its text once the read finishes.
+    orphaned: bool,
+}
+
+impl Clipboard {
+    pub(super) fn new(display: &smithay::reexports::wayland_server::DisplayHandle) -> Self {
+        Self {
+            primary_state: PrimarySelectionState::new::<State>(display),
+            owners: [Owner::default(), Owner::default()],
+            pending_offer: None,
+            read: None,
+            conversions: Vec::new(),
+            writes: Vec::new(),
+            kept: None,
+            orphaned: false,
+        }
+    }
+
+    fn owner(&mut self, target: SelectionTarget) -> &mut Owner {
+        match target {
+            SelectionTarget::Clipboard => &mut self.owners[0],
+            SelectionTarget::Primary => &mut self.owners[1],
+        }
+    }
+}
+
+/// X11 `STRING` is ISO 8859-1; every other text type is UTF-8.
+fn latin1(mime: &str) -> bool {
+    mime == "STRING"
+}
+
+fn decode(bytes: Vec<u8>, latin1: bool) -> String {
+    if latin1 {
+        return bytes.into_iter().map(char::from).collect();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|error| {
+        tracing::warn!("selection text is not valid UTF-8; replacing invalid bytes");
+        String::from_utf8_lossy(error.as_bytes()).into_owned()
+    })
+}
+
+fn encode(text: &str, latin1: bool) -> Arc<[u8]> {
+    if latin1 {
+        text.chars()
+            .map(|c| u8::try_from(c).unwrap_or(b'?'))
+            .collect()
+    } else {
+        Arc::from(text.as_bytes())
+    }
+}
+
+/// `types` plus each of `extra` it lacks, when it offers any text type.
+fn with_text(mut types: Vec<String>, extra: &[&str]) -> Vec<String> {
+    if types.iter().any(|t| TEXT.contains(&t.as_str())) {
+        for mime in extra {
+            if !types.iter().any(|t| t == mime) {
+                types.push((*mime).into());
+            }
+        }
+    }
+    types
+}
+
+fn strings(types: &[&str]) -> Vec<String> {
+    types.iter().map(|&t| t.into()).collect()
+}
+
+fn nonblocking_pipe() -> anyhow::Result<(File, OwnedFd)> {
+    let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
+    let flags = OFlag::from_bits_truncate(fcntl(&read, FcntlArg::F_GETFL)?);
+    fcntl(&read, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok((File::from(read), write))
+}
+
+impl Read {
+    fn new(fd: File, latin1: bool, purpose: &'static str) -> Self {
+        Self {
+            fd,
+            bytes: Vec::new(),
+            latin1,
+            deadline: Instant::now() + TIMEOUT,
+            purpose,
+        }
+    }
+
+    /// Reads what the owner has written so far. Oversized, stalled and failed
+    /// transfers are logged and dropped, which closes the owner's pipe.
+    fn poll(&mut self) -> Progress {
+        if Instant::now() >= self.deadline {
+            tracing::warn!(
+                purpose = self.purpose,
+                bytes = self.bytes.len(),
+                "selection owner did not finish writing within {TIMEOUT:?}; dropped the transfer"
+            );
+            return Progress::Failed;
+        }
+        let mut part = vec![0; 65536];
+        match self.fd.read(&mut part) {
+            Ok(0) => Progress::Done(decode(std::mem::take(&mut self.bytes), self.latin1)),
+            Ok(n) if self.bytes.len() + n <= MAX_CLIPBOARD_BYTES => {
+                self.bytes.extend_from_slice(&part[..n]);
+                Progress::Pending
+            }
+            Ok(n) => {
+                tracing::warn!(
+                    purpose = self.purpose,
+                    bytes = self.bytes.len() + n,
+                    limit = MAX_CLIPBOARD_BYTES,
+                    "selection text exceeds the transfer limit; dropped the transfer"
+                );
+                Progress::Failed
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Progress::Pending
+            }
+            Err(error) => {
+                tracing::warn!(purpose = self.purpose, %error, "selection read failed");
+                Progress::Failed
+            }
+        }
+    }
+}
+
+impl SelectionHandler for State {
+    type SelectionUserData = SelectionData;
+    fn new_selection(
+        &mut self,
+        target: SelectionTarget,
+        source: Option<SelectionSource>,
+        _: Seat<Self>,
+    ) {
+        // Smithay invokes this before it installs the seat's selection.
+        let types = source.map(|source| source.mime_types());
+        if let Some(xwm) = &mut self.xwm
+            && let Err(error) = xwm.new_selection(
+                target,
+                types.clone().map(|types| with_text(types, &X11_TEXT)),
+            )
+        {
+            tracing::warn!(%error, ?target, "forward selection ownership to X11");
+        }
+        self.x11_stacking = None;
+        *self.clipboard.owner(target) = Owner {
+            wayland: types.is_some(),
+            types: types.clone().unwrap_or_default(),
+        };
+        if target == SelectionTarget::Clipboard {
+            self.clipboard_offer(types.unwrap_or_default());
+        }
+    }
+    fn send_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime: String,
+        fd: OwnedFd,
+        _: Seat<Self>,
+        data: &SelectionData,
+    ) {
+        match data {
+            SelectionData::Text(text) => self.send_text(&mime, fd, text),
+            SelectionData::X11 => self.serve_selection(target, mime, fd),
+        }
+    }
+}
+
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.clipboard.primary_state
+    }
 }
 
 impl State {
     pub(super) fn clipboard_active(&self) -> bool {
         self.clipboard.pending_offer.is_some()
             || self.clipboard.read.is_some()
+            || self.clipboard.orphaned
+            || !self.clipboard.conversions.is_empty()
             || !self.clipboard.writes.is_empty()
     }
 
     pub(super) fn clipboard_set(&mut self, text: &ClipboardText) {
+        self.clipboard_own(Arc::from(text.as_str()));
+        self.emit(Event::Clipboard(text.clone()));
+    }
+
+    /// Serves `text` as the clipboard from the compositor itself.
+    fn clipboard_own(&mut self, text: Arc<str>) {
         self.clipboard.pending_offer = None;
         self.clipboard.read = None;
+        self.clipboard.orphaned = false;
+        *self.clipboard.owner(SelectionTarget::Clipboard) = Owner::default();
+        self.clipboard.kept = Some(Arc::clone(&text));
         set_data_device_selection(
             &self.display_handle,
             &self.seat,
-            vec![MIME.into(), "text/plain".into()],
-            SelectionData::Text(Arc::<str>::from(text.as_str())),
+            strings(&WAYLAND_TEXT),
+            SelectionData::Text(text),
         );
         if let Some(xwm) = &mut self.xwm
-            && let Err(error) = xwm.new_selection(
-                smithay::wayland::selection::SelectionTarget::Clipboard,
-                Some(vec![MIME.into(), "text/plain".into()]),
-            )
+            && let Err(error) =
+                xwm.new_selection(SelectionTarget::Clipboard, Some(strings(&X11_TEXT)))
         {
             tracing::warn!(%error, "forward clipboard ownership to X11");
         }
         self.x11_stacking = None;
-        self.emit(Event::Clipboard(text.clone()));
     }
 
-    pub(crate) fn send_clipboard(&mut self, mime: String, fd: OwnedFd) {
-        let own = smithay::wayland::selection::data_device::current_data_device_selection_userdata(
-            &self.seat,
-        )
-        .map(|data| data.clone());
-        match own {
-            Some(SelectionData::Text(text)) => self.clipboard_send(&mime, fd, text),
-            Some(SelectionData::X11) => {}
-            None => {
-                if let Err(error) = request_data_device_client_selection(&self.seat, mime, fd) {
-                    tracing::warn!(%error, "send native clipboard to X11");
-                }
-            }
+    /// An X11 client took `target`.
+    pub(crate) fn x11_selection(&mut self, target: SelectionTarget, types: Vec<String>) {
+        let offered = with_text(types.clone(), &WAYLAND_TEXT);
+        match target {
+            SelectionTarget::Clipboard => set_data_device_selection(
+                &self.display_handle,
+                &self.seat,
+                offered,
+                SelectionData::X11,
+            ),
+            SelectionTarget::Primary => set_primary_selection(
+                &self.display_handle,
+                &self.seat,
+                offered,
+                SelectionData::X11,
+            ),
         }
-    }
-
-    pub(super) fn clipboard_changed(&mut self, source: Option<SelectionSource>) {
-        self.clipboard_offer(source.map(|source| source.mime_types()).unwrap_or_default());
-    }
-
-    pub(crate) fn clipboard_offer(&mut self, types: Vec<String>) {
-        self.clipboard.read = None;
-        // Smithay invokes new_selection before installing the seat's selection.
-        // Defer the request until dispatch completes, replacing older pending offers.
-        self.clipboard.pending_offer = Some(types);
-    }
-
-    fn clipboard_begin_read(&mut self, types: &[String]) {
-        let Some(mime) = [MIME, "text/plain", "UTF8_STRING"]
-            .into_iter()
-            .find(|mime| types.iter().any(|t| t == mime))
-        else {
-            return;
+        *self.clipboard.owner(target) = Owner {
+            types: types.clone(),
+            wayland: false,
         };
-        let result = (|| -> anyhow::Result<()> {
-            let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
-            let flags = OFlag::from_bits_truncate(fcntl(&read, FcntlArg::F_GETFL)?);
-            fcntl(&read, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-            let x11 =
-                smithay::wayland::selection::data_device::current_data_device_selection_userdata(
-                    &self.seat,
-                )
-                .is_some_and(|data| matches!(*data, SelectionData::X11));
-            if x11 {
-                if let Some(xwm) = &mut self.xwm {
-                    xwm.send_selection(
-                        smithay::wayland::selection::SelectionTarget::Clipboard,
-                        mime.into(),
-                        write,
-                    )?;
-                }
-            } else {
-                request_data_device_client_selection(&self.seat, mime.into(), write)?;
-            }
-            self.clipboard.read = Some((File::from(read), Vec::new(), Instant::now() + TIMEOUT));
-            Ok(())
-        })();
-        if let Err(error) = result {
-            tracing::warn!(%error, "clipboard receive failed");
+        if target == SelectionTarget::Clipboard {
+            self.clipboard_offer(types);
         }
     }
 
-    pub(super) fn clipboard_send(&mut self, mime: &str, fd: OwnedFd, text: Arc<str>) {
-        if ![MIME, "text/plain"].contains(&mime) || self.clipboard.writes.len() >= 8 {
+    /// The X11 client owning `target` released it, usually by exiting.
+    pub(crate) fn x11_selection_cleared(&mut self, target: SelectionTarget) {
+        let x11 = match target {
+            SelectionTarget::Clipboard => current_data_device_selection_userdata(&self.seat)
+                .is_some_and(|data| matches!(*data, SelectionData::X11)),
+            SelectionTarget::Primary => current_primary_selection_userdata(&self.seat)
+                .is_some_and(|data| matches!(*data, SelectionData::X11)),
+        };
+        if x11 {
+            self.selection_orphaned(target);
+        }
+    }
+
+    /// The client owning `target` is gone. The clipboard keeps its text; the
+    /// primary selection empties, as it does on X11.
+    fn selection_orphaned(&mut self, target: SelectionTarget) {
+        let owner = std::mem::take(self.clipboard.owner(target));
+        match target {
+            SelectionTarget::Clipboard => self.clipboard.orphaned = true,
+            SelectionTarget::Primary if owner.wayland => {
+                if let Some(xwm) = &mut self.xwm
+                    && let Err(error) = xwm.new_selection(target, None)
+                {
+                    tracing::warn!(%error, "clear X11 primary selection");
+                }
+                self.x11_stacking = None;
+            }
+            SelectionTarget::Primary => clear_primary_selection(&self.display_handle, &self.seat),
+        }
+    }
+
+    /// Whether the Wayland source of `target` still exists.
+    fn wayland_selection_alive(&self, target: SelectionTarget) -> bool {
+        // Probe with a type no source offers: only a vanished selection
+        // reports `NoSelection`.
+        let Ok(fd) = File::open("/dev/null") else {
+            return true;
+        };
+        match target {
+            SelectionTarget::Clipboard => !matches!(
+                request_data_device_client_selection(&self.seat, String::new(), fd.into()),
+                Err(data_device::SelectionRequestError::NoSelection)
+            ),
+            SelectionTarget::Primary => !matches!(
+                request_primary_client_selection(&self.seat, String::new(), fd.into()),
+                Err(primary_selection::SelectionRequestError::NoSelection)
+            ),
+        }
+    }
+
+    /// Writes `target` as `mime` into `fd` for a client that does not own it.
+    pub(crate) fn serve_selection(&mut self, target: SelectionTarget, mime: String, fd: OwnedFd) {
+        let text = match target {
+            SelectionTarget::Clipboard => current_data_device_selection_userdata(&self.seat)
+                .and_then(|data| match &*data {
+                    SelectionData::Text(text) => Some(Arc::clone(text)),
+                    SelectionData::X11 => None,
+                }),
+            SelectionTarget::Primary => None,
+        };
+        if let Some(text) = text {
+            self.send_text(&mime, fd, &text);
+            return;
+        }
+        let types = &self.clipboard.owner(target).types;
+        let source = TEXT
+            .into_iter()
+            .find(|text| types.iter().any(|t| t == text));
+        // Wayland sources such as wl-copy offer `STRING` but write UTF-8 for
+        // it, so produce ISO 8859-1 from a UTF-8 type whenever there is one.
+        let native =
+            types.contains(&mime) && !(latin1(&mime) && source.is_some_and(|s| !latin1(s)));
+        let result = if native {
+            self.fetch(target, mime, fd)
+        } else if let Some(source) = source
+            && TEXT.contains(&mime.as_str())
+        {
+            self.convert(target, source, &mime, fd)
+        } else {
+            tracing::debug!(?target, mime, "selection owner does not offer this type");
+            Ok(())
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, ?target, "selection transfer failed");
+        }
+    }
+
+    /// Asks the owner of `target` to write `mime` into `fd`.
+    fn fetch(&mut self, target: SelectionTarget, mime: String, fd: OwnedFd) -> anyhow::Result<()> {
+        if self.clipboard.owner(target).wayland {
+            match target {
+                SelectionTarget::Clipboard => {
+                    request_data_device_client_selection(&self.seat, mime, fd)?;
+                }
+                SelectionTarget::Primary => request_primary_client_selection(&self.seat, mime, fd)?,
+            }
+        } else if let Some(xwm) = &mut self.xwm {
+            xwm.send_selection(target, mime, fd)?;
+        }
+        Ok(())
+    }
+
+    /// Reads `source` from the owner of `target` and writes it into `fd` in
+    /// the encoding of `mime`.
+    fn convert(
+        &mut self,
+        target: SelectionTarget,
+        source: &str,
+        mime: &str,
+        fd: OwnedFd,
+    ) -> anyhow::Result<()> {
+        if self.clipboard.conversions.len() >= MAX_TRANSFERS {
+            tracing::warn!(
+                ?target,
+                mime,
+                "too many selection conversions in flight; dropped one"
+            );
+            return Ok(());
+        }
+        let (read, write) = nonblocking_pipe()?;
+        self.fetch(target, source.into(), write)?;
+        self.clipboard.conversions.push((
+            Read::new(read, latin1(source), "type conversion"),
+            fd,
+            latin1(mime),
+        ));
+        Ok(())
+    }
+
+    fn send_text(&mut self, mime: &str, fd: OwnedFd, text: &str) {
+        if !TEXT.contains(&mime) {
+            tracing::debug!(mime, "compositor selection holds only text");
+            return;
+        }
+        self.queue_write(fd, encode(text, latin1(mime)));
+    }
+
+    fn queue_write(&mut self, fd: OwnedFd, bytes: Arc<[u8]>) {
+        if self.clipboard.writes.len() >= MAX_TRANSFERS {
+            tracing::warn!("too many selection writes in flight; dropped one");
             return;
         }
         if let Ok(flags) = fcntl(&fd, FcntlArg::F_GETFL)
@@ -137,13 +493,50 @@ impl State {
             )
             .is_ok()
         {
-            self.clipboard
-                .writes
-                .push((File::from(fd), text, 0, Instant::now() + TIMEOUT));
+            self.clipboard.writes.push(Write {
+                fd: File::from(fd),
+                bytes,
+                offset: 0,
+                deadline: Instant::now() + TIMEOUT,
+            });
+        }
+    }
+
+    pub(crate) fn clipboard_offer(&mut self, types: Vec<String>) {
+        self.clipboard.read = None;
+        self.clipboard.kept = None;
+        self.clipboard.orphaned = false;
+        // Smithay invokes new_selection before installing the seat's selection.
+        // Defer the request until dispatch completes, replacing older pending offers.
+        self.clipboard.pending_offer = Some(types);
+    }
+
+    fn clipboard_begin_read(&mut self, types: &[String]) {
+        let Some(mime) = TEXT
+            .into_iter()
+            .find(|mime| types.iter().any(|t| t == mime))
+        else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let (read, write) = nonblocking_pipe()?;
+            self.fetch(SelectionTarget::Clipboard, mime.into(), write)?;
+            self.clipboard.read = Some(Read::new(read, latin1(mime), "viewer sync"));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%error, "clipboard receive failed");
         }
     }
 
     pub(super) fn clipboard_tick(&mut self) {
+        if CLIENT_LEFT.swap(false, Ordering::Relaxed) {
+            for target in [SelectionTarget::Clipboard, SelectionTarget::Primary] {
+                if self.clipboard.owner(target).wayland && !self.wayland_selection_alive(target) {
+                    self.selection_orphaned(target);
+                }
+            }
+        }
         let mut completed = None;
         if let Some(types) = self.clipboard.pending_offer.take() {
             if types.is_empty() {
@@ -152,71 +545,218 @@ impl State {
                 self.clipboard_begin_read(&types);
             }
         }
-        let mut keep = false;
-        if let Some((fd, bytes, deadline)) = self.clipboard.read.as_mut() {
-            let mut part = vec![0; 65536];
-            if Instant::now() < *deadline {
-                match fd.read(&mut part) {
-                    Ok(0) => {
-                        completed = String::from_utf8(std::mem::take(bytes))
-                            .ok()
-                            .and_then(|text| ClipboardText::new(text).ok());
+        if let Some(read) = self.clipboard.read.as_mut() {
+            match read.poll() {
+                Progress::Pending => {}
+                Progress::Done(text) => {
+                    self.clipboard.read = None;
+                    match ClipboardText::new(text) {
+                        Ok(text) => {
+                            self.clipboard.kept = Some(Arc::from(text.as_str()));
+                            completed = Some(text);
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "clipboard text exceeds the viewer limit; not synced or kept"
+                        ),
                     }
-                    Ok(n) if bytes.len() + n <= MAX_CLIPBOARD_BYTES => {
-                        bytes.extend_from_slice(&part[..n]);
-                        keep = true;
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        keep = true;
-                    }
-                    Ok(_) | Err(_) => {}
                 }
+                Progress::Failed => self.clipboard.read = None,
             }
-        }
-        if !keep {
-            self.clipboard.read = None;
         }
         // A fresh selection completes a copy even when its text is unchanged.
         if let Some(text) = completed {
             self.emit(Event::Clipboard(text));
         }
-        self.clipboard
-            .writes
-            .retain_mut(|(fd, text, offset, deadline)| {
-                if Instant::now() >= *deadline {
-                    return false;
+        if self.clipboard.orphaned
+            && self.clipboard.pending_offer.is_none()
+            && self.clipboard.read.is_none()
+        {
+            self.clipboard_keep();
+        }
+        for (mut read, fd, latin1) in std::mem::take(&mut self.clipboard.conversions) {
+            match read.poll() {
+                Progress::Pending => self.clipboard.conversions.push((read, fd, latin1)),
+                Progress::Done(text) => self.queue_write(fd, encode(&text, latin1)),
+                Progress::Failed => {}
+            }
+        }
+        self.clipboard.writes.retain_mut(|write| {
+            if Instant::now() >= write.deadline {
+                tracing::warn!(
+                    written = write.offset,
+                    bytes = write.bytes.len(),
+                    "selection reader did not finish within {TIMEOUT:?}; dropped the transfer"
+                );
+                return false;
+            }
+            let end = write.bytes.len().min(write.offset + 65536);
+            match write.fd.write(&write.bytes[write.offset..end]) {
+                Ok(0) => false,
+                Ok(n) => {
+                    write.offset += n;
+                    write.offset < write.bytes.len()
                 }
-                match fd.write(&text.as_bytes()[*offset..text.len().min(*offset + 65536)]) {
-                    Ok(0) => false,
-                    Ok(n) => {
-                        *offset += n;
-                        *offset < text.len()
-                    }
-                    Err(error) => matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ),
-                }
-            });
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ),
+            }
+        });
+    }
+
+    /// Serves the exited owner's text, or empties the clipboard when none was kept.
+    fn clipboard_keep(&mut self) {
+        if let Some(text) = self.clipboard.kept.clone() {
+            tracing::debug!(
+                bytes = text.len(),
+                "kept clipboard text after its owner exited"
+            );
+            self.clipboard_own(text);
+        } else {
+            self.clipboard.orphaned = false;
+            clear_data_device_selection(&self.display_handle, &self.seat);
+            if let Some(xwm) = &mut self.xwm
+                && let Err(error) = xwm.new_selection(SelectionTarget::Clipboard, None)
+            {
+                tracing::warn!(%error, "clear X11 clipboard");
+            }
+            self.x11_stacking = None;
+            if let Ok(text) = ClipboardText::new(String::new()) {
+                self.emit(Event::Clipboard(text));
+            }
+        }
+        // Ticks run outside dispatch; flush the XWM's ownership change now.
+        crate::xwayland::sync_stacking(self);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn offer_read(state: &mut State, text: &str) {
+        offer_bytes(state, text.as_bytes(), false);
+    }
+
+    /// Stands in for the owner's reply to the viewer read; tests have no XWM.
+    fn offer_bytes(state: &mut State, bytes: &[u8], latin1: bool) {
         let (read, write) =
             nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).expect("clipboard test pipe");
         File::from(write)
-            .write_all(text.as_bytes())
+            .write_all(bytes)
             .expect("write clipboard offer");
-        state.clipboard.read = Some((read.into(), Vec::new(), Instant::now() + TIMEOUT));
+        state.clipboard.read = Some(Read::new(read.into(), latin1, "test"));
+    }
+
+    /// Requests `mime` from the clipboard as a client does and returns the reply.
+    fn request(state: &mut State, mime: &str) -> Vec<u8> {
+        let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("request pipe");
+        state.serve_selection(SelectionTarget::Clipboard, mime.into(), write);
+        while !state.clipboard.writes.is_empty() {
+            state.clipboard_tick();
+        }
+        let mut bytes = Vec::new();
+        File::from(read)
+            .read_to_end(&mut bytes)
+            .expect("read reply");
+        bytes
+    }
+
+    fn clipboard(text: &str) -> Event {
+        Event::Clipboard(ClipboardText::new(text.into()).expect("valid clipboard text"))
+    }
+
+    #[test]
+    fn string_requests_get_iso_8859_1() {
+        let (_display, mut state) = crate::tests::test_state();
+        state.clipboard_set(&ClipboardText::new("café €".into()).expect("valid clipboard text"));
+        assert_eq!(request(&mut state, "STRING"), b"caf\xe9 ?");
+        assert_eq!(request(&mut state, MIME), "café €".as_bytes());
+        assert_eq!(request(&mut state, "UTF8_STRING"), "café €".as_bytes());
+        assert_eq!(request(&mut state, "image/png"), b"");
+    }
+
+    #[test]
+    fn clipboard_text_outlives_an_owner_that_exits_mid_read() {
+        let (_display, mut state) = crate::tests::test_state();
+        state.x11_selection(SelectionTarget::Clipboard, vec!["STRING".into()]);
+        state.clipboard.pending_offer = None;
+        offer_bytes(&mut state, b"na\xefve", true);
+        state.clipboard_tick(); // Buffered; the end of the reply is still to come.
+        state.x11_selection_cleared(SelectionTarget::Clipboard);
+        state.clipboard_tick();
+        state.clipboard_tick();
+        assert_eq!(state.event_sink.take_events(), vec![clipboard("naïve")]);
+        assert!(matches!(
+            current_data_device_selection_userdata(&state.seat).as_deref(),
+            Some(SelectionData::Text(text)) if &**text == "naïve"
+        ));
+        assert_eq!(request(&mut state, MIME), "naïve".as_bytes());
+        assert_eq!(request(&mut state, "STRING"), b"na\xefve");
+
+        // Only text is kept: an exiting image owner leaves an empty clipboard.
+        state.x11_selection(SelectionTarget::Clipboard, vec!["image/png".into()]);
+        state.clipboard_tick();
+        state.x11_selection_cleared(SelectionTarget::Clipboard);
+        state.clipboard_tick();
+        assert_eq!(state.event_sink.take_events(), vec![clipboard("")]);
+        assert!(current_data_device_selection_userdata(&state.seat).is_none());
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn oversized_clipboard_is_logged_and_releases_its_owner() {
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (_display, mut state) = crate::tests::test_state();
+            let (read, write) = nonblocking_pipe().expect("clipboard test pipe");
+            state.clipboard.read = Some(Read::new(read, false, "test"));
+            let owner = std::thread::spawn(move || {
+                File::from(write).write_all(&vec![b'x'; 2 * MAX_CLIPBOARD_BYTES])
+            });
+            // Well inside TIMEOUT, so the size limit is what ends the read.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.clipboard.read.is_some() {
+                assert!(Instant::now() < deadline, "oversized read did not end");
+                state.clipboard_tick();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let error = owner
+                .join()
+                .expect("owner thread")
+                .expect_err("the owner's write must fail once the read is dropped");
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(state.event_sink.take_events().is_empty());
+        });
+        let logs = String::from_utf8(logs.0.lock().expect("log buffer").clone()).expect("logs");
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("exceeds the transfer limit")
+                && logs.contains("limit=1048576"),
+            "{logs}"
+        );
     }
 
     #[test]

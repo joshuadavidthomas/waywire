@@ -31,7 +31,6 @@ use smithay::wayland::fractional_scale::FractionalScaleHandler;
 use smithay::wayland::fractional_scale::with_fractional_scale;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::seat::WaylandFocus;
-use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::DataDeviceHandler;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::data_device::WaylandDndGrabHandler;
@@ -55,7 +54,9 @@ pub(crate) struct ClientState {
 }
 impl ClientData for ClientState {
     fn initialized(&self, _: ClientId) {}
-    fn disconnected(&self, _: ClientId, _: DisconnectReason) {}
+    fn disconnected(&self, _: ClientId, _: DisconnectReason) {
+        super::clipboard::CLIENT_LEFT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl CompositorHandler for State {
@@ -213,12 +214,14 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
-        set_data_device_focus(
+        let client = focus
+            .and_then(WaylandFocus::wl_surface)
+            .and_then(|s| s.client());
+        set_data_device_focus(&self.display_handle, seat, client.clone());
+        smithay::wayland::selection::primary_selection::set_primary_focus(
             &self.display_handle,
             seat,
-            focus
-                .and_then(WaylandFocus::wl_surface)
-                .and_then(|s| s.client()),
+            client,
         );
     }
     fn cursor_image(&mut self, _: &Seat<Self>, image: CursorImageStatus) {
@@ -246,53 +249,6 @@ impl SeatHandler for State {
     }
 }
 impl smithay::wayland::text_input::TextInputActivation for State {}
-impl SelectionHandler for State {
-    type SelectionUserData = super::clipboard::SelectionData;
-    fn new_selection(
-        &mut self,
-        target: smithay::wayland::selection::SelectionTarget,
-        source: Option<smithay::wayland::selection::SelectionSource>,
-        _: Seat<Self>,
-    ) {
-        if target == smithay::wayland::selection::SelectionTarget::Clipboard {
-            if let Some(xwm) = &mut self.xwm
-                && let Err(error) = xwm.new_selection(
-                    target,
-                    source
-                        .as_ref()
-                        .map(smithay::wayland::selection::SelectionSource::mime_types),
-                )
-            {
-                tracing::warn!(%error, "forward clipboard ownership to X11");
-            }
-            self.x11_stacking = None;
-            self.clipboard_changed(source);
-        }
-    }
-    fn send_selection(
-        &mut self,
-        target: smithay::wayland::selection::SelectionTarget,
-        mime: String,
-        fd: std::os::fd::OwnedFd,
-        _: Seat<Self>,
-        text: &Self::SelectionUserData,
-    ) {
-        if target == smithay::wayland::selection::SelectionTarget::Clipboard {
-            match text {
-                super::clipboard::SelectionData::Text(text) => {
-                    self.clipboard_send(&mime, fd, std::sync::Arc::clone(text));
-                }
-                super::clipboard::SelectionData::X11 => {
-                    if let Some(xwm) = &mut self.xwm
-                        && let Err(error) = xwm.send_selection(target, mime, fd)
-                    {
-                        tracing::warn!(%error, "send X11 clipboard");
-                    }
-                }
-            }
-        }
-    }
-}
 impl DataDeviceHandler for State {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state

@@ -1526,3 +1526,227 @@ fn xwayland_resource_dpi_tracks_output_scale() {
         "missing 2x DPI: {resources}"
     );
 }
+
+/// A compositor whose session only waits, for driving the clipboard with
+/// wl-clipboard and xclip.
+struct Desktop {
+    compositor: Compositor,
+    runtime: tempfile::TempDir,
+    display: String,
+    wayland: String,
+}
+
+#[expect(clippy::expect_used, reason = "test helper requires a live desktop")]
+fn desktop() -> Desktop {
+    let runtime = tempfile::tempdir().expect("runtime");
+    let ready = runtime.path().join("displays");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("address").port().to_string();
+    let compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                "printf '%s\\n%s' \"$DISPLAY\" \"$WAYLAND_DISPLAY\" > \"$0.tmp\"; mv \"$0.tmp\" \"$0\"; exec sleep 60",
+            ])
+            .arg(&ready)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "session did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let displays = fs::read_to_string(ready).expect("displays");
+    let (display, wayland) = displays.split_once('\n').expect("two displays");
+    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
+    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
+    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
+    Desktop {
+        display: display.to_owned(),
+        wayland: wayland.to_owned(),
+        compositor,
+        runtime,
+    }
+}
+
+impl Desktop {
+    fn command(&self, args: &[&str]) -> ProcessCommand {
+        let mut command = ProcessCommand::new(args[0]);
+        command
+            .args(&args[1..])
+            .env("DISPLAY", &self.display)
+            .env("WAYLAND_DISPLAY", &self.wayland)
+            .env("XDG_RUNTIME_DIR", self.runtime.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        command
+    }
+
+    /// Starts a tool that owns a selection, writing `input` to it.
+    #[expect(clippy::expect_used, reason = "test helper requires the tool")]
+    fn copy(&self, args: &[&str], input: &[u8]) -> Child {
+        let mut child = self
+            .command(args)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start copy tool");
+        child
+            .stdin
+            .take()
+            .expect("tool stdin")
+            .write_all(input)
+            .expect("write copy input");
+        child
+    }
+
+    /// Pastes with `args` until the output is `expected` or five seconds pass.
+    #[expect(clippy::expect_used, reason = "test helper requires the tool")]
+    fn paste(&self, args: &[&str], expected: &[u8]) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // A hung transfer fails the test instead of hanging it.
+            let output = self
+                .command(&[&["timeout", "5"], args].concat())
+                .stdin(Stdio::null())
+                .output()
+                .expect("run paste tool")
+                .stdout;
+            if output == expected || Instant::now() >= deadline {
+                return output;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, wl-clipboard and xclip"]
+fn primary_selection_crosses_wayland_and_x11() {
+    let mut desktop = desktop();
+    let mut wayland = desktop.copy(
+        &["wl-copy", "--primary", "--foreground"],
+        "wayland α".as_bytes(),
+    );
+    assert_eq!(
+        desktop.paste(
+            &["xclip", "-o", "-selection", "primary"],
+            "wayland α".as_bytes()
+        ),
+        "wayland α".as_bytes()
+    );
+    let mut x11 = desktop.copy(
+        &["xclip", "-quiet", "-i", "-selection", "primary"],
+        "x11 β".as_bytes(),
+    );
+    assert_eq!(
+        desktop.paste(
+            &["wl-paste", "--primary", "--no-newline"],
+            "x11 β".as_bytes()
+        ),
+        "x11 β".as_bytes()
+    );
+    // The primary selection stays on the desktop.
+    let mut decoder = Decoder::<Event>::new();
+    let synced = events(&mut desktop.compositor.0, &mut decoder);
+    assert!(
+        !synced
+            .iter()
+            .any(|event| matches!(event, Event::Clipboard(_))),
+        "the primary selection reached the viewer: {synced:?}"
+    );
+    for child in [&mut wayland, &mut x11] {
+        drop(child.kill());
+        drop(child.wait());
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, wl-clipboard and xclip"]
+fn x11_string_clipboard_is_iso_8859_1_both_ways() {
+    let mut desktop = desktop();
+    let mut wayland = desktop.copy(
+        &[
+            "wl-copy",
+            "--foreground",
+            "--type",
+            "text/plain;charset=utf-8",
+        ],
+        "café €".as_bytes(),
+    );
+    let string = ["xclip", "-o", "-selection", "clipboard", "-t", "STRING"];
+    assert_eq!(desktop.paste(&string, b"caf\xe9 ?"), b"caf\xe9 ?");
+    let mut x11 = desktop.copy(
+        &[
+            "xclip",
+            "-quiet",
+            "-i",
+            "-selection",
+            "clipboard",
+            "-t",
+            "STRING",
+        ],
+        b"na\xefve",
+    );
+    assert_eq!(
+        desktop.paste(&["wl-paste", "--no-newline"], "naïve".as_bytes()),
+        "naïve".as_bytes()
+    );
+    let mut decoder = Decoder::<Event>::new();
+    let synced = events(&mut desktop.compositor.0, &mut decoder);
+    assert!(
+        synced
+            .iter()
+            .any(|event| matches!(event, Event::Clipboard(text) if text.as_str() == "naïve")),
+        "the viewer did not receive the X11 STRING copy: {synced:?}"
+    );
+    for child in [&mut wayland, &mut x11] {
+        drop(child.kill());
+        drop(child.wait());
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, wl-clipboard and xclip"]
+fn clipboard_outlives_its_wayland_and_x11_owners() {
+    let desktop = desktop();
+    let mut wayland = desktop.copy(&["wl-copy", "--foreground"], b"from wayland");
+    assert_eq!(
+        desktop.paste(&["wl-paste", "--no-newline"], b"from wayland"),
+        b"from wayland"
+    );
+    drop(wayland.kill());
+    drop(wayland.wait());
+    let x11_paste = ["xclip", "-o", "-selection", "clipboard"];
+    assert_eq!(desktop.paste(&x11_paste, b"from wayland"), b"from wayland");
+    assert_eq!(
+        desktop.paste(&["wl-paste", "--no-newline"], b"from wayland"),
+        b"from wayland"
+    );
+
+    let mut x11 = desktop.copy(
+        &["xclip", "-quiet", "-i", "-selection", "clipboard"],
+        b"from x11",
+    );
+    assert_eq!(
+        desktop.paste(&["wl-paste", "--no-newline"], b"from x11"),
+        b"from x11"
+    );
+    drop(x11.kill());
+    drop(x11.wait());
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        desktop.paste(&["wl-paste", "--no-newline"], b"from x11"),
+        b"from x11"
+    );
+    assert_eq!(desktop.paste(&x11_paste, b"from x11"), b"from x11");
+}

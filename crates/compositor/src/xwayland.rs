@@ -32,9 +32,6 @@ use smithay::reexports::x11rb::protocol::xproto::PropMode;
 use smithay::utils::Logical;
 use smithay::utils::Rectangle;
 use smithay::wayland::selection::SelectionTarget;
-use smithay::wayland::selection::data_device::clear_data_device_selection;
-use smithay::wayland::selection::data_device::current_data_device_selection_userdata;
-use smithay::wayland::selection::data_device::set_data_device_selection;
 use smithay::wayland::xwayland_shell::XWaylandShellHandler;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Surface;
@@ -48,7 +45,6 @@ use smithay::xwayland::xwm::WmWindowProperty;
 use smithay::xwayland::xwm::XwmId;
 
 use crate::State;
-use crate::clipboard::SelectionData;
 
 // Keep X11 hit testing in the scene's stacking order. This also flushes XWM
 // requests issued by Wayland callbacks (notably new_selection, which does not
@@ -649,9 +645,9 @@ impl XwmHandler for State {
         }
     }
 
-    fn allow_selection_access(&mut self, _: XwmId, selection: SelectionTarget) -> bool {
+    fn allow_selection_access(&mut self, _: XwmId, _: SelectionTarget) -> bool {
         // One trusted desktop session; clipboard clients such as xclip need no window.
-        selection == SelectionTarget::Clipboard
+        true
     }
 
     fn send_selection(
@@ -661,31 +657,15 @@ impl XwmHandler for State {
         mime_type: String,
         fd: OwnedFd,
     ) {
-        if selection == SelectionTarget::Clipboard {
-            self.send_clipboard(mime_type, fd);
-        }
+        self.serve_selection(selection, mime_type, fd);
     }
 
     fn new_selection(&mut self, _: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
-        if selection == SelectionTarget::Clipboard {
-            set_data_device_selection(
-                &self.display_handle,
-                &self.seat,
-                mime_types.clone(),
-                SelectionData::X11,
-            );
-            self.clipboard_offer(mime_types);
-        }
+        self.x11_selection(selection, mime_types);
     }
 
     fn cleared_selection(&mut self, _: XwmId, selection: SelectionTarget) {
-        if selection == SelectionTarget::Clipboard
-            && current_data_device_selection_userdata(&self.seat)
-                .is_some_and(|data| matches!(*data, SelectionData::X11))
-        {
-            clear_data_device_selection(&self.display_handle, &self.seat);
-            self.clipboard_offer(Vec::new());
-        }
+        self.x11_selection_cleared(selection);
     }
 
     fn disconnected(&mut self, _: XwmId) {
