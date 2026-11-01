@@ -1599,6 +1599,153 @@ mod tests {
         );
     }
 
+    /// Press on `parent` at `at`, open a popup that grabs the pointer, close
+    /// it again, and render the frame whose cleanup ends the grab: a popover
+    /// closing to open a file chooser.
+    fn grab_and_close_popup(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        connection: &Connection,
+        queue: &mut EventQueue<App>,
+        app: &mut App,
+        parent: &XdgSurface,
+        at: (f64, f64),
+    ) {
+        use smithay::backend::renderer::damage::OutputDamageTracker;
+        use smithay::backend::renderer::pixman::PixmanRenderer;
+        use smithay::reexports::pixman::FormatCode;
+        use smithay::reexports::pixman::Image;
+
+        let qh = queue.handle();
+        state.pointer_motion(KeyboardSource::MAIN, at.into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        sync(display, state, connection, queue, app);
+        let wm_base = app.wm_base.as_ref().expect("wm base");
+        let positioner = wm_base.create_positioner(&qh, ());
+        positioner.set_size(10, 10);
+        positioner.set_anchor_rect(0, 0, 1, 1);
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = wm_base.get_xdg_surface(&surface, &qh, ());
+        let popup = xdg.get_popup(Some(parent), &positioner, &qh, ());
+        popup.grab(
+            app.seat.as_ref().expect("seat"),
+            app.button_serial.expect("press reached the parent"),
+        );
+        surface.commit();
+        sync(display, state, connection, queue, app);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        assert!(
+            state
+                .seat
+                .get_pointer()
+                .expect("pointer")
+                .with_grab(|_, grab| grab.is::<smithay::desktop::PopupPointerGrab<crate::State>>())
+                .unwrap_or(false),
+            "the popup grabs the pointer"
+        );
+        // GTK destroys the popup role but keeps the surface, which still has
+        // keyboard focus, so the frame does not move focus.
+        popup.destroy();
+        xdg.destroy();
+        sync(display, state, connection, queue, app);
+        let mut renderer = PixmanRenderer::new().expect("renderer");
+        let mut image = Image::new(FormatCode::A8R8G8B8, 1920, 1080, true).expect("render target");
+        let mut tracker = OutputDamageTracker::from_output(&state.output);
+        state
+            .render(&mut renderer, &mut image, &mut tracker)
+            .expect("render a frame");
+    }
+
+    /// A popup grab that ended must not swallow the motion of the next click,
+    /// nor keep pointer focus from a dialog that maps under the pointer.
+    #[test]
+    fn pointer_input_after_a_grabbing_popup_closes_reaches_its_target() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let _client_pointer = app
+            .seat
+            .as_ref()
+            .expect("seat")
+            .get_pointer(&queue.handle(), ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, editor_xdg, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Editor",
+            "editor",
+        );
+        // The third toplevel maps at (128, 128); the editor sits under it.
+        state
+            .space
+            .map_element(top_window(&state), (128, 128), false);
+        let (target_surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Target",
+            "target",
+        );
+        state
+            .space
+            .map_element(top_window(&state), (300, 300), false);
+        let pointer = state.seat.get_pointer().expect("pointer");
+
+        grab_and_close_popup(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &editor_xdg,
+            (128.0, 128.0),
+        );
+        let clicks = app.button_targets.len();
+        state.pointer_motion(KeyboardSource::MAIN, (300.0, 300.0).into());
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
+        state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(pointer.current_location(), (300.0, 300.0).into());
+        assert_eq!(
+            app.button_targets[clicks..],
+            [target_surface.clone(), target_surface],
+            "the click lands on the window under its own motion"
+        );
+
+        grab_and_close_popup(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &editor_xdg,
+            (128.0, 128.0),
+        );
+        let (chooser_surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Chooser",
+            "chooser",
+        );
+        assert_eq!(
+            app.pointer_focus,
+            Some(chooser_surface),
+            "a dialog mapped under the still pointer receives it"
+        );
+    }
+
     #[test]
     fn chip_click_focuses_unfocused_window() {
         let (mut display, mut state, connection, mut queue, mut app, first) = action_fixture();

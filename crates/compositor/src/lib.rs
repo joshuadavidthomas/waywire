@@ -66,7 +66,9 @@ use smithay::backend::renderer::Bind;
 use smithay::backend::renderer::Offscreen;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::pixman::PixmanRenderer;
+use smithay::desktop::PopupGrab;
 use smithay::desktop::PopupManager;
+use smithay::desktop::PopupPointerGrab;
 use smithay::desktop::Space;
 use smithay::desktop::Window;
 use smithay::desktop::WindowSurfaceType;
@@ -238,6 +240,8 @@ pub(crate) struct State {
     pub(crate) drag: Option<dnd::Drag>,
     pub(crate) activation: XdgActivationState,
     pub(crate) popups: PopupManager,
+    /// The popup grab holding the pointer, kept to see when it ends.
+    popup_grab: Option<PopupGrab<State>>,
     pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
     /// Last X11 stacking order sent to the XWM; `None` forces the next sync,
     /// which also flushes requests such as `new_selection` that do not flush.
@@ -391,6 +395,7 @@ impl State {
             drag: None,
             activation,
             popups: PopupManager::default(),
+            popup_grab: None,
             xwm: None,
             x11_stacking: None,
             xdisplay: None,
@@ -881,6 +886,7 @@ impl State {
     }
 
     pub(crate) fn refresh_pointer_focus(&mut self) {
+        self.release_ended_popup_grab();
         if let Some(pointer) = self.seat.get_pointer() {
             let window_grab = pointer
                 .with_grab(|_, grab| grab.is::<grabs::WindowGrab>())
@@ -898,6 +904,24 @@ impl State {
         }
     }
 
+    /// A popup grab ends once its popups are gone, but Smithay releases the
+    /// pointer only when the grab sees the next motion, and drops that
+    /// motion; a click right after a popup closed then lands at the old
+    /// position, and focus refreshes skip the grabbed pointer until then.
+    fn release_ended_popup_grab(&mut self) {
+        if !self.popup_grab.as_ref().is_some_and(PopupGrab::has_ended) {
+            return;
+        }
+        self.popup_grab = None;
+        if let Some(pointer) = self.seat.get_pointer()
+            && pointer
+                .with_grab(|_, grab| grab.is::<PopupPointerGrab<Self>>())
+                .unwrap_or(false)
+        {
+            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
+        }
+    }
+
     /// Relative input also reaches clients as relative motion, unclamped, so
     /// locked-pointer clients keep receiving movement at the output edge. It
     /// shares the absolute motion's frame: Xwayland's warp emulator then
@@ -911,6 +935,7 @@ impl State {
         if !self.accepts_input(source) {
             return;
         }
+        self.release_ended_popup_grab();
         let scale = self.output.current_scale().fractional_scale();
         let mut location = Point::from((
             location

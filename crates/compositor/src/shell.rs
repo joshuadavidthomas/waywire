@@ -409,6 +409,7 @@ impl XdgShellHandler for State {
         if let Some(pointer) = seat.get_pointer() {
             pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
         }
+        self.popup_grab = Some(grab);
     }
 }
 impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for State {}
