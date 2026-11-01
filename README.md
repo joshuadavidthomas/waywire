@@ -222,6 +222,9 @@ Pressure the link does not explain, such as a busy decoder or dropped encoder
 frames, lowers encoded scale, then bitrate, then FPS one step at a time, and
 recovers in reverse order. Quality stays 4:2:0. Each change restarts the encoder
 with a key frame; changing encoded scale does not resize the desktop itself.
+`just benchmark --check` holds this to account on a 500 kbps link: frames at most
+a second old, at least 8 a second with FFmpeg and 15 with OpenH264, and full
+quality again within 150 seconds of the link clearing.
 The existing bitrate cap and low-latency settings are unchanged; short measurements
 can exceed the cap while the encoder's two-second VBV buffer fills.
 

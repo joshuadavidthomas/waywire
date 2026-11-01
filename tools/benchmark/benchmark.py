@@ -21,11 +21,12 @@ Slow link: with each encoder, waywire streams a full-screen animation in
 Chromium while the viewer's link drops to 500 kbps for 45 seconds, then clears.
 On the slow link the viewer must lower the encoded scale and the bitrate target,
 not only the frame rate. Over the last 15 seconds on the slow link it must
-still draw at least 4 frames a second, and the median decoded frame must be at
-most 5 seconds old, measured from capture on the host's monotonic clock. Once
-the link clears, quality must return to the full scale, bitrate and frame rate
-within 150 seconds. Both encoders drew about 5 frames a second about 3.5
-seconds old: the ladder stops at half the bitrate ceiling, far above 500 kbps.
+still draw at least 8 frames a second with FFmpeg and 15 with OpenH264, and the
+median decoded frame must be at most 1 second old, measured from capture on the
+host's monotonic clock. Once the link clears, quality must return to the full
+scale, bitrate and frame rate within 150 seconds. In six runs each on the
+reference orb, FFmpeg drew 11 to 25 frames a second at most 464 ms old and
+OpenH264 drew 20 to 25 at most 552 ms old.
 
 Requires release binaries (just build), agent-browser, xterm, ffmpeg, Xwayland,
 xdotool, grim, wlr-randr, Debian Chromium, git, uv and the Amp Waymote installation.
@@ -59,8 +60,8 @@ URL = f"http://127.0.0.1:{PORT}"
 SECONDS = 8
 SLOW_LINK_KBPS = 500
 SLOW_LINK_SECONDS = 45
-SLOW_LINK_MIN_FPS = 4
-SLOW_LINK_MAX_AGE_MS = 5000
+SLOW_LINK_MIN_FPS = {"ffmpeg": 8, "openh264": 15}
+SLOW_LINK_MAX_AGE_MS = 1000
 RECOVERY_SECONDS = 150
 ENCODERS = ("ffmpeg", "openh264")
 MOTION_PAGE = (
@@ -955,9 +956,9 @@ def check_slow_link(encoder, result):
         failures.append(
             f"slow link {encoder}: bitrate stayed at {result['full_bitrate']}"
         )
-    if result["slow_fps"] < SLOW_LINK_MIN_FPS:
+    if result["slow_fps"] < SLOW_LINK_MIN_FPS[encoder]:
         failures.append(
-            f"slow link {encoder} fps: {result['slow_fps']} < {SLOW_LINK_MIN_FPS}"
+            f"slow link {encoder} fps: {result['slow_fps']} < {SLOW_LINK_MIN_FPS[encoder]}"
         )
     if result["slow_age_ms"] is None or result["slow_age_ms"] > SLOW_LINK_MAX_AGE_MS:
         failures.append(

@@ -38,9 +38,9 @@ def slow_link_result():
         "full_scale": 100,
         "lowest_bitrate": 6000,
         "full_bitrate": 12000,
-        "slow_fps": 12.0,
+        "slow_fps": 20.0,
         "slow_kbps": 480,
-        "slow_age_ms": 3500,
+        "slow_age_ms": 300,
         "recovery_s": 90.0,
         "samples": [],
     }
@@ -285,18 +285,34 @@ class RegressionCheckTest(unittest.TestCase):
             ),
         )
 
-    def test_slow_link_frame_rate_floor_is_inclusive(self):
-        self.results["slow_link"]["ffmpeg"]["slow_fps"] = 4
+    def test_slow_link_frame_rate_floor_is_inclusive_and_per_encoder(self):
+        self.results["slow_link"]["ffmpeg"]["slow_fps"] = 8
+        self.results["slow_link"]["openh264"]["slow_fps"] = 15
         self.assertEqual(self.run_check(), (0, "Regression check passed"))
-        self.results["slow_link"]["ffmpeg"]["slow_fps"] = 3.9
+        self.results["slow_link"]["ffmpeg"]["slow_fps"] = 7.9
+        self.results["slow_link"]["openh264"]["slow_fps"] = 14.9
         self.assertEqual(
             self.run_check(),
-            (1, "Regression check failed:\nslow link ffmpeg fps: 3.9 < 4"),
+            (
+                1,
+                "Regression check failed:\nslow link ffmpeg fps: 7.9 < 8"
+                "\nslow link openh264 fps: 14.9 < 15",
+            ),
         )
 
     def test_slow_link_frame_age_bound_is_inclusive(self):
-        self.results["slow_link"]["openh264"]["slow_age_ms"] = 5000
+        self.results["slow_link"]["openh264"]["slow_age_ms"] = 1000
         self.assertEqual(self.run_check(), (0, "Regression check passed"))
+        # A target stepped down instead of measured left frames 3.5 seconds old.
+        self.results["slow_link"]["openh264"]["slow_age_ms"] = 3547
+        self.assertEqual(
+            self.run_check(),
+            (
+                1,
+                "Regression check failed:"
+                "\nslow link openh264 frame age: 3547 ms > 1000 ms",
+            ),
+        )
         # A backlog hidden in a kernel send buffer left frames seconds old.
         self.results["slow_link"]["openh264"]["slow_age_ms"] = 20036
         self.assertEqual(
@@ -304,7 +320,7 @@ class RegressionCheckTest(unittest.TestCase):
             (
                 1,
                 "Regression check failed:"
-                "\nslow link openh264 frame age: 20036 ms > 5000 ms",
+                "\nslow link openh264 frame age: 20036 ms > 1000 ms",
             ),
         )
 
