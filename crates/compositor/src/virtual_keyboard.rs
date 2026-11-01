@@ -17,11 +17,17 @@
 //! model: a browser takeover releases held keys and drops later virtual-keyboard
 //! input at the seat entry points in `lib.rs`.
 
+use std::any::Any;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+
 use smithay::backend::input::Event;
 use smithay::backend::input::InputEvent;
 use smithay::backend::input::KeyboardKeyEvent;
 use smithay::input::keyboard::KeymapFile;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1;
 use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::wayland_server::protocol::wl_keyboard::KeymapFormat;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardBackend;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardHandler;
@@ -29,6 +35,29 @@ use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardSpecialEvent;
 
 use crate::State;
+
+/// Leave the NUL terminator out of a client keymap's size. `wtype` and other C
+/// clients count it, as `wl_keyboard.keymap` does, and Smithay compiles the
+/// buffer at that size, which libxkbcommon before 1.6 rejects. Runs on every
+/// request before dispatch and changes only virtual-keyboard keymaps.
+pub(crate) fn exclude_keymap_nul(request: &mut dyn Any) {
+    let Some(zwp_virtual_keyboard_v1::Request::Keymap { format, fd, size }) =
+        request.downcast_mut()
+    else {
+        return;
+    };
+    if *format != KeymapFormat::XkbV1 as u32 || *size == 0 {
+        return;
+    }
+    let mut last = [0xff];
+    let read = fd
+        .try_clone()
+        .map(File::from)
+        .and_then(|file| file.read_exact_at(&mut last, u64::from(*size - 1)));
+    if read.is_ok() && last == [0] {
+        *size -= 1;
+    }
+}
 
 /// Register the virtual keyboard manager global.
 pub(crate) fn init(display_handle: &DisplayHandle) {
@@ -202,6 +231,7 @@ impl VirtualKeyboardHandler for State {
 mod tests {
     use std::io::Write;
     use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
 
     use smithay::input::keyboard::xkb;
     use smithay::reexports::wayland_server::Display;
@@ -279,18 +309,23 @@ mod tests {
         }
     }
 
-    /// Create a virtual keyboard that uploads its own keymap.
+    /// Create a virtual keyboard that uploads its own keymap. With
+    /// `trailing_nul` the size counts a NUL terminator, as `wtype` sends it.
     fn keyboard_with_keymap(
         app: &App,
         qh: &QueueHandle<App>,
         layout: &str,
+        trailing_nul: bool,
     ) -> ZwpVirtualKeyboardV1 {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_names(&context, "", "", layout, "", None, 0)
             .expect("test keymap compiles");
-        let text = keymap
+        let mut text = keymap
             .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
             .into_bytes();
+        if trailing_nul {
+            text.push(0);
+        }
         let mut file = tempfile::tempfile().expect("keymap file");
         file.write_all(&text).expect("keymap written");
         let keyboard = app
@@ -334,7 +369,7 @@ mod tests {
                 .id()
         };
         let seat_keymap = keymap_id(&state);
-        let keyboard = keyboard_with_keymap(&app, &qh, "de");
+        let keyboard = keyboard_with_keymap(&app, &qh, "de", false);
         round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
         let virtual_keymap = keymap_id(&state);
         assert_ne!(virtual_keymap, seat_keymap);
@@ -391,9 +426,9 @@ mod tests {
         };
         let seat_keymap = keymap_id(&state);
 
-        let first = keyboard_with_keymap(&app, &qh, "de");
+        let first = keyboard_with_keymap(&app, &qh, "de", false);
         round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        let second = keyboard_with_keymap(&app, &qh, "fr");
+        let second = keyboard_with_keymap(&app, &qh, "fr", false);
         round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
         let second_keymap = keymap_id(&state);
         assert_ne!(
@@ -413,5 +448,55 @@ mod tests {
             seat_keymap,
             "the seat keymap is restored"
         );
+    }
+
+    /// `wtype` counts the keymap's NUL terminator in its size, which
+    /// libxkbcommon before 1.6 refuses to compile from a buffer.
+    #[test]
+    fn a_keymap_size_counting_its_nul_terminator_activates() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (client_socket, server_socket) =
+            std::os::unix::net::UnixStream::pair().expect("socket pair");
+        display
+            .handle()
+            .insert_client(
+                server_socket,
+                std::sync::Arc::new(crate::shell::ClientState::default()),
+            )
+            .expect("insert client");
+        let connection = Connection::from_socket(client_socket).expect("client connection");
+        let mut queue: EventQueue<App> = connection.new_event_queue();
+        let qh = queue.handle();
+        let mut app = App::default();
+        connection.display().get_registry(&qh, ());
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let keymap = |state: &State| {
+            state
+                .seat
+                .get_keyboard()
+                .expect("seat keyboard")
+                .keymap_file()
+        };
+        let seat_keymap = keymap(&state).id();
+        let _keyboard = keyboard_with_keymap(&app, &qh, "de", true);
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let active = keymap(&state);
+        assert_ne!(
+            active.id(),
+            seat_keymap,
+            "the virtual keyboard's keymap is active"
+        );
+        let mut german = None;
+        active
+            .with_fd(false, |fd, size| {
+                let mut text = vec![0; size];
+                std::fs::File::from(fd.try_clone_to_owned().expect("keymap fd"))
+                    .read_exact_at(&mut text, 0)
+                    .expect("keymap read");
+                german = Some(String::from_utf8_lossy(&text).contains("German"));
+            })
+            .expect("keymap file");
+        assert_eq!(german, Some(true), "the active keymap is the uploaded one");
     }
 }

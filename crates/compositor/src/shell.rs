@@ -10,6 +10,11 @@ use smithay::input::keyboard::KeyboardSource;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::DataInit;
+use smithay::reexports::wayland_server::Dispatch;
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::wayland_server::GlobalDispatch;
+use smithay::reexports::wayland_server::New;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::backend::ClientId;
@@ -18,6 +23,8 @@ use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Serial;
+use smithay::wayland::Dispatch2;
+use smithay::wayland::GlobalDispatch2;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::CompositorClientState;
 use smithay::wayland::compositor::CompositorHandler;
@@ -676,4 +683,49 @@ impl State {
         });
     }
 }
-smithay::delegate_dispatch2!(State);
+// Smithay's `delegate_dispatch2!`, with one request fix-up before dispatch:
+// see `exclude_keymap_nul`.
+impl<I, UserData> Dispatch<I, UserData> for State
+where
+    I: Resource + 'static,
+    I::Request: 'static,
+    UserData: Dispatch2<I, Self>,
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &I,
+        mut request: I::Request,
+        data: &UserData,
+        dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        crate::virtual_keyboard::exclude_keymap_nul(&mut request);
+        data.request(state, client, resource, request, dhandle, data_init);
+    }
+
+    fn destroyed(state: &mut Self, client: ClientId, resource: &I, data: &UserData) {
+        data.destroyed(state, client, resource);
+    }
+}
+
+impl<I, UserData> GlobalDispatch<I, UserData> for State
+where
+    I: Resource,
+    UserData: GlobalDispatch2<I, Self>,
+{
+    fn bind(
+        state: &mut Self,
+        dhandle: &DisplayHandle,
+        client: &Client,
+        resource: New<I>,
+        data: &UserData,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data.bind(state, dhandle, client, resource, data_init);
+    }
+
+    fn can_view(client: Client, data: &UserData) -> bool {
+        data.can_view(&client)
+    }
+}
