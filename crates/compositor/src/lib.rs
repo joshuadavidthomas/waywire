@@ -1884,6 +1884,12 @@ impl State {
     fn apply_command(&mut self, command: Command) -> Result<()> {
         if let Some(sequence) = command.input_sequence() {
             self.latest_input_sequence = Some(sequence);
+            tracing::debug!(
+                target: "waywire_latency",
+                stage = "compositor_input",
+                input = sequence.get(),
+                at_ns = capture::monotonic_nanos(),
+            );
         }
         let source = KeyboardSource::MAIN;
         match command {
@@ -2058,14 +2064,17 @@ impl State {
             match frame {
                 // A full stdout queue drops this frame rather than the session. The
                 // stripes it carried are now out of step, so code a key frame next.
-                Ok(frame) => match self.event_sink.send(&Event::EncodedFrame(frame)) {
-                    Ok(()) => {}
-                    Err(event_writer::EventWriterError::QueueFull) => {
-                        self.request_key();
-                        self.frame_pending = FrameRequest::Pending;
+                Ok(frame) => {
+                    let sequence = frame.metadata.sequence;
+                    match self.event_sink.send(&Event::EncodedFrame(frame)) {
+                        Ok(()) => capture::trace_frame("emitted", sequence, 0),
+                        Err(event_writer::EventWriterError::QueueFull) => {
+                            self.request_key();
+                            self.frame_pending = FrameRequest::Pending;
+                        }
+                        Err(error) => self.fail(error.into()),
                     }
-                    Err(error) => self.fail(error.into()),
-                },
+                }
                 Err(error) => self.fail(anyhow!(error)),
             }
         }
@@ -2089,6 +2098,7 @@ impl State {
         image: &mut Image<'static, 'static>,
         tracker: &mut OutputDamageTracker,
     ) -> Result<()> {
+        let render_started_ns = capture::monotonic_nanos();
         let size = (
             i32::try_from(self.size.width())?,
             i32::try_from(self.size.height())?,
@@ -2150,6 +2160,7 @@ impl State {
                 && self.acknowledged == Some(self.generation);
             self.forced_frame_hash = hash;
             if !unchanged {
+                capture::trace_frame("render", self.sequence, render_started_ns);
                 self.submit_video(image, damage, false)?;
                 self.refresh = Refresh::Due {
                     at: Instant::now() + REFRESH_DELAY,
@@ -2218,13 +2229,11 @@ impl State {
             crf: self.quality.crf,
             chroma: self.quality.chroma,
         };
-        let timestamp = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)?;
         let metadata = FrameMetadata {
             generation: self.generation,
             width: config.encoded_width,
             height: config.encoded_height,
-            capture_nanos: u64::try_from(timestamp.tv_sec())? * 1_000_000_000
-                + u64::try_from(timestamp.tv_nsec())?,
+            capture_nanos: capture::monotonic_nanos(),
             sequence: self.sequence,
             input_sequence: self.latest_input_sequence,
             fps: self.quality.fps,

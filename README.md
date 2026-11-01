@@ -129,6 +129,15 @@ into a temporary directory. `just benchmark --check` compares both results
 against the tolerances in the script and exits nonzero for a regression or a
 missing comparison.
 
+For waywire, the benchmark also splits each key's input-to-screen latency into
+stages, from the browser key event through the gateway, compositor, client
+commit, render, encoder (in-process OpenH264 or the FFmpeg process, each with
+its own stages), and back to the browser's decoder and canvas. The
+gateway and compositor log stage times on `CLOCK_MONOTONIC` under the
+`waywire_latency` tracing target (`RUST_LOG=waywire_latency=debug`), and the
+browser's times are shifted onto that clock with the control socket's
+lowest-round-trip ping. The stages of each key add up to its end-to-end time.
+
 Both runs below used 1280×720 at 30 Hz and a 30 fps, 12,000 kbps encoder
 target, with xterm and Debian Chromium 156.0.8078.73 as the applications.
 Waywire (0.1.0-rc.1) was built from

@@ -136,6 +136,7 @@ impl StripedEncoder {
         {
             return Err(VideoError::InvalidFrame);
         }
+        let submitted_ns = crate::capture::monotonic_nanos();
         let mut staging = self
             .shared
             .staging
@@ -207,6 +208,7 @@ impl StripedEncoder {
                 *band = true;
             }
         }
+        crate::capture::trace_frame("converted", frame.metadata.sequence, submitted_ns);
         staging.pending = Some(Pending {
             metadata: frame.metadata.clone(),
             crf: frame.crf,
@@ -335,6 +337,7 @@ fn run(
             copy_changed_stripes(&mut staging, current);
             (pending, key)
         };
+        let taken_ns = crate::capture::monotonic_nanos();
         let Some(current) = stripes.as_mut() else {
             continue;
         };
@@ -367,6 +370,9 @@ fn run(
             }
             Err(error) => Err(error),
         };
+        if let Ok(frame) = &notification {
+            crate::capture::trace_frame("encoder_output", frame.metadata.sequence, taken_ns);
+        }
         let fatal = notification.is_err();
         if sender.send(notification).is_err() {
             return;

@@ -166,6 +166,14 @@ impl Correlator {
                 bytes: byte_permit,
             } = pending.value;
             drop(byte_permit);
+            tracing::debug!(
+                target: "waywire_latency",
+                stage = "correlated",
+                sequence = metadata.sequence,
+                generation = unit.generation.get(),
+                rtp_timestamp = unit.timestamp.0,
+                at_ns = super::monotonic_nanos(),
+            );
             let generation_changed = self.last_generation != Some(metadata.generation);
             let recovering = self.keyframe == GopState::Recovering;
             let continuity = if recovering

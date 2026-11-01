@@ -10,7 +10,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from benchmark import ENCODERS, main, process_snapshot
+from benchmark import ENCODERS, latency_breakdown, main, process_snapshot
 
 
 def result():
@@ -65,6 +65,136 @@ class ProcessSnapshotTest(unittest.TestCase):
             os.killpg(process.pid, signal.SIGTERM)
             process.wait()
             process.stdout.close()
+
+
+class LatencyBreakdownTest(unittest.TestCase):
+    def test_stages_join_on_one_clock_and_add_up(self):
+        # Server clock = browser clock + 1000 ms, measured by a 0.4 ms ping.
+        clock = [
+            {"sent": 0.0, "received": 2.0, "serverNanos": "1001000000"},
+            {"sent": 5.0, "received": 5.4, "serverNanos": "1005200000"},
+        ]
+
+        def line(fields):
+            return f"2026-11-01T00:00:00Z DEBUG waywire_latency: {fields}"
+
+        def ns(browser_ms):
+            return int((browser_ms + 1000) * 1e6)
+
+        log = "\n".join(
+            line(fields)
+            for fields in (
+                f'stage="render" sequence=6 start_ns={ns(8)} at_ns={ns(9)}',
+                f'stage="gateway_input" input=3 at_ns={ns(11)}',
+                f'stage="compositor_input" input=3 at_ns={ns(12)}',
+                f'stage="render" sequence=7 start_ns={ns(13)} at_ns={ns(14)}',
+                # The previous render started after this commit, so it is not the change.
+                f'stage="commit" cursor=false at_ns={ns(12.5)}',
+                f'stage="commit" cursor=true at_ns={ns(15)}',
+                f'stage="commit" cursor=false at_ns={ns(16)}',
+                f'stage="commit" cursor=false at_ns={ns(17)}',
+                f'stage="render" sequence=8 start_ns={ns(20)} at_ns={ns(21)}',
+                f'stage="encoder_input" sequence=8 start_ns={ns(22)} at_ns={ns(24)}',
+                # The same RTP timestamp in an older generation must not match.
+                f'stage="encoded" generation=1 rtp_timestamp=900 bytes=10 at_ns={ns(25)}',
+                f'stage="encoded" generation=2 rtp_timestamp=900 bytes=10 at_ns={ns(30)}',
+                f'stage="correlated" sequence=8 generation=2 rtp_timestamp=900 at_ns={ns(31)}',
+                f'stage="gateway_send" sequence=8 start_ns={ns(31.5)} at_ns={ns(32)}',
+            )
+        )
+        traces = [
+            {
+                "keydown": 10.0,
+                "armed": 0.5,
+                "sent": 10.8,
+                "input": 3,
+                "sequence": 8,
+                "received": 33.0,
+                "decoding": 33.5,
+                "decoded": 35.0,
+                "drawn": 60.0,
+                "detected": 62.0,
+            }
+        ]
+        breakdown = latency_breakdown(traces, clock, log)
+        stages = {name: stage["p50_ms"] for name, stage in breakdown["stages"].items()}
+        self.assertEqual(breakdown["clock_uncertainty_ms"], 0.2)
+        self.assertEqual(
+            stages,
+            {
+                "keydown → viewer handler (harness readback)": 0.5,
+                "viewer handler → input sent": 0.3,
+                "input sent → gateway receive": 0.2,
+                "gateway → compositor input": 1.0,
+                "compositor input → client commit": 4.0,
+                "client commit → render start": 4.0,
+                "render": 1.0,
+                "render → encoder thread": 1.0,
+                "raw frame pipe write": 2.0,
+                "FFmpeg encode → RTP received": 6.0,
+                "RTP received → frame correlated": 1.0,
+                "correlated → gateway send done": 1.0,
+                "gateway send → browser receive": 1.0,
+                "browser receive → decode submit": 0.5,
+                "decode": 1.5,
+                "decoded → canvas paint": 25.0,
+                "canvas paint → changed pixel (harness readback)": 2.0,
+            },
+        )
+        self.assertEqual(breakdown["encoder"], "ffmpeg")
+        self.assertEqual(breakdown["sum_of_stage_mean_ms"], 52.0)
+        self.assertEqual(breakdown["end_to_end"]["mean_ms"], 52.0)
+
+    def test_in_process_encoder_has_its_own_stages(self):
+        clock = [{"sent": 0.0, "received": 0.4, "serverNanos": "1000200000"}]
+
+        def ns(browser_ms):
+            return int((browser_ms + 1000) * 1e6)
+
+        log = "\n".join(
+            f"2026-11-01T00:00:00Z DEBUG waywire_latency: {fields}"
+            for fields in (
+                f'stage="gateway_input" input=3 at_ns={ns(11)}',
+                f'stage="compositor_input" input=3 at_ns={ns(12)}',
+                f'stage="commit" cursor=false at_ns={ns(13)}',
+                f'stage="render" sequence=8 start_ns={ns(14)} at_ns={ns(15)}',
+                f'stage="converted" sequence=8 start_ns={ns(15)} at_ns={ns(15.5)}',
+                f'stage="encoder_output" sequence=8 start_ns={ns(16)} at_ns={ns(18)}',
+                f'stage="emitted" sequence=8 start_ns=0 at_ns={ns(18.5)}',
+                f'stage="encoded_received" sequence=8 at_ns={ns(19)}',
+                f'stage="gateway_send" sequence=8 start_ns={ns(19.5)} at_ns={ns(20)}',
+            )
+        )
+        traces = [
+            {
+                "keydown": 10.0,
+                "armed": 0.5,
+                "sent": 10.8,
+                "input": 3,
+                "sequence": 8,
+                "received": 21.0,
+                "decoding": 21.5,
+                "decoded": 22.0,
+                "drawn": 25.0,
+                "detected": 27.0,
+            }
+        ]
+        breakdown = latency_breakdown(traces, clock, log)
+        stages = {name: stage["p50_ms"] for name, stage in breakdown["stages"].items()}
+        self.assertEqual(breakdown["encoder"], "openh264")
+        self.assertEqual(
+            list(stages.items())[7:13],
+            [
+                ("BGRA→I420 of damaged rows", 0.5),
+                ("converted → encoder thread", 0.5),
+                ("OpenH264 encode", 2.0),
+                ("encoder → compositor event out", 0.5),
+                ("compositor → gateway receive", 0.5),
+                ("gateway receive → send done", 1.0),
+            ],
+        )
+        self.assertEqual(breakdown["sum_of_stage_mean_ms"], 17.0)
+        self.assertEqual(breakdown["end_to_end"]["mean_ms"], 17.0)
 
 
 class RegressionCheckTest(unittest.TestCase):

@@ -66,6 +66,14 @@ const MAX_ACCESS_UNIT: usize = MAX_VIDEO_DATA_BYTES;
 const UNMATCHED_DEADLINE: Duration = Duration::from_secs(2);
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// `CLOCK_MONOTONIC`, the clock of frame capture timestamps, for `waywire_latency` traces.
+pub(crate) fn monotonic_nanos() -> u64 {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map_or(0, |time| {
+        u64::try_from(time.tv_sec()).unwrap_or(0) * 1_000_000_000
+            + u64::try_from(time.tv_nsec()).unwrap_or(0)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GopState {
     KeyframeCached,
@@ -220,6 +228,12 @@ impl VideoPipeline {
     }
 
     pub(crate) async fn metadata(&self, value: FrameMetadata) -> anyhow::Result<()> {
+        debug!(
+            target: "waywire_latency",
+            stage = "metadata",
+            sequence = value.sequence,
+            at_ns = monotonic_nanos(),
+        );
         // Observe ordered Submitted events before correlation can discard them.
         // Gaps here are producer replacement/backpressure, not RTP/browser loss.
         self.sessions.submitted(&value);
@@ -230,6 +244,12 @@ impl VideoPipeline {
     }
 
     pub(crate) async fn encoded(&self, value: EncodedFrame) -> anyhow::Result<()> {
+        debug!(
+            target: "waywire_latency",
+            stage = "encoded_received",
+            sequence = value.metadata.sequence,
+            at_ns = monotonic_nanos(),
+        );
         self.sessions.submitted(&value.metadata);
         self.tx
             .send(PipelineMessage::Encoded(value))
@@ -308,7 +328,17 @@ impl VideoPipeline {
                     .context("video pipeline stopped")?;
             }
             match result.outcome {
-                Ok(AssemblyOutcome::Complete(unit)) => self.unit(unit).await?,
+                Ok(AssemblyOutcome::Complete(unit)) => {
+                    debug!(
+                        target: "waywire_latency",
+                        stage = "encoded",
+                        generation = unit.generation.get(),
+                        rtp_timestamp = unit.timestamp.0,
+                        bytes = unit.data.len(),
+                        at_ns = monotonic_nanos(),
+                    );
+                    self.unit(unit).await?;
+                }
                 Ok(AssemblyOutcome::Dropped | AssemblyOutcome::Incomplete) => {}
                 Err(error) => summary.record_rejection(PacketFailure::Reject(error)),
             }

@@ -839,6 +839,7 @@ impl Worker<'_> {
             let Some((slot, frame)) = take_pending_frame(self.shared) else {
                 continue;
             };
+            let taken_ns = crate::capture::monotonic_nanos();
 
             if frame.metadata.generation != current_generation(self.shared) {
                 release_slot(self.shared, slot, frame);
@@ -904,6 +905,7 @@ impl Worker<'_> {
                 }
             }
 
+            crate::capture::trace_frame("encoder_input", frame.metadata.sequence, taken_ns);
             // Correlation metadata follows only a complete raw-frame pipe write.
             if !send_notification(
                 self.shared,

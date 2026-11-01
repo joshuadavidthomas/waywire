@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import signal
 import statistics
@@ -234,6 +235,269 @@ def latency():
     }
 
 
+_INPUT_STAGES = (
+    ("keydown → viewer handler (harness readback)", "keydown", "handler"),
+    ("viewer handler → input sent", "handler", "sent"),
+    ("input sent → gateway receive", "sent", "gateway_input"),
+    ("gateway → compositor input", "gateway_input", "compositor_input"),
+    ("compositor input → client commit", "compositor_input", "commit"),
+    ("client commit → render start", "commit", "render_start"),
+    ("render", "render_start", "render"),
+)
+_VIEWER_STAGES = (
+    ("gateway send → browser receive", "gateway_send", "received"),
+    ("browser receive → decode submit", "received", "decoding"),
+    ("decode", "decoding", "decoded"),
+    ("decoded → canvas paint", "decoded", "drawn"),
+    ("canvas paint → changed pixel (harness readback)", "drawn", "detected"),
+)
+# Each encoder's stages between the render and the gateway's WebSocket send.
+LATENCY_STAGES = {
+    "ffmpeg": _INPUT_STAGES
+    + (
+        ("render → encoder thread", "render", "encoder_start"),
+        ("raw frame pipe write", "encoder_start", "encoder_input"),
+        ("FFmpeg encode → RTP received", "encoder_input", "encoded"),
+        ("RTP received → frame correlated", "encoded", "correlated"),
+        ("correlated → gateway send done", "correlated", "gateway_send"),
+    )
+    + _VIEWER_STAGES,
+    "openh264": _INPUT_STAGES
+    + (
+        ("BGRA→I420 of damaged rows", "render", "converted"),
+        ("converted → encoder thread", "converted", "encoder_start"),
+        ("OpenH264 encode", "encoder_start", "encoder_output"),
+        ("encoder → compositor event out", "encoder_output", "emitted"),
+        ("compositor → gateway receive", "emitted", "encoded_received"),
+        ("gateway receive → send done", "encoded_received", "gateway_send"),
+    )
+    + _VIEWER_STAGES,
+}
+TRACE_FIELD = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
+
+
+def latency_events(log):
+    """Parse waywire_latency trace lines into stage dictionaries."""
+    events = []
+    for line in log.splitlines():
+        _, marker, fields = line.partition(" waywire_latency: ")
+        if not marker:
+            continue
+        event = {}
+        for name, quoted, plain in TRACE_FIELD.findall(fields):
+            value = quoted if quoted else plain
+            event[name] = int(value) if value.isdigit() else value
+        events.append(event)
+    return events
+
+
+def clock_offset(samples):
+    """Browser performance.now() milliseconds to server monotonic nanoseconds.
+
+    The ping with the shortest round trip bounds the offset most tightly; its
+    uncertainty is half that round trip.
+    """
+    best = min(samples, key=lambda sample: sample["received"] - sample["sent"])
+    rtt = best["received"] - best["sent"]
+    offset = int(best["serverNanos"]) / 1e6 - (best["sent"] + best["received"]) / 2
+    return offset, rtt / 2
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[math.ceil(len(ordered) * fraction) - 1]
+
+
+def encoder_times(encoder_name, events, first, sequence):
+    """Server times in nanoseconds of one frame's encoder stages, or None."""
+    if encoder_name == "openh264":
+        stages = ("converted", "encoder_output", "emitted", "encoded_received")
+        converted, output, emitted, received = (
+            first(stage, sequence=sequence) for stage in stages
+        )
+        if None in (converted, output, emitted, received):
+            return None
+        return {
+            "converted": converted["at_ns"],
+            "encoder_start": output["start_ns"],
+            "encoder_output": output["at_ns"],
+            "emitted": emitted["at_ns"],
+            "encoded_received": received["at_ns"],
+        }
+    encoder = first("encoder_input", sequence=sequence)
+    correlated = first("correlated", sequence=sequence)
+    if None in (encoder, correlated):
+        return None
+    encoded = max(
+        (
+            event
+            for event in events
+            if event.get("stage") == "encoded"
+            and event["generation"] == correlated["generation"]
+            and event["rtp_timestamp"] == correlated["rtp_timestamp"]
+            and event["at_ns"] <= correlated["at_ns"]
+        ),
+        key=lambda event: event["at_ns"],
+        default=None,
+    )
+    if encoded is None:
+        return None
+    return {
+        "encoder_start": encoder["start_ns"],
+        "encoder_input": encoder["at_ns"],
+        "encoded": encoded["at_ns"],
+        "correlated": correlated["at_ns"],
+    }
+
+
+def latency_breakdown(traces, clock, log):
+    """Join browser traces with server stage events on one clock.
+
+    Browser times are performance.now() milliseconds. Server events carry
+    CLOCK_MONOTONIC nanoseconds and are shifted onto the browser clock with
+    the measured ping offset. Stages are consecutive, so per trace they add
+    up to the end-to-end keydown-to-changed-pixel time exactly; the offset
+    only moves time between the two network stages and the server stages.
+    """
+    if not traces or not clock:
+        return {"status": "n/a: no browser traces or clock samples"}
+    offset, uncertainty = clock_offset(clock)
+    events = latency_events(log)
+    # The in-process encoder reports its output; the FFmpeg process does not.
+    encoder_name = (
+        "openh264"
+        if any(event.get("stage") == "encoder_output" for event in events)
+        else "ffmpeg"
+    )
+
+    def ms(nanos):
+        return nanos / 1e6 - offset
+
+    def first(stage, **match):
+        return next(
+            (
+                event
+                for event in events
+                if event.get("stage") == stage
+                and all(event.get(key) == value for key, value in match.items())
+            ),
+            None,
+        )
+
+    rows = []
+    incomplete = 0
+    for trace in traces:
+        row = {
+            "keydown": trace["keydown"],
+            "handler": trace["keydown"] + trace["armed"],
+            "sent": trace.get("sent"),
+            "received": trace.get("received"),
+            "decoding": trace.get("decoding"),
+            "decoded": trace.get("decoded"),
+            "drawn": trace["drawn"],
+            "detected": trace["detected"],
+        }
+        gateway = first("gateway_input", input=trace.get("input"))
+        compositor = first("compositor_input", input=trace.get("input"))
+        sequence = trace.get("sequence")
+        render = first("render", sequence=sequence)
+        sent = first("gateway_send", sequence=sequence)
+        encoder = encoder_times(encoder_name, events, first, sequence)
+        if None in (gateway, compositor, render, sent, encoder):
+            incomplete += 1
+            continue
+        # The change reached the screen in the first commit after both the
+        # input and the start of the previous render, which did not show it.
+        previous_render = max(
+            (
+                event["start_ns"]
+                for event in events
+                if event.get("stage") == "render"
+                and event["start_ns"] < render["start_ns"]
+            ),
+            default=0,
+        )
+        commit = next(
+            (
+                event
+                for event in events
+                if event.get("stage") == "commit"
+                and event.get("cursor") != "true"
+                and event["at_ns"] >= max(compositor["at_ns"], previous_render)
+                and event["at_ns"] <= render["start_ns"]
+            ),
+            None,
+        )
+        if commit is None:
+            incomplete += 1
+            continue
+        row.update(
+            gateway_input=ms(gateway["at_ns"]),
+            compositor_input=ms(compositor["at_ns"]),
+            commit=ms(commit["at_ns"]),
+            render_start=ms(render["start_ns"]),
+            render=ms(render["at_ns"]),
+            gateway_send=ms(sent["at_ns"]),
+            **{name: ms(nanos) for name, nanos in encoder.items()},
+        )
+        if None in row.values():
+            incomplete += 1
+            continue
+        rows.append(row)
+    if not rows:
+        return {"status": "n/a: no complete traces", "incomplete": incomplete}
+    stages = {}
+    for name, start, end in LATENCY_STAGES[encoder_name]:
+        values = [row[end] - row[start] for row in rows]
+        stages[name] = {
+            "p50_ms": round(statistics.median(values), 2),
+            "p95_ms": round(percentile(values, 0.95), 2),
+            "mean_ms": round(statistics.fmean(values), 2),
+        }
+    total = [row["detected"] - row["keydown"] for row in rows]
+    return {
+        "encoder": encoder_name,
+        "traces": len(rows),
+        "incomplete": incomplete,
+        "clock_uncertainty_ms": round(uncertainty, 3),
+        "stages": stages,
+        "sum_of_stage_p50_ms": round(
+            sum(stage["p50_ms"] for stage in stages.values()), 1
+        ),
+        "sum_of_stage_mean_ms": round(
+            sum(stage["mean_ms"] for stage in stages.values()), 1
+        ),
+        "end_to_end": {
+            "p50_ms": round(statistics.median(total), 1),
+            "p95_ms": round(percentile(total, 0.95), 1),
+            "mean_ms": round(statistics.fmean(total), 1),
+        },
+    }
+
+
+def print_breakdown(breakdown):
+    if "stages" not in breakdown:
+        print(f"latency breakdown {breakdown['status']}", flush=True)
+        return
+    print(
+        f"Viewer latency by stage ({breakdown['encoder']}, {breakdown['traces']} keys, clock offset "
+        f"±{breakdown['clock_uncertainty_ms']} ms)\n"
+        f"{'stage':48} {'p50 ms':>8} {'p95 ms':>8} {'mean ms':>8}",
+        flush=True,
+    )
+    for name, stage in breakdown["stages"].items():
+        print(
+            f"{name:48} {stage['p50_ms']:8.2f} {stage['p95_ms']:8.2f} {stage['mean_ms']:8.2f}"
+        )
+    total = breakdown["end_to_end"]
+    print(
+        f"{'keydown → changed pixel':48} {total['p50_ms']:8.1f} {total['p95_ms']:8.1f} "
+        f"{total['mean_ms']:8.1f}\n{'sum of stage p50 / mean':48} "
+        f"{breakdown['sum_of_stage_p50_ms']:8.1f} {'':>8} {breakdown['sum_of_stage_mean_ms']:8.1f}",
+        flush=True,
+    )
+
+
 def agent_checks(app_env, window, directory, fixture):
     subprocess.run(["xdotool", "windowfocus", window], env=app_env, check=True)
     marker = directory / "xdotool-result"
@@ -329,6 +593,7 @@ def run_desktop(name, fixture):
             try:
                 launched = time.time() * 1000
                 if name == "waywire":
+                    env["RUST_LOG"] = "info,waywire_latency=debug"
                     processes.append(start(waywire_command(URL, app), env, log))
                 else:
                     env.update(
@@ -526,6 +791,14 @@ def run_desktop(name, fixture):
                 browser("click", "#display")
                 time.sleep(1)
                 results["latency"] = latency()
+                if name == "waywire":
+                    log.flush()
+                    results["latency"]["breakdown"] = latency_breakdown(
+                        evaluate("window.benchmarkTraces"),
+                        evaluate("window.benchmarkClock"),
+                        (directory / "desktop.log").read_text(),
+                    )
+                    print_breakdown(results["latency"]["breakdown"])
                 browser("open", "about:blank")
                 results["agents"] = agent_checks(app_env, window, directory, fixture)
                 print(json.dumps({name: results}, indent=2), flush=True)

@@ -248,6 +248,23 @@ pub(crate) fn monotonic() -> Duration {
     )
 }
 
+/// The same clock as frame capture timestamps, for `waywire_latency` traces.
+pub(crate) fn monotonic_nanos() -> u64 {
+    u64::try_from(monotonic().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Trace a frame stage that began at `start_ns` and ends now, for the benchmark's
+/// viewer latency breakdown.
+pub(crate) fn trace_frame(stage: &'static str, sequence: u64, start_ns: u64) {
+    tracing::debug!(
+        target: "waywire_latency",
+        stage,
+        sequence,
+        start_ns,
+        at_ns = monotonic_nanos(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

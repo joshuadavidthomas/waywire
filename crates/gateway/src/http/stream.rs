@@ -77,6 +77,15 @@ async fn send_video(
         send(socket, configuration, cancellation).await?;
         *announced_generation = Some(generation);
     }
+    let started_ns = crate::video::monotonic_nanos();
     let bytes = frame.encode();
-    send(socket, Message::Binary(bytes.into()), cancellation).await
+    send(socket, Message::Binary(bytes.into()), cancellation).await?;
+    tracing::debug!(
+        target: "waywire_latency",
+        stage = "gateway_send",
+        sequence = frame.metadata.sequence,
+        start_ns = started_ns,
+        at_ns = crate::video::monotonic_nanos(),
+    );
+    Ok(())
 }

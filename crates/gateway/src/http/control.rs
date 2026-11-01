@@ -180,7 +180,18 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
                             .await
                         }
                         Message::Binary(bytes) => {
-                            match parse_browser_record(&bytes) {
+                            let record = parse_browser_record(&bytes);
+                            if let Ok(command) = &record
+                                && let Some(sequence) = command.input_sequence()
+                            {
+                                tracing::debug!(
+                                    target: "waywire_latency",
+                                    stage = "gateway_input",
+                                    input = sequence.get(),
+                                    at_ns = crate::video::monotonic_nanos(),
+                                );
+                            }
+                            match record {
                                 Ok(Command::Resize(resize)) => {
                                     match state.sessions.resize(socket_id, resize).await {
                                         Ok(ResizeOutcome::Sent | ResizeOutcome::InputOwnedByAnother) => Ok(()),

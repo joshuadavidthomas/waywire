@@ -138,6 +138,12 @@ impl CompositorHandler for State {
         }
     }
     fn commit(&mut self, surface: &WlSurface) {
+        tracing::debug!(
+            target: "waywire_latency",
+            stage = "commit",
+            cursor = self.cursor_surface.as_ref() == Some(surface),
+            at_ns = crate::capture::monotonic_nanos(),
+        );
         on_commit_buffer_handler::<Self>(surface);
         if self.cursor_surface.as_ref() == Some(surface) {
             self.update_cursor_image();
