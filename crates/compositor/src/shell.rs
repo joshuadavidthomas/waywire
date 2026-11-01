@@ -1,3 +1,7 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::desktop::PopupKind;
 use smithay::desktop::Window;
@@ -51,14 +55,37 @@ use waywire_protocol::pipe::Event;
 
 use super::State;
 
-#[derive(Default)]
 pub(crate) struct ClientState {
     pub(crate) compositor_state: CompositorClientState,
+    /// The compositor's own flag for "a client left"; see `Clipboard::client_left`.
+    client_left: Arc<AtomicBool>,
 }
+
+impl ClientState {
+    pub(crate) fn new(state: &State) -> Self {
+        Self {
+            compositor_state: CompositorClientState::default(),
+            client_left: state.clipboard.client_left(),
+        }
+    }
+}
+
+/// A client whose disconnect no compositor watches, for tests that never
+/// depend on a departed client's clipboard.
+#[cfg(test)]
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            compositor_state: CompositorClientState::default(),
+            client_left: Arc::default(),
+        }
+    }
+}
+
 impl ClientData for ClientState {
     fn initialized(&self, _: ClientId) {}
     fn disconnected(&self, _: ClientId, _: DisconnectReason) {
-        super::clipboard::CLIENT_LEFT.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.client_left.store(true, Ordering::Relaxed);
     }
 }
 

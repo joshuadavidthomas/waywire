@@ -63,10 +63,6 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 /// Transfers of each kind the compositor relays at once.
 const MAX_TRANSFERS: usize = 8;
 
-/// Set when a Wayland client disconnects. Smithay drops a dead client's
-/// selection without calling `new_selection`, so the next tick checks.
-pub(crate) static CLIENT_LEFT: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone)]
 pub(crate) enum SelectionData {
     /// Text the compositor serves itself: browser writes and kept clipboards.
@@ -118,6 +114,11 @@ pub(super) struct Clipboard {
     kept: Option<Arc<str>>,
     /// The clipboard owner exited; keep its text once the read finishes.
     orphaned: bool,
+    /// Set when a Wayland client disconnects. Smithay drops a dead client's
+    /// selection without calling `new_selection`, so the next tick checks.
+    /// Each compositor owns its flag, so one compositor's tick never consumes
+    /// another's disconnect.
+    client_left: Arc<AtomicBool>,
 }
 
 impl Clipboard {
@@ -146,7 +147,13 @@ impl Clipboard {
             writes: Vec::new(),
             kept: None,
             orphaned: false,
+            client_left: Arc::default(),
         }
+    }
+
+    /// The flag each client sets when it disconnects.
+    pub(crate) fn client_left(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.client_left)
     }
 
     fn owner(&mut self, target: SelectionTarget) -> &mut Owner {
@@ -567,7 +574,7 @@ impl State {
     }
 
     pub(super) fn clipboard_tick(&mut self) {
-        if CLIENT_LEFT.swap(false, Ordering::Relaxed) {
+        if self.clipboard.client_left.swap(false, Ordering::Relaxed) {
             for target in [SelectionTarget::Clipboard, SelectionTarget::Primary] {
                 if self.clipboard.owner(target).wayland && !self.wayland_selection_alive(target) {
                     self.selection_orphaned(target);
@@ -1026,7 +1033,7 @@ mod tests {
             let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
             display
                 .handle()
-                .insert_client(server, Arc::new(crate::shell::ClientState::default()))
+                .insert_client(server, Arc::new(crate::shell::ClientState::new(state)))
                 .expect("insert client");
             let connection =
                 wayland_client::Connection::from_socket(client).expect("client connection");

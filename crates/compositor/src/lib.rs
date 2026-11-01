@@ -2344,9 +2344,8 @@ pub fn run(mut options: Config) -> Result<()> {
         Generic::new(socket, Interest::READ, Mode::Level),
         |_, socket, state| {
             while let Some(stream) = socket.accept()? {
-                state
-                    .display_handle
-                    .insert_client(stream, Arc::new(shell::ClientState::default()))?;
+                let client = Arc::new(shell::ClientState::new(state));
+                state.display_handle.insert_client(stream, client)?;
             }
             Ok(PostAction::Continue)
         },
