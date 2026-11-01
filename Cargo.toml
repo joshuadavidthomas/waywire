@@ -49,6 +49,9 @@ pangocairo = "0.22.9"
 # ScreenCast video. Built against the system libpipewire-0.3 through bindgen;
 # 0.3.34 is the oldest API the stream code uses (pw_stream_trigger_process).
 pipewire = { version = "0.10.1", features = ["v0_3_34"] }
+# Property tests for the wire decoders. The default fork and timeout features
+# are not needed.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rust-embed = { version = "8.13.0", features = ["deterministic-timestamps"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

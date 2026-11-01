@@ -154,7 +154,177 @@ pub(super) fn decode_packet(data: &[u8]) -> Result<Packet, PacketReject> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+
     use super::*;
+
+    /// An RTP packet laid out by RFC 3550 section 5.1, written here rather
+    /// than through the decoder under test.
+    #[derive(Clone, Debug)]
+    struct Layout {
+        marker: bool,
+        sequence: u16,
+        timestamp: u32,
+        ssrc: u32,
+        csrcs: Vec<u32>,
+        extension: Option<(u16, Vec<u32>)>,
+        /// Padding bytes after the payload, the last holding their count.
+        padding: u8,
+        payload: Vec<u8>,
+    }
+
+    impl Layout {
+        fn bytes(&self) -> Vec<u8> {
+            let count = u8::try_from(self.csrcs.len()).expect("at most 15 CSRCs");
+            let mut bytes = vec![
+                0x80 | (u8::from(self.padding > 0) << 5)
+                    | (u8::from(self.extension.is_some()) << 4)
+                    | count,
+                (u8::from(self.marker) << 7) | 0x60, // payload type 96
+            ];
+            bytes.extend(self.sequence.to_be_bytes());
+            bytes.extend(self.timestamp.to_be_bytes());
+            bytes.extend(self.ssrc.to_be_bytes());
+            for csrc in &self.csrcs {
+                bytes.extend(csrc.to_be_bytes());
+            }
+            if let Some((profile, words)) = &self.extension {
+                bytes.extend(profile.to_be_bytes());
+                bytes.extend(
+                    u16::try_from(words.len())
+                        .expect("short extension")
+                        .to_be_bytes(),
+                );
+                for word in words {
+                    bytes.extend(word.to_be_bytes());
+                }
+            }
+            bytes.extend(&self.payload);
+            if self.padding > 0 {
+                bytes.extend(std::iter::repeat_n(0, usize::from(self.padding) - 1));
+                bytes.push(self.padding);
+            }
+            bytes
+        }
+
+        /// Where the CSRC list ends and where the payload starts.
+        fn offsets(&self) -> (usize, usize) {
+            let csrc_end = 12 + 4 * self.csrcs.len();
+            let payload = csrc_end
+                + self
+                    .extension
+                    .as_ref()
+                    .map_or(0, |(_, words)| 4 + 4 * words.len());
+            (csrc_end, payload)
+        }
+    }
+
+    fn layouts() -> impl Strategy<Value = Layout> {
+        (
+            any::<bool>(),
+            any::<u16>(),
+            any::<u32>(),
+            1..=u32::MAX,
+            proptest::collection::vec(any::<u32>(), 0..=15),
+            proptest::option::of((any::<u16>(), proptest::collection::vec(any::<u32>(), 0..6))),
+            prop_oneof![Just(0_u8), any::<u8>()],
+            proptest::collection::vec(any::<u8>(), 1..48),
+        )
+            .prop_map(
+                |(marker, sequence, timestamp, ssrc, csrcs, extension, padding, payload)| Layout {
+                    marker,
+                    sequence,
+                    timestamp,
+                    ssrc,
+                    csrcs,
+                    extension,
+                    padding,
+                    payload,
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn rtp_packets_decode_to_the_fields_they_were_built_from(layout in layouts()) {
+            let packet = decode_packet(&layout.bytes()).expect("well-formed RTP packet");
+            prop_assert_eq!(&packet.payload, &layout.payload);
+            prop_assert_eq!(packet.sequence, RtpSequence(layout.sequence));
+            prop_assert_eq!(packet.timestamp, RtpTimestamp(layout.timestamp));
+            prop_assert_eq!(packet.generation.get(), layout.ssrc);
+            prop_assert_eq!(
+                packet.end,
+                if layout.marker { AccessUnitEnd::Final } else { AccessUnitEnd::More }
+            );
+        }
+
+        #[test]
+        fn rtp_packets_cut_before_their_payload_name_the_part_cut(
+            layout in layouts(),
+            cut in any::<Index>(),
+        ) {
+            let bytes = layout.bytes();
+            let (csrc_end, payload) = layout.offsets();
+            let length = cut.index(payload);
+            let expected = if length < 12 {
+                PacketReject::InvalidHeader
+            } else if length < csrc_end {
+                PacketReject::TruncatedCsrc
+            } else if length < csrc_end + 4 {
+                PacketReject::TruncatedExtension
+            } else {
+                PacketReject::TruncatedExtensionPayload
+            };
+            prop_assert_eq!(decode_packet(&bytes[..length]).err(), Some(expected));
+        }
+
+        #[test]
+        fn rtp_padding_must_leave_a_payload(layout in layouts(), excess in 1..=255_usize) {
+            let mut bytes = layout.bytes();
+            let (_, payload) = layout.offsets();
+            // Mark the whole packet body as padding, or more than all of it.
+            bytes[0] |= 0x20;
+            let available = bytes.len() - payload;
+            if let Ok(count) = u8::try_from(available) {
+                *bytes.last_mut().expect("payload") = count;
+                prop_assert_eq!(
+                    decode_packet(&bytes).err(),
+                    Some(PacketReject::WrongPayloadTypeOrEmptyPayload)
+                );
+            }
+            if let Ok(count) = u8::try_from(available + excess) {
+                *bytes.last_mut().expect("payload") = count;
+                prop_assert_eq!(decode_packet(&bytes).err(), Some(PacketReject::InvalidPadding));
+            }
+            *bytes.last_mut().expect("payload") = 0;
+            prop_assert_eq!(decode_packet(&bytes).err(), Some(PacketReject::InvalidPadding));
+        }
+
+        #[test]
+        fn rtp_packets_with_another_version_payload_type_or_no_ssrc_are_rejected(
+            layout in layouts(),
+            version in 0..=3_u8,
+            payload_type in 0..=127_u8,
+        ) {
+            let bytes = layout.bytes();
+            let mut changed = bytes.clone();
+            changed[0] = (changed[0] & 0x3f) | (version << 6);
+            prop_assert_eq!(
+                decode_packet(&changed).is_err_and(|error| error == PacketReject::InvalidHeader),
+                version != 2
+            );
+            let mut changed = bytes.clone();
+            changed[1] = (changed[1] & 0x80) | payload_type;
+            prop_assert_eq!(
+                decode_packet(&changed).err(),
+                (payload_type != 96).then_some(PacketReject::WrongPayloadTypeOrEmptyPayload)
+            );
+            let mut changed = bytes;
+            changed[8..12].fill(0);
+            prop_assert_eq!(decode_packet(&changed).err(), Some(PacketReject::ZeroGeneration));
+        }
+    }
 
     #[test]
     fn rtp_decoder_parses_ssrc_as_a_generation() {

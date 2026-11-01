@@ -457,10 +457,125 @@ impl PartialUnit {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+
     use super::*;
     use crate::video::rtp::AccessUnitEnd;
     use crate::video::tests::consume;
     use crate::video::tests::packet;
+
+    /// How the test packetizer carries one NAL unit (RFC 6184 section 5).
+    #[derive(Clone, Debug)]
+    enum Carriage {
+        Single,
+        /// Joined with neighboring aggregated NAL units in one STAP-A packet.
+        Aggregated,
+        /// Split into FU-A fragments at these points of the NAL body.
+        Fragmented(Vec<Index>),
+    }
+
+    fn nal_units() -> impl Strategy<Value = Vec<(Vec<u8>, Carriage)>> {
+        let nal = (
+            0..=3_u8,
+            1..=23_u8,
+            proptest::collection::vec(any::<u8>(), 1..40),
+        )
+            .prop_map(|(nri, kind, body)| {
+                let mut nal = vec![(nri << 5) | kind];
+                nal.extend(body);
+                nal
+            });
+        let carriage = prop_oneof![
+            Just(Carriage::Single),
+            Just(Carriage::Aggregated),
+            proptest::collection::vec(any::<Index>(), 1..4).prop_map(Carriage::Fragmented),
+        ];
+        proptest::collection::vec((nal, carriage), 1..6)
+    }
+
+    /// RTP payloads for one access unit, built from RFC 6184 rather than
+    /// from the assembler.
+    fn packetize(units: &[(Vec<u8>, Carriage)]) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        let mut aggregate: Vec<u8> = Vec::new();
+        let flush = |aggregate: &mut Vec<u8>, payloads: &mut Vec<Vec<u8>>| {
+            if !aggregate.is_empty() {
+                let mut stap = vec![24];
+                stap.append(aggregate);
+                payloads.push(stap);
+            }
+        };
+        for (nal, carriage) in units {
+            match carriage {
+                Carriage::Aggregated => {
+                    aggregate.extend(u16::try_from(nal.len()).expect("short NAL").to_be_bytes());
+                    aggregate.extend(nal);
+                }
+                Carriage::Fragmented(cuts) if nal.len() > 2 => {
+                    flush(&mut aggregate, &mut payloads);
+                    let body = &nal[1..];
+                    let mut points: Vec<usize> = cuts
+                        .iter()
+                        .map(|cut| 1 + cut.index(body.len() - 1))
+                        .collect();
+                    points.sort_unstable();
+                    points.dedup();
+                    let mut start = 0;
+                    for (index, end) in points.iter().copied().chain([body.len()]).enumerate() {
+                        let first = index == 0;
+                        let last = end == body.len();
+                        let header = (u8::from(first) << 7) | (u8::from(last) << 6) | (nal[0] & 31);
+                        // FU-A indicator: the NAL unit's F and NRI bits with type 28.
+                        let mut fragment = vec![(nal[0] & 0xe0) | 0x1c, header];
+                        fragment.extend(&body[start..end]);
+                        payloads.push(fragment);
+                        start = end;
+                    }
+                }
+                Carriage::Single | Carriage::Fragmented(_) => {
+                    flush(&mut aggregate, &mut payloads);
+                    payloads.push(nal.clone());
+                }
+            }
+        }
+        flush(&mut aggregate, &mut payloads);
+        payloads
+    }
+
+    proptest! {
+        #[test]
+        fn any_packetization_of_an_access_unit_reassembles_to_annex_b(
+            units in nal_units(),
+            first_sequence in any::<u16>(),
+            timestamp in any::<u32>(),
+        ) {
+            let payloads = packetize(&units);
+            let mut assembler = Assembler::default();
+            let mut sequence = first_sequence;
+            for payload in &payloads[..payloads.len() - 1] {
+                let unit = consume(
+                    &mut assembler,
+                    packet(sequence, timestamp, 1, AccessUnitEnd::More, payload),
+                );
+                prop_assert!(unit.is_none(), "an access unit completes only at its marker");
+                sequence = sequence.wrapping_add(1);
+            }
+            let unit = consume(
+                &mut assembler,
+                packet(sequence, timestamp, 1, AccessUnitEnd::Final, &payloads[payloads.len() - 1]),
+            )
+            .expect("the marker packet completes the access unit");
+            let annex_b: Vec<u8> = units
+                .iter()
+                .flat_map(|(nal, _)| [0, 0, 0, 1].iter().chain(nal).copied())
+                .collect();
+            prop_assert_eq!(&*unit.data, annex_b.as_slice());
+            let keyframe = units.iter().any(|(nal, _)| nal[0] & 31 == 5);
+            prop_assert_eq!(unit.kind, if keyframe { FrameKind::Key } else { FrameKind::Delta });
+            prop_assert_eq!(unit.timestamp, RtpTimestamp(timestamp));
+        }
+    }
 
     #[test]
     fn emits_final_access_unit_at_marker() {

@@ -664,6 +664,50 @@ mod tests {
     }
 
     #[test]
+    fn resize_records_in_the_viewer_layout_parse_across_its_envelope_and_scales() {
+        // The viewer's resizeRecord layout: header, u32 width, u32 height,
+        // u16 scale, u16 request. Its sizes are even, 320 to 6000 by 180 to
+        // 6000 within the shared pixel cap, and its scales 120 to 480.
+        let record = |width: u32, height: u32, scale: u16| {
+            let mut bytes = vec![PROTOCOL_VERSION, 6, 0, 0, 12, 0, 0, 0];
+            bytes.extend(width.to_le_bytes());
+            bytes.extend(height.to_le_bytes());
+            bytes.extend(scale.to_le_bytes());
+            bytes.extend(7_u16.to_le_bytes());
+            bytes
+        };
+        for (width, height) in [
+            (320, 180),
+            (6000, 180),
+            (320, 6000),
+            (6000, 1382),
+            (4988, 1662),
+            (2880, 2880),
+            (3840, 2160),
+        ] {
+            for scale in 120..=480 {
+                let Ok(Command::Resize(resize)) =
+                    parse_browser_record(&record(width, height, scale))
+                else {
+                    panic!("{width}x{height}@{scale} should parse as a resize");
+                };
+                assert_eq!(
+                    (
+                        resize.size.width(),
+                        resize.size.height(),
+                        resize.scale_v120.get()
+                    ),
+                    (width, height, scale)
+                );
+                assert_eq!(resize.request_id.get(), 7);
+            }
+            for scale in [119, 481] {
+                assert!(parse_browser_record(&record(width, height, scale)).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn browser_records_reject_private_kinds() {
         let commands = [
             Command::Clipboard(value(ClipboardText::new(String::new()))),

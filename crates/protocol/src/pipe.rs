@@ -2289,4 +2289,264 @@ mod tests {
             r#"["default","context-menu","help","pointer","progress","wait","cell","crosshair","text","vertical-text","alias","copy","move","no-drop","not-allowed","grab","grabbing","e-resize","n-resize","ne-resize","nw-resize","s-resize","se-resize","sw-resize","w-resize","ew-resize","ns-resize","nesw-resize","nwse-resize","col-resize","row-resize","all-scroll","zoom-in","zoom-out","dnd-ask","all-resize"]"#
         );
     }
+
+    // Property tests over the pinned records above, which cover every kind.
+    // `PROPTEST_CASES` raises the case count for longer runs (`just fuzz`).
+
+    /// The largest payload each command kind may declare, from the field
+    /// layouts: fixed kinds carry exactly their fields, text carries up to 4000
+    /// bytes after its one-byte action and four-byte sequence, and a clipboard
+    /// up to 1 MiB.
+    const COMMAND_LIMITS: [(u8, u32); 15] = [
+        (1, 12),      // pointer absolute: x, y, sequence
+        (2, 9),       // pointer button: button, state, sequence
+        (3, 12),      // pointer scroll: dx, dy, sequence
+        (4, 9),       // keyboard key: key, state, sequence
+        (5, 0),       // release all
+        (6, 12),      // resize: width, height, scale, request
+        (7, 1 << 20), // clipboard
+        (8, 12),      // pointer relative: dx, dy, sequence
+        (9, 14),      // quality: bitrate, fps, scale, CRF, chroma
+        (10, 4_005),  // text
+        (11, 5),      // keyframe readiness: generation, state
+        (12, 0),      // reset video
+        (13, 1),      // input lease
+        (14, 12),     // pointer wheel
+        (15, 12),     // pointer scroll stop
+    ];
+
+    /// The same for events. A cursor image is a six-byte header and a PNG of
+    /// at most 8 bytes per pixel of a 128x128 cursor.
+    const EVENT_LIMITS: [(u8, u32); 10] = [
+        (1, 1 << 20),           // clipboard
+        (2, 33),                // frame metadata
+        (3, 16),                // resize applied: request, size, scale, generation
+        (4, 1),                 // cursor shape
+        (5, 1),                 // cursor visibility
+        (6, 9),                 // cursor position: x, y, source
+        (7, 1),                 // reset video refused
+        (8, 2),                 // agent input
+        (9, 6 + 128 * 128 * 8), // cursor image
+        (10, 9),                // cursor click
+    ];
+
+    fn limit(table: &[(u8, u32)], kind: u8) -> Option<u32> {
+        table
+            .iter()
+            .find(|(candidate, _)| *candidate == kind)
+            .map(|(_, limit)| *limit)
+    }
+
+    fn pinned_bytes<R>(cases: Vec<(&'static str, R, Vec<u8>)>) -> Vec<Vec<u8>> {
+        cases.into_iter().map(|(_, _, bytes)| bytes).collect()
+    }
+
+    /// A decoder must not accept two encodings of one value: any bytes it
+    /// accepts must be exactly what the value encodes back to.
+    fn assert_canonical<R: Record + PartialEq + std::fmt::Debug>(
+        record: &[u8],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        if let Ok(value) = R::decode(record) {
+            proptest::prop_assert_eq!(value.encode(), record, "decoded {:?}", value);
+        }
+        Ok(())
+    }
+
+    /// Feed `stream` to a decoder in pieces split at `cuts` and check every
+    /// record arrives once, in order, with only the unfinished one buffered.
+    fn assert_chunked_stream<R: Record + PartialEq + std::fmt::Debug>(
+        records: &[(R, Vec<u8>)],
+        cuts: &[proptest::sample::Index],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let stream: Vec<u8> = records
+            .iter()
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect();
+        let mut boundaries = vec![0];
+        for (_, bytes) in records {
+            boundaries.push(boundaries.last().copied().unwrap_or(0) + bytes.len());
+        }
+        let mut cuts: Vec<usize> = cuts
+            .iter()
+            .map(|cut| cut.index(stream.len() + 1))
+            .chain([stream.len()])
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut decoder = Decoder::<R>::new();
+        let mut received = Vec::new();
+        let mut start = 0;
+        for cut in cuts {
+            received.extend(
+                decoder.push(&stream[start..cut]).map_err(|error| {
+                    proptest::test_runner::TestCaseError::fail(error.to_string())
+                })?,
+            );
+            start = cut;
+            let complete = boundaries
+                .iter()
+                .rev()
+                .find(|boundary| **boundary <= cut)
+                .copied()
+                .unwrap_or(0);
+            proptest::prop_assert_eq!(decoder.pending(), cut - complete);
+            proptest::prop_assert_eq!(
+                received.len(),
+                boundaries
+                    .iter()
+                    .filter(|boundary| (1..=cut).contains(*boundary))
+                    .count()
+            );
+        }
+        let expected: Vec<&R> = records.iter().map(|(record, _)| record).collect();
+        proptest::prop_assert_eq!(received.iter().collect::<Vec<_>>(), expected);
+        proptest::prop_assert!(decoder.finish().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn every_strict_prefix_of_a_record_is_truncated() {
+        fn check<R: Record + std::fmt::Debug>(records: &[Vec<u8>]) {
+            for record in records {
+                for length in 0..record.len() {
+                    let prefix = &record[..length];
+                    assert!(
+                        matches!(R::decode(prefix), Err(ProtocolError::Truncated)),
+                        "{prefix:?} should be truncated"
+                    );
+                    let mut decoder = Decoder::<R>::new();
+                    assert!(
+                        decoder.push(prefix).is_ok_and(|records| records.is_empty()),
+                        "{prefix:?} should wait for the rest of the record"
+                    );
+                    assert_eq!(decoder.pending(), length);
+                    if length > 0 {
+                        assert_eq!(decoder.finish(), Err(ProtocolError::Truncated));
+                    }
+                }
+            }
+        }
+        check::<Command>(&pinned_bytes(command_cases()));
+        check::<Event>(&pinned_bytes(event_cases()));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn mutated_records_decode_only_to_their_own_encoding(
+            command in proptest::sample::select(pinned_bytes(command_cases())),
+            event in proptest::sample::select(pinned_bytes(event_cases())),
+            mutations in proptest::collection::vec(
+                (proptest::prelude::any::<proptest::sample::Index>(), proptest::prelude::any::<u8>()),
+                1..4,
+            ),
+        ) {
+            for mut record in [command.clone(), event.clone()] {
+                // Keep the header so the mutations reach the payload decoders.
+                let payload = record.len() - HEADER_BYTES;
+                if payload == 0 {
+                    continue;
+                }
+                for (index, byte) in &mutations {
+                    record[HEADER_BYTES + index.index(payload)] = *byte;
+                }
+                if record[..HEADER_BYTES] == command[..HEADER_BYTES] {
+                    assert_canonical::<Command>(&record)?;
+                } else {
+                    assert_canonical::<Event>(&record)?;
+                }
+            }
+        }
+
+        #[test]
+        fn command_streams_decode_the_same_however_they_are_split(
+            picks in proptest::collection::vec(proptest::sample::select(command_cases()), 0..12),
+            cuts in proptest::collection::vec(proptest::prelude::any::<proptest::sample::Index>(), 0..24),
+        ) {
+            let records: Vec<_> = picks.into_iter().map(|(_, record, bytes)| (record, bytes)).collect();
+            assert_chunked_stream(&records, &cuts)?;
+        }
+
+        #[test]
+        fn event_streams_decode_the_same_however_they_are_split(
+            picks in proptest::collection::vec(proptest::sample::select(event_cases()), 0..12),
+            cuts in proptest::collection::vec(proptest::prelude::any::<proptest::sample::Index>(), 0..24),
+        ) {
+            let records: Vec<_> = picks.into_iter().map(|(_, record, bytes)| (record, bytes)).collect();
+            assert_chunked_stream(&records, &cuts)?;
+        }
+
+        #[test]
+        fn headers_with_another_version_or_nonzero_reserved_bytes_are_invalid(
+            // Bias each checked byte toward its valid value so every
+            // combination of one wrong byte with two right ones is common.
+            version in proptest::prop_oneof![proptest::strategy::Just(11_u8), proptest::prelude::any::<u8>()],
+            reserved in proptest::array::uniform2(
+                proptest::prop_oneof![proptest::strategy::Just(0_u8), proptest::prelude::any::<u8>()],
+            ),
+            kind in 1..=10_u8,
+            length in 0..=1_u32,
+        ) {
+            let mut reserved = reserved;
+            if version == 11 && reserved == [0, 0] {
+                // Make one reserved byte wrong rather than discard the case.
+                reserved[usize::from(kind % 2)] = kind;
+            }
+            let mut header = [version, kind, reserved[0], reserved[1], 0, 0, 0, 0];
+            header[4..].copy_from_slice(&length.to_le_bytes());
+            proptest::prop_assert_eq!(Command::record_len(&header), Err(ProtocolError::InvalidHeader));
+            proptest::prop_assert_eq!(Event::record_len(&header), Err(ProtocolError::InvalidHeader));
+            proptest::prop_assert_eq!(
+                Decoder::<Command>::new().push(&header),
+                Err(ProtocolError::InvalidHeader)
+            );
+        }
+
+        #[test]
+        fn declared_lengths_are_checked_against_each_kind_before_buffering(
+            kind in proptest::prelude::any::<u8>(),
+            length in proptest::prelude::any::<u32>(),
+            // One byte over the limit is the likeliest mistake; bias toward it.
+            excess in proptest::prop_oneof![1..=4_u32, 1..=u32::MAX],
+        ) {
+            for (limit, record_len, push) in [
+                (
+                    limit(&COMMAND_LIMITS, kind),
+                    Command::record_len as fn(&[u8]) -> Result<usize, ProtocolError>,
+                    (|header: &[u8]| Decoder::<Command>::new().push(header).map(|records| records.len()))
+                        as fn(&[u8]) -> Result<usize, ProtocolError>,
+                ),
+                (
+                    limit(&EVENT_LIMITS, kind),
+                    Event::record_len,
+                    |header: &[u8]| Decoder::<Event>::new().push(header).map(|records| records.len()),
+                ),
+            ] {
+                let header = |length: u32| {
+                    let mut header = [11, kind, 0, 0, 0, 0, 0, 0];
+                    header[4..].copy_from_slice(&length.to_le_bytes());
+                    header
+                };
+                let Some(limit) = limit else {
+                    proptest::prop_assert_eq!(record_len(&header(length)), Err(ProtocolError::InvalidKind { kind }));
+                    proptest::prop_assert_eq!(push(&header(length)), Err(ProtocolError::InvalidKind { kind }));
+                    continue;
+                };
+                let within = length % (limit + 1);
+                proptest::prop_assert_eq!(
+                    record_len(&header(within)),
+                    Ok(HEADER_BYTES + usize::try_from(within).expect("u32 fits usize"))
+                );
+                if limit > 0 {
+                    // A nonempty declared payload within the limit is awaited.
+                    let awaited = 1 + length % limit;
+                    proptest::prop_assert_eq!(push(&header(awaited)), Ok(0));
+                }
+                let beyond = limit.saturating_add(excess);
+                if beyond > limit {
+                    proptest::prop_assert_eq!(record_len(&header(beyond)), Err(ProtocolError::PayloadTooLarge));
+                    proptest::prop_assert_eq!(push(&header(beyond)), Err(ProtocolError::PayloadTooLarge));
+                }
+            }
+        }
+    }
 }

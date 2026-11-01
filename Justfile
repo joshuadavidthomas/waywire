@@ -40,6 +40,10 @@ clippy-check:
 dev-web:
     pnpm --filter @waywire/web dev
 
+# Run the decoder property tests with more cases than the 256 each run in CI.
+fuzz CASES="100000":
+    PROPTEST_CASES={{ CASES }} cargo test --locked -p waywire-protocol -p waywire-gateway -- pipe::tests video::rtp video::assembler
+
 fmt:
     @just --fmt
     cd tools/rustfmt && cargo fmt --manifest-path "{{ justfile_directory() }}/Cargo.toml" --all
