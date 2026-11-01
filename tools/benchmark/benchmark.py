@@ -13,7 +13,9 @@ XTest through xdotool and the upstream Anthropic tool with grim capture.
 Regression limits: waywire may exceed Waymote by 20% plus 2 CPU percentage
 points, 15% plus 10 MiB RSS, 25% plus 20 kbps stream traffic, 25% plus
 200 ms launch time, or 25% plus 10 ms latency. Each agent must pass if the
-corresponding Waymote agent passes. Missing comparisons fail the check.
+corresponding Waymote agent passes. Missing comparisons fail the check. Each
+desktop is launched and viewed once before measuring, so the viewer's cold
+start counts against neither.
 
 Slow link: with each encoder, waywire streams a full-screen animation in
 Chromium while the viewer's link drops to 500 kbps for 45 seconds, then clears.
@@ -581,7 +583,7 @@ def waywire_command(public_url, app):
     ]
 
 
-def run_desktop(name, fixture):
+def run_desktop(name, fixture, warmup=False):
     with tempfile.TemporaryDirectory(prefix="waywire-benchmark-") as tmp:
         directory = Path(tmp)
         os.chmod(directory, 0o700)
@@ -682,6 +684,8 @@ def run_desktop(name, fixture):
                 )
                 print(f"{name}: viewer decoded a nonblank frame", flush=True)
                 first_frame = evaluate("window.benchmarkFirstFrame")
+                if warmup:
+                    return None
                 if name == "waywire":
                     browser("eval", "document.querySelector('#control-toggle').click()")
                 roots = [process.pid for process in processes] + [terminal_pid]
@@ -1101,6 +1105,10 @@ def main():
                 "open",
                 "about:blank",
             )
+            # A throwaway launch of each desktop first, so neither measured
+            # launch pays for the viewer's cold start.
+            for name in ("waywire", "waymote"):
+                run_desktop(name, fixture, warmup=True)
             results = {
                 name: run_desktop(name, fixture) for name in ("waywire", "waymote")
             }
