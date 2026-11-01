@@ -1459,7 +1459,7 @@ fn ffmpeg_flags_match_the_rtp_contract() {
         pair
             == [
                 "-x264-params",
-                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on",
+                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:vbv-init=0.1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709:fullrange=on",
             ]
     }));
     assert_eq!(
@@ -1630,7 +1630,7 @@ fn ffmpeg_rgb_preserves_components_at_full_and_reduced_size() {
             ["-color_range", "pc"],
             [
                 "-x264-params",
-                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=gbr:fullrange=on",
+                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:vbv-init=0.1:colorprim=bt709:transfer=iec61966-2-1:colormatrix=gbr:fullrange=on",
             ],
         ] {
             assert!(args.windows(2).any(|actual| actual == pair));

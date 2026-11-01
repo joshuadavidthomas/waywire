@@ -1278,8 +1278,11 @@ fn ffmpeg_args(
             // saves ~13% bitrate, and 8x8dct keeps the SPS at the advertised High profile.
             // Write the desktop color contract into the H.264 VUI explicitly;
             // FFmpeg's frame metadata alone does not reach the SPS in every build.
+            // x264 starts its VBV buffer 90% full, so each process a quality change
+            // starts could burst about 1.8 s of the bitrate target above its rate,
+            // which queues behind a link held at that rate. 10% caps it near 200 ms.
             format!(
-                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
+                "cabac=1:8x8dct=1:aud=1:repeat-headers=1:vbv-init=0.1:colorprim=bt709:transfer=iec61966-2-1:colormatrix={matrix}:fullrange=on"
             ),
         ]);
     } else {
