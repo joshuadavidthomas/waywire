@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import maximumProtocolPixels from "../../../../protocol/max-display-pixels.json";
 import { PROTOCOL_VERSION } from "./messages.ts";
 import { WaywireSession, type ResizeEvent } from "./session.ts";
 import {
@@ -517,6 +518,80 @@ test("reconnect sends one unchanged resize across observer and ownership callbac
   }
 });
 
+test("every resize record the viewer sends fits the Rust FrameSize and ScaleV120 ranges", async () => {
+  installBrowser();
+  const control = new FakeWebSocket();
+  const session = new WaywireSession({
+    endpoint: "https://remote.example.com",
+    createWebSocket: (path) =>
+      socket(path === "/control" ? control : new FakeWebSocket()),
+  });
+  session.attachSurface(surfaceOptions());
+  // A fixed seed keeps failures reproducible.
+  let seed = 0x5eed;
+  const random = (): number => {
+    seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+    return seed / 2 ** 31;
+  };
+  const edges = [
+    0.25, 1, 179, 180.5, 319, 320, 321, 333.3, 2161, 5999, 6001, 9999.9,
+  ];
+  const scales = [0.001, 0.5, 1, 1.004, 1.25, 1.5, 3.999, 4, 4.01, 7];
+  const policies: Array<[number, number, number]> = [];
+  for (const width of edges)
+    for (const height of edges)
+      for (const scale of scales) policies.push([width, height, scale]);
+  for (let index = 0; index < 4000; index += 1)
+    policies.push([
+      0.01 + random() * 12_000,
+      0.01 + random() * 12_000,
+      0.001 + random() * 8,
+    ]);
+  try {
+    session.connect();
+    await flush();
+    control.readyState = FakeWebSocket.OPEN;
+    control.dispatch("open", {});
+    for (const [width, height, scale] of policies)
+      session.remoteDisplay.setPolicy({ mode: "fixed", width, height, scale });
+    const records = resizeRecords(control);
+    assert.ok(
+      records.length > policies.length / 2,
+      `${records.length} records`,
+    );
+    for (const record of records) {
+      const view = new DataView(record);
+      // The Rust Resize layout: header, u32 width, u32 height, u16 scale,
+      // u16 request.
+      assert.deepEqual(
+        [...new Uint8Array(record, 0, 8)],
+        [PROTOCOL_VERSION, 6, 0, 0, 12, 0, 0, 0],
+      );
+      assert.equal(record.byteLength, 20);
+      const width = view.getUint32(8, true);
+      const height = view.getUint32(12, true);
+      const scale = view.getUint16(16, true);
+      const accepted =
+        width >= 320 &&
+        width <= 6000 &&
+        width % 2 === 0 &&
+        height >= 180 &&
+        height <= 6000 &&
+        height % 2 === 0 &&
+        width * height <= maximumProtocolPixels &&
+        scale >= 120 &&
+        scale <= 480 &&
+        view.getUint16(18, true) !== 0;
+      assert.ok(
+        accepted,
+        `${width}x${height}@${scale} is outside the protocol`,
+      );
+    }
+  } finally {
+    await session.dispose();
+  }
+});
+
 test("a native resolution selection sends scale 120 after releasing ownership without moving focus", async () => {
   const { document } = installBrowser();
   const control = new FakeWebSocket();
@@ -766,21 +841,33 @@ test("releasing Meta on other platforms does not release held keys", async () =>
 test("macOS editing shortcuts use Ctrl while other Cmd shortcuts use Super", async () => {
   const { canvas, session, control } = await keyboardFixture();
   installGlobal("navigator", { platform: "MacIntel" });
+  // Select all, cut, copy and undo, with their codes from
+  // linux/input-event-codes.h.
+  const editing: Array<[string, number]> = [
+    ["KeyA", 30],
+    ["KeyX", 45],
+    ["KeyC", 46],
+    ["KeyZ", 44],
+  ];
   try {
     canvas.dispatch("keydown", keyEvent({ code: "MetaLeft" }));
-    canvas.dispatch("keydown", keyEvent({ code: "KeyA", metaKey: true }));
-    canvas.dispatch("keyup", keyEvent({ code: "KeyA", metaKey: true }));
+    for (const [code] of editing) {
+      canvas.dispatch("keydown", keyEvent({ code, metaKey: true }));
+      canvas.dispatch("keyup", keyEvent({ code, metaKey: true }));
+    }
     canvas.dispatch("keydown", keyEvent({ code: "Tab", metaKey: true }));
     canvas.dispatch("keyup", keyEvent({ code: "Tab", metaKey: true }));
     canvas.dispatch("keyup", keyEvent({ code: "MetaLeft" }));
     assert.deepEqual(keyboardRecords(control), [
       { key: 125, state: 1 },
-      { key: 125, state: 0 },
-      { key: 29, state: 1 },
-      { key: 30, state: 1 },
-      { key: 30, state: 0 },
-      { key: 29, state: 0 },
-      { key: 125, state: 1 },
+      ...editing.flatMap(([, key]) => [
+        { key: 125, state: 0 },
+        { key: 29, state: 1 },
+        { key, state: 1 },
+        { key, state: 0 },
+        { key: 29, state: 0 },
+        { key: 125, state: 1 },
+      ]),
       { key: 15, state: 1 },
       { key: 15, state: 0 },
       { key: 125, state: 0 },
@@ -955,6 +1042,153 @@ test("the first remote copy syncs when acquisition has no snapshot", async () =>
     });
     assert.deepEqual(writes, ["first copy"]);
   } finally {
+    await session.dispose();
+  }
+});
+
+function remoteClipboard(control: FakeWebSocket, text: string): void {
+  control.dispatch("message", {
+    data: JSON.stringify({ type: "clipboard", text }),
+  });
+}
+
+function recordClipboardWrites(
+  writeText: (text: string) => Promise<void> = () => Promise.resolve(),
+): string[] {
+  const writes: string[] = [];
+  installGlobal("navigator", {
+    clipboard: {
+      writeText: (text: string) => {
+        writes.push(text);
+        return writeText(text);
+      },
+    },
+  });
+  return writes;
+}
+
+test("clipboard auto-sync stays off unless the surface enables it", async () => {
+  const { session, control } = await keyboardFixture();
+  const writes = recordClipboardWrites();
+  const statuses: string[] = [];
+  session.on("clipboard", (event) => statuses.push(event.status));
+  try {
+    remoteClipboard(control, "remote copy");
+    await flush();
+    assert.deepEqual(writes, []);
+    assert.equal(session.clipboard.latestRemoteText, "remote copy");
+    assert.deepEqual(statuses, ["Remote clipboard ready"]);
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("clipboard auto-sync writes only non-empty copies while the page is visible and focused", async () => {
+  const { session, control, document } = await keyboardFixture({
+    clipboardAutoSync: true,
+  });
+  const writes = recordClipboardWrites();
+  const statuses: string[] = [];
+  session.on("clipboard", (event) => statuses.push(event.status));
+  try {
+    document.hidden = true;
+    remoteClipboard(control, "while hidden");
+    document.hidden = false;
+    document.hasFocus = () => false;
+    remoteClipboard(control, "while unfocused");
+    document.hasFocus = () => true;
+    remoteClipboard(control, "");
+    await flush();
+    assert.deepEqual(writes, []);
+    assert.equal(session.clipboard.latestRemoteText, "");
+    assert.deepEqual(statuses, [
+      "Remote clipboard ready",
+      "Remote clipboard ready",
+      "Remote clipboard empty",
+    ]);
+
+    remoteClipboard(control, "visible and focused");
+    await flush();
+    assert.deepEqual(writes, ["visible and focused"]);
+    assert.equal(statuses.at(-1), "Clipboard synced");
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("a refused clipboard auto-sync leaves the remote copy ready", async () => {
+  const { session, control } = await keyboardFixture({
+    clipboardAutoSync: true,
+  });
+  const writes = recordClipboardWrites(() =>
+    Promise.reject(new Error("Document is not focused")),
+  );
+  const statuses: string[] = [];
+  session.on("clipboard", (event) => statuses.push(event.status));
+  try {
+    remoteClipboard(control, "refused");
+    await flush();
+    assert.deepEqual(writes, ["refused"]);
+    assert.deepEqual(statuses, [
+      "Remote clipboard ready",
+      "Remote clipboard ready",
+    ]);
+    assert.equal(session.clipboard.latestRemoteText, "refused");
+  } finally {
+    await session.dispose();
+  }
+});
+
+test("Ctrl+Shift+C copies the next remote clipboard through one ClipboardItem", async () => {
+  const { canvas, session, control } = await keyboardFixture({
+    clipboardAutoSync: true,
+  });
+  // The browser resolves each item's data when it writes the clipboard.
+  const itemWrites: Array<Promise<string>> = [];
+  const writes: string[] = [];
+  installGlobal(
+    "ClipboardItem",
+    class {
+      constructor(readonly items: Record<string, Promise<Blob>>) {}
+    },
+  );
+  installGlobal("navigator", {
+    clipboard: {
+      write: (items: Array<{ items: Record<string, Promise<Blob>> }>) => {
+        const texts = items.map(async (item) => {
+          const blob = await item.items["text/plain"];
+          return blob ? blob.text() : "";
+        });
+        itemWrites.push(...texts);
+        return Promise.all(texts).then(() => undefined);
+      },
+      writeText: (text: string) => {
+        writes.push(text);
+        return Promise.resolve();
+      },
+    },
+  });
+  const statuses: string[] = [];
+  session.on("clipboard", (event) => statuses.push(event.status));
+  try {
+    canvas.dispatch(
+      "keydown",
+      keyEvent({ code: "KeyC", ctrlKey: true, shiftKey: true }),
+    );
+    assert.equal(itemWrites.length, 1, "the shortcut reserves one write");
+    remoteClipboard(control, "terminal selection");
+    assert.deepEqual(await Promise.all(itemWrites), ["terminal selection"]);
+    await flush();
+    assert.deepEqual(writes, [], "the copy is not written a second time");
+    assert.equal(statuses.at(-1), "Remote clipboard copied");
+
+    // The shortcut covers one copy; later copies auto-sync again.
+    remoteClipboard(control, "later copy");
+    await flush();
+    assert.equal(itemWrites.length, 1);
+    assert.deepEqual(writes, ["later copy"]);
+  } finally {
+    installGlobal("ClipboardItem", undefined);
     await session.dispose();
   }
 });

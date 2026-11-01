@@ -64,6 +64,38 @@ test("video parser decodes the Rust v11 frame vector", () => {
   assert.deepEqual([...packet.data], [1, 2]);
 });
 
+test("video parser rejects every truncated, extended or mislabeled frame", () => {
+  // The Rust v11 frame vector above: an 8-byte header and a 37-byte payload.
+  const frame = [
+    11, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0,
+    0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
+  ];
+  const parse = (bytes: number[]) =>
+    parseVideoPacket(new Uint8Array(bytes).buffer);
+  assert.ok(parse(frame));
+  for (let length = 0; length < frame.length; length += 1)
+    assert.equal(parse(frame.slice(0, length)), null, `${length}-byte prefix`);
+  assert.equal(parse([...frame, 0]), null, "a byte past the declared length");
+  // Each header byte other than the length: version, kind and the two
+  // reserved bytes.
+  for (const [index, value] of [
+    [0, 12],
+    [1, 2],
+    [2, 1],
+    [3, 1],
+  ] as const) {
+    const changed = [...frame];
+    changed[index] = value;
+    assert.equal(parse(changed), null, `header byte ${index} = ${value}`);
+  }
+  // Frame kind and continuity are booleans on the wire.
+  for (const index of [8, 9]) {
+    const changed = [...frame];
+    changed[index] = 2;
+    assert.equal(parse(changed), null, `payload byte ${index} = 2`);
+  }
+});
+
 test("video parser accepts every v11 format and rejects unknown chroma and v10", () => {
   const record = videoFrame(
     1,
