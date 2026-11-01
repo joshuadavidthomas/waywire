@@ -359,16 +359,22 @@ upstream code to local copies of it.
 
 ## Tests
 
-Add these alongside the phases above:
+The window-management, WebSocket, decoder, viewer and input-scale tests from
+the review are in place. Remaining gaps:
 
-- Window-management policy tests on the existing compositor `test_state()`
-  helper: focus, map and unmap, dialogs, maximize and scale.
-- End-to-end WebSocket tests: the 403 on a bad Origin, the 503 when full, and a
-  disconnect releasing ownership.
-- Protocol fuzzing and round-trip tests for the decoders, plus a test that Rust
-  accepts every size the TypeScript resize code can produce.
-- Clipboard auto-sync and macOS key handling in the viewer.
-- Input and scale conversion in the compositor.
+- Coverage-guided fuzzing. The pipe, RTP and H.264 depacketization decoders
+  have proptest properties: CI runs 256 cases of each, and `just fuzz` runs
+  more. `cargo-fuzz` sanitizers need nightly `-Z` flags, which the pinned
+  stable 1.97.1 rejects. The browser JSON parser
+  (`ClientMessage::parse_json`) has only example tests.
+- The WebSocket tests run the gateway binary against a stub compositor that
+  records the command pipe. No test drives the browser viewer through a live
+  gateway and compositor.
+- `composed_text_reaches_wayland_client_without_text_input` failed once in a
+  full ignored run because its GTK client never started within 15 seconds. It
+  did not recur in 30 later paired suite runs or in 150 standalone starts. One
+  unverified suspect is GTK blocking on `org.a11y.Bus` activation on the
+  private session bus.
 
 ## Decisions
 
