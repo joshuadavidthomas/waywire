@@ -90,6 +90,22 @@ fn switches(pid: u32) -> u64 {
         .sum()
 }
 
+/// Wait for a file a test client writes once, and return its contents. Python's
+/// `open(path, 'w').write(text)` creates the file before it writes the text, so
+/// a reader that only waits for the file to exist can read it empty.
+fn written_contents(path: &std::path::Path, deadline: Instant, what: &str) -> String {
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) if !contents.is_empty() => return contents,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn idle_window_delay(now: Duration) -> Duration {
     let elapsed = Duration::new(now.as_secs() % 60, now.subsec_nanos());
     let remaining = Duration::from_mins(1).saturating_sub(elapsed);
@@ -316,11 +332,7 @@ fn x11_requested_position_is_honored_and_constrained() {
             .expect("start compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !marker.exists() {
-        assert!(Instant::now() < deadline, "xterm did not map");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let target = fs::read_to_string(&marker).expect("xterm target");
+    let target = written_contents(&marker, deadline, "xterm did not map");
     let mut target = target.split_whitespace();
     let display = target.next().expect("display");
     let wayland = target.next().expect("Wayland display");
@@ -414,11 +426,7 @@ fn x11_minimize_requests_update_wm_state() {
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "client did not map");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let pid = fs::read_to_string(&ready).expect("pid");
+    let pid = written_contents(&ready, deadline, "client did not map");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
     let env = |name: &[u8]| {
         environ
@@ -563,11 +571,7 @@ Gtk.main()
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "GTK window did not map");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let pid = fs::read_to_string(&ready).expect("pid");
+    let pid = written_contents(&ready, deadline, "GTK window did not map");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
     let environment = |name: &[u8]| {
         environ
@@ -660,11 +664,7 @@ fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
             .expect("start compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !marker.exists() {
-        assert!(Instant::now() < deadline, "GTK3 window did not map");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let target = fs::read_to_string(&marker).expect("GTK3 window target");
+    let target = written_contents(&marker, deadline, "GTK3 window did not map");
     let (display, id) = target.split_once(' ').expect("display and window id");
     let geometry = || {
         let output = ProcessCommand::new("xdotool")
@@ -761,11 +761,7 @@ Gtk.main()
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "GTK dialog did not map");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let pid = fs::read_to_string(&ready).expect("pid");
+    let pid = written_contents(&ready, deadline, "GTK dialog did not map");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
     let display = environ
         .split(|byte| *byte == 0)
@@ -1102,11 +1098,7 @@ fn x11_resize(mode: &str) {
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "client did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let pid = fs::read_to_string(&ready).expect("pid");
+    let pid = written_contents(&ready, deadline, "client did not start");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
     let display = environ
         .split(|byte| *byte == 0)
@@ -1332,10 +1324,7 @@ root.mainloop()
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "client did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let pid = written_contents(&ready, deadline, "client did not start");
     let stdout = compositor.0.stdout.as_ref().expect("event pipe");
     let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
     fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
@@ -1361,7 +1350,6 @@ root.mainloop()
         thread::sleep(Duration::from_millis(10));
     }
     thread::sleep(Duration::from_millis(300));
-    let pid = fs::read_to_string(&ready).expect("client pid");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("client environment");
     let display = environ
         .split(|byte| *byte == 0)
@@ -1428,11 +1416,7 @@ root.mainloop()
             .expect("click");
     }
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !click.exists() {
-        assert!(Instant::now() < deadline, "click did not reach X11 client");
-        thread::sleep(Duration::from_millis(10));
-    }
-    let coordinates = fs::read_to_string(&click).expect("click coordinates");
+    let coordinates = written_contents(&click, deadline, "click did not reach X11 client");
     let coordinates: Vec<i32> = coordinates
         .split_whitespace()
         .map(|v| v.parse().expect("coordinate"))
@@ -1483,11 +1467,7 @@ fn xwayland_resource_dpi_tracks_output_scale() {
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "session did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let display = fs::read_to_string(ready).expect("display");
+    let display = written_contents(&ready, deadline, "session did not start");
     let stdout = compositor.0.stdout.as_ref().expect("event pipe");
     let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
     fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
@@ -1561,11 +1541,7 @@ fn desktop() -> Desktop {
             .expect("compositor"),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "session did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let displays = fs::read_to_string(ready).expect("displays");
+    let displays = written_contents(&ready, deadline, "session did not start");
     let (display, wayland) = displays.split_once('\n').expect("two displays");
     let stdout = compositor.0.stdout.as_ref().expect("event pipe");
     let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
