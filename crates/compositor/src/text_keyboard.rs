@@ -151,6 +151,50 @@ impl State {
         }
     }
 
+    /// Installs the base keymap with the slots' current characters.
+    fn install_text_keymap(&mut self) -> bool {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+        let Some(keymap) = self.text_keyboard.keymap() else {
+            tracing::warn!("unexpected XKB keymap format");
+            self.text_keyboard.base = None;
+            return false;
+        };
+        let modifiers = keyboard.modifier_state();
+        if let Err(error) = keyboard.set_keymap_from_string(self, keymap) {
+            tracing::warn!(%error, "text keyboard keymap failed");
+            self.text_keyboard.base = None;
+            return false;
+        }
+        self.text_keyboard.installed = Some(keyboard.keymap_file().id());
+        keyboard.set_modifier_state(modifiers);
+        keyboard.advertise_modifier_state(self);
+        true
+    }
+
+    /// A key pressed on a spare keycode that holds a composed character, such
+    /// as Zenkaku/Hankaku under a US layout, gets its own empty symbols back
+    /// before the press, so it never retypes that character.
+    pub(crate) fn reclaim_text_keycode(&mut self, code: u32) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if self.text_keyboard.installed != Some(keyboard.keymap_file().id()) {
+            return;
+        }
+        let Some(slot) = self
+            .text_keyboard
+            .slots
+            .iter_mut()
+            .find(|slot| slot.code == code && slot.character.is_some())
+        else {
+            return;
+        };
+        slot.character = None;
+        self.install_text_keymap();
+    }
+
     pub(crate) fn flush_text_keyboard(&mut self) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
@@ -176,21 +220,8 @@ impl State {
         );
         while let Some(text) = self.text_keyboard.pending.pop_front() {
             let (codes, changed) = self.text_keyboard.assign(&text, wayland);
-            if changed {
-                let Some(keymap) = self.text_keyboard.keymap() else {
-                    tracing::warn!("unexpected XKB keymap format");
-                    self.text_keyboard.base = None;
-                    return;
-                };
-                let modifiers = keyboard.modifier_state();
-                if let Err(error) = keyboard.set_keymap_from_string(self, keymap) {
-                    tracing::warn!(%error, "text keyboard keymap failed");
-                    self.text_keyboard.base = None;
-                    return;
-                }
-                self.text_keyboard.installed = Some(keyboard.keymap_file().id());
-                keyboard.set_modifier_state(modifiers);
-                keyboard.advertise_modifier_state(self);
+            if changed && !self.install_text_keymap() {
+                return;
             }
             for code in codes {
                 for state in [KeyState::Pressed, KeyState::Released] {

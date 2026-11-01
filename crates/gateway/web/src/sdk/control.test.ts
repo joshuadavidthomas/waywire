@@ -669,6 +669,39 @@ test("dead key composition commits text without a physical accent", async () => 
   }
 });
 
+test("Japanese and Korean keys reach the remote as their evdev codes", async () => {
+  const { canvas, session, control } = await keyboardFixture();
+  // KeyboardEvent code, key value, and the code from linux/input-event-codes.h.
+  const keys: Array<[string, string, number]> = [
+    ["Lang1", "HangulMode", 122], // KEY_HANGEUL
+    ["Lang2", "HanjaMode", 123], // KEY_HANJA
+    ["Lang3", "Katakana", 90], // KEY_KATAKANA
+    ["Lang4", "Hiragana", 91], // KEY_HIRAGANA
+    ["Lang5", "ZenkakuHankaku", 85], // KEY_ZENKAKUHANKAKU
+    ["Convert", "Convert", 92], // KEY_HENKAN
+    ["NonConvert", "NonConvert", 94], // KEY_MUHENKAN
+    ["KanaMode", "KanaMode", 93], // KEY_KATAKANAHIRAGANA
+    ["IntlRo", "\\", 89], // KEY_RO
+    ["IntlYen", "\u00a5", 124], // KEY_YEN
+    ["NumpadComma", ",", 121], // KEY_KPCOMMA
+  ];
+  try {
+    for (const [code, key] of keys) {
+      canvas.dispatch("keydown", keyEvent({ code, key }));
+      canvas.dispatch("keyup", keyEvent({ code, key }));
+    }
+    assert.deepEqual(
+      keyboardRecords(control),
+      keys.flatMap(([, , key]) => [
+        { key, state: 1 },
+        { key, state: 0 },
+      ]),
+    );
+  } finally {
+    await session.dispose();
+  }
+});
+
 test("releasing Meta releases keys whose keyup macOS never delivered", async () => {
   const { canvas, session, control } = await keyboardFixture();
   installGlobal("navigator", { platform: "MacIntel" });

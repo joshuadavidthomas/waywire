@@ -297,8 +297,9 @@ Remaining:
   keyboard keycodes can hold drops the excess characters for clients without
   text-input-v3. The X11 pool is limited to keycodes at or below 255. X11
   clients that have not consumed earlier keyboard events may decode them using
-  a newer mapping after a spare keycode is reused.
-- **Low:** Japanese and Korean keys are missing from the key map.
+  a newer mapping after a spare keycode is reused, or is returned to its
+  physical key, such as Zenkaku/Hankaku under a US layout, when that key is
+  pressed.
 
 ## 6. Parity and missing protocols
 

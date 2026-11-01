@@ -837,6 +837,9 @@ impl State {
             }
             return;
         }
+        if state == KeyState::Pressed {
+            self.reclaim_text_keycode(key + 8);
+        }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.input_from_source::<(), _>(
                 source,
@@ -2523,6 +2526,53 @@ mod tests {
                 held,
             }))
             .expect("lease command");
+    }
+
+    /// The keysyms the seat's active keymap gives XKB keycode `code`.
+    fn keysyms(state: &mut State, code: u32) -> Vec<u32> {
+        use smithay::input::keyboard::xkb;
+        let keyboard = state.seat.get_keyboard().expect("seat keyboard");
+        let text = keyboard.with_xkb_state(state, |context| {
+            context.xkb().lock().expect("xkb lock").keymap_as_string()
+        });
+        let keymap = xkb::Keymap::new_from_string(
+            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            text,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("active keymap");
+        keymap
+            .key_get_syms_by_level(code.into(), 0, 0)
+            .iter()
+            .map(|keysym| keysym.raw())
+            .collect()
+    }
+
+    #[test]
+    fn japanese_keys_on_spare_keycodes_do_not_retype_composed_text() {
+        let (_display, mut state) = test_state();
+        // Without Wayland focus, composed text uses the X11 spare keycodes:
+        // the US layout gives Zenkaku/Hankaku (85), Ro (89) and Yen (124) no
+        // symbols, so they are among them.
+        let text: String = ('\u{3b1}'..='\u{3c9}').collect();
+        state
+            .apply_command(Command::Text(pipe::Text {
+                action: pipe::TextAction::Commit,
+                sequence: InputSequence::new(1).expect("sequence"),
+                text: pipe::InputText::new(text).expect("text"),
+            }))
+            .expect("commit text");
+        for key in [85, 89, 124] {
+            let composed = keysyms(&mut state, key + 8);
+            assert!(
+                composed.len() == 1 && composed[0] >= 0x0100_03b1,
+                "{key} holds no composed character: {composed:x?}"
+            );
+            state.keyboard_key(KeyboardSource::MAIN, key, KeyState::Pressed);
+            assert_eq!(keysyms(&mut state, key + 8), Vec::<u32>::new());
+            state.keyboard_key(KeyboardSource::MAIN, key, KeyState::Released);
+        }
     }
 
     #[test]
