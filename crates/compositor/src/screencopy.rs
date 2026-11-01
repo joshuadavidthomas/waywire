@@ -268,6 +268,13 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
         let FrameData::Pending { region, copied } = self else {
             return;
         };
+        let (buffer, with_damage) = match request {
+            zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, false),
+            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
+            // Destroy and any future request leave the frame alone; Destroy is
+            // a destructor, valid after a copy, and cleanup runs in `destroyed`.
+            _ => return,
+        };
         if copied.load(Ordering::SeqCst) {
             frame.post_error(
                 zwlr_screencopy_frame_v1::Error::AlreadyUsed,
@@ -275,14 +282,6 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
             );
             return;
         }
-
-        let (buffer, with_damage) = match request {
-            zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, false),
-            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
-            // Destroy and any future request leave the frame alone; Destroy is
-            // a destructor handled by the client.
-            _ => return,
-        };
 
         // Only buffers matching the advertised parameters are accepted.
         let valid = shm::with_buffer_contents(&buffer, |_, _, data| {
@@ -411,6 +410,234 @@ mod tests {
         // A region entirely beyond the output cannot capture anything.
         assert!(region_rect(2000, 0, 100, 100, 1.0, Transform::Normal, output_size).is_none());
         assert!(region_rect(-100, -100, 50, 50, 1.0, Transform::Normal, output_size).is_none());
+    }
+
+    mod client {
+        use wayland_client::Connection;
+        use wayland_client::Dispatch;
+        use wayland_client::QueueHandle;
+        use wayland_client::protocol::wl_buffer::WlBuffer;
+        use wayland_client::protocol::wl_output::WlOutput;
+        use wayland_client::protocol::wl_registry;
+        use wayland_client::protocol::wl_shm::WlShm;
+        use wayland_client::protocol::wl_shm_pool::WlShmPool;
+        use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1;
+        use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1;
+        use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
+
+        #[derive(Default)]
+        pub(super) struct App {
+            pub(super) shm: Option<WlShm>,
+            pub(super) output: Option<WlOutput>,
+            pub(super) manager: Option<ZwlrScreencopyManagerV1>,
+            pub(super) ready: bool,
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, ()> for App {
+            fn event(
+                app: &mut Self,
+                registry: &wl_registry::WlRegistry,
+                event: wl_registry::Event,
+                (): &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                let wl_registry::Event::Global {
+                    name, interface, ..
+                } = event
+                else {
+                    return;
+                };
+                match interface.as_str() {
+                    "wl_shm" => app.shm = Some(registry.bind(name, 1, qh, ())),
+                    "wl_output" => app.output = Some(registry.bind(name, 1, qh, ())),
+                    "zwlr_screencopy_manager_v1" => {
+                        app.manager = Some(registry.bind(name, 3, qh, ()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        impl Dispatch<ZwlrScreencopyFrameV1, ()> for App {
+            fn event(
+                app: &mut Self,
+                _: &ZwlrScreencopyFrameV1,
+                event: zwlr_screencopy_frame_v1::Event,
+                (): &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let zwlr_screencopy_frame_v1::Event::Ready { .. } = event {
+                    app.ready = true;
+                }
+            }
+        }
+
+        wayland_client::delegate_noop!(App: ignore WlShm);
+        wayland_client::delegate_noop!(App: ignore WlOutput);
+        wayland_client::delegate_noop!(App: WlShmPool);
+        wayland_client::delegate_noop!(App: ignore WlBuffer);
+        wayland_client::delegate_noop!(App: ZwlrScreencopyManagerV1);
+    }
+
+    fn round_trip(
+        display: &mut smithay::reexports::wayland_server::Display<State>,
+        state: &mut State,
+        connection: &wayland_client::Connection,
+        queue: &mut wayland_client::EventQueue<client::App>,
+        app: &mut client::App,
+    ) {
+        for _ in 0..2 {
+            // A protocol error closes the connection, so flushing can fail;
+            // the test asserts on the connection's error afterwards.
+            drop(connection.flush());
+            display.dispatch_clients(state).expect("server dispatch");
+            drop(display.handle().flush_clients());
+            if let Some(guard) = connection.prepare_read() {
+                drop(guard.read());
+            }
+            drop(queue.dispatch_pending(app));
+        }
+    }
+
+    struct Session {
+        display: smithay::reexports::wayland_server::Display<State>,
+        state: State,
+        connection: wayland_client::Connection,
+        queue: wayland_client::EventQueue<client::App>,
+        app: client::App,
+        /// A 4x4 `Xrgb8888` buffer matching a 4x4 region capture.
+        buffer: wayland_client::protocol::wl_buffer::WlBuffer,
+    }
+
+    fn connect() -> Session {
+        use std::os::fd::AsFd;
+
+        use wayland_client::Connection;
+        use wayland_client::protocol::wl_shm::Format;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (client_socket, server_socket) =
+            std::os::unix::net::UnixStream::pair().expect("socket pair");
+        display
+            .handle()
+            .insert_client(
+                server_socket,
+                std::sync::Arc::new(crate::shell::ClientState::default()),
+            )
+            .expect("insert client");
+        let connection = Connection::from_socket(client_socket).expect("client connection");
+        let mut queue = connection.new_event_queue();
+        let qh = queue.handle();
+        let mut app = client::App::default();
+        connection.display().get_registry(&qh, ());
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let file = tempfile::tempfile().expect("shm file");
+        file.set_len(4 * 4 * 4).expect("shm size");
+        let pool =
+            app.shm
+                .as_ref()
+                .expect("wl_shm bound")
+                .create_pool(file.as_fd(), 4 * 4 * 4, &qh, ());
+        let buffer = pool.create_buffer(0, 4, 4, 16, Format::Xrgb8888, &qh, ());
+        Session {
+            display,
+            state,
+            connection,
+            queue,
+            app,
+            buffer,
+        }
+    }
+
+    /// Clients that keep their connection across captures destroy each frame
+    /// after `ready`, as the protocol asks; that must not end the connection.
+    #[test]
+    fn destroying_a_used_frame_keeps_the_client_connected() {
+        let Session {
+            mut display,
+            mut state,
+            connection,
+            mut queue,
+            mut app,
+            buffer,
+        } = connect();
+        let qh = queue.handle();
+        let image = Image::new(
+            smithay::reexports::pixman::FormatCode::X8R8G8B8,
+            1920,
+            1080,
+            true,
+        )
+        .expect("rendered image");
+        for capture in 1..=2 {
+            app.ready = false;
+            let frame = app
+                .manager
+                .as_ref()
+                .expect("screencopy manager bound")
+                .capture_output_region(
+                    0,
+                    app.output.as_ref().expect("wl_output bound"),
+                    0,
+                    0,
+                    4,
+                    4,
+                    &qh,
+                    (),
+                );
+            round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+            frame.copy(&buffer);
+            round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+            serve_pending(&mut state, &image);
+            round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+            assert!(app.ready, "capture {capture} completes");
+
+            frame.destroy();
+            round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+            if let Some(error) = connection.protocol_error() {
+                panic!("destroying used frame {capture} ended the connection: {error}");
+            }
+        }
+    }
+
+    /// The protocol still forbids a second copy into the same frame.
+    #[test]
+    fn copying_a_used_frame_again_is_a_protocol_error() {
+        let Session {
+            mut display,
+            mut state,
+            connection,
+            mut queue,
+            mut app,
+            buffer,
+        } = connect();
+        let qh = queue.handle();
+        let frame = app
+            .manager
+            .as_ref()
+            .expect("screencopy manager bound")
+            .capture_output_region(
+                0,
+                app.output.as_ref().expect("wl_output bound"),
+                0,
+                0,
+                4,
+                4,
+                &qh,
+                (),
+            );
+        frame.copy(&buffer);
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        frame.copy(&buffer);
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let error = connection.protocol_error().expect("second copy is refused");
+        assert_eq!(
+            error.code,
+            zwlr_screencopy_frame_v1::Error::AlreadyUsed as u32
+        );
     }
 
     #[test]
