@@ -291,8 +291,10 @@ impl XdgShellHandler for State {
             .elements()
             .find(|window| window.toplevel() == Some(&surface))
             .cloned();
+        // A client that dies or destroys its toplevel without first committing
+        // a null buffer never unmaps it, so destruction unmaps it here.
         if let Some(window) = window {
-            self.end_window_grab(&window);
+            self.window_unmapped(&window);
         }
     }
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {

@@ -1513,6 +1513,92 @@ mod tests {
         assert_eq!(chips[0].title, "Renamed");
     }
 
+    /// A client killed with its window mapped never unmaps it; its chip must
+    /// still go, as must its focus and its window menu.
+    #[test]
+    fn a_killed_client_leaves_no_chip_behind() {
+        use smithay::backend::renderer::damage::OutputDamageTracker;
+        use smithay::backend::renderer::pixman::PixmanRenderer;
+        use smithay::reexports::pixman::FormatCode;
+        use smithay::reexports::pixman::Image;
+
+        let (mut display, mut state) = crate::tests::test_state();
+        let (kept_connection, mut kept_queue, mut kept_app) = connect_client(&mut display.handle());
+        sync(
+            &mut display,
+            &mut state,
+            &kept_connection,
+            &mut kept_queue,
+            &mut kept_app,
+        );
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &kept_connection,
+            &mut kept_queue,
+            &mut kept_app,
+            "Kept",
+            "kept",
+        );
+        let kept = top_window(&state);
+        let (killed_connection, mut killed_queue, mut killed_app) =
+            connect_client(&mut display.handle());
+        sync(
+            &mut display,
+            &mut state,
+            &killed_connection,
+            &mut killed_queue,
+            &mut killed_app,
+        );
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &killed_connection,
+            &mut killed_queue,
+            &mut killed_app,
+            "Killed",
+            "killed",
+        );
+        let killed = top_window(&state);
+        state.window_action(&killed, crate::WindowAction::ShowMenu);
+        assert!(state.window_menu.is_some());
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&killed)
+        );
+
+        // SIGKILL: the socket closes with the window still mapped.
+        drop(killed_queue);
+        drop(killed_connection);
+        display
+            .dispatch_clients(&mut state)
+            .expect("server dispatch");
+        assert!(!smithay::utils::IsAlive::alive(&killed));
+        // Rendering a frame runs the per-frame cleanup of dead windows.
+        let mut renderer = PixmanRenderer::new().expect("renderer");
+        let mut image = Image::new(FormatCode::A8R8G8B8, 1920, 1080, true).expect("render target");
+        let mut tracker = OutputDamageTracker::from_output(&state.output);
+        state
+            .render(&mut renderer, &mut image, &mut tracker)
+            .expect("render a frame");
+
+        let chips = state.taskbar_chips();
+        assert_eq!(
+            chips
+                .iter()
+                .map(|chip| chip.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Kept"],
+            "only the live window has a chip"
+        );
+        assert_eq!(chips[0].window, Some(kept.clone()));
+        assert!(chips[0].focused, "focus passes to the remaining window");
+        assert!(
+            state.window_menu.is_none(),
+            "the killed window's menu closes"
+        );
+    }
+
     #[test]
     fn chip_click_focuses_unfocused_window() {
         let (mut display, mut state, connection, mut queue, mut app, first) = action_fixture();
