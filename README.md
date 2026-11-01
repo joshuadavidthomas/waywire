@@ -46,7 +46,8 @@ independent of video quality and output scaling.
 - pnpm 11.9.0, as declared in `package.json`
 - the Rust toolchains declared in `rust-toolchain.toml` and `tools/rustfmt/rust-toolchain.toml`
 - [just](https://just.systems/) and [uv](https://docs.astral.sh/uv/)
-- Linux, pkg-config, and the Pixman, xkbcommon, Cairo, and Pango development packages
+- Linux, pkg-config, and the Pixman, xkbcommon, Cairo, Pango and PipeWire 0.3
+  development packages, plus libclang for the PipeWire bindings
 
 ```sh
 pnpm install --frozen-lockfile
@@ -63,7 +64,10 @@ font or desktop theme is bundled.
 
 At runtime, the compositor needs FFmpeg with libx264, Xwayland, and the application
 you choose to launch. It currently starts the X11 bridge even for native Wayland
-applications. Pass your application and arguments directly to the gateway:
+applications. The compositor links the PipeWire client library. When the
+`pipewire` daemon binary is installed, it starts a private daemon so the
+ScreenCast portal can deliver video. Without the binary, ScreenCast reports
+stream metadata only. Pass your application and arguments directly to the gateway:
 
 ```sh
 ./target/release/waywire-gateway \

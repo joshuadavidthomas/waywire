@@ -60,16 +60,18 @@ interface, which current Linux drivers (trycua's cua-driver, computer-use-linux)
 use. Its `ConnectToEIS` call hands a driver a connection to the EIS server
 waywire already runs, so the backend is a thin D-Bus service, not a new input
 stack. xdg-desktop-portal-wlr provides no RemoteDesktop, so waywire implements
-that backend and the Screenshot backend itself. The compositor starts its own
+that backend and the ScreenCast and Screenshot backends itself. The compositor starts its own
 `dbus-daemon` on a socket in its runtime directory and publishes the portal
 environment there, so portals work without an inherited session bus and never
-modify a host desktop's activation environment. The wlr virtual-pointer and
+modify a host desktop's activation environment. A private `pipewire` daemon
+in the same directory carries ScreenCast video. The wlr virtual-pointer and
 virtual-keyboard protocols cover drivers that synthesize input directly.
 
 | Protocol or interface           | Installed tools that use it                                    | Status                                                            |
 | ------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------- |
 | RemoteDesktop portal (EIS)      | cua-driver, computer-use-linux                                 | Done; compositor's private bus                                    |
 | Screenshot portal               | computer-use-linux, Pillow and pyautogui fallbacks, apps       | Done; compositor's private bus                                    |
+| ScreenCast portal (PipeWire)    | GStreamer `pipewiresrc`, OBS, browsers, RemoteDesktop drivers  | Done; private PipeWire daemon, SHM video, hidden cursor           |
 | wlr-screencopy                  | grim 1.4 (Debian 13, Ubuntu 24.04, Fedora 41), cua-driver      | Done                                                              |
 | ext-image-copy-capture          | grim 1.5 (Fedora 42, Arch, Alpine), portal-wlr 0.8, cua-driver | Done                                                              |
 | wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                                     |
@@ -145,8 +147,8 @@ ydotool (uinput needs libinput) cannot work on this desktop.
   then RemoteDesktop `Start`, but rejected the empty streams and never called
   `ConnectToEIS`; its click did not reach Foot. Outside COSMIC it sends
   input only through the RemoteDesktop Notify methods and reads stream
-  metadata, never PipeWire video. waywire now serves those methods and one
-  metadata-only stream. On a rerun against Debian 13, screenshot and portal
+  metadata, never PipeWire video. waywire now serves those methods, and the
+  stream is a PipeWire node. On a rerun against Debian 13, screenshot and portal
   click succeeded after installing xrandr, but computer-use-linux 0.7.32
   refused `type_text`: it requires a supported focused-window discovery
   backend before sending portal keyboard input, and none recognizes a native
