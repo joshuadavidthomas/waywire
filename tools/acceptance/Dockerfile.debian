@@ -5,7 +5,8 @@ RUN echo 'deb http://deb.debian.org/debian trixie-backports main' > /etc/apt/sou
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        build-essential ca-certificates cargo dbus ffmpeg foot fonts-dejavu-core \
        grim libegl-mesa0 libegl1 libgl1-mesa-dri libpixman-1-0 libxkbcommon0 \
-       libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libssl-dev pkg-config python3 \
+       libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libpipewire-0.3-0t64 pipewire-bin \
+       libssl-dev pkg-config python3 \
        wtype x11-xserver-utils xdg-desktop-portal xwayland \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -t trixie-backports rustc cargo \
     && CARGO_BUILD_JOBS=1 cargo install --locked --debug --bin computer-use-linux computer-use-linux@0.7.32 \

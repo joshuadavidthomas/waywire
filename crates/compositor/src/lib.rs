@@ -9,6 +9,7 @@ mod event_writer;
 mod focus;
 mod foreign_toplevel;
 mod grabs;
+mod pipewire;
 mod pointer_warp;
 mod portal;
 mod screencopy;
@@ -240,6 +241,9 @@ pub(crate) struct State {
     text_keyboard: text_keyboard::TextKeyboard,
     capture: capture::Capture,
     screencopy: screencopy::Screencopy,
+    /// `ScreenCast` portal video, present while the private `PipeWire`
+    /// daemon is reachable.
+    screencast: Option<pipewire::Streams>,
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
@@ -384,6 +388,7 @@ impl State {
             text_keyboard: text_keyboard::TextKeyboard::default(),
             capture,
             screencopy,
+            screencast: None,
             toplevel_list,
             clipboard: clipboard::Clipboard::default(),
             windows: HashMap::new(),
@@ -1795,6 +1800,9 @@ impl State {
                 self.output_resized();
                 self.update_cursor_image();
                 self.capture.output_resized();
+                if let Some(screencast) = &self.screencast {
+                    screencast.resize((p.size.width(), p.size.height()), self.quality.fps.get());
+                }
                 crate::eis::refresh_regions(self);
                 self.advance_generation()?;
                 self.emit(Event::ResizeApplied(pipe::ResizeApplied {
@@ -1969,6 +1977,9 @@ impl State {
             if let Some(video) = &self.video {
                 video.submit(CapturedFrame::new(pixels, metadata, config))?;
             }
+            if let Some(screencast) = &self.screencast {
+                screencast.frame(image);
+            }
         }
         capture::serve_pending(self, image);
         screencopy::serve_pending(self, image);
@@ -2017,6 +2028,11 @@ pub fn run(mut options: Config) -> Result<()> {
     // Portals need a session bus, but it must be ours: an inherited bus may
     // belong to the desktop that launched us. Without a daemon, portals are off.
     let mut bus = session_bus::SessionBus::start(runtime.path());
+    // ScreenCast video likewise needs our own PipeWire daemon, and only
+    // matters when portals run.
+    let mut pipewire_daemon = bus
+        .as_ref()
+        .and_then(|_| pipewire::Daemon::start(runtime.path()));
     let socket_path = runtime.path().join("wayland-0");
     let socket = ListeningSocket::bind_absolute(socket_path.clone())?;
     let mut event_loop = EventLoop::<State>::try_new()?;
@@ -2122,6 +2138,9 @@ pub fn run(mut options: Config) -> Result<()> {
     if let Some(pid) = bus.as_ref().and_then(session_bus::SessionBus::pid) {
         wake_on_exit(&handle, pid)?;
     }
+    if let Some(pid) = pipewire_daemon.as_ref().and_then(pipewire::Daemon::pid) {
+        wake_on_exit(&handle, pid)?;
+    }
     let mut renderer = PixmanRenderer::new()?;
     // The portal backends read the most recently rendered frame from the
     // calloop loop, which is the only writer.
@@ -2156,6 +2175,9 @@ pub fn run(mut options: Config) -> Result<()> {
         portal: session_environment,
     });
     state.loop_handle = Some(handle.clone());
+    if let Some(daemon) = &pipewire_daemon {
+        state.screencast = start_screencast(&handle, daemon, Rc::clone(&image));
+    }
     let mut tracker = OutputDamageTracker::from_output(&state.output);
     let mut next_frame = Instant::now();
     let mut next_housekeeping = Instant::now() + Duration::from_secs(2);
@@ -2225,6 +2247,9 @@ pub fn run(mut options: Config) -> Result<()> {
         if let Some(bus) = bus.as_mut() {
             bus.poll();
         }
+        if let Some(daemon) = pipewire_daemon.as_mut() {
+            daemon.poll();
+        }
         if let Some(child) = child.0.as_mut() {
             match child.try_wait() {
                 Ok(Some(_)) => state.running = false,
@@ -2234,6 +2259,9 @@ pub fn run(mut options: Config) -> Result<()> {
         }
     }
     drop(child);
+    // Streams first: their proxies talk to the daemon.
+    state.screencast = None;
+    drop(pipewire_daemon);
     drop(bus);
     state.release_input(KeyboardSource::MAIN);
     if let Some(video) = state.video.take() {
@@ -2241,6 +2269,45 @@ pub fn run(mut options: Config) -> Result<()> {
     }
     event_writer.stop();
     state.failure.map_or(Ok(()), Err)
+}
+
+/// Connect to the private `PipeWire` daemon and dispatch its events on the
+/// calloop loop. A consumer that frees a buffer wakes the loop, which retries
+/// the latest rendered frame. Returns `None`, leaving `ScreenCast` metadata
+/// only, when the connection fails.
+fn start_screencast(
+    handle: &calloop::LoopHandle<'static, State>,
+    daemon: &pipewire::Daemon,
+    image: Rc<RefCell<Image<'static, 'static>>>,
+) -> Option<pipewire::Streams> {
+    let streams = match pipewire::Streams::connect(daemon.socket()) {
+        Ok(streams) => streams,
+        Err(error) => {
+            tracing::warn!(%error, "PipeWire connection failed; ScreenCast video disabled");
+            return None;
+        }
+    };
+    let fd = match streams.fd() {
+        Ok(fd) => fd,
+        Err(error) => {
+            tracing::warn!(%error, "PipeWire loop descriptor; ScreenCast video disabled");
+            return None;
+        }
+    };
+    if let Err(error) = handle.insert_source(
+        Generic::new(fd, Interest::READ, Mode::Level),
+        move |_, _, state| {
+            if let Some(streams) = &state.screencast {
+                streams.dispatch();
+                streams.offer_pending(&image.borrow());
+            }
+            Ok(PostAction::Continue)
+        },
+    ) {
+        tracing::warn!(%error, "PipeWire event source; ScreenCast video disabled");
+        return None;
+    }
+    Some(streams)
 }
 
 fn frame_deadline(previous: Instant, finished: Instant, interval: Duration) -> Instant {

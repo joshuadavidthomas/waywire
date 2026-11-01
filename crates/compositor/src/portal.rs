@@ -4,7 +4,7 @@
 //!
 //! zbus serves the backends on the private bus as
 //! `org.freedesktop.impl.portal.desktop.waywire`, implementing `RemoteDesktop`
-//! (with `ConnectToEIS`), a `ScreenCast` stub, and Screenshot; method calls that
+//! (with `ConnectToEIS`), `ScreenCast` with `PipeWire` video, and Screenshot; method calls that
 //! need the seat or the rendered frame travel over a channel into the calloop
 //! loop and are answered when the loop gets to them.
 //!
@@ -72,6 +72,16 @@ pub(crate) enum PortalRequest {
     OutputSize {
         reply: oneshot::Sender<Option<(i32, i32)>>,
     },
+    /// Start the session's screen-cast stream; the reply is its `PipeWire`
+    /// node ID, or `None` when the stream carries metadata only.
+    StartCast {
+        session: String,
+        reply: oneshot::Sender<Option<u32>>,
+    },
+    /// Destroy the session's screen-cast stream, if any.
+    CloseCast {
+        session: String,
+    },
     /// Hand out a new EI connection for a `ConnectToEIS` call.
     ConnectToEis {
         reply: oneshot::Sender<std::io::Result<(OwnedFd, std::os::unix::net::UnixStream)>>,
@@ -85,6 +95,9 @@ pub(crate) enum PortalRequest {
 /// Directories the compositor publishes for portal discovery.
 #[derive(Clone)]
 pub(crate) struct PortalDirs {
+    /// The compositor's runtime directory, where the private `PipeWire`
+    /// daemon's socket lives.
+    pub runtime: PathBuf,
     /// Prepended to `XDG_DATA_DIRS`.
     pub data_dir: PathBuf,
     /// Set as `XDG_DESKTOP_PORTAL_DIR`.
@@ -179,6 +192,7 @@ pub(crate) fn write_portal_files(runtime_path: &Path) -> Result<PortalDirs> {
         }
     }
     Ok(PortalDirs {
+        runtime: runtime_path.to_path_buf(),
         data_dir,
         portals_dir,
     })
@@ -221,6 +235,12 @@ fn portal_environment_from(
             "XDG_DESKTOP_PORTAL_DIR".to_owned(),
             dirs.portals_dir.to_string_lossy().into_owned(),
         ),
+        // OpenPipeWireRemote connects the frontend to the default daemon,
+        // which must be the compositor's, not the host's.
+        (
+            "PIPEWIRE_RUNTIME_DIR".to_owned(),
+            dirs.runtime.to_string_lossy().into_owned(),
+        ),
     ]
 }
 
@@ -262,6 +282,23 @@ pub(crate) fn start(
                     .map(|rect| (rect.size.w, rect.size.h));
                 if reply.send(size).is_err() {
                     tracing::debug!("portal requester hung up");
+                }
+            }
+            PortalRequest::StartCast { session, reply } => {
+                let size = (state.size.width(), state.size.height());
+                let fps = state.quality.fps.get();
+                match state.screencast.as_mut() {
+                    Some(streams) => streams.start(session, size, fps, reply),
+                    None => {
+                        if reply.send(None).is_err() {
+                            tracing::debug!("portal requester hung up");
+                        }
+                    }
+                }
+            }
+            PortalRequest::CloseCast { session } => {
+                if let Some(streams) = state.screencast.as_mut() {
+                    streams.close(&session);
                 }
             }
             PortalRequest::ConnectToEis { reply } => {
@@ -398,7 +435,7 @@ mod tests {
         reason = "one private-bus test covers both shared interfaces"
     )]
     #[test]
-    fn screencast_serves_metadata_streams_on_the_shared_backend() {
+    fn screencast_reports_each_session_node_on_the_shared_backend() {
         use std::collections::HashMap;
 
         use zbus::zvariant::OwnedValue;
@@ -407,24 +444,34 @@ mod tests {
         let Some(bus) = crate::session_bus::SessionBus::start(runtime.path()) else {
             return;
         };
+        // The loop answers each session's stream with a distinct node ID and
+        // records which sessions closed their stream.
         let (requests, incoming) = calloop::channel::channel();
         let worker = std::thread::spawn(move || {
-            let mut event_loop = calloop::EventLoop::<usize>::try_new().expect("event loop");
+            let mut event_loop =
+                calloop::EventLoop::<(usize, Vec<String>)>::try_new().expect("event loop");
             event_loop
                 .handle()
-                .insert_source(incoming, |event, (), count| {
-                    if let Event::Msg(PortalRequest::OutputSize { reply }) = event {
+                .insert_source(incoming, |event, (), (count, closed)| match event {
+                    Event::Msg(PortalRequest::OutputSize { reply }) => {
                         reply.send(Some((1920, 1080))).expect("size reply");
+                    }
+                    Event::Msg(PortalRequest::StartCast { session, reply }) => {
+                        let node = if session.ends_with("/cast") { 57 } else { 58 };
+                        reply.send(Some(node)).expect("node reply");
                         *count += 1;
                     }
+                    Event::Msg(PortalRequest::CloseCast { session }) => closed.push(session),
+                    Event::Msg(_) | Event::Closed => {}
                 })
                 .expect("request source");
-            let mut count = 0;
-            while count < 2 {
+            let mut progress = (0, Vec::new());
+            while progress.0 < 2 || progress.1.len() < 2 {
                 event_loop
-                    .dispatch(std::time::Duration::from_secs(1), &mut count)
+                    .dispatch(std::time::Duration::from_secs(1), &mut progress)
                     .expect("dispatch");
             }
+            progress.1
         });
         let _backend = build_connection(requests, bus.address()).expect("portal backend");
         let client = zbus::blocking::connection::Builder::address(bus.address())
@@ -454,9 +501,13 @@ mod tests {
 
         let handle = ObjectPath::try_from("/org/freedesktop/portal/desktop/request/test")
             .expect("request path");
-        let session = ObjectPath::try_from("/org/freedesktop/portal/desktop/session/test")
+        let session = ObjectPath::try_from("/org/freedesktop/portal/desktop/session/cast")
             .expect("session path");
         let options: HashMap<String, OwnedValue> = HashMap::new();
+        let (status, _): (u32, HashMap<String, OwnedValue>) = screen
+            .call("CreateSession", &(&handle, &session, "", &options))
+            .expect("create ScreenCast session");
+        assert_eq!(status, 0);
         let (status, values): (u32, HashMap<String, OwnedValue>) = screen
             .call("SelectSources", &(&handle, &session, "", &options))
             .expect("select sources");
@@ -472,7 +523,8 @@ mod tests {
             .try_into()
             .expect("stream array type");
         assert_eq!(streams.len(), 1);
-        assert_eq!(streams[0].0, screencast::STREAM_ID);
+        // The stream ID is the PipeWire node the frontend grants access to.
+        assert_eq!(streams[0].0, 57);
         let size: zbus::zvariant::Value<'_> = streams[0]
             .1
             .get("size")
@@ -484,7 +536,18 @@ mod tests {
             <(i32, i32)>::try_from(size).expect("size type"),
             (1920, 1080)
         );
+        zbus::blocking::Proxy::new(
+            &client,
+            PORTAL_NAME,
+            &session,
+            "org.freedesktop.impl.portal.Session",
+        )
+        .expect("ScreenCast session proxy")
+        .call::<_, _, ()>("Close", &())
+        .expect("close ScreenCast session");
 
+        let session = ObjectPath::try_from("/org/freedesktop/portal/desktop/session/remote")
+            .expect("session path");
         let remote = zbus::blocking::Proxy::new(
             &client,
             PORTAL_NAME,
@@ -506,7 +569,7 @@ mod tests {
             .try_into()
             .expect("stream array type");
         assert_eq!(streams.len(), 1);
-        assert_eq!(streams[0].0, screencast::STREAM_ID);
+        assert_eq!(streams[0].0, 58);
         let size: zbus::zvariant::Value<'_> = streams[0]
             .1
             .get("size")
@@ -522,21 +585,45 @@ mod tests {
             u32::try_from(values.remove("devices").expect("devices result")).expect("device types"),
             3
         );
-        let error = remote
+        remote
             .call::<_, _, ()>(
                 "NotifyPointerMotionAbsolute",
-                &(&session, &options, 2u32, 1.0f64, 1.0f64),
+                &(&session, &options, 58u32, 1.0f64, 1.0f64),
             )
-            .expect_err("unknown stream must be rejected");
-        assert!(
-            matches!(error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs")
+            .expect("the session's own stream is accepted");
+        for stream in [screencast::STREAM_ID, 57] {
+            let error = remote
+                .call::<_, _, ()>(
+                    "NotifyPointerMotionAbsolute",
+                    &(&session, &options, stream, 1.0f64, 1.0f64),
+                )
+                .expect_err("another stream must be rejected");
+            assert!(
+                matches!(error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs")
+            );
+        }
+        zbus::blocking::Proxy::new(
+            &client,
+            PORTAL_NAME,
+            &session,
+            "org.freedesktop.impl.portal.Session",
+        )
+        .expect("RemoteDesktop session proxy")
+        .call::<_, _, ()>("Close", &())
+        .expect("close RemoteDesktop session");
+        assert_eq!(
+            worker.join().expect("request worker"),
+            vec![
+                "/org/freedesktop/portal/desktop/session/cast".to_owned(),
+                "/org/freedesktop/portal/desktop/session/remote".to_owned(),
+            ]
         );
-        worker.join().expect("request worker");
     }
 
     #[test]
     fn portal_environment_prepends_the_data_dir_and_names_the_desktop() {
         let dirs = PortalDirs {
+            runtime: PathBuf::from("/run/waywire"),
             data_dir: PathBuf::from("/run/waywire/share"),
             portals_dir: PathBuf::from("/run/waywire/share/xdg-desktop-portal/portals"),
         };
@@ -561,6 +648,7 @@ mod tests {
                     "XDG_DESKTOP_PORTAL_DIR".to_owned(),
                     "/run/waywire/share/xdg-desktop-portal/portals".to_owned()
                 ),
+                ("PIPEWIRE_RUNTIME_DIR".to_owned(), "/run/waywire".to_owned()),
             ]
         );
     }

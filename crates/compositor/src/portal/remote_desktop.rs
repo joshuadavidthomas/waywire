@@ -26,6 +26,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 use calloop::channel::Sender;
 use smithay::backend::input::Axis;
@@ -265,6 +267,8 @@ struct PortalSession {
     /// down ends the EI connection even though the loop keeps its own
     /// descriptor, and the loop then releases the seat input it owns.
     eis_server: Mutex<Option<UnixStream>>,
+    /// The stream `Start` reported, the only one absolute motion may name.
+    stream: AtomicU32,
 }
 
 /// Serves `org.freedesktop.impl.portal.RemoteDesktop` on the session bus.
@@ -311,6 +315,7 @@ impl RemoteDesktop {
             source: KeyboardSource::new_auxiliary(),
             warned_keysyms: Mutex::new(HashSet::new()),
             eis_server: Mutex::new(None),
+            stream: AtomicU32::new(super::screencast::STREAM_ID),
         });
         self.sessions
             .lock()
@@ -364,25 +369,26 @@ impl RemoteDesktop {
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         tracing::debug!(%session_handle, %app_id, "start remote desktop session");
-        let source = self
+        let session = self
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session_handle)
-            .map(|session| session.source)
+            .cloned()
             .ok_or_else(|| zbus::fdo::Error::InvalidArgs("unknown session".into()))?;
         self.requests
-            .send(PortalRequest::RegisterSource { source })
+            .send(PortalRequest::RegisterSource {
+                source: session.source,
+            })
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         // See the module comment: approve without a dialog for now.
         let mut results = HashMap::new();
         results.insert("devices".to_owned(), OwnedValue::from(DEVICE_TYPES));
         // The frontend starts a shared RemoteDesktop/ScreenCast session through
         // RemoteDesktop.Start, not ScreenCast.Start.
-        results.insert(
-            "streams".to_owned(),
-            super::screencast::streams(&self.requests).await?,
-        );
+        let (stream, streams) = super::screencast::streams(&self.requests, &session_handle).await?;
+        session.stream.store(stream, Ordering::Relaxed);
+        results.insert("streams".to_owned(), streams);
         Ok((RESPONSE_OK, results))
     }
 
@@ -409,12 +415,19 @@ impl RemoteDesktop {
         x: f64,
         y: f64,
     ) -> zbus::fdo::Result<()> {
-        if stream != super::screencast::STREAM_ID {
+        finite_pair(x, y)?;
+        let session = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_handle)
+            .cloned()
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("unknown session".into()))?;
+        if stream != session.stream.load(Ordering::Relaxed) {
             return Err(zbus::fdo::Error::InvalidArgs("unknown stream".into()));
         }
-        finite_pair(x, y)?;
         self.send_input(PortalInput::Absolute {
-            source: self.source(&session_handle)?,
+            source: session.source,
             x,
             y,
         })
@@ -607,6 +620,7 @@ impl Session {
         }) {
             tracing::debug!(%error, "disconnect portal source");
         }
+        super::screencast::close(&self.requests, &self.path);
         if let Some(stream) = self
             .state
             .eis_server

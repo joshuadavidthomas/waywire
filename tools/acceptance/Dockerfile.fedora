@@ -1,5 +1,6 @@
 FROM fedora:42
 
 RUN dnf install -y xorg-x11-server-Xwayland xterm xdotool grim ffmpeg-free \
-    openh264 dbus-daemon pixman libxkbcommon cairo pango dejavu-sans-mono-fonts \
+    openh264 dbus-daemon pixman libxkbcommon cairo pango pipewire-libs pipewire \
+    dejavu-sans-mono-fonts \
     python3 && dnf clean all
