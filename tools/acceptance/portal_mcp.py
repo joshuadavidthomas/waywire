@@ -20,7 +20,7 @@ env.update(
     COMPUTER_USE_LINUX_INDICATOR="0",
 )
 process = subprocess.Popen(
-    ["/root/.cargo/bin/computer-use-linux", "mcp"],
+    ["/opt/drivers/cul-stock", "mcp"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=sys.stderr,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a packaged-driver takeover in a disposable Docker container.
 
-Requires Docker, gh, uv, agent-browser, ImageMagick, tesseract and host release binaries.
+Requires Docker, uv, agent-browser, ImageMagick, tesseract and host release binaries.
 The Docker daemon must support host networking. Run one scenario at a time.
 """
 
@@ -133,29 +133,6 @@ def main(scenario):
                 "x86_64-manylinux2014",
                 "anthropic==2.3.0",
             )
-        if scenario == "cua-driver":
-            archive = "cua-driver-rs-0.38.0-linux-x86_64-binary.tar.gz"
-            run(
-                "gh",
-                "release",
-                "download",
-                "cua-driver-rs-v0.38.0",
-                "-R",
-                "trycua/cua",
-                "-p",
-                archive,
-                "-p",
-                "checksums.txt",
-                "-D",
-                str(temp),
-            )
-            line = next(
-                line
-                for line in (temp / "checksums.txt").read_text().splitlines()
-                if line.endswith(archive)
-            )
-            run("sha256sum", "-c", "-", input=line + "\n", cwd=temp)
-            run("tar", "-xzf", str(temp / archive), "-C", str(temp))
         mounts = ["-v", f"{ROOT}:/repo:ro", "-v", f"{temp}:/acceptance:ro"]
         gateway = monitor = driver = cua = None
         created = False
@@ -273,7 +250,7 @@ def main(scenario):
                         NAME,
                         "python3",
                         "/repo/tools/acceptance/session_exec.py",
-                        "/acceptance/cua-driver",
+                        "/opt/cua/cua-driver",
                         "serve",
                         "--no-overlay",
                         "--socket",
@@ -284,13 +261,13 @@ def main(scenario):
                     lambda: exists_in_container("/tmp/cua.sock"),
                     "cua server did not start",
                 )
-                docker("exec", NAME, "/acceptance/cua-driver", "telemetry", "disable")
+                docker("exec", NAME, "/opt/cua/cua-driver", "telemetry", "disable")
 
                 def action(method, payload):
                     result = docker(
                         "exec",
                         NAME,
-                        "/acceptance/cua-driver",
+                        "/opt/cua/cua-driver",
                         "call",
                         "--socket",
                         "/tmp/cua.sock",

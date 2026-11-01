@@ -10,6 +10,10 @@ default:
 acceptance SCENARIO:
     python3 tools/acceptance/scenario.py {{ SCENARIO }}
 
+# Replay the dogfood tasks in Debian containers after `just build`.
+acceptance-tasks *ARGS:
+    python3 tools/acceptance/suite.py {{ ARGS }}
+
 # Compare the desktops using the installed Waymote and release binaries.
 benchmark *ARGS:
     python3 tools/benchmark/benchmark.py {{ ARGS }}

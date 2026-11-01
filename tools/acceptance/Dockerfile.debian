@@ -1,13 +1,58 @@
-FROM debian:trixie
+# Packaged-driver acceptance image: Debian packages plus the pinned drivers.
+# Build with --build-arg RELEASE=bookworm (Debian 12) or trixie (Debian 13).
+ARG RELEASE=trixie
 
-RUN echo 'deb http://deb.debian.org/debian trixie-backports main' > /etc/apt/sources.list.d/backports.list \
-    && apt-get update -qq \
+# Both computer-use-linux variants build on Debian 12 with its rustc-web 1.96,
+# so the binaries' glibc floor (2.36) suits both runtime releases.
+FROM debian:bookworm AS computer-use-linux
+RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       build-essential ca-certificates cargo dbus ffmpeg foot fonts-dejavu-core \
-       grim libegl-mesa0 libegl1 libgl1-mesa-dri libpixman-1-0 libxkbcommon0 \
-       libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libpipewire-0.3-0t64 pipewire-bin \
-       libssl-dev pkg-config python3 \
-       wtype x11-xserver-utils xdg-desktop-portal xwayland \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y -t trixie-backports rustc cargo \
-    && CARGO_BUILD_JOBS=1 cargo install --locked --debug --bin computer-use-linux computer-use-linux@0.7.32 \
+       build-essential ca-certificates cargo-web curl git libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
+# Stock: the published crate, checked against its crates.io sha256.
+RUN curl -fsSL -o /tmp/cul.crate https://static.crates.io/crates/computer-use-linux/computer-use-linux-0.7.35.crate \
+    && echo '2868a912822879b5bb29750c780780ce078275cbd140e9b7ebe2b48510861362  /tmp/cul.crate' | sha256sum -c - \
+    && mkdir /src && tar -xzf /tmp/cul.crate -C /src \
+    && cargo install --locked --path /src/computer-use-linux-0.7.35 --root /opt/cul-stock \
+    && rm -rf /src /tmp/cul.crate /root/.cargo/registry
+# Patched: upstream 3175c04 with the open pull requests #359 (wlr-foreign-toplevel
+# backend) and #360 (wtype chords) merged, checked by the merged tree's hash.
+RUN git clone -q https://github.com/agent-sh/computer-use-linux /src \
+    && cd /src \
+    && git checkout -q 3175c045a68011235bcefb8b60305204c7a14729 \
+    && git fetch -q https://github.com/joshuadavidthomas/computer-use-linux \
+       78892cf21446bb1a2c424bf838c39d444015a486 27ca862c39287a349caf45fb201da4ec1f238172 \
+    && git -c user.name=acceptance -c user.email=acceptance@localhost merge -q --no-edit \
+       78892cf21446bb1a2c424bf838c39d444015a486 27ca862c39287a349caf45fb201da4ec1f238172 \
+    && test "$(git rev-parse 'HEAD^{tree}')" = ff768579c6901ad2779cbf4f443716eeb6a03818 \
+    && cargo install --locked --path . --root /opt/cul-patched \
+    && rm -rf /src /root/.cargo/registry
+
+FROM debian:${RELEASE}
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       at-spi2-core ca-certificates chromium curl dbus dbus-x11 ffmpeg foot \
+       fonts-dejavu-core fonts-dejavu-extra gir1.2-glib-2.0 git gnome-text-editor grim libglib2.0-bin \
+       libcairo2 libegl-mesa0 libegl1 libgl1-mesa-dri libpango-1.0-0 libpangocairo-1.0-0 \
+       libpipewire-0.3-0 libpixman-1-0 libx11-6 libxext6 libxi6 libxkbcommon0 \
+       pipewire-bin procps psmisc python3 python3-gi python3-venv thunar wl-clipboard \
+       wtype x11-utils x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-gtk \
+       xdotool xterm xwayland \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=computer-use-linux /opt/cul-stock/bin/computer-use-linux /opt/drivers/cul-stock
+COPY --from=computer-use-linux /opt/cul-patched/bin/computer-use-linux /opt/drivers/cul-patched
+# cua-driver 0.38.0: the release archive and its binary, both by sha256.
+RUN curl -fsSL -o /tmp/cua.tgz \
+       https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.38.0/cua-driver-rs-0.38.0-linux-x86_64-binary.tar.gz \
+    && echo '31ab9709dd91ce73677e49b9f3e75c6f0d3e4d9625c286c9e58262bfbea698dd  /tmp/cua.tgz' | sha256sum -c - \
+    && mkdir /opt/cua && tar -xzf /tmp/cua.tgz -C /opt/cua && rm /tmp/cua.tgz \
+    && echo 'bf57b2f3778a0a7daa9388e241f20ce948b32a7a2f4dd102e497f34e54137934  /opt/cua/cua-driver' | sha256sum -c -
+# The xdotool loop: Anthropic's ComputerTool at a pinned commit, with its
+# Python dependencies installed from a hash-locked list.
+COPY x11-loop-requirements.txt /tmp/
+RUN git clone -q https://github.com/anthropics/anthropic-quickstarts.git /opt/anthropic-quickstarts \
+    && git -C /opt/anthropic-quickstarts checkout -q 1a18c340ca42b9137d991637afe867bdcf70a9ce \
+    && python3 -m venv /opt/x11-loop \
+    && /opt/x11-loop/bin/pip install -q --no-deps --require-hashes -r /tmp/x11-loop-requirements.txt \
+    && rm -rf /opt/anthropic-quickstarts/.git /tmp/x11-loop-requirements.txt /root/.cache
+RUN useradd -m -u 1000 user
