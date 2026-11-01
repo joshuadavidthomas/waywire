@@ -2807,6 +2807,118 @@ mod tests {
         );
     }
 
+    fn resize(state: &mut State, width: u32, height: u32, scale_v120: u16) {
+        state
+            .apply_command(Command::Resize(pipe::Resize {
+                size: FrameSize::new(width, height).expect("test size"),
+                scale_v120: pipe::ScaleV120::new(scale_v120).expect("test scale"),
+                request_id: pipe::RequestId::new(1).expect("test request"),
+            }))
+            .expect("resize command");
+    }
+
+    fn browser_absolute(state: &mut State, x: u32, y: u32) {
+        state
+            .apply_command(Command::PointerAbsolute(pipe::PointerAbsolute {
+                x: pipe::PointerCoordinate::new(x).expect("x"),
+                y: pipe::PointerCoordinate::new(y).expect("y"),
+                sequence: InputSequence::new(1).expect("sequence"),
+            }))
+            .expect("pointer command");
+    }
+
+    /// The normalized positions reported to the viewer since the last call.
+    fn reported_positions(state: &State) -> Vec<(u32, u32)> {
+        state
+            .event_sink
+            .take_events()
+            .into_iter()
+            .filter_map(|event| {
+                if let Event::CursorPosition(position) = event {
+                    Some((position.x.get(), position.y.get()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn assert_location(state: &State, expected: (f64, f64)) {
+        let location = state
+            .seat
+            .get_pointer()
+            .expect("pointer")
+            .current_location();
+        assert!(
+            (location.x - expected.0).abs() < 1e-9 && (location.y - expected.1).abs() < 1e-9,
+            "pointer at {location:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn browser_pointer_maps_onto_the_logical_output_at_fractional_scales() {
+        let (_display, mut state) = test_state();
+        // 21845 is a third of 65535: pixel 640 of 1920 and row 360 of 1080,
+        // which each scale divides into logical coordinates.
+        for (scale_v120, expected) in [
+            (120, (640.0, 360.0)),
+            (150, (512.0, 288.0)),
+            (180, (640.0 / 1.5, 240.0)),
+            (480, (160.0, 90.0)),
+        ] {
+            resize(&mut state, 1920, 1080, scale_v120);
+            state.event_sink.take_events();
+            browser_absolute(&mut state, 21845, 21845);
+            assert_location(&state, expected);
+            assert_eq!(
+                reported_positions(&state),
+                [(21845, 21845)],
+                "the viewer's cursor returns to the point it sent at scale {scale_v120}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_pointer_at_the_output_edges_stays_on_the_outermost_pixels() {
+        let (_display, mut state) = test_state();
+        for (scale_v120, scale) in [(120, 1.0), (150, 1.25), (180, 1.5)] {
+            resize(&mut state, 1920, 1080, scale_v120);
+            browser_absolute(&mut state, 0, 0);
+            assert_location(&state, (0.0, 0.0));
+            state.event_sink.take_events();
+            // The far edge is pixel 1919 and row 1079, not one past them:
+            // 1919 / 1920 * 65535 rounds to 65501 and 1079 / 1080 * 65535 to
+            // 65474 at every scale.
+            browser_absolute(&mut state, 65535, 65535);
+            assert_location(&state, (1919.0 / scale, 1079.0 / scale));
+            assert_eq!(reported_positions(&state), [(65501, 65474)]);
+        }
+        // Shrinking the output pulls a pointer on the old edge onto the new one.
+        resize(&mut state, 800, 600, 120);
+        assert_location(&state, (799.0, 599.0));
+    }
+
+    #[test]
+    fn browser_relative_motion_divides_pixels_by_the_scale_and_stops_at_the_edge() {
+        let (_display, mut state) = test_state();
+        resize(&mut state, 1920, 1080, 180);
+        browser_absolute(&mut state, 21845, 21845);
+        let relative = |state: &mut State, dx: f32, dy: f32| {
+            state
+                .apply_command(Command::PointerRelative(pipe::PointerRelative {
+                    dx: pipe::PointerDelta::new(dx).expect("dx"),
+                    dy: pipe::PointerDelta::new(dy).expect("dy"),
+                    sequence: InputSequence::new(2).expect("sequence"),
+                }))
+                .expect("relative command");
+        };
+        // Three pixels right and six up at 1.5 are two and four logical units.
+        relative(&mut state, 3.0, -6.0);
+        assert_location(&state, (640.0 / 1.5 + 2.0, 236.0));
+        relative(&mut state, 4000.0, -4000.0);
+        assert_location(&state, (1919.0 / 1.5, 0.0));
+    }
+
     #[test]
     fn frame_work_does_not_lengthen_the_period() {
         let start = Instant::now();

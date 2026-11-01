@@ -231,6 +231,8 @@ mod tests {
         self as activation_token,
     };
     use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+    use wayland_protocols::xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1;
+    use wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1::XdgWmDialogV1;
     use wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
     use wayland_protocols::xdg::shell::client::xdg_popup::{
         self,
@@ -290,6 +292,8 @@ mod tests {
         dnd: DndEvents,
         activation: Option<XdgActivationV1>,
         activation_token: Option<String>,
+        dialogs: Option<XdgWmDialogV1>,
+        configured_size: Option<(i32, i32)>,
     }
 
     /// Drag-and-drop events seen by a source or target client.
@@ -374,6 +378,9 @@ mod tests {
                     }
                     "xdg_activation_v1" => {
                         state.activation = Some(registry.bind(name, 1, qh, ()));
+                    }
+                    "xdg_wm_dialog_v1" => {
+                        state.dialogs = Some(registry.bind(name, 1, qh, ()));
                     }
                     _ => {}
                 }
@@ -694,6 +701,30 @@ mod tests {
         }
     }
 
+    impl Dispatch<XdgWmDialogV1, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &XdgWmDialogV1,
+            _: wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<XdgDialogV1, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &XdgDialogV1,
+            _: wayland_protocols::xdg::dialog::v1::client::xdg_dialog_v1::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
     impl Dispatch<XdgWmBase, ()> for App {
         fn event(
             _: &mut Self,
@@ -734,6 +765,14 @@ mod tests {
         ) {
             if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::Close = event {
                 state.close_requests += 1;
+            }
+            if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::Configure {
+                width,
+                height,
+                ..
+            } = event
+            {
+                state.configured_size = Some((width, height));
             }
             if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::ConfigureBounds {
                 width,
@@ -2977,6 +3016,170 @@ mod tests {
             child,
             "maximizing the parent keeps its dialog above it"
         );
+    }
+
+    #[test]
+    fn unmapping_the_focused_window_focuses_the_topmost_remaining_window() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let mut windows = Vec::new();
+        for title in ["First", "Second", "Third", "Fourth"] {
+            let (surface, _, _) = map_toplevel(
+                &mut display,
+                &mut state,
+                &connection,
+                &mut queue,
+                &mut app,
+                title,
+                title,
+            );
+            windows.push((surface, top_window(&state)));
+        }
+        let [(first_surface, first), (_, second), (third_surface, _), _] = &windows[..] else {
+            panic!("four mapped windows");
+        };
+        // Raise Second, then First: from the bottom the stack is Third, Fourth,
+        // Second, First, so the topmost survivor is neither the latest mapped
+        // window nor the bottom one.
+        state.focus_window(Some(second.clone()));
+        state.focus_window(Some(first.clone()));
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(first)
+        );
+
+        third_surface.attach(None, 0, 0);
+        third_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(first),
+            "unmapping a background window keeps focus"
+        );
+
+        first_surface.attach(None, 0, 0);
+        first_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(second),
+            "focus passes to the topmost window that is still mapped"
+        );
+    }
+
+    #[test]
+    fn xdg_dialog_modal_requests_control_focus_redirection() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (_, _, parent_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Parent",
+            "parent",
+        );
+        let parent = top_window(&state);
+        let qh = queue.handle();
+        let child_surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let child_xdg =
+            app.wm_base
+                .as_ref()
+                .expect("shell")
+                .get_xdg_surface(&child_surface, &qh, ());
+        let child_top = child_xdg.get_toplevel(&qh, ());
+        child_top.set_parent(Some(&parent_top));
+        let dialog = app
+            .dialogs
+            .as_ref()
+            .expect("xdg_wm_dialog_v1 advertised")
+            .get_xdg_dialog(&child_top, &qh, ());
+        child_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        child_xdg.ack_configure(app.last_configure.expect("configure"));
+        attach_buffer(&child_surface, &app, &qh, 1);
+        child_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let child = top_window(&state);
+        assert_ne!(child, parent);
+        let focus_parent = |state: &mut crate::State| {
+            state.focus_window(Some(parent.clone()));
+            state.seat.get_keyboard().expect("keyboard").current_focus()
+        };
+        assert_eq!(
+            focus_parent(&mut state),
+            KeyboardFocus::window(&parent),
+            "a child without the modal hint leaves focus on its parent"
+        );
+
+        dialog.set_modal();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            focus_parent(&mut state),
+            KeyboardFocus::window(&child),
+            "set_modal redirects focus from the parent to the dialog"
+        );
+
+        dialog.unset_modal();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            focus_parent(&mut state),
+            KeyboardFocus::window(&parent),
+            "unset_modal returns focus to the parent"
+        );
+
+        dialog.set_modal();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(focus_parent(&mut state), KeyboardFocus::window(&child));
+        child_surface.attach(None, 0, 0);
+        child_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            state.seat.get_keyboard().expect("keyboard").current_focus(),
+            KeyboardFocus::window(&parent),
+            "closing a modal dialog returns focus to its parent"
+        );
+    }
+
+    #[test]
+    fn maximized_window_follows_the_logical_work_area_across_fractional_scales() {
+        let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
+        let resize = |state: &mut crate::State, scale_v120: u16| {
+            use waywire_protocol::pipe;
+            state
+                .apply_command(pipe::Command::Resize(pipe::Resize {
+                    size: pipe::FrameSize::new(1920, 1080).expect("size"),
+                    scale_v120: pipe::ScaleV120::new(scale_v120).expect("scale"),
+                    request_id: pipe::RequestId::new(1).expect("request"),
+                }))
+                .expect("resize");
+        };
+        // 1920x1080 pixels at 1.5 are 1280x720 logical; the 32-pixel taskbar
+        // leaves 688 rows for an undecorated maximized window.
+        resize(&mut state, 180);
+        state.window_action(&window, crate::WindowAction::Maximize);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.configured_size, Some((1280, 688)));
+        assert_eq!(state.space.element_location(&window), Some((0, 0).into()));
+
+        // At 1.25 the same pixels are 1536x864 logical.
+        resize(&mut state, 150);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.configured_size, Some((1536, 832)));
+
+        // Restoring returns the 1x1 size the window had before maximizing.
+        state.window_action(&window, crate::WindowAction::Restore);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.configured_size, Some((1, 1)));
     }
 
     #[test]
