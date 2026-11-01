@@ -323,6 +323,16 @@ pub(crate) fn notice_dict(notice: &Notice) -> (&'static str, HashMap<String, Val
             insert_text_field(&mut dict, *text_field);
             ("TextFieldChanged", dict)
         }
+        Notice::WindowChanged {
+            serial,
+            time_usec,
+            window,
+        } => {
+            insert(&mut dict, "serial", *serial);
+            insert(&mut dict, "time_usec", *time_usec);
+            insert(&mut dict, "window", window_dict(Some(window)));
+            ("WindowChanged", dict)
+        }
     }
 }
 

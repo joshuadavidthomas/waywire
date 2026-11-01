@@ -476,13 +476,15 @@ impl XdgShellHandler for State {
 impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for State {}
 impl State {
     fn update_toplevel_metadata(&mut self, surface: &ToplevelSurface) {
-        if let Some(window) = self
+        let window = self
             .space
             .elements()
             .find(|w| w.toplevel() == Some(surface))
-            .cloned()
+            .cloned();
+        if let Some(window) = window
+            && self.toplevel_list.update(&window)
         {
-            self.toplevel_list.update(&window);
+            self.window_changed(&window);
         }
     }
 

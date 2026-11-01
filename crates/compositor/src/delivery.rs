@@ -310,6 +310,12 @@ pub(crate) enum Notice {
         window: Option<WindowRecord>,
         text_field: TextField,
     },
+    /// A mapped window's title or app id changed.
+    WindowChanged {
+        serial: u64,
+        time_usec: u64,
+        window: WindowRecord,
+    },
 }
 
 /// A signal for the bus thread to send to each named connection.
@@ -821,6 +827,22 @@ impl State {
             window: self.window_record(window),
             parent,
             modal: Self::modal_dialog(window),
+        };
+        self.delivery.send(everyone, Signal::Notice(notice));
+    }
+
+    /// A mapped window's title or app id changed. Clients often set the
+    /// final title after they map and take focus, so the records in earlier
+    /// events are stale until this arrives.
+    pub(crate) fn window_changed(&mut self, window: &Window) {
+        let everyone = self.delivery.everyone();
+        if everyone.is_empty() {
+            return;
+        }
+        let notice = Notice::WindowChanged {
+            serial: self.delivery.next_serial(),
+            time_usec: monotonic_usec(),
+            window: self.window_record(window),
         };
         self.delivery.send(everyone, Signal::Notice(notice));
     }

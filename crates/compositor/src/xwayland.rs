@@ -570,7 +570,9 @@ impl XwmHandler for State {
         if matches!(property, WmWindowProperty::Title | WmWindowProperty::Class)
             && let Some(window) = self.x11_window(&surface)
         {
-            self.toplevel_list.update(&window);
+            if self.toplevel_list.update(&window) {
+                self.window_changed(&window);
+            }
             self.dirty = true;
         }
     }

@@ -72,19 +72,23 @@ impl ToplevelList {
     }
 
     /// Refresh an announced window's title and app id, sending `done` only
-    /// when one of them changed.
-    pub(crate) fn update(&mut self, window: &Window) {
+    /// when one of them changed. Returns whether an announced window changed.
+    pub(crate) fn update(&mut self, window: &Window) -> bool {
         let Some((title, app_id)) = metadata(window) else {
-            return;
+            return false;
         };
-        if let Some(handle) = self.handles.get(window)
+        let changed = if let Some(handle) = self.handles.get(window)
             && (handle.title() != title || handle.app_id() != app_id)
         {
             handle.send_title(&title);
             handle.send_app_id(&app_id);
             handle.send_done();
-        }
+            true
+        } else {
+            false
+        };
         self.foreign.update_metadata(window, &title, &app_id);
+        changed
     }
 
     /// Refresh the foreign-toplevel states of every window after a focus
@@ -4572,6 +4576,56 @@ mod tests {
         assert_eq!(focused.id, mapped.id, "focus names the popup by that id");
         assert_eq!(focused.title, "Session expiring");
         assert_eq!(*cause, FocusCause::Activation, "the token moved focus");
+    }
+
+    #[test]
+    fn a_title_set_after_map_and_focus_is_announced_for_the_same_id() {
+        use crate::delivery::Notice;
+        use crate::delivery::Signal;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let received = delivery_subscribers(&mut state, KeyboardSource::new_auxiliary());
+        // Chromium maps and takes focus as "Untitled", then sets the page
+        // title once the page loads.
+        let (surface, _, toplevel) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Untitled - Chromium",
+            "chromium",
+        );
+        let mapped = delivered(&received, "observer")
+            .into_iter()
+            .find_map(|signal| match signal {
+                Signal::Notice(Notice::WindowMapped { window, .. }) => Some(window),
+                Signal::Notice(_) | Signal::Receipt(_) => None,
+            })
+            .expect("the window maps");
+        assert_eq!(mapped.title, "Untitled - Chromium");
+
+        toplevel.set_title("Registration form - Chromium".into());
+        surface.commit();
+        toplevel.set_title("Registration form - Chromium".into());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let changes: Vec<_> = delivered(&received, "observer")
+            .into_iter()
+            .filter_map(|signal| match signal {
+                Signal::Notice(Notice::WindowChanged { window, .. }) => Some(window),
+                Signal::Notice(_) | Signal::Receipt(_) => None,
+            })
+            .collect();
+        let [change] = changes.as_slice() else {
+            panic!("expected one change for one new title, got {changes:?}");
+        };
+        assert_eq!(change.id, mapped.id, "the change names the mapped window");
+        assert_eq!(change.title, "Registration form - Chromium");
+        assert_eq!(change.app_id, "chromium");
     }
 
     #[test]

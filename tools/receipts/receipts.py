@@ -92,6 +92,8 @@ def describe(member, record):
             f" over {window_label(record['parent'])}" if record.get("parent") else ""
         )
         return f"#{serial} new {kind} {window_label(record.get('window'))}{parent}"
+    if member == "WindowChanged":
+        return f"#{serial} window now {window_label(record.get('window'))}"
     if member == "TextFieldChanged":
         return (
             f"#{serial} text field in {window_label(record.get('window'))}"

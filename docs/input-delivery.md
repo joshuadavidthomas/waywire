@@ -45,12 +45,13 @@ uses the RemoteDesktop portal or AT-SPI has a connection to that bus.
 The compositor sends each signal as a unicast signal to each subscriber that
 may see it. Other connections on the bus do not receive it. Each signal has
 one argument, an `a{sv}` dictionary, so later versions can add keys. Consumers
-must ignore keys they do not know.
+must ignore keys and signals they do not know.
 
 - `Receipt`: one input event and where it went.
 - `FocusChanged`: keyboard focus moved.
 - `WindowMapped`: a window appeared.
 - `TextFieldChanged`: the focused client gained or lost a focused text field.
+- `WindowChanged`: a mapped window's title or app id changed.
 
 ## Records
 
@@ -198,6 +199,15 @@ Sent when the client that holds keyboard focus enables or disables text input.
 | `window`                     | `a{sv}` | The focused window. |
 | `text_field`, `text_purpose` | `s`     | As in a receipt.    |
 
+### WindowChanged
+
+Sent when a window that has had `WindowMapped` changes its title or app id.
+
+| Key                   | Type    | Meaning                                    |
+| --------------------- | ------- | ------------------------------------------ |
+| `serial`, `time_usec` | `t`     | As in a receipt.                           |
+| `window`              | `a{sv}` | The window, with its new title and app id. |
+
 ## Ordering
 
 Serials increase in the order the compositor processes events. Signals are
@@ -209,10 +219,13 @@ order.
 A window can take focus before it maps: Chromium activates a `window.open`
 popup before its first buffer. The compositor reports that focus change after
 the window's `WindowMapped`, when the window has an `id`, and keeps the cause
-that moved focus, such as `activation`. Titles can change after a window maps;
-Chromium maps a popup as `about:blank` and renames it afterwards. Later
-receipts carry the current title, and `ext-foreign-toplevel-list` reports
-title changes. This interface has no title-change signal in version 1.
+that moved focus, such as `activation`.
+
+Every record is a snapshot, and titles often change after a window maps,
+takes focus and focuses a text field. Chromium maps a page as
+`Untitled - Chromium` and can enable text input before it sets the page
+title; it maps a `window.open` popup as `about:blank`. `WindowChanged` reports
+each later title, so join records by `id`, not by title.
 
 ## Privacy
 
@@ -229,8 +242,8 @@ limits who receives each signal:
   client sent it.
 - Viewer receipts never go on the bus. Each one goes back to the viewer whose
   input it describes, over the gateway's control channel.
-- `FocusChanged`, `WindowMapped` and `TextFieldChanged` go to every
-  subscriber. They describe window state that `ext-foreign-toplevel-list` and
+- `FocusChanged`, `WindowMapped`, `WindowChanged` and `TextFieldChanged` go
+  to every subscriber. They describe window state that `ext-foreign-toplevel-list` and
   the screen already show every client. `receipt` is present only for the
   input's owners.
 

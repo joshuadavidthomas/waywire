@@ -286,9 +286,10 @@ Backed, most important first:
      virtual-keyboard and virtual-pointer gets a receipt that names its source and its result:
      a window, given by its foreign-toplevel id, app id, title and pid; compositor chrome;
      nowhere; or dropped during a takeover. It also gets the focused window's text-field
-     state from text-input-v3. `FocusChanged`, `WindowMapped` and `TextFieldChanged` events
-     carry a cause such as `new-window`, `new-dialog`, `activation`, `click` or
-     `window-request`. Viewer input gets the same receipt over the control channel.
+     state from text-input-v3. `FocusChanged` events carry a cause such as `new-window`,
+     `new-dialog`, `activation`, `click` or `window-request`; `WindowMapped`,
+     `WindowChanged` and `TextFieldChanged` report windows appearing, retitling and
+     focusing a text field. Viewer input gets the same receipt over the control channel.
    - **Proof.** `tools/receipts/receipts.py` prints receipts and events.
      `just acceptance receipts-t6a` replays T6a with cua-driver 0.38.0. With the page
      `alert()`, the phone keys land in the form while it reports no focused text field.
@@ -303,9 +304,9 @@ Backed, most important first:
      - The text-field state is a hint. X11 clients and Chromium with
        `--wayland-text-input-version=1` report `unknown`. Qt 6 stays `focused` after focus
        moves to a button.
-     - There is no title-change event. Chromium maps a `window.open` popup as
-       `about:blank` and renames it afterwards; consumers join by id or read the title from
-       later receipts or foreign-toplevel.
+     - Records are snapshots. Chromium maps a page as `Untitled - Chromium` and can focus
+       its text field before it sets the page title (6 of 47 launches in one orb).
+       `WindowChanged` reports the later title; consumers must join by id.
      - Xwayland does not say which X client used XTest, so XTest receipts go to every
        subscriber.
      - The driver patch has not been offered upstream, and no other compositor implements
