@@ -242,6 +242,8 @@ pub struct FeedbackValues {
     /// Capacity/reset loss, not decoded frames superseded by a newer canvas draw.
     pub dropped: u32,
     pub rtt: f64,
+    /// Stream payload bytes the viewer received during the sample.
+    pub bytes: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,6 +314,11 @@ impl Feedback {
     #[must_use]
     pub const fn rtt(self) -> f64 {
         self.0.rtt
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.0.bytes
     }
 }
 
@@ -497,7 +504,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![12, kind, 0, 0];
+        let mut bytes = vec![13, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -517,7 +524,7 @@ mod tests {
             let event = ClientEvent::video_config(chroma.h264_profile().codec());
             assert_eq!(
                 json(&event),
-                format!(r#"{{"type":"video-config","version":12,"codec":"{codec}"}}"#)
+                format!(r#"{{"type":"video-config","version":13,"codec":"{codec}"}}"#)
             );
         }
     }
@@ -671,7 +678,7 @@ mod tests {
         vec![
             (
                 "pointer absolute",
-                record(1, &[12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0]),
+                record(1, &[13, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0]),
                 record(1, &[0, 0, 1, 0, 34, 0, 0, 0, 7, 0, 0, 0]),
             ),
             (
@@ -804,13 +811,13 @@ mod tests {
 
     #[test]
     fn feedback_is_parsed_and_validated_in_one_step() {
-        let valid = br#"{"type":"feedback","received":40,"presented":42,"queuePeak":2,"queueBusyMs":25,"sampleMs":1000,"dropped":0,"rtt":20}"#;
+        let valid = br#"{"type":"feedback","received":40,"presented":42,"queuePeak":2,"queueBusyMs":25,"sampleMs":1000,"dropped":0,"rtt":20,"bytes":250000}"#;
         assert!(matches!(
             ClientMessage::parse_json(valid),
             Ok(ClientMessage::Feedback(_))
         ));
 
-        let invalid = br#"{"type":"feedback","received":1,"presented":1,"queuePeak":2,"queueBusyMs":0,"sampleMs":0,"dropped":0,"rtt":20}"#;
+        let invalid = br#"{"type":"feedback","received":1,"presented":1,"queuePeak":2,"queueBusyMs":0,"sampleMs":0,"dropped":0,"rtt":20,"bytes":250000}"#;
         let error = ClientMessage::parse_json(invalid).map_err(|error| error.to_string());
         assert_eq!(error, Err("invalid feedback: sampleMs out of range".into()));
     }
@@ -927,7 +934,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            12, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            13, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

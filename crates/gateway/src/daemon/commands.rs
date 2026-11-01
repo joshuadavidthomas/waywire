@@ -505,6 +505,7 @@ mod tests {
             sample_ms: 1_000.0,
             dropped: 0,
             rtt: 20.0,
+            bytes: 0,
         })
         .expect("test feedback should be valid");
 

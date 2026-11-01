@@ -32,6 +32,8 @@ export type VideoFeedback = Readonly<{
   sampleMs: number;
   /** Capacity/reset loss, excluding frames superseded by a newer canvas draw. */
   dropped: number;
+  /** Video payload bytes that arrived, so the gateway can see the link's rate. */
+  bytes: number;
 }>;
 
 export type VideoStatsContext = Readonly<{
@@ -153,6 +155,7 @@ export class VideoRuntime {
   private decoderGeneration = 0;
   private receivedChunks = 0;
   private intervalReceivedFrames = 0;
+  private intervalReceivedBytes = 0;
   private receivedKeyframes = 0;
   private queuePeak = 0;
   private queueBusyMilliseconds = 0;
@@ -353,6 +356,7 @@ export class VideoRuntime {
         });
       } else if (event.data instanceof ArrayBuffer) {
         const data = event.data;
+        this.intervalReceivedBytes += data.byteLength;
         // A later video-config can finish before this packet's decoder setup.
         // Never submit an old profile's queued packet to the new decoder.
         const generation = this.decoderGeneration;
@@ -443,6 +447,7 @@ export class VideoRuntime {
 
   resetFeedbackInterval(now = performance.now()): void {
     this.intervalReceivedFrames = 0;
+    this.intervalReceivedBytes = 0;
     this.intervalPresentedFrames = 0;
     this.intervalDroppedFrames = 0;
     this.queueBusyMilliseconds = 0;
@@ -472,6 +477,7 @@ export class VideoRuntime {
             sampleMs,
             // A long link stall can drop more frames than the gateway accepts.
             dropped: Math.min(this.intervalDroppedFrames, 10_000),
+            bytes: Math.min(this.intervalReceivedBytes, 0xffff_ffff),
           }
         : null;
     this.resetFeedbackInterval(now);

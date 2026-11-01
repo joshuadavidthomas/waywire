@@ -402,6 +402,8 @@ mod tests {
             sample_ms: 1000.0,
             dropped,
             rtt,
+            // Unconstrained: the link carried everything that was sent.
+            bytes: u32::MAX,
         })
         .expect("test feedback should be valid")
     }

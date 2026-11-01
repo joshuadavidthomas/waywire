@@ -359,6 +359,30 @@ test("where MediaStreamTrackGenerator exists, frames show through a <video> over
   }
 });
 
+test("feedback reports the video bytes that arrived in each interval", async (context) => {
+  const h = await presentation(context, 0);
+  try {
+    const sizes = [5_000, 700, 1_300];
+    let expected = 0;
+    for (const [i, size] of sizes.entries()) {
+      const packet = videoPacket(i * 1000, {
+        keyframe: i === 0,
+        sequence: i,
+        data: new Uint8Array(size),
+      });
+      expected += packet.byteLength;
+      await h.feedRaw(packet);
+    }
+    // Every packet counts, including its header, whether or not it was drawn.
+    assert.equal(h.draws.length, 0);
+    assert.ok(expected > 7_000);
+    assert.equal(h.video.takeFeedback(1000)?.bytes, expected);
+    assert.equal(h.video.takeFeedback(2000)?.bytes, 0);
+  } finally {
+    h.video.disconnect();
+  }
+});
+
 test("stalled presentation exposes live loss without publishing imaginary draws", async (context) => {
   const h = await presentation(context, 0);
   try {

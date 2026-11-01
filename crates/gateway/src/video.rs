@@ -678,6 +678,7 @@ mod tests {
                 queue_busy_ms: 0.0,
                 sample_ms: 1000.0,
                 rtt: 20.0,
+                bytes: 0,
             })
             .expect("healthy browser feedback");
             let mut frame = metadata(1, 1);

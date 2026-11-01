@@ -1014,7 +1014,7 @@ mod tests {
         acquire(&state, &mut commands, socket).await;
         let (outbound, mut events) = outbound();
         let mut ownership = InputOwnership::Held;
-        let message = r#"{"type":"feedback","received":50,"presented":50,"queuePeak":5,"queueBusyMs":200.0,"sampleMs":1000.0,"dropped":0,"rtt":20.0}"#;
+        let message = r#"{"type":"feedback","received":50,"presented":50,"queuePeak":5,"queueBusyMs":200.0,"sampleMs":1000.0,"dropped":0,"rtt":20.0,"bytes":125000}"#;
 
         handle_test_text(&outbound, &state, socket, &mut ownership, message)
             .await
