@@ -132,6 +132,15 @@ input still reaches it, and GTK 4.8 does not race.
 Flaky dogfood cells are not replayed: batched T2 and T6a sequences without the
 learned sleeps, whose outcome depends on timing in the application.
 
+### Continuous integration
+
+`.github/workflows/acceptance.yml` builds the release binaries in a Debian 12
+container and runs the suite on Debian 12 and Debian 13 in parallel jobs,
+nightly and on manual dispatch. It does not run on every push: one distro's
+cells take about six minutes, and building its image from scratch takes about
+24 minutes more, because both computer-use-linux builds compile from source.
+Each job uploads `target/acceptance/<distro>/`.
+
 ## Takeover scenarios
 
 Build the host release binaries with `just build`, start Docker, and run one of:
