@@ -51,6 +51,30 @@ already use before building new ones, and do it in two passes.
 Agents and their harnesses run inside the box. Make existing tools work by
 supporting the standard protocols and portals they speak.
 
+Targets, most important first (checked November 1, 2026):
+
+1. **The ChatGPT and Claude desktop apps.** Both have computer use on macOS
+   and Windows, and both ship Linux desktop apps without it. OpenAI says
+   [a future release will add it](https://learn.chatgpt.com/docs/linux/linux-app);
+   Anthropic lists it as
+   [not yet in the Linux beta](https://code.claude.com/docs/en/desktop-linux).
+   Neither says how the Linux version will see or drive apps. On macOS they use
+   Screen Recording and Accessibility. The likely Linux equivalents are the
+   Screenshot, ScreenCast and RemoteDesktop portals and the AT-SPI
+   accessibility bus, all of which waywire serves. Run both apps against
+   waywire as soon as either ships Linux computer use.
+2. **cua-driver** (trycua/cua, 31,430 stars; 44,241 downloads of the v0.38.0
+   Linux assets). It passes the takeover acceptance scenario.
+3. **computer-use-linux** (agent-sh, 780 stars; 1,566 crates.io downloads,
+   first published May 2026). It needs the upstream window backend and chord
+   fixes described below, proposed in
+   [agent-sh/computer-use-linux#358](https://github.com/agent-sh/computer-use-linux/issues/358)
+   with PRs [#359](https://github.com/agent-sh/computer-use-linux/pull/359)
+   and [#360](https://github.com/agent-sh/computer-use-linux/pull/360).
+
+Anthropic's computer-use demo and OpenAI's pyautogui sample are compatibility
+checks for X11-only tools, not product targets.
+
 The bar is the versions distributions actually ship. A tool that has to be
 built from source, or a patched Xwayland, does not count as "existing". Pick
 protocols by what installed tools speak, not by what Smithay makes cheap.
@@ -80,6 +104,32 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | wlr-foreign-toplevel-management | wlrctl window actions                                          | Done; activate, close, maximize, fullscreen, minimize and restore |
 | Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done; locks, confines and relative motion                         |
 | XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below)              |
+| AT-SPI accessibility bus        | Screen readers, accessibility-tree agents                      | Works through the private bus; screen coordinates wrong (below)   |
+
+### AT-SPI
+
+Checked November 1, 2026 on `a6ff700`, Debian 13 packages (at-spi2-core
+2.46, Chromium, gtk3-widget-factory), with a libatspi client on the session's
+bus:
+
+- The compositor's private bus activates `org.a11y.Bus` from the distribution
+  service file, and `GetAddress` returns an accessibility bus in the session's
+  runtime directory. `IsEnabled` is true.
+- GTK 3 registers without configuration: 259 accessible nodes, and its named
+  buttons expose the Action interface. The action itself was not invoked.
+- Chromium registers only when started after `ScreenReaderEnabled` is set, and
+  then exposes only its 4-node window frame. With
+  `--force-renderer-accessibility` it exposes the page: the AT-SPI `press`
+  action on a page button ran its click handler. This is Chromium's own
+  policy, not something the compositor controls.
+- **Screen coordinates are wrong.** Wayland clients do not know where their
+  window is, so they report window-relative positions as screen positions.
+  Chromium reported its page button at (34, 171); OCR of a grim capture found
+  the label at (184, 184). GTK reports its frame at (0, 0). An agent can
+  navigate the tree and run actions, but cannot click from AT-SPI extents
+  alone. It needs each window's position on screen, which no standard Wayland
+  protocol gives clients. Decide how to provide it only after a target driver
+  shows it needs it.
 
 ### X11-only drivers
 
