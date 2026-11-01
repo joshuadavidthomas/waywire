@@ -50,6 +50,8 @@ export function h264Codec(unit: Uint8Array): string | null {
 type Composite = {
   readonly timestamp: number;
   remaining: number;
+  /** One stripe covers the whole picture, so its decoded frame is the picture. */
+  whole: boolean;
 };
 
 type StripeDecoder = {
@@ -106,7 +108,7 @@ export class StripeCompositor {
       this.canvas = new OffscreenCanvas(width, height);
       this.context = this.canvas.getContext("2d");
     }
-    const composite: Composite = { timestamp, remaining: 0 };
+    const composite: Composite = { timestamp, remaining: 0, whole: false };
     for (const stripe of stripes) {
       const decoder = this.decoderFor(stripe);
       if (!decoder) continue;
@@ -119,6 +121,13 @@ export class StripeCompositor {
         }),
       );
     }
+    // A stream of one stripe never paints the canvas. The stripe layout only
+    // changes with the picture's height, which starts a new canvas anyway.
+    composite.whole =
+      this.decoders.size === 1 &&
+      stripes.length === 1 &&
+      stripes[0]?.y === 0 &&
+      stripes[0].height === height;
     if (composite.remaining > 0) this.composites.push(composite);
     return true;
   }
@@ -161,12 +170,17 @@ export class StripeCompositor {
 
   private paint(y: number, frame: VideoFrame): void {
     const timestamp = frame.timestamp;
-    this.context?.drawImage(frame, 0, y);
-    frame.close();
     const index = this.composites.findIndex(
       (composite) => composite.timestamp === timestamp,
     );
     const composite = this.composites[index];
+    if (composite?.whole) {
+      this.composites.splice(0, index + 1);
+      this.onFrame(frame);
+      return;
+    }
+    this.context?.drawImage(frame, 0, y);
+    frame.close();
     if (!composite) return;
     composite.remaining -= 1;
     if (composite.remaining > 0 || !this.canvas) return;
