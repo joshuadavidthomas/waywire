@@ -22,6 +22,7 @@ use waywire_protocol::Record;
 use waywire_protocol::pipe::Button;
 use waywire_protocol::pipe::ButtonState;
 use waywire_protocol::pipe::Command;
+use waywire_protocol::pipe::CursorShape;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::InputSequence;
@@ -1092,11 +1093,15 @@ fn x11_resize(mode: &str) {
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("compositor"),
     );
+    let stdout = compositor.0.stdout.as_ref().expect("event pipe");
+    let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
+    fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking events");
+    let mut decoder = Decoder::<Event>::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     let pid = written_contents(&ready, deadline, "client did not start");
     let environ = fs::read(format!("/proc/{pid}/environ")).expect("environment");
@@ -1134,7 +1139,7 @@ fn x11_resize(mode: &str) {
         };
         (value("X="), value("Y="), value("WIDTH="), value("HEIGHT="))
     };
-    let stdin = compositor.0.stdin.as_mut().expect("stdin");
+    let mut stdin = compositor.0.stdin.take().expect("stdin");
     let mut sequence = 0;
     let mut send = |command: Command| stdin.write_all(&command.encode()).expect("send input");
     if mode == "xterm" {
@@ -1171,6 +1176,29 @@ fn x11_resize(mode: &str) {
     } else {
         None
     };
+    // The compositor maps an X11 window, and starts a resize from its frame,
+    // only once Xwayland commits the window's first buffer, which can trail
+    // the X11 map under load. Hover the left edge until the compositor shows
+    // the resize cursor, as a user would, before pressing.
+    let (x, y, _, height) = geometry();
+    loop {
+        sequence += 1;
+        send(Command::PointerAbsolute(PointerAbsolute {
+            x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
+            y: PointerCoordinate::new((y + height / 2) * 65535 / 600).expect("y"),
+            sequence: InputSequence::new(sequence).expect("sequence"),
+        }));
+        if events(&mut compositor.0, &mut decoder)
+            .contains(&Event::CursorShape(CursorShape::WResize))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "left edge never showed a resize cursor"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let (mut x, mut y, mut width, mut height) = geometry();
     let first_dx = if mode == "xterm" {
         31
