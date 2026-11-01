@@ -207,11 +207,21 @@ High 4:4:4 Predictive, including the tested Amp macOS embedded viewer.
 The compositor still renders RGB pixels; FFmpeg converts them to YUV for encoding.
 Chroma subsampling can soften small colored text.
 
-Adaptation lowers encoded scale, then bitrate, then FPS under sustained pressure,
-and recovers in reverse order without switching away from 4:2:0. Frames the
-gateway drops because a viewer's link falls behind count as pressure. These
-changes restart the encoder; changing encoded scale does not resize the desktop
-itself.
+Adaptation follows the viewer's link for both encoders. Each second the viewer
+reports the video bytes it received, and the gateway compares them with what
+the encoder produced. When video backs up behind the link, or the gateway
+discards frames the link could not carry, the gateway measures what arrived over
+the next two seconds and sets the bitrate target to half of it, no lower than
+300 kbps, so the backlog drains while video keeps moving. The first time, it also
+lowers the encoded scale one step; later jumps change only the bitrate.
+Recovery returns to 85% of the measured rate, which leaves room for key frames
+and the still-screen refresh, then probes 25% above it after 15 seconds. A probe
+that fails returns to 85% and doubles the wait, up to a minute; one that holds
+for 15 seconds means the link cleared, and the target then doubles at each step.
+Pressure the link does not explain, such as a busy decoder or dropped encoder
+frames, lowers encoded scale, then bitrate, then FPS one step at a time, and
+recovers in reverse order. Quality stays 4:2:0. Each change restarts the encoder
+with a key frame; changing encoded scale does not resize the desktop itself.
 The existing bitrate cap and low-latency settings are unchanged; short measurements
 can exceed the cap while the encoder's two-second VBV buffer fills.
 

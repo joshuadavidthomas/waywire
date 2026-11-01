@@ -188,6 +188,12 @@ impl Kbps {
     pub const MINIMUM: Self = Self(300);
     pub const MAXIMUM: Self = Self(50_000);
 
+    /// The nearest bitrate in range.
+    #[must_use]
+    pub fn saturating(kbps: u32) -> Self {
+        Self(kbps.clamp(Self::MINIMUM.get(), Self::MAXIMUM.get()))
+    }
+
     #[must_use]
     pub fn scaled(self, percent: u8) -> Self {
         let value = self

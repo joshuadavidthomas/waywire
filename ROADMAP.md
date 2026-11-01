@@ -24,6 +24,9 @@ installed in Amp orbs under `/opt/amp-wayland`. Measure:
 - Idle CPU and resident memory across all desktop processes.
 - CPU and bitrate while typing in a terminal and scrolling a browser page.
 - Input-to-screen latency in the browser viewer.
+- Frame rate and frame age over a 500 kbps viewer link, which adaptation must
+  meet by measuring what the viewer receives, and recovery once the link clears.
+  This check is waywire's own; Waymote does not adapt to the link.
 - Time from launch to the first decoded frame.
 - Whether an unmodified XTest agent (xdotool, and Anthropic's computer-use
   demo loop with `grim` for screenshots) can drive the desktop.

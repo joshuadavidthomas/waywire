@@ -251,6 +251,7 @@ impl VideoPipeline {
             at_ns = monotonic_nanos(),
         );
         self.sessions.submitted(&value.metadata);
+        self.sessions.produced(value.data.len());
         self.tx
             .send(PipelineMessage::Encoded(value))
             .await
@@ -259,6 +260,7 @@ impl VideoPipeline {
 
     async fn unit(&self, value: Unit) -> anyhow::Result<()> {
         let bytes = u32::try_from(value.data.len()).context("access unit size overflow")?;
+        self.sessions.produced(value.data.len());
         let permit = Arc::clone(&self.unit_budget)
             .acquire_many_owned(bytes)
             .await

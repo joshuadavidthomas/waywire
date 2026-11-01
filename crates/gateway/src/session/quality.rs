@@ -48,7 +48,32 @@ const LOW_CRF: Crf = match Crf::new(36) {
     Err(_) => panic!("LOW_CRF is outside the CRF range"),
 };
 const DOWN_STEP_PERCENT: u8 = 80;
-const UP_STEP_PERCENT: u8 = 110;
+// The bitrate floor is 300 kbps, so recovery doubles: ten percent steps would take
+// minutes to reach a ceiling 40 times higher.
+const UP_STEP_PERCENT: u8 = 200;
+// A slow link is measured, not searched for. Its buffers are already full when
+// pressure shows, so the first target is half of what the viewer received: the
+// backlog then drains at the same rate the video uses, and a measurement that
+// over-reads the link by a large message still lands below it. Recovery returns
+// to LINK_HOLD_PERCENT of the measured rate, which leaves room for key frames,
+// still-screen refreshes and rate-control overshoot.
+const LINK_DRAIN_PERCENT: u32 = 50;
+// Video the encoder produced and the viewer has not received waits in buffers
+// along the link, and every later frame waits behind it. More than half a second
+// of what the link carries is a backlog. The byte minimum keeps one large key
+// frame on either side of a sample boundary from counting.
+const LINK_BACKLOG_MILLIS: u64 = 500;
+const LINK_BACKLOG_MIN_BYTES: u64 = 16 << 10;
+// One second can end with a large message still in flight and read a fraction of
+// the link; two seconds of backlog smooth that out.
+const LINK_MEASURE_MILLIS: u64 = 2000;
+const LINK_HOLD_PERCENT: u32 = 85;
+// Above the held rate a raise is a probe of a link that was too slow. Probes wait
+// longer than ordinary recovery and back off after each failure, so a link that
+// stays slow settles instead of saw-toothing.
+const LINK_PROBE_PERCENT: u8 = 125;
+const LINK_PROBE_PATIENCE: u8 = 15;
+const LINK_PROBE_PATIENCE_LIMIT: u8 = 60;
 const FPS_STEP: u32 = 10;
 const SCALE_STEP: u32 = 25;
 
@@ -57,6 +82,18 @@ enum Streak {
     None,
     Bad(u8),
     Good(u8),
+}
+
+impl Streak {
+    fn next(self, is_bad: bool, is_good: bool) -> Self {
+        match (is_bad, is_good, self) {
+            (true, _, Self::Bad(count)) => Self::Bad(count.saturating_add(1)),
+            (true, _, Self::None | Self::Good(_)) => Self::Bad(1),
+            (false, true, Self::Good(count)) => Self::Good(count.saturating_add(1)),
+            (false, true, Self::None | Self::Bad(_)) => Self::Good(1),
+            (false, false, _) => Self::None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -119,6 +156,67 @@ pub(super) struct QualityChange {
     pub(super) new_chroma: Chroma,
 }
 
+/// What the viewer received over some time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Delivery {
+    bytes: u64,
+    millis: u64,
+}
+
+impl Delivery {
+    fn kbps(self) -> Option<Kbps> {
+        (self.millis >= LINK_MEASURE_MILLIS).then(|| {
+            Kbps::saturating(u32::try_from(self.bytes * 8 / self.millis).unwrap_or(u32::MAX))
+        })
+    }
+}
+
+/// One feedback sample's view of the viewer's link.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent signals of one sample"
+)]
+struct LinkSample {
+    /// Video arrived, or some waited for the link.
+    active: bool,
+    /// More than `LINK_BACKLOG_MILLIS` of video waits for the link.
+    backlog: bool,
+    /// Frames were lost while video waited for the link: the gateway discarded
+    /// what the link could not carry.
+    loss: bool,
+    /// More arrived than was produced: the link is emptying its queue.
+    draining: bool,
+    delivered: u64,
+    /// What the link carries, once congestion has lasted long enough to tell.
+    measured: Option<Kbps>,
+}
+
+/// How a streak of pressure lowers quality.
+#[derive(Clone, Copy)]
+enum Lowering {
+    /// A probe above the held rate failed: return to it.
+    FailedProbe,
+    /// Meet the measured link.
+    ToLink(Kbps),
+    /// One step down the ladder, for pressure the link does not explain.
+    Step,
+    /// Wait until the link is measured.
+    Measuring,
+}
+
+/// What the viewer's link carried when it last limited the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinkLimit {
+    delivered: Kbps,
+    patience: u8,
+}
+
+impl LinkLimit {
+    fn held(self) -> Kbps {
+        Kbps::saturating(self.delivered.get() * LINK_HOLD_PERCENT / 100)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QualityBounds {
     bitrate_floor: Kbps,
@@ -139,7 +237,7 @@ impl QualityBounds {
             QualityPreset::Low => (max_bitrate.scaled(25), LOW_CRF),
         };
         Self {
-            bitrate_floor: bitrate_ceiling.scaled(50),
+            bitrate_floor: Kbps::MINIMUM,
             bitrate_ceiling,
             fps_floor: max_fps.min(FPS_FLOOR),
             fps_ceiling: max_fps,
@@ -148,6 +246,47 @@ impl QualityBounds {
             crf,
         }
     }
+}
+
+type Signals = [(bool, &'static str); 7];
+
+/// What counts against quality in a sample, and what blocks its recovery.
+fn signals(
+    feedback: &Feedback,
+    link: &LinkSample,
+    lossy: bool,
+    encoder_bad: bool,
+    encoder_good: bool,
+) -> (Signals, Signals) {
+    let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
+    let active = link.active;
+    let pressure = [
+        (encoder_bad, "encoder-replacement"),
+        (active && queue_pressure >= 0.10, "decoder-busy"),
+        (active && feedback.queue_peak() >= 24, "decoder-peak"),
+        (active && feedback.rtt() > 250.0, "rtt"),
+        (lossy && !link.loss, "browser-loss"),
+        (link.loss, "link-loss"),
+        (link.backlog, "link-backlog"),
+    ];
+    // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
+    // so one dropped frame does not erase an otherwise healthy recovery streak.
+    // Feedback excludes newest-due presentation skips. A 60Hz display may
+    // legitimately draw half a 120 FPS stream; zero draws cannot recover.
+    let recovery_vetoes = [
+        (!encoder_good, "encoder-replacement"),
+        (queue_pressure >= 0.05, "decoder-busy"),
+        (feedback.queue_peak() >= 24, "decoder-peak"),
+        (
+            u64::from(feedback.dropped()) * 100
+                > u64::from(feedback.received()) * GOOD_DROP_PERCENT,
+            "browser-loss",
+        ),
+        (feedback.rtt() >= 120.0, "rtt"),
+        (link.backlog, "link-backlog"),
+        (feedback.presented() == 0, "no-presentation"),
+    ];
+    (pressure, recovery_vetoes)
 }
 
 /// Bad samples move down one ladder level; good samples move up one. Changes
@@ -164,6 +303,14 @@ pub(super) struct Quality {
     last_change: Option<Instant>,
     encoder: EncoderPressure,
     encoder_was_bad: bool,
+    /// What the viewer received while video backed up behind its link.
+    congestion: Option<Delivery>,
+    link: Option<LinkLimit>,
+    /// Encoded bytes since the last feedback. The viewer also counts each frame's
+    /// header, about 40 bytes, so the queue estimate errs low.
+    produced: u64,
+    /// Encoded bytes the viewer has not yet received.
+    queued: u64,
 }
 
 impl Quality {
@@ -183,6 +330,10 @@ impl Quality {
             last_change: None,
             encoder: EncoderPressure::default(),
             encoder_was_bad: false,
+            congestion: None,
+            link: None,
+            produced: 0,
+            queued: 0,
         }
     }
 
@@ -194,6 +345,15 @@ impl Quality {
         self.encoder = EncoderPressure::default();
         self.encoder_was_bad = false;
         self.streak = Streak::None;
+        // Another viewer's link says nothing about this one.
+        self.congestion = None;
+        self.link = None;
+        self.produced = 0;
+        self.queued = 0;
+    }
+
+    pub(super) fn produced(&mut self, bytes: usize) {
+        self.produced = self.produced.saturating_add(bytes as u64);
     }
 
     pub(super) fn submitted(&mut self, metadata: &FrameMetadata) {
@@ -233,34 +393,12 @@ impl Quality {
     pub(super) fn update(&mut self, feedback: &Feedback, now: Instant) -> Option<QualityChange> {
         let (attempted, replaced, encoder_bad, encoder_good) = self.encoder.take();
         let encoder_was_bad = std::mem::replace(&mut self.encoder_was_bad, encoder_bad);
-        let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
-        let loss_percent = u64::from(feedback.dropped()) * 100;
-        let active = feedback.received() > 0;
-        let pressure = [
-            (encoder_bad, "encoder-replacement"),
-            (active && queue_pressure >= 0.10, "decoder-busy"),
-            (active && feedback.queue_peak() >= 24, "decoder-peak"),
-            (active && feedback.rtt() > 250.0, "rtt"),
-            (
-                active && loss_percent >= u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT,
-                "browser-loss",
-            ),
-        ];
-        // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
-        // so one dropped frame does not erase an otherwise healthy recovery streak.
-        // Feedback excludes newest-due presentation skips. A 60Hz display may
-        // legitimately draw half a 120 FPS stream; zero draws cannot recover.
-        let recovery_vetoes = [
-            (!encoder_good, "encoder-replacement"),
-            (queue_pressure >= 0.05, "decoder-busy"),
-            (feedback.queue_peak() >= 24, "decoder-peak"),
-            (
-                loss_percent > u64::from(feedback.received()) * GOOD_DROP_PERCENT,
-                "browser-loss",
-            ),
-            (feedback.rtt() >= 120.0, "rtt"),
-            (feedback.presented() == 0, "no-presentation"),
-        ];
+        let lossy = feedback.received() > 0
+            && u64::from(feedback.dropped()) * 100
+                >= u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT;
+        let link = self.observe_link(feedback, lossy);
+        let (pressure, recovery_vetoes) =
+            signals(feedback, &link, lossy, encoder_bad, encoder_good);
         let cooldown = self.last_change.map_or(Duration::ZERO, |last| {
             QUALITY_CHANGE_COOLDOWN.saturating_sub(now.saturating_duration_since(last))
         });
@@ -277,46 +415,61 @@ impl Quality {
             bad_reasons = ?pressure.iter().filter_map(|(active, reason)| active.then_some(*reason)).collect::<Vec<_>>(),
             recovery_vetoes = ?recovery_vetoes.iter().filter_map(|(active, reason)| active.then_some(*reason)).collect::<Vec<_>>(),
             streak_before = ?self.streak,
+            delivered = link.delivered,
+            queued = self.queued,
+            link = ?self.link,
             levels = ?self.levels,
             cooldown_ms = cooldown.as_millis(),
         )
         .entered();
         // The stream is damage-driven: absence of frames says nothing about its
         // health. Idle feedback preserves recovery, but interrupts producer overload.
-        if feedback.received() == 0 && !encoder_bad {
+        if !link.active && !encoder_bad {
             if encoder_was_bad {
                 self.streak = Streak::None;
             }
             debug!(decision = "idle", streak_after = ?self.streak, "quality decision");
             return None;
         }
+        // After a jump the link still carries video queued before it. Its late and
+        // lost frames say nothing about the new levels, so wait until it empties.
+        if self.link.is_some() && link.draining && !encoder_bad {
+            debug!(decision = "draining", streak_after = ?self.streak, "quality decision");
+            return None;
+        }
         let is_bad = pressure.iter().any(|(active, _)| *active);
+        let local_pressure = pressure
+            .iter()
+            .any(|(active, reason)| *active && !reason.starts_with("link-"));
         let is_good = !recovery_vetoes.iter().any(|(active, _)| *active);
-        self.streak = match (is_bad, is_good, self.streak) {
-            (true, _, Streak::Bad(count)) => Streak::Bad(count.saturating_add(1)),
-            (true, _, Streak::None | Streak::Good(_)) => Streak::Bad(1),
-            (false, true, Streak::Good(count)) => Streak::Good(count.saturating_add(1)),
-            (false, true, Streak::None | Streak::Bad(_)) => Streak::Good(1),
-            (false, false, _) => Streak::None,
-        };
-        if !cooldown.is_zero() {
+        self.streak = self.streak.next(is_bad, is_good);
+        let streak_lowers =
+            matches!(self.streak, Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD);
+        let lowering = self.lowering(streak_lowers, &link, local_pressure);
+        // A link measured too slow is met at once, and so is a failed probe: waiting
+        // out the cooldown would only queue more video behind it.
+        let link_jump = matches!(lowering, Some(Lowering::FailedProbe | Lowering::ToLink(_)));
+        if !cooldown.is_zero() && !link_jump {
             debug!(decision = "cooldown", streak_after = ?self.streak, "quality decision");
             return None;
         }
         let old = self.levels;
         let old_chroma = self.chroma;
-        let direction = match self.streak {
-            Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD => {
-                self.lower_one_level();
-                self.streak = Streak::None;
+        let direction = match (lowering, self.streak) {
+            (Some(Lowering::Measuring), _) => {
+                debug!(decision = "measuring", streak_after = ?self.streak, "quality decision");
+                return None;
+            }
+            (Some(lowering), _) => {
+                self.lower(lowering);
                 "lower"
             }
-            Streak::Good(count) if count >= GOOD_STREAK_THRESHOLD => {
+            (None, Streak::Good(count)) if count >= self.raise_patience() => {
                 self.raise_one_level();
                 self.streak = Streak::None;
                 "raise"
             }
-            Streak::None | Streak::Bad(_) | Streak::Good(_) => {
+            (None, Streak::None | Streak::Bad(_) | Streak::Good(_)) => {
                 debug!(decision = "hold", streak_after = ?self.streak, "quality decision");
                 return None;
             }
@@ -335,6 +488,105 @@ impl Quality {
             old_chroma,
             new_chroma: self.chroma,
         })
+    }
+
+    /// Account for what the encoder produced and the viewer received since the last
+    /// sample.
+    fn observe_link(&mut self, feedback: &Feedback, lossy: bool) -> LinkSample {
+        let produced = std::mem::take(&mut self.produced);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "feedback validates sampleMs between 0 and 60,000"
+        )]
+        let delivered = Delivery {
+            bytes: u64::from(feedback.bytes()),
+            millis: (feedback.sample_ms().round() as u64).max(1),
+        };
+        let queued = (self.queued + produced).saturating_sub(delivered.bytes);
+        // Frames the gateway discards for a slow link will never arrive; the viewer
+        // reports them as lost.
+        self.queued = if feedback.dropped() > 0 { 0 } else { queued };
+        // Once congested, a link stays congested while less arrives than was
+        // produced, even after the gateway discards its queue.
+        let saturated = produced >= delivered.bytes.saturating_add(LINK_BACKLOG_MIN_BYTES);
+        // A second without video is idle only when none is waiting: otherwise the
+        // link stalled.
+        let active = feedback.received() > 0 || self.queued >= LINK_BACKLOG_MIN_BYTES;
+        let backlog_bytes =
+            LINK_BACKLOG_MIN_BYTES.max(delivered.bytes * LINK_BACKLOG_MILLIS / delivered.millis);
+        let backlog =
+            active && (self.queued >= backlog_bytes || self.congestion.is_some() && saturated);
+        let loss = lossy && queued >= LINK_BACKLOG_MIN_BYTES;
+        // Congestion means the link, not the encoder or decoder, sets the rate, and
+        // what arrives while it lasts measures the link, more exactly the longer it
+        // lasts: the viewer counts each message when its last byte arrives. The
+        // first second can include video sent before the link slowed, so it only
+        // starts the measurement.
+        self.congestion = (backlog || loss).then(|| {
+            self.congestion
+                .map_or(Delivery::default(), |congestion| Delivery {
+                    bytes: congestion.bytes + delivered.bytes,
+                    millis: congestion.millis + delivered.millis,
+                })
+        });
+        LinkSample {
+            active,
+            backlog,
+            loss,
+            draining: delivered.bytes >= produced.saturating_add(LINK_BACKLOG_MIN_BYTES),
+            delivered: delivered.bytes,
+            measured: self.congestion.and_then(Delivery::kbps),
+        }
+    }
+
+    fn lowering(
+        &self,
+        streak_lowers: bool,
+        sample: &LinkSample,
+        local_pressure: bool,
+    ) -> Option<Lowering> {
+        // A restart's key frame alone can back the link up for a second, but the
+        // gateway discards video only when the link cannot keep up.
+        let probing = self
+            .link
+            .is_some_and(|link| self.levels.bitrate > link.held());
+        if probing && !local_pressure && (streak_lowers || sample.loss) {
+            return Some(Lowering::FailedProbe);
+        }
+        if !streak_lowers {
+            return None;
+        }
+        // Congestion that lasts while it is measured shows the link carries less
+        // than the encoder produces, whatever the target says.
+        Some(match sample.measured {
+            Some(delivered) => Lowering::ToLink(delivered),
+            None if local_pressure => Lowering::Step,
+            None => Lowering::Measuring,
+        })
+    }
+
+    fn lower(&mut self, lowering: Lowering) {
+        match lowering {
+            Lowering::FailedProbe => self.fail_probe(),
+            Lowering::ToLink(delivered) => self.lower_to_link(delivered),
+            Lowering::Step | Lowering::Measuring => self.lower_one_level(),
+        }
+        // Video at the new levels is measured afresh.
+        self.congestion = None;
+        self.streak = Streak::None;
+    }
+
+    /// The link still carries what it did: go back to the held rate and wait twice
+    /// as long before the next probe.
+    fn fail_probe(&mut self) {
+        if let Some(link) = self.link.as_mut() {
+            self.levels.bitrate = link.held().at_most(self.levels.bitrate);
+            link.patience = link
+                .patience
+                .saturating_mul(2)
+                .min(LINK_PROBE_PATIENCE_LIMIT);
+        }
     }
 
     fn bounds(&self) -> QualityBounds {
@@ -359,6 +611,42 @@ impl Quality {
             .max(bounds.scale_floor)
             .min(bounds.scale_ceiling);
         self.crf = bounds.crf;
+    }
+
+    /// Jump to the measured link instead of stepping down to it.
+    fn lower_to_link(&mut self, delivered: Kbps) {
+        let bounds = self.bounds();
+        // A link that just became slow also gets fewer pixels, so its few bits per
+        // pixel still draw legible text. Later jumps change only the bitrate.
+        let patience = if let Some(link) = self.link {
+            link.patience
+        } else {
+            self.levels.scale = self.levels.scale.lowered_by(SCALE_STEP, bounds.scale_floor);
+            LINK_PROBE_PATIENCE
+        };
+        self.link = Some(LinkLimit {
+            delivered,
+            patience,
+        });
+        self.levels.bitrate = Kbps::saturating(delivered.get() * LINK_DRAIN_PERCENT / 100)
+            .at_least(bounds.bitrate_floor)
+            .at_most(self.levels.bitrate);
+    }
+
+    /// A probe waits at the held rate, longer after each failure. Its verdict waits
+    /// `LINK_PROBE_PATIENCE`: a small overshoot takes that long to fill the gateway's
+    /// queue for the viewer.
+    fn raise_patience(&self) -> u8 {
+        match self.link {
+            Some(link) if self.levels.fps >= self.bounds().fps_ceiling => {
+                match self.levels.bitrate.cmp(&link.held()) {
+                    std::cmp::Ordering::Greater => LINK_PROBE_PATIENCE,
+                    std::cmp::Ordering::Equal => link.patience,
+                    std::cmp::Ordering::Less => GOOD_STREAK_THRESHOLD,
+                }
+            }
+            Some(_) | None => GOOD_STREAK_THRESHOLD,
+        }
     }
 
     // Keep YUV420 through adaptation and recovery for browser compatibility.
@@ -387,11 +675,22 @@ impl Quality {
         if self.levels.fps < bounds.fps_ceiling {
             self.levels.fps = self.levels.fps.raised_by(FPS_STEP, bounds.fps_ceiling);
         } else if self.levels.bitrate < bounds.bitrate_ceiling {
-            self.levels.bitrate = self
-                .levels
-                .bitrate
-                .scaled(UP_STEP_PERCENT)
-                .at_most(bounds.bitrate_ceiling);
+            let raised = match self.link {
+                // Return to the held rate the link already carried.
+                Some(link) if self.levels.bitrate < link.held() => self
+                    .levels
+                    .bitrate
+                    .scaled(UP_STEP_PERCENT)
+                    .at_most(link.held()),
+                // The probe held for a whole recovery streak, so the link cleared.
+                Some(link) if self.levels.bitrate > link.delivered => {
+                    self.link = None;
+                    self.levels.bitrate.scaled(UP_STEP_PERCENT)
+                }
+                Some(_) => self.levels.bitrate.scaled(LINK_PROBE_PERCENT),
+                None => self.levels.bitrate.scaled(UP_STEP_PERCENT),
+            };
+            self.levels.bitrate = raised.at_most(bounds.bitrate_ceiling);
         } else if self.levels.scale < bounds.scale_ceiling {
             self.levels.scale = self
                 .levels
@@ -786,8 +1085,10 @@ mod tests {
             (800, 30, 50, Chroma::Yuv420),
             (640, 30, 50, Chroma::Yuv420),
             (512, 30, 50, Chroma::Yuv420),
-            (500, 30, 50, Chroma::Yuv420),
-            (500, 20, 50, Chroma::Yuv420),
+            (409, 30, 50, Chroma::Yuv420),
+            (327, 30, 50, Chroma::Yuv420),
+            (300, 30, 50, Chroma::Yuv420),
+            (300, 20, 50, Chroma::Yuv420),
         ];
 
         for (bitrate, frame_rate, scale, chroma) in expected {
@@ -812,7 +1113,7 @@ mod tests {
             (quality.levels(), quality.chroma),
             (
                 QualityLevels {
-                    bitrate: value(Kbps::new(500)),
+                    bitrate: value(Kbps::new(300)),
                     fps: value(Fps::new(20)),
                     scale: value(ScalePercent::new(50)),
                 },
@@ -822,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_floor_is_three_hundred_when_half_the_maximum_is_lower() {
+    fn bitrate_floor_is_three_hundred() {
         let mut quality = Quality::new(value(Kbps::new(500)), value(Fps::new(20)));
         let mut now = Instant::now();
 
@@ -855,13 +1156,6 @@ mod tests {
         let expected = [
             (500, 30, 50, Chroma::Yuv420),
             (500, 40, 50, Chroma::Yuv420),
-            (550, 40, 50, Chroma::Yuv420),
-            (605, 40, 50, Chroma::Yuv420),
-            (665, 40, 50, Chroma::Yuv420),
-            (731, 40, 50, Chroma::Yuv420),
-            (804, 40, 50, Chroma::Yuv420),
-            (884, 40, 50, Chroma::Yuv420),
-            (972, 40, 50, Chroma::Yuv420),
             (1_000, 40, 50, Chroma::Yuv420),
             (1_000, 40, 75, Chroma::Yuv420),
             (1_000, 40, 100, Chroma::Yuv420),
@@ -891,13 +1185,10 @@ mod tests {
     fn presets_have_exact_bounds() {
         let quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
         let cases = [
-            (
-                QualityPreset::Automatic,
-                (4_000, 8_000, 20, 60, 50, 100, 27),
-            ),
-            (QualityPreset::High, (4_000, 8_000, 20, 60, 50, 100, 22)),
-            (QualityPreset::Medium, (2_000, 4_000, 20, 60, 50, 100, 32)),
-            (QualityPreset::Low, (1_000, 2_000, 20, 60, 50, 100, 36)),
+            (QualityPreset::Automatic, (300, 8_000, 20, 60, 50, 100, 27)),
+            (QualityPreset::High, (300, 8_000, 20, 60, 50, 100, 22)),
+            (QualityPreset::Medium, (300, 4_000, 20, 60, 50, 100, 32)),
+            (QualityPreset::Low, (300, 2_000, 20, 60, 50, 100, 36)),
         ];
 
         for (
@@ -1160,6 +1451,236 @@ mod tests {
             assert_eq!(quality.update(&good_feedback(), now), None);
             assert_eq!(quality.chroma, Chroma::Yuv420);
         }
+    }
+
+    /// A link that carries `kbps` a second, or anything when it is `None`, and
+    /// queues the rest.
+    #[derive(Default)]
+    struct Link {
+        kbps: Option<u32>,
+        queued: u32,
+    }
+
+    impl Link {
+        /// One second of video that fills its bitrate target. Nothing is late or
+        /// lost yet: only the bytes show the link.
+        fn second(&mut self, quality: &mut Quality) -> Feedback {
+            let produced = quality.levels().bitrate.get() * 125;
+            quality.produced(produced as usize);
+            self.queued += produced;
+            let delivered = self
+                .kbps
+                .map_or(self.queued, |kbps| self.queued.min(kbps * 125));
+            self.queued -= delivered;
+            // The gateway holds about half a second of frames for a viewer, then
+            // discards them and the viewer reports them lost.
+            let dropped = if self.queued > produced / 2 {
+                self.queued = 0;
+                15
+            } else {
+                0
+            };
+            Feedback::new(waywire_protocol::browser::FeedbackValues {
+                received: 30,
+                presented: 30 - dropped,
+                queue_peak: 0,
+                queue_busy_ms: 0.0,
+                sample_ms: 1000.0,
+                dropped,
+                rtt: 20.0,
+                bytes: delivered,
+            })
+            .expect("link feedback should be valid")
+        }
+    }
+
+    /// Each second's change as (second, kbps, fps, scale).
+    fn drive(
+        quality: &mut Quality,
+        link: &mut Link,
+        start: Instant,
+        seconds: std::ops::RangeInclusive<u64>,
+    ) -> Vec<(u64, u32, u32, u32)> {
+        seconds
+            .filter_map(|second| {
+                let sample = link.second(quality);
+                let change = quality.update(&sample, start + Duration::from_secs(second))?;
+                Some((
+                    second,
+                    change.new.bitrate.get(),
+                    change.new.fps.get(),
+                    change.new.scale.get(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_slow_link_is_met_at_once_held_steadily_and_left_when_it_clears() {
+        let mut quality = Quality::new(value(Kbps::new(12_000)), value(Fps::new(30)));
+        let mut link = Link::default();
+        let start = Instant::now();
+
+        // Half of the 500 kbps it carried is below the floor, then 85% of it holds.
+        // A probe above it fails when the gateway discards video for the link, and
+        // returns to the held rate; the next waits twice as long.
+        assert_eq!(
+            {
+                link.kbps = Some(500);
+                drive(&mut quality, &mut link, start, 1..=60)
+            },
+            [
+                (3, 300, 30, 75),
+                (11, 425, 30, 75),
+                (26, 531, 30, 75),
+                (35, 425, 30, 75),
+            ]
+        );
+        // Once the link clears, the waiting probe holds and recovery doubles.
+        assert_eq!(
+            {
+                link.kbps = None;
+                drive(&mut quality, &mut link, start, 61..=200)
+            },
+            [
+                (65, 531, 30, 75),
+                (80, 1_062, 30, 75),
+                (88, 2_124, 30, 75),
+                (96, 4_248, 30, 75),
+                (104, 8_496, 30, 75),
+                (112, 12_000, 30, 75),
+                (120, 12_000, 30, 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_that_stays_slow_is_probed_less_and_less_often() {
+        let mut quality = Quality::new(value(Kbps::new(12_000)), value(Fps::new(30)));
+        let mut link = Link {
+            kbps: Some(500),
+            queued: 0,
+        };
+        let probes: Vec<_> = drive(&mut quality, &mut link, Instant::now(), 1..=400)
+            .into_iter()
+            .filter(|&(_, kbps, _, _)| kbps > 500)
+            .map(|(second, ..)| second)
+            .collect();
+        assert_eq!(probes, [26, 65, 134, 203, 272, 341]);
+        assert_eq!(quality.levels().bitrate, value(Kbps::new(425)));
+    }
+
+    #[test]
+    fn a_new_input_owner_does_not_inherit_the_last_owners_link() {
+        let mut quality = Quality::new(value(Kbps::new(12_000)), value(Fps::new(30)));
+        let start = Instant::now();
+        let mut link = Link {
+            kbps: Some(500),
+            queued: 0,
+        };
+        drive(&mut quality, &mut link, start, 1..=11);
+        assert_eq!(quality.levels().bitrate, value(Kbps::new(425)));
+        quality.reset_samples();
+        // The new owner's link is clear, so recovery doubles without probing.
+        let mut clear = Link::default();
+        assert_eq!(
+            drive(&mut quality, &mut clear, start, 12..=27),
+            [(19, 850, 30, 75), (27, 1_700, 30, 75)]
+        );
+    }
+
+    #[test]
+    fn a_new_slow_link_is_measured_again() {
+        let mut quality = Quality::new(value(Kbps::new(12_000)), value(Fps::new(30)));
+        let start = Instant::now();
+        let mut link = Link {
+            kbps: Some(2_000),
+            queued: 0,
+        };
+        drive(&mut quality, &mut link, start, 1..=20);
+        assert_eq!(quality.levels().bitrate, value(Kbps::new(1_700)));
+        // The link narrows further: jump to half of what it now carries.
+        assert_eq!(
+            {
+                link.kbps = Some(800);
+                drive(&mut quality, &mut link, start, 21..=31)
+            },
+            [(23, 400, 30, 75), (31, 680, 30, 75)]
+        );
+    }
+
+    #[test]
+    fn a_backlog_is_measured_over_two_seconds_after_its_first_and_then_drains_quietly() {
+        let sample = |bytes, dropped| {
+            Feedback::new(waywire_protocol::browser::FeedbackValues {
+                received: 30,
+                presented: 30,
+                queue_peak: 0,
+                queue_busy_ms: 0.0,
+                sample_ms: 1000.0,
+                dropped,
+                rtt: 20.0,
+                bytes,
+            })
+            .expect("link feedback should be valid")
+        };
+        let mut quality = Quality::new(value(Kbps::new(12_000)), value(Fps::new(30)));
+        let now = Instant::now();
+        // The link slows to 1 Mbps during the first congested second, which still
+        // carries 2 Mbps of the 4 Mbps produced. Later seconds count whole messages
+        // as they complete: one second alone would read 1.6 Mbps or 400 kbps.
+        quality.produced(500_000);
+        assert_eq!(quality.update(&sample(250_000, 0), now), None);
+        quality.produced(500_000);
+        assert_eq!(quality.update(&sample(200_000, 0), now), None);
+        quality.produced(500_000);
+        let change = quality
+            .update(&sample(50_000, 0), now)
+            .expect("two measured seconds jump");
+        assert_eq!(change.new.bitrate, value(Kbps::new(500)));
+        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
+        // The link then carries video queued before the jump faster than the encoder
+        // produces it, and frames the gateway dropped then show up as losses.
+        for second in 1..=12 {
+            quality.produced(62_500);
+            assert_eq!(
+                quality.update(&sample(125_000, 10), now + Duration::from_secs(second)),
+                None
+            );
+        }
+        // A two-second burst above what the link carries is no reason to lower.
+        for second in 13..=14 {
+            quality.produced(100_000);
+            assert_eq!(
+                quality.update(&sample(70_000, 0), now + Duration::from_secs(second)),
+                None
+            );
+        }
+        assert_eq!(quality.levels().bitrate, value(Kbps::new(500)));
+        assert_eq!(quality.levels().scale, value(ScalePercent::new(75)));
+    }
+
+    #[test]
+    fn local_pressure_steps_down_even_when_little_was_delivered() {
+        // A busy decoder on a quiet screen: the low delivery rate is the screen,
+        // not the link, so the bitrate target keeps its value.
+        let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
+        let busy = Feedback::new(waywire_protocol::browser::FeedbackValues {
+            received: 50,
+            presented: 50,
+            queue_peak: 5,
+            queue_busy_ms: 200.0,
+            sample_ms: 1000.0,
+            dropped: 0,
+            rtt: 20.0,
+            bytes: 12_500,
+        })
+        .expect("decoder feedback should be valid");
+        let now = Instant::now();
+        assert_eq!(quality.update(&busy, now), None);
+        let change = quality.update(&busy, now).expect("decoder pressure lowers");
+        assert_eq!(change.new.bitrate, value(Kbps::new(8_000)));
+        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
     }
 
     #[test]

@@ -200,6 +200,11 @@ impl Sessions {
         self.quality_ladder().submitted(metadata);
     }
 
+    /// Count encoded video, so viewer feedback shows how much of it the link carried.
+    pub(crate) fn produced(&self, bytes: usize) {
+        self.quality_ladder().produced(bytes);
+    }
+
     #[cfg(test)]
     pub(crate) fn quality_chroma(&self) -> waywire_protocol::pipe::Chroma {
         self.quality_ladder().chroma()
