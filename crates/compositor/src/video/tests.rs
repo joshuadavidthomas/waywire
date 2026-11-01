@@ -1519,7 +1519,7 @@ fn openh264_arguments_use_bitrate_control_and_rtp_contract() {
             "-allow_skip_frames",
             "1",
             "-g",
-            "15",
+            "30",
             "-bf",
             "0",
             "-bsf:v",
@@ -1575,8 +1575,8 @@ fn encoder_reports_the_chroma_it_can_encode() {
 }
 
 #[test]
-fn keyframes_use_quarter_the_nominal_frame_rate_without_changing_input_rate() {
-    for (rate, interval) in [(60, 15), (30, 8), (10, 3)] {
+fn keyframes_use_half_the_nominal_frame_rate_without_changing_input_rate() {
+    for (rate, interval) in [(60, 30), (30, 15), (10, 5)] {
         let mut config = frame(1, 1).config;
         config.fps = fps(rate);
         let args = ffmpeg_args(5000, config, generation(17), Encoder::X264);

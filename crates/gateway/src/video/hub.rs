@@ -47,8 +47,10 @@ struct ViewerHandle {
     notify: Arc<Notify>,
 }
 
-/// A viewer can hold two GOPs at the configured maximum frame rate. The byte bound is the
-/// same as the GOP cache and exceeds the encoder's 16 MiB maximum access unit.
+/// A viewer can hold one GOP at the configured maximum frame rate and the key frame after
+/// it, so a cached GOP always seeds a new viewer. A slow viewer drops frames past that
+/// instead of falling further behind. The byte bound is the same as the GOP cache and
+/// exceeds the encoder's 16 MiB maximum access unit.
 #[derive(Clone, Copy)]
 struct ViewerBounds {
     frames: usize,
@@ -59,7 +61,7 @@ impl ViewerBounds {
     fn for_max_fps(fps: Fps) -> Self {
         let keyframe_interval = fps.keyframe_interval() as usize;
         Self {
-            frames: keyframe_interval.saturating_mul(2),
+            frames: keyframe_interval.saturating_add(1),
             bytes: VIEWER_BYTES,
         }
     }
@@ -339,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn viewer_queue_delivers_every_frame_up_to_its_bound() {
-        for (max_fps, frame_bound) in [(10, 6_u64), (30, 16), (60, 30), (120, 60)] {
+        for (max_fps, frame_bound) in [(10, 6_u64), (30, 16), (60, 31), (120, 61)] {
             let hub = VideoHub::new(fps(max_fps));
             let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             let mut frames = hub.subscribe();
@@ -359,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn viewer_queue_clears_on_the_first_frame_past_its_bound() {
-        for (max_fps, frame_bound) in [(10, 6_u64), (30, 16), (60, 30), (120, 60)] {
+        for (max_fps, frame_bound) in [(10, 6_u64), (30, 16), (60, 31), (120, 61)] {
             let hub = VideoHub::new(fps(max_fps));
             let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             let mut frames = hub.subscribe();
