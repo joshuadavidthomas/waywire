@@ -10,6 +10,7 @@ import { StripeCompositor } from "./stripes.ts";
 import { decodeRecord, readFrameMetadata } from "./wire.ts";
 export const maximumVideoDecodeQueueSize = 24;
 const busyDecodeQueueSize = 5;
+const keyFrameRequestIntervalMs = 500;
 const initialReconnectDelayMilliseconds = 250;
 const maximumReconnectDelayMilliseconds = 5000;
 // A connection must stay open this long before the backoff restarts; a socket
@@ -63,6 +64,8 @@ export interface VideoOwner {
     height: number,
   ): void;
   publishStats(stats: WaywireStats): void;
+  /** A striped stream has no periodic key frames, so a viewer that lost one asks. */
+  requestKeyFrame(): void;
 }
 
 export type VideoPacket = Readonly<{
@@ -143,6 +146,7 @@ export class VideoRuntime {
   private connectAttempt: ConnectionAttempt | null = null;
   private decoderConfiguration: VideoDecoderConfig | null = null;
   private waitingForKeyframe = true;
+  private keyFrameRequestedAt = Number.NEGATIVE_INFINITY;
   private decoderGeneration = 0;
   private receivedChunks = 0;
   private intervalReceivedFrames = 0;
@@ -626,12 +630,11 @@ export class VideoRuntime {
       });
       this.resetDecoder(decoder);
     }
-    if (
-      this.decoder !== decoder ||
-      decoder.state !== "configured" ||
-      (this.waitingForKeyframe && !packet.keyframe)
-    )
+    if (this.decoder !== decoder || decoder.state !== "configured") return;
+    if (this.waitingForKeyframe && !packet.keyframe) {
+      if (packet.striped) this.requestKeyFrame();
       return;
+    }
     this.waitingForKeyframe = false;
     const metadata: FrameMetadata = {
       generation: packet.generation,
@@ -664,6 +667,12 @@ export class VideoRuntime {
       }),
     );
     this.observeDecodeQueue(decoder.decodeQueueSize);
+  }
+
+  private requestKeyFrame(now = performance.now()): void {
+    if (now - this.keyFrameRequestedAt < keyFrameRequestIntervalMs) return;
+    this.keyFrameRequestedAt = now;
+    this.owner.requestKeyFrame();
   }
 
   private observeDecodeQueue(size: number, now = performance.now()): void {

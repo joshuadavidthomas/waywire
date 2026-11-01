@@ -589,6 +589,11 @@ async fn handle_text(
                 }
             }
         },
+        // Any viewer may ask: it only makes the next striped frame a key frame.
+        ClientMessage::RequestKeyFrame => {
+            state.hub.request_key_frame();
+            Ok(())
+        }
         ClientMessage::ResetVideo => match *ownership {
             InputOwnership::NotHeld => Ok(()),
             InputOwnership::Held => {
@@ -1160,6 +1165,29 @@ mod tests {
         .expect("reset video message should succeed");
 
         assert_eq!(commands.recv().await, Some(Command::ResetVideo(ResetVideo)));
+    }
+
+    #[tokio::test]
+    async fn any_viewer_can_ask_for_a_key_frame() {
+        let (state, mut commands) = test_state();
+        acquire(&state, &mut commands, SocketId::new(1)).await;
+        let (outbound, _events) = outbound();
+        let mut ownership = InputOwnership::NotHeld;
+        let key_wanted = state.hub.key_wanted();
+
+        handle_test_text(
+            &outbound,
+            &state,
+            SocketId::new(2),
+            &mut ownership,
+            r#"{"type":"request-key-frame"}"#,
+        )
+        .await
+        .expect("key frame request should succeed");
+
+        timeout(Duration::from_millis(20), key_wanted.notified())
+            .await
+            .expect("the video worker should be asked for a key frame");
     }
 
     #[tokio::test]

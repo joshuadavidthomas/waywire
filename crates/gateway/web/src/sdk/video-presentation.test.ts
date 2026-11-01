@@ -58,6 +58,7 @@ async function presentation(context: TestContext, latency: number) {
       setLatestAppliedInput() {},
       presentResizeGeneration() {},
       publishStats: (stats) => published.push(stats),
+      requestKeyFrame() {},
     },
     latency,
     0,

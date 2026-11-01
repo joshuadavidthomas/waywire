@@ -280,6 +280,13 @@ export class ControlRuntime {
         presentResizeGeneration: (generation, width, height) =>
           this.presentResizeGeneration(generation, width, height),
         publishStats: (stats) => this.emit("stats", stats),
+        requestKeyFrame: () => {
+          if (this.controlSocket?.readyState === WebSocket.OPEN) {
+            this.controlSocket.send(
+              JSON.stringify({ type: "request-key-frame" }),
+            );
+          }
+        },
       },
       this.options.latency,
       this.options.statsIntervalMs,

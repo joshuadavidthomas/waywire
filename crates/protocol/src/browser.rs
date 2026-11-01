@@ -167,6 +167,8 @@ pub enum ClientMessage {
         text: ClipboardText,
     },
     ResetVideo,
+    /// A viewer of a striped stream lost its decoder state and waits for a key frame.
+    RequestKeyFrame,
 }
 
 impl ClientMessage {
@@ -191,6 +193,7 @@ impl ClientMessage {
                 text: ClipboardText::new(text).map_err(BrowserError::InvalidClipboard)?,
             }),
             JsonInput::ResetVideo => Ok(Self::ResetVideo),
+            JsonInput::RequestKeyFrame => Ok(Self::RequestKeyFrame),
         }
     }
 }
@@ -216,6 +219,7 @@ enum JsonInput {
         text: String,
     },
     ResetVideo,
+    RequestKeyFrame,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -806,6 +810,11 @@ mod tests {
             ClientMessage::parse_json(br#"{"type":"reset-video"}"#)
                 .expect("reset video should parse"),
             ClientMessage::ResetVideo
+        );
+        assert_eq!(
+            ClientMessage::parse_json(br#"{"type":"request-key-frame"}"#)
+                .expect("key frame request should parse"),
+            ClientMessage::RequestKeyFrame
         );
     }
 

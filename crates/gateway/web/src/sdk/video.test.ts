@@ -338,6 +338,46 @@ test("decode queue overflow drops stale data and waits for a keyframe", async (t
   ]);
 });
 
+test("a striped viewer waiting for a key frame asks for one at most every 500 ms", async (t) => {
+  installQueueVideoDecoder();
+  let now = 1_000;
+  t.mock.method(performance, "now", () => now);
+  const fixture = await videoFixture();
+  t.after(() => fixture.session.dispose());
+  configure(fixture.videoSocket);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const control = fixture.socketAttempts.find(
+    ({ path }) => path === "/control",
+  )?.socket;
+  if (!control) throw new Error("control socket was not opened");
+  control.readyState = FakeWebSocket.OPEN;
+  control.dispatch("open", {});
+  await flush();
+  const requests = () =>
+    control.sent.filter(
+      (message) => message === JSON.stringify({ type: "request-key-frame" }),
+    ).length;
+  const deliver = async (timestamp: number, striped: boolean) => {
+    const data = new Uint8Array(videoPacket(timestamp));
+    if (striped) data[1] = 2;
+    fixture.videoSocket.dispatch("message", { data: data.buffer });
+    await flush();
+  };
+
+  await deliver(2_000, true);
+  assert.equal(requests(), 1);
+  now += 499;
+  await deliver(2_001, true);
+  assert.equal(requests(), 1);
+  now += 1;
+  await deliver(2_002, true);
+  assert.equal(requests(), 2);
+  // A whole-frame stream brings its own periodic key frames.
+  now += 1_000;
+  await deliver(2_003, false);
+  assert.equal(requests(), 2);
+});
+
 test("video reconnect backoff resets only after a stable connection", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   t.mock.method(console, "warn", () => {});

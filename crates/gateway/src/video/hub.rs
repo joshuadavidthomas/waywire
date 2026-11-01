@@ -201,6 +201,11 @@ impl VideoHub {
         Arc::clone(&self.key_wanted)
     }
 
+    /// Ask the video worker for a key frame on behalf of a viewer.
+    pub(crate) fn request_key_frame(&self) {
+        self.key_wanted.notify_one();
+    }
+
     pub(crate) fn subscribe(&self) -> VideoSubscription {
         let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let id = SubscriberId(hub.next_subscriber);

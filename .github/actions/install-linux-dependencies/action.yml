@@ -18,6 +18,7 @@ runs:
           libpango1.0-dev \
           libpipewire-0.3-dev \
           libclang-dev \
+          nasm \
           pipewire-bin \
           fonts-dejavu-core \
           shellcheck
