@@ -966,6 +966,12 @@ def check_slow_link(encoder, result):
     return failures
 
 
+# Absolute ceilings for waywire's viewer keydown-to-changed-pixel latency on the
+# README's reference orb. Comparing with Waymote alone allowed 1.25 x its ~67 ms
+# plus 10 ms; waywire reached ~19 ms median, ~25 ms p95 (the slowest of 12 keys).
+VIEWER_LATENCY_CEILING_MS = {"median_ms": 25, "p95_ms": 35}
+
+
 def check_regressions(results):
     waywire, waymote = results["waywire"], results["waymote"]
     comparisons = [
@@ -1021,7 +1027,11 @@ def check_regressions(results):
                 10,
             )
         )
-    failures = []
+    failures = [
+        f"latency {metric}: {actual} > {ceiling} ms ceiling"
+        for metric, ceiling in VIEWER_LATENCY_CEILING_MS.items()
+        if (actual := waywire["latency"].get(metric)) is not None and actual > ceiling
+    ]
     for name, actual, baseline, multiplier, allowance in comparisons:
         if actual is None or baseline is None:
             failures.append(f"{name}: unavailable")

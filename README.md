@@ -127,7 +127,9 @@ under `/opt/amp-wayland`. The script header lists the other development-tool
 prerequisites. It downloads a pinned Anthropic demo and its Python dependency
 into a temporary directory. `just benchmark --check` compares both results
 against the tolerances in the script and exits nonzero for a regression or a
-missing comparison.
+missing comparison. It also holds waywire's viewer latency, keydown to changed
+pixel, under absolute ceilings of 25 ms median and 35 ms p95 on the hardware
+below, where it measures about 19 ms and 25 ms.
 
 For waywire, the benchmark also splits each key's input-to-screen latency into
 stages, from the browser key event through the gateway, compositor, client

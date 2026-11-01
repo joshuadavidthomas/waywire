@@ -27,7 +27,7 @@ def result():
             "rss_mib": 100,
             "kbps_by_socket": {"/stream": 100},
         },
-        "latency": {"median_ms": 100, "p95_ms": 100},
+        "latency": {"median_ms": 20, "p95_ms": 30},
         "agents": {"xdotool": "pass", "anthropic_grim": "pass"},
     }
 
@@ -230,6 +230,21 @@ class RegressionCheckTest(unittest.TestCase):
         self.assertEqual(
             self.run_check(),
             (1, "Regression check failed:\ntyping CPU %: 14.1 > 14.0 (Waymote 10)"),
+        )
+
+    def test_viewer_latency_ceiling_is_absolute_and_inclusive(self):
+        self.results["waymote"]["latency"] = {"median_ms": 100, "p95_ms": 100}
+        self.results["waywire"]["latency"] = {"median_ms": 25, "p95_ms": 35}
+        self.assertEqual(self.run_check(), (0, "Regression check passed"))
+        self.results["waywire"]["latency"] = {"median_ms": 25.1, "p95_ms": 35.1}
+        self.assertEqual(
+            self.run_check(),
+            (
+                1,
+                "Regression check failed:\n"
+                "latency median_ms: 25.1 > 25 ms ceiling\n"
+                "latency p95_ms: 35.1 > 35 ms ceiling",
+            ),
         )
 
     def test_missing_metric_fails(self):
