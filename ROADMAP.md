@@ -296,16 +296,15 @@ Remaining:
   text-input-v3. The X11 pool is limited to keycodes at or below 255. X11
   clients that have not consumed earlier keyboard events may decode them using
   a newer mapping after a spare keycode is reused.
-- **Low:** clipboard shortcuts press held modifiers twice. Japanese and Korean
-  keys are missing from the key map. The EI keycode subtraction can underflow.
+- **Low:** Japanese and Korean keys are missing from the key map. The EI
+  keycode subtraction can underflow.
 
 ## 6. Parity and missing protocols
 
 - Drag-and-drop: every drag is cancelled today.
-- Primary selection for middle-click paste.
 - Audio, which the Amp orb Desktop already streams.
-- `STRING`/`TEXT` clipboard targets for older X11 apps, keeping the clipboard
-  after the copying app exits, and logging oversized transfers.
+- ext-data-control, for clipboard managers and agents. Without it, wl-clipboard
+  maps a window to take keyboard focus for each copy and paste.
 - xdg-dialog and xdg-activation.
 
 Layer-shell, idle-inhibit and keyboard-shortcuts-inhibit can wait.
@@ -366,3 +365,22 @@ Add these alongside the phases above:
   modal hint; X11 windows continue to use `_NET_WM_STATE_MODAL`. Dialog chrome
   and taskbar grouping remain based on the parent relationship.
 - **Theme.** Chrome and apps follow the viewer's light or dark preference.
+- **Clipboard persistence.** When the app that owns the clipboard exits, the
+  compositor keeps serving its plain text: at most 1 MiB of UTF-8, the viewer
+  sync limit. It offers that text as `text/plain;charset=utf-8` and
+  `text/plain` to Wayland clients and as `UTF8_STRING`, `TEXT` and `STRING` to
+  X11 clients. Other types, such as HTML, images and file lists, end with their
+  owner, and a clipboard without kept text becomes empty. The next copy or
+  viewer write replaces the kept text. A Wayland client that clears the
+  selection clears it. X11 cannot tell an explicit release from an exit, so an
+  X11 release keeps the text.
+- **Primary selection.** Wayland clients get primary-selection v1, bridged both
+  ways to X11 `PRIMARY`. It stays on the desktop: it is never sent to or set
+  from the viewer, because browsers have no primary-selection API and syncing
+  each text selection would overwrite the viewer's clipboard. Like X11, it ends
+  when its owner exits.
+- **`STRING`.** X11 `STRING` is ISO 8859-1. The compositor converts it to and
+  from the owner's UTF-8 text, and characters outside ISO 8859-1 become `?`.
+  Conversions and viewer reads are capped at 1 MiB and three seconds, and each
+  dropped transfer is logged as a warning. Transfers between apps that share a
+  type pass through unchanged and uncapped.
