@@ -743,6 +743,76 @@ mod tests {
         assert_eq!(pointer.current_location(), (1919.0, 0.0).into());
     }
 
+    /// Sends `keys` as presses from a keyboard on a real EI connection.
+    fn ei_key_presses(stream: UnixStream, keys: &'static [u32]) -> std::io::Result<()> {
+        use smithay::reexports::reis::PendingRequestResult;
+        use smithay::reexports::reis::ei;
+        use smithay::reexports::reis::event::DeviceCapability;
+        use smithay::reexports::reis::event::EiEvent;
+        use smithay::reexports::reis::event::EiEventConverter;
+        use smithay::reexports::reis::handshake::ei_handshake_blocking;
+
+        let context = ei::Context::new(stream)?;
+        let handshake =
+            ei_handshake_blocking(&context, "key test", ei::handshake::ContextType::Sender)
+                .map_err(std::io::Error::other)?;
+        let mut converter = EiEventConverter::new(&context, handshake);
+        loop {
+            // The socket is nonblocking: zero bytes means nothing to read yet.
+            match context.read() {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            while let Some(PendingRequestResult::Request(event)) = context.pending_event() {
+                converter
+                    .handle_event(event)
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            }
+            while let Some(event) = converter.next_event() {
+                if let EiEvent::SeatAdded(added) = &event {
+                    added
+                        .seat
+                        .bind_capabilities(DeviceCapability::Keyboard.into());
+                } else if let EiEvent::DeviceResumed(resumed) = &event
+                    && let Some(keyboard) = resumed.device.interface::<ei::Keyboard>()
+                {
+                    let device = resumed.device.device();
+                    device.start_emulating(resumed.serial, 1);
+                    for &key in keys {
+                        keyboard.key(key, ei::keyboard::KeyState::Press);
+                        device.frame(resumed.serial, 1);
+                    }
+                }
+            }
+            context.flush().map_err(std::io::Error::from)?;
+        }
+    }
+
+    #[test]
+    fn ei_keys_beyond_the_evdev_range_are_dropped() {
+        let mut event_loop =
+            smithay::reexports::calloop::EventLoop::<State>::try_new().expect("event loop");
+        let (_display, mut state) = crate::tests::test_state();
+        let (client, server) = connect_to_eis(&event_loop.handle(), "us").expect("connect to EIS");
+        // u32::MAX is the largest code an EI sender can send; 30 is KEY_A.
+        let sender = std::thread::spawn(move || {
+            ei_key_presses(UnixStream::from(client), &[u32::MAX, 0x300, 30])
+        });
+        let keyboard = state.seat.get_keyboard().expect("keyboard");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !keyboard.pressed_keys().contains(&38u32.into()) {
+            assert!(std::time::Instant::now() < deadline, "KEY_A never arrived");
+            event_loop
+                .dispatch(std::time::Duration::from_millis(10), &mut state)
+                .expect("dispatch EIS");
+        }
+        assert_eq!(keyboard.pressed_keys(), [38u32.into()].into());
+        shut_down(&server);
+        sender.join().expect("EI sender").expect("EI connection");
+    }
+
     #[test]
     fn keyboard_input_maps_keysyms_and_obeys_lease() {
         let (_display, mut state) = crate::tests::test_state();

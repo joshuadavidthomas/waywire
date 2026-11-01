@@ -298,8 +298,7 @@ Remaining:
   text-input-v3. The X11 pool is limited to keycodes at or below 255. X11
   clients that have not consumed earlier keyboard events may decode them using
   a newer mapping after a spare keycode is reused.
-- **Low:** Japanese and Korean keys are missing from the key map. The EI
-  keycode subtraction can underflow.
+- **Low:** Japanese and Korean keys are missing from the key map.
 
 ## 6. Parity and missing protocols
 

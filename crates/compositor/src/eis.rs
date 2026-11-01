@@ -25,6 +25,9 @@ use smithay::reexports::reis::eis;
 
 use crate::State;
 
+/// The highest evdev key code (`KEY_MAX` in linux/input-event-codes.h).
+const KEY_MAX: u32 = 0x2ff;
+
 // Keep the adapter's lifecycle and event dispatch together. EI scale is f32,
 // and its discrete scroll is an i32 exposed as f64 by the generic input trait.
 #[allow(
@@ -117,17 +120,14 @@ pub(crate) fn serve_connection(
                         let source = *sources
                             .entry(event.device().id())
                             .or_insert_with(KeyboardSource::new_auxiliary);
-                        // Smithay's adapter converts evdev to XKB; our shared entry point accepts evdev.
-                        // Evdev key codes below KEY_ESC (9) are not key events;
-                        // subtracting the 8-code XKB offset would underflow.
-                        let Some(key) = u32::from(event.key_code()).checked_sub(8) else {
-                            tracing::debug!(
-                                key_code = u32::from(event.key_code()),
-                                "dropped EI key code below the evdev key range"
-                            );
+                        // EI sends evdev codes, which the shared entry point takes.
+                        // Smithay's `key_code()` adds the XKB offset without
+                        // overflow checks, so read the code as sent.
+                        if event.key > KEY_MAX {
+                            tracing::debug!(key = event.key, "dropped EI key code above KEY_MAX");
                             return;
-                        };
-                        state.keyboard_key(source, key, event.state());
+                        }
+                        state.keyboard_key(source, event.key, event.state());
                     }
                     InputEvent::PointerButton { event } => {
                         let source = *sources
