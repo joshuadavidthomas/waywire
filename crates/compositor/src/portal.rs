@@ -59,6 +59,8 @@ const PORTAL_INTERFACES: &str = "org.freedesktop.impl.portal.RemoteDesktop;org.f
 pub(crate) enum PortalRequest {
     RegisterSource {
         source: KeyboardSource,
+        /// The process that opened the session.
+        owner: Option<u32>,
     },
     DisconnectSource {
         source: KeyboardSource,
@@ -84,6 +86,7 @@ pub(crate) enum PortalRequest {
     },
     /// Hand out a new EI connection for a `ConnectToEIS` call.
     ConnectToEis {
+        owner: Option<u32>,
         reply: oneshot::Sender<std::io::Result<(OwnedFd, std::os::unix::net::UnixStream)>>,
     },
     /// Copy the rendered frame into a PNG file; the reply is its path.
@@ -260,7 +263,13 @@ pub(crate) fn start(
     let loop_handle = handle.clone();
     if let Err(error) = handle.insert_source(incoming, move |request, (), state| match request {
         Event::Msg(request) => match request {
-            PortalRequest::RegisterSource { source } => state.register_agent_source(source),
+            PortalRequest::RegisterSource { source, owner } => {
+                state.delivery.describe(
+                    source,
+                    crate::delivery::SourceInfo::new(crate::delivery::SourceKind::Portal, owner),
+                );
+                state.register_agent_source(source);
+            }
             PortalRequest::DisconnectSource { source } => state.disconnect_input_source(source),
             PortalRequest::Input(input) => {
                 if let Err(error) = remote_desktop::apply_portal_input(state, input) {
@@ -301,9 +310,9 @@ pub(crate) fn start(
                     streams.close(&session);
                 }
             }
-            PortalRequest::ConnectToEis { reply } => {
+            PortalRequest::ConnectToEis { reply, owner } => {
                 if let Err(error) =
-                    reply.send(remote_desktop::connect_to_eis(&loop_handle, &layout))
+                    reply.send(remote_desktop::connect_to_eis(&loop_handle, &layout, owner))
                 {
                     tracing::debug!(?error, "portal requester hung up");
                 }

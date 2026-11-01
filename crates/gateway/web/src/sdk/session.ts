@@ -111,12 +111,23 @@ export interface QualityEvent {
   readonly scalePercent: number;
 }
 
+/** Where one of this viewer's input events went on the remote desktop. */
+export interface InputReceiptEvent {
+  readonly sequence: number;
+  readonly delivery: "window" | "compositor" | "nowhere" | "dropped";
+  /** The window's ext-foreign-toplevel-list identifier, or "". */
+  readonly windowId: string;
+  readonly appId: string;
+  readonly title: string;
+}
+
 export interface WaywireEventMap {
   readonly state: WaywireSessionState;
   readonly stats: WaywireStats;
   readonly clipboard: ClipboardUpdateEvent;
   readonly resize: ResizeEvent;
   readonly quality: QualityEvent;
+  readonly receipt: InputReceiptEvent;
   readonly error: Error;
 }
 

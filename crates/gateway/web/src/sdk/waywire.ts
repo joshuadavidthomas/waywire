@@ -4,6 +4,7 @@ export {
   type ClipboardController,
   type ClipboardUpdateEvent,
   type InputController,
+  type InputReceiptEvent,
   type InputState,
   type QualityEvent,
   type QualityPreset,

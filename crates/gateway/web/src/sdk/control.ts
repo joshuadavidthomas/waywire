@@ -969,6 +969,10 @@ export class ControlRuntime {
             message.text,
             message.type === "clipboard-snapshot",
           );
+        if (message.type === "input-receipt") {
+          const { type: _type, ...receipt } = message;
+          this.emit("receipt", Object.freeze(receipt));
+        }
         if (message.type === "agent-input") {
           this.owner.updateState("agent", {
             connected: message.connected,

@@ -625,7 +625,9 @@ impl XwmHandler for State {
         _: Option<X11Surface>,
     ) {
         if let Some(window) = self.x11_window(&surface) {
-            self.focus_window(Some(window));
+            self.with_focus_cause(crate::delivery::FocusCause::WindowRequest, |state| {
+                state.focus_window(Some(window));
+            });
         }
     }
 

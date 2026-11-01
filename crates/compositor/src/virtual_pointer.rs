@@ -19,11 +19,13 @@ use smithay::backend::input::PointerMotionEvent;
 use smithay::input::keyboard::KeyboardSource;
 use smithay::input::pointer::AxisFrame;
 use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::virtual_pointer::VirtualPointerBackend;
 use smithay::wayland::virtual_pointer::VirtualPointerHandler;
 use smithay::wayland::virtual_pointer::VirtualPointerManagerState;
 
 use crate::State;
+use crate::delivery::SourceKind;
 
 /// Register the virtual pointer manager global.
 pub(crate) fn install(display_handle: &DisplayHandle) {
@@ -40,6 +42,8 @@ impl VirtualPointerHandler for State {
                 // held buttons are tracked and released independently of other
                 // input sources.
                 let source = KeyboardSource::new_auxiliary();
+                let client = device.wl_seat().and_then(Resource::client);
+                self.describe_client_source(source, SourceKind::VirtualPointer, client);
                 self.virtual_pointers.insert(device, source);
                 self.register_agent_source(source);
             }

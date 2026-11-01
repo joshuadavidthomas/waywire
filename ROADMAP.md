@@ -276,15 +276,40 @@ measured cost behind it.
 
 Backed, most important first:
 
-1. **Input delivery receipts and focus events.**
+1. **Input delivery receipts and focus events.** Done; see
+   [`docs/input-delivery.md`](docs/input-delivery.md).
    - **Measured cost.** A dialog that opened mid-task swallowed typed input in 16 of 24 runs,
      on every desktop and every pixel driver, while every call reported success. One run
      submitted a corrupted phone number.
-   - **What to build.** The compositor knows which surface received each key and button
-     event, and when keyboard focus moves to a newly mapped window. Report both to the agent,
-     per input and as events.
-   - **Why it wins.** None of the compared desktops or drivers offers this, so it is the item
-     that would make waywire clearly better than X11 desktops, not just level with them.
+   - **What shipped.** The compositor serves `InputDelivery1` on the session bus it gives
+     its applications. Every key, button, scroll and text commit from the portal, EIS, XTest,
+     virtual-keyboard and virtual-pointer gets a receipt that names its source and its result:
+     a window, given by its foreign-toplevel id, app id, title and pid; compositor chrome;
+     nowhere; or dropped during a takeover. It also gets the focused window's text-field
+     state from text-input-v3. `FocusChanged`, `WindowMapped` and `TextFieldChanged` events
+     carry a cause such as `new-window`, `new-dialog`, `activation`, `click` or
+     `window-request`. Viewer input gets the same receipt over the control channel.
+   - **Proof.** `tools/receipts/receipts.py` prints receipts and events.
+     `just acceptance receipts-t6a` replays T6a with cua-driver 0.38.0. With the page
+     `alert()`, the phone keys land in the form while it reports no focused text field.
+     With a `window.open` popup, the focus event names the popup by id and the keys land in
+     it. The scenario fails without receipts, with a wrong text-field state, and without
+     focus events. A computer-use-linux patch, kept outside the repository, fails
+     `type_text` and `press_key` when their receipts disagree with the agent's target.
+   - **What remains.**
+     - A browser `alert()` or another in-window dialog moves no surface focus. Receipts
+       show it only as the text field turning `none`. AT-SPI focus events are the
+       complement.
+     - The text-field state is a hint. X11 clients and Chromium with
+       `--wayland-text-input-version=1` report `unknown`. Qt 6 stays `focused` after focus
+       moves to a button.
+     - There is no title-change event. Chromium maps a `window.open` popup as
+       `about:blank` and renames it afterwards; consumers join by id or read the title from
+       later receipts or foreign-toplevel.
+     - Xwayland does not say which X client used XTest, so XTest receipts go to every
+       subscriber.
+     - The driver patch has not been offered upstream, and no other compositor implements
+       the interface yet.
 2. **A window query with stable ids, geometry, stacking, pid and focus.**
    - **Measured cost.** On waywire no tool gives screen-space window bounds: foreign-toplevel
      has none, and cua and agent-desktop report AT-SPI window-relative bounds as screen
@@ -525,3 +550,38 @@ the review are in place. Remaining gaps:
   one path, which restores a minimized window or raises and focuses it.
   Launched apps never inherit `XDG_ACTIVATION_TOKEN` or `DESKTOP_STARTUP_ID`
   from the compositor's environment.
+- **Input delivery transport.** Receipts and focus events are a D-Bus
+  interface, `io.github.joshuadavidthomas.waywire.InputDelivery1`, on the
+  session bus the compositor gives its applications. cua-driver and
+  computer-use-linux already connect to that bus for AT-SPI and the portal,
+  and they already depend on zbus, so a driver adds one match rule and two
+  calls. `GetFocus` replies only after every signal for earlier input, so a
+  driver can use it as a barrier instead of a sleep. Rejected alternatives:
+  - A Wayland protocol extension. Drivers inject input through EIS,
+    the portal or XTest and often hold no Wayland connection. XTest drivers
+    run as X11 clients, and the protocol would need its own generator and
+    review before any driver could use it.
+  - The gateway's control channel. Only the browser viewer reaches it.
+    Viewer receipts use it; on-box drivers would need the gateway's port
+    and the viewer's authentication.
+  - A network endpoint. Pass 2 keeps the endpoint for later, and every
+    measured run was on the box.
+  - Extending the portal. The RemoteDesktop portal is a standard interface,
+    and its backends live in each desktop. A private extension to it would
+    work only with waywire's backend.
+- **Input delivery privacy.** A receipt reveals when a process sent each
+  key and where it went, so the compositor sends it only to the input's
+  owner: a subscriber whose process created the input source, or is one of
+  its ancestors (the compositor records `/proc` ancestry when the source
+  connects; for the portal, the source is the process that created the
+  session). This lets a driver run a typing helper such as wtype and still
+  see its receipts. XTest receipts go to every subscriber, because Xwayland
+  does not identify the X client that used XTest, and every X client can
+  already watch XTest input through XInput 2 raw events. Viewer receipts go
+  only to the viewer that sent the input, over the control channel, never on
+  the bus. Focus, window and text-field events go to every subscriber,
+  because foreign-toplevel and the screen already show every client the same
+  facts. A focus event names the receipt that caused it only for the owner
+  of that input. Receipts never carry key codes, text or coordinates. Like
+  the data-control decision, this assumes one trusted user per session; a
+  sandboxed client under security-context-v1 should not reach the bus.

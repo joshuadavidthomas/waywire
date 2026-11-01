@@ -1,0 +1,43 @@
+<!doctype html>
+<title>Registration form</title>
+<!-- The dogfood run's T6a form. Focusing Phone opens a surprise dialog 300 ms
+     later: a page alert() by default, a popup window with ?interrupt=window,
+     or nothing with ?interrupt=none. -->
+<style>
+  body {
+    font: 18px sans-serif;
+    margin: 24px;
+  }
+  label {
+    display: block;
+    margin: 10px 0 2px;
+  }
+  input {
+    font-size: 18px;
+    width: 360px;
+  }
+</style>
+<h1>Registration</h1>
+<label for="name">Full name</label
+><input id="name" autocomplete="off" autofocus />
+<label for="email">Email</label><input id="email" autocomplete="off" />
+<label for="phone">Phone</label><input id="phone" autocomplete="off" />
+<script>
+  const mode = new URLSearchParams(location.search).get("interrupt");
+  let fired = false;
+  document.getElementById("phone").addEventListener("focus", () => {
+    if (fired || mode === "none") return;
+    fired = true;
+    setTimeout(() => {
+      if (mode !== "window") {
+        alert("Session expiring soon. Click OK to continue.");
+        return;
+      }
+      const popup = window.open("", "expiring", "popup,width=420,height=160");
+      popup.document.title = "Session expiring";
+      popup.document.body.innerHTML =
+        "<p>Session expiring soon.</p><button>OK</button>";
+      popup.document.querySelector("button").focus();
+    }, 300);
+  });
+</script>

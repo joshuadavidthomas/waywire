@@ -72,7 +72,9 @@ impl ClientEventAudience for ClientEvent {
         match self {
             ClientEvent::Clipboard { .. }
             | ClientEvent::ClipboardSnapshot { .. }
-            | ClientEvent::ResetVideoRefused { .. } => Audience::InputOwner,
+            | ClientEvent::ResetVideoRefused { .. }
+            // Receipts describe the input owner's own keys and clicks.
+            | ClientEvent::InputReceipt { .. } => Audience::InputOwner,
             ClientEvent::Cursor(_)
             | ClientEvent::ResizeApplied(_)
             | ClientEvent::VideoConfig { .. }

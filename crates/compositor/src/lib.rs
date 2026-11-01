@@ -5,6 +5,7 @@ mod capture;
 mod clipboard;
 mod cursor;
 mod decorations;
+mod delivery;
 mod dnd;
 mod eis;
 mod event_writer;
@@ -322,6 +323,7 @@ pub(crate) struct State {
     /// daemon is reachable.
     screencast: Option<pipewire::Streams>,
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
+    pub(crate) delivery: delivery::Delivery,
     clipboard: clipboard::Clipboard,
     windows: HashMap<Window, grabs::WindowState>,
     pins: Vec<Pin>,
@@ -334,7 +336,8 @@ pub(crate) struct State {
     window_menu: Option<decorations::WindowMenu>,
     taskbar: decorations::Taskbar,
     clock: String,
-    menu_button: Option<(KeyboardSource, u32)>,
+    /// A press the compositor consumed, so its release is consumed too.
+    menu_button: Option<(KeyboardSource, u32, delivery::Chrome)>,
     menu_escape: Option<KeyboardSource>,
     last_titlebar_press: Option<TitlebarPress>,
     pending_restore_drag: Option<TitlebarPress>,
@@ -489,6 +492,7 @@ impl State {
             screencopy,
             screencast: None,
             toplevel_list,
+            delivery: delivery::Delivery::default(),
             clipboard,
             windows: HashMap::new(),
             pins: options
@@ -840,6 +844,7 @@ impl State {
     /// it as connected.
     pub(crate) fn disconnect_input_source(&mut self, source: KeyboardSource) {
         self.release_input(source);
+        self.delivery.forget(source);
         self.dropped_agent_sources.remove(&source);
         if self.agent_sources.remove(&source) {
             self.publish_agent_input();
@@ -902,22 +907,60 @@ impl State {
     }
 
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
+        let serial = self.begin_input(source, delivery::FocusCause::Key);
+        let (target, text_field) = self.dispatch_key(source, key, state);
+        let input = delivery::InputKind::Key {
+            pressed: state == KeyState::Pressed,
+        };
+        self.finish_input(source, serial, input, &target, text_field);
+    }
+
+    /// Route one key and say where it went.
+    fn dispatch_key(
+        &mut self,
+        source: KeyboardSource,
+        key: u32,
+        state: KeyState,
+    ) -> (delivery::Target, Option<delivery::TextField>) {
+        use delivery::Chrome;
+        use delivery::Target;
         if !self.accepts_input(source) {
-            return;
+            return (Target::Dropped, None);
         }
-        if key == 1 && state == KeyState::Pressed && self.window_menu.take().is_some() {
+        if key == 1
+            && state == KeyState::Pressed
+            && let Some(menu) = self.window_menu.take()
+        {
             self.menu_escape = Some(source);
             self.dirty = true;
             self.refresh_pointer_focus();
-            return;
+            return (
+                Target::Compositor {
+                    window: Some(menu.window),
+                    chrome: Chrome::WindowMenu,
+                },
+                None,
+            );
         }
         if key == 1 && state == KeyState::Released && self.menu_escape == Some(source) {
             self.menu_escape = None;
-            return;
+            return (
+                Target::Compositor {
+                    window: None,
+                    chrome: Chrome::WindowMenu,
+                },
+                None,
+            );
         }
         if key == 50 && state == KeyState::Released && self.restore_key_source == Some(source) {
             self.restore_key_source = None;
-            return;
+            return (
+                Target::Compositor {
+                    window: None,
+                    chrome: Chrome::Shortcut,
+                },
+                None,
+            );
         }
         if key == 50
             && state == KeyState::Pressed
@@ -927,14 +970,26 @@ impl State {
             })
         {
             self.restore_key_source = Some(source);
-            if let Some(window) = self.minimized_order.last().cloned() {
-                self.window_action(&window, WindowAction::Restore);
+            let window = self.minimized_order.last().cloned();
+            if let Some(window) = &window {
+                self.window_action(window, WindowAction::Restore);
             }
-            return;
+            return (
+                Target::Compositor {
+                    window,
+                    chrome: Chrome::Shortcut,
+                },
+                None,
+            );
         }
         if state == KeyState::Pressed {
             self.reclaim_text_keycode(key + 8);
         }
+        let (target, text_field) = if self.delivery.wanted(source) {
+            self.keyboard_target()
+        } else {
+            (Target::Nowhere, delivery::TextField::Unknown)
+        };
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.input_from_source::<(), _>(
                 source,
@@ -949,6 +1004,7 @@ impl State {
                 self.flush_text_keyboard();
             }
         }
+        (target, Some(text_field))
     }
 
     /// Apply a virtual keyboard's modifier state through the same gate as its
@@ -1168,39 +1224,59 @@ impl State {
         button: u32,
         state: ButtonState,
     ) {
-        if !self.accepts_input(source) {
-            return;
-        }
-        if source != KeyboardSource::MAIN
-            && state == ButtonState::Pressed
-            && let Some(pointer) = self.seat.get_pointer()
-        {
-            let location = pointer.current_location();
-            let scale = self.output.current_scale().fractional_scale();
-            self.emit(Event::CursorClick(pipe::CursorPosition {
-                x: normalized_coordinate(location.x * scale, self.size.width()),
-                y: normalized_coordinate(location.y * scale, self.size.height()),
-                source: pipe::CursorSource::Agent,
-            }));
-        }
-        self.pointer_button_inner(source, button, state);
+        let serial = self.begin_input(source, delivery::FocusCause::Click);
+        let target = if self.accepts_input(source) {
+            if source != KeyboardSource::MAIN
+                && state == ButtonState::Pressed
+                && let Some(pointer) = self.seat.get_pointer()
+            {
+                let location = pointer.current_location();
+                let scale = self.output.current_scale().fractional_scale();
+                self.emit(Event::CursorClick(pipe::CursorPosition {
+                    x: normalized_coordinate(location.x * scale, self.size.width()),
+                    y: normalized_coordinate(location.y * scale, self.size.height()),
+                    source: pipe::CursorSource::Agent,
+                }));
+            }
+            self.pointer_button_inner(source, button, state)
+        } else {
+            delivery::Target::Dropped
+        };
+        let input = delivery::InputKind::Button {
+            button,
+            pressed: state == ButtonState::Pressed,
+        };
+        self.finish_input(source, serial, input, &target, None);
     }
 
     pub(crate) fn pointer_axis(&mut self, source: KeyboardSource, frame: AxisFrame) {
-        if !self.accepts_input(source) {
-            return;
-        }
-        if let Some(pointer) = self.seat.get_pointer() {
-            pointer.axis(self, frame);
-            pointer.frame(self);
-        }
+        let serial = self.begin_input(source, delivery::FocusCause::Other);
+        let target = if self.accepts_input(source) {
+            let target = self.pointer_target();
+            if let Some(pointer) = self.seat.get_pointer() {
+                pointer.axis(self, frame);
+                pointer.frame(self);
+            }
+            target
+        } else {
+            delivery::Target::Dropped
+        };
+        self.finish_input(source, serial, delivery::InputKind::Scroll, &target, None);
     }
 
+    /// Route one button event and say where it went.
     #[expect(
         clippy::too_many_lines,
         reason = "pointer dispatch keeps button ownership together"
     )]
-    fn pointer_button_inner(&mut self, source: KeyboardSource, button: u32, state: ButtonState) {
+    fn pointer_button_inner(
+        &mut self,
+        source: KeyboardSource,
+        button: u32,
+        state: ButtonState,
+    ) -> delivery::Target {
+        use delivery::Chrome;
+        use delivery::Target;
         if button == 0x110
             && state == ButtonState::Released
             && self
@@ -1233,15 +1309,23 @@ impl State {
             {
                 self.decoration_press = None;
             }
-            return;
+            // Another source holds the same button, so no event is sent.
+            return Target::Nowhere;
         }
         let Some(pointer) = self.seat.get_pointer() else {
-            return;
+            return Target::Nowhere;
         };
         let serial = SERIAL_COUNTER.next_serial();
-        if state == ButtonState::Released && self.menu_button == Some((source, button)) {
+        if state == ButtonState::Released
+            && let Some((owner, held, chrome)) = self.menu_button
+            && owner == source
+            && held == button
+        {
             self.menu_button = None;
-            return;
+            return Target::Compositor {
+                window: None,
+                chrome,
+            };
         }
         if let Some(menu) = self.window_menu.as_ref() {
             if state == ButtonState::Pressed {
@@ -1268,14 +1352,24 @@ impl State {
                         );
                         self.window_action(&window, action);
                         pointer.frame(self);
-                        return;
+                        return Target::Compositor {
+                            window: Some(window),
+                            chrome: Chrome::WindowMenu,
+                        };
                     }
                     self.window_action(&window, action);
                 }
-                self.menu_button = Some((source, button));
+                self.menu_button = Some((source, button, Chrome::WindowMenu));
                 self.refresh_pointer_focus();
+                return Target::Compositor {
+                    window: Some(window),
+                    chrome: Chrome::WindowMenu,
+                };
             }
-            return;
+            return Target::Compositor {
+                window: None,
+                chrome: Chrome::WindowMenu,
+            };
         }
         if state == ButtonState::Pressed && button == 0x110 && !pointer.is_grabbed() {
             let position = pointer.current_location();
@@ -1298,13 +1392,17 @@ impl State {
                     } else {
                         WindowAction::Focus
                     };
-                    if let Some(window) = &chip.window {
+                    let window = chip.window.clone();
+                    if let Some(window) = &window {
                         self.window_action(window, action);
                     } else if let Some(pin) = chip.pin {
                         self.launch_pin(pin);
                     }
-                    self.menu_button = Some((source, button));
-                    return;
+                    self.menu_button = Some((source, button, Chrome::Taskbar));
+                    return Target::Compositor {
+                        window,
+                        chrome: Chrome::Taskbar,
+                    };
                 }
             }
         }
@@ -1315,8 +1413,11 @@ impl State {
                 self.decoration_under(pointer.current_location())
         {
             self.window_action(&window, WindowAction::ShowMenu);
-            self.menu_button = Some((source, button));
-            return;
+            self.menu_button = Some((source, button, Chrome::Titlebar));
+            return Target::Compositor {
+                window: Some(window),
+                chrome: Chrome::Titlebar,
+            };
         }
         if state == ButtonState::Pressed
             && button == 0x110
@@ -1333,9 +1434,12 @@ impl State {
                     time: InputTime::now(),
                 },
             );
-            self.press_decoration(source, window, action);
+            self.press_decoration(source, window.clone(), action);
             pointer.frame(self);
-            return;
+            return Target::Compositor {
+                window: Some(window),
+                chrome: Chrome::Titlebar,
+            };
         }
         if state == ButtonState::Pressed
             && !pointer.is_grabbed()
@@ -1348,6 +1452,16 @@ impl State {
         if state == ButtonState::Released {
             self.refresh_drag_target();
         }
+        let target = match &self.decoration_press {
+            Some((owner, window)) if *owner == source && state == ButtonState::Released => {
+                Target::Compositor {
+                    window: Some(window.clone()),
+                    chrome: Chrome::Titlebar,
+                }
+            }
+            _ if self.delivery.wanted(source) => self.pointer_target(),
+            _ => Target::Nowhere,
+        };
         pointer.button(
             self,
             &ButtonEvent {
@@ -1370,6 +1484,7 @@ impl State {
         {
             self.window_action(&window, WindowAction::Close);
         }
+        target
     }
 
     fn press_decoration(
@@ -1476,7 +1591,10 @@ impl State {
                         .get_keyboard()
                         .and_then(|keyboard| keyboard.current_focus());
                     if focused == focus::KeyboardFocus::window(window) {
-                        self.focus_window(self.topmost_focusable(Some(window)));
+                        let next = self.topmost_focusable(Some(window));
+                        self.with_focus_cause(delivery::FocusCause::Minimized, |state| {
+                            state.focus_window(next);
+                        });
                     }
                     self.refresh_toplevel_states();
                     self.refresh_pointer_focus();
@@ -2028,6 +2146,17 @@ impl State {
                 }
             }
             Command::Text(p) => {
+                if matches!(p.action, pipe::TextAction::Commit) {
+                    let serial = self.begin_input(source, delivery::FocusCause::Key);
+                    let (target, text_field) = self.keyboard_target();
+                    self.finish_input(
+                        source,
+                        serial,
+                        delivery::InputKind::Text,
+                        &target,
+                        Some(text_field),
+                    );
+                }
                 let cursor = i32::try_from(p.text.as_str().len())?;
                 let text_input = self.seat.text_input();
                 let mut active = false;
@@ -2122,7 +2251,10 @@ impl State {
             .and_then(|keyboard| keyboard.current_focus())
             .is_some_and(|focus| !smithay::utils::IsAlive::alive(&focus))
         {
-            self.focus_window(self.topmost_focusable(None));
+            let next = self.topmost_focusable(None);
+            self.with_focus_cause(delivery::FocusCause::WindowClosed, |state| {
+                state.focus_window(next);
+            });
         }
         let elements = self.scene_elements(renderer);
         let forced = self.dirty || self.acknowledged != Some(self.generation);
@@ -2442,6 +2574,12 @@ pub fn run(mut options: Config) -> Result<()> {
                 .into(),
         )?,
     ));
+    if let Some(bus) = &bus {
+        match crate::delivery::start(&handle, bus.address()) {
+            Ok(outgoing) => state.delivery.set_outgoing(outgoing),
+            Err(error) => tracing::error!(%error, "input delivery D-Bus service failed to start"),
+        }
+    }
     let portal_dirs = match &bus {
         Some(bus) => crate::portal::start(
             &handle,

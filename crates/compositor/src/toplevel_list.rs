@@ -64,6 +64,13 @@ impl ToplevelList {
         self.foreign.publish(window, title, app_id, states);
     }
 
+    /// The window's ext-foreign-toplevel-list identifier, once announced.
+    pub(crate) fn identifier(&self, window: &Window) -> Option<String> {
+        self.handles
+            .get(window)
+            .map(ForeignToplevelHandle::identifier)
+    }
+
     /// Refresh an announced window's title and app id, sending `done` only
     /// when one of them changed.
     pub(crate) fn update(&mut self, window: &Window) {
@@ -226,6 +233,10 @@ mod tests {
     use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{
         self as relative,
     };
+    use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+    use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ContentHint;
+    use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ContentPurpose;
+    use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
     use wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::XdgActivationTokenV1;
     use wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::{
         self as activation_token,
@@ -294,6 +305,7 @@ mod tests {
         activation_token: Option<String>,
         dialogs: Option<XdgWmDialogV1>,
         configured_size: Option<(i32, i32)>,
+        text_inputs: Option<ZwpTextInputManagerV3>,
     }
 
     /// Drag-and-drop events seen by a source or target client.
@@ -382,9 +394,36 @@ mod tests {
                     "xdg_wm_dialog_v1" => {
                         state.dialogs = Some(registry.bind(name, 1, qh, ()));
                     }
+                    "zwp_text_input_manager_v3" => {
+                        state.text_inputs = Some(registry.bind(name, 1, qh, ()));
+                    }
                     _ => {}
                 }
             }
+        }
+    }
+
+    impl Dispatch<ZwpTextInputManagerV3, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &ZwpTextInputManagerV3,
+            _: wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<ZwpTextInputV3, ()> for App {
+        fn event(
+            _: &mut Self,
+            _: &ZwpTextInputV3,
+            _: wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
         }
     }
 
@@ -4236,5 +4275,404 @@ mod tests {
 
         state.focus_window(Some(target_window.clone()));
         assert!(!urgent(&state, &target_window), "focus clears attention");
+    }
+
+    /// Subscribe an agent that owns `source` and an observer that owns no
+    /// input, and return what each receives.
+    fn delivery_subscribers(
+        state: &mut crate::State,
+        source: KeyboardSource,
+    ) -> std::sync::mpsc::Receiver<crate::delivery::Message> {
+        use crate::delivery::SourceInfo;
+        use crate::delivery::SourceKind;
+        let (outgoing, received) = std::sync::mpsc::channel();
+        state.delivery.set_outgoing(outgoing);
+        let agent = std::process::id();
+        state.delivery.describe(
+            source,
+            SourceInfo::new(SourceKind::VirtualKeyboard, Some(agent)),
+        );
+        state.delivery.subscribe("agent".into(), Some(agent));
+        state.delivery.subscribe("observer".into(), None);
+        received
+    }
+
+    /// Signals sent to `name` since the last call.
+    fn sent(
+        received: &std::sync::mpsc::Receiver<crate::delivery::Message>,
+    ) -> Vec<crate::delivery::Outgoing> {
+        received
+            .try_iter()
+            .filter_map(|message| match message {
+                crate::delivery::Message::Send(outgoing) => Some(outgoing),
+                crate::delivery::Message::Flush(after) => {
+                    after();
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn delivered(
+        received: &std::sync::mpsc::Receiver<crate::delivery::Message>,
+        name: &str,
+    ) -> Vec<crate::delivery::Signal> {
+        sent(received)
+            .into_iter()
+            .filter(|message| message.to.iter().any(|to| to == name))
+            .map(|message| message.signal)
+            .collect()
+    }
+
+    fn receipts(signals: &[crate::delivery::Signal]) -> Vec<crate::delivery::Receipt> {
+        signals
+            .iter()
+            .filter_map(|signal| match signal {
+                crate::delivery::Signal::Receipt(receipt) => Some(receipt.clone()),
+                crate::delivery::Signal::Notice(_) => None,
+            })
+            .collect()
+    }
+
+    fn press(state: &mut crate::State, source: KeyboardSource) {
+        state.keyboard_key(source, 30, smithay::backend::input::KeyState::Pressed);
+        state.keyboard_key(source, 30, smithay::backend::input::KeyState::Released);
+    }
+
+    #[test]
+    fn agent_key_receipts_name_the_window_dropped_and_nowhere_only_to_their_owner() {
+        use crate::delivery::InputKind;
+        use crate::delivery::SourceKind;
+        use crate::delivery::TextField;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let source = KeyboardSource::new_auxiliary();
+        let received = delivery_subscribers(&mut state, source);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Registration form",
+            "chromium",
+        );
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let identifier = app.handles[0].identifier.clone();
+        assert!(!identifier.is_empty(), "foreign-toplevel identifier");
+
+        press(&mut state, source);
+        let signals = delivered(&received, "agent");
+        let receipts = receipts(&signals);
+        assert_eq!(receipts.len(), 2, "one receipt per key event");
+        let down = &receipts[0];
+        assert_eq!(down.source, SourceKind::VirtualKeyboard);
+        assert_eq!(down.source_pid, Some(std::process::id()));
+        assert_eq!(down.input, InputKind::Key { pressed: true });
+        assert_eq!(down.delivery, "window");
+        let window = down.window.clone().expect("receiving window");
+        assert_eq!(window.id, identifier, "the id lswt and lswt-like tools see");
+        assert_eq!(window.title, "Registration form");
+        assert_eq!(window.app_id, "chromium");
+        assert_eq!(window.pid, Some(std::process::id()));
+        assert_eq!(down.text_field, Some(TextField::Unknown));
+        assert!(receipts[1].serial > down.serial);
+        assert!(
+            self::receipts(&delivered(&received, "observer")).is_empty(),
+            "another client's keys stay private"
+        );
+
+        state.set_browser_lease(true);
+        press(&mut state, source);
+        let dropped = self::receipts(&delivered(&received, "agent"));
+        assert_eq!(
+            dropped.iter().map(|r| r.delivery).collect::<Vec<_>>(),
+            ["dropped", "dropped"]
+        );
+        assert_eq!(dropped[0].window, None);
+
+        state.set_browser_lease(false);
+        state.focus_window(None);
+        press(&mut state, source);
+        let nowhere = self::receipts(&delivered(&received, "agent"));
+        assert_eq!(
+            nowhere.iter().map(|r| r.delivery).collect::<Vec<_>>(),
+            ["nowhere", "nowhere"]
+        );
+    }
+
+    #[test]
+    fn a_dialog_that_maps_between_keys_is_announced_and_takes_the_next_keys() {
+        use crate::delivery::FocusCause;
+        use crate::delivery::Notice;
+        use crate::delivery::Signal;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let source = KeyboardSource::new_auxiliary();
+        let (_, _, form) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Registration form",
+            "chromium",
+        );
+        let received = delivery_subscribers(&mut state, source);
+        press(&mut state, source);
+        let before = receipts(&delivered(&received, "agent"));
+        let form_id = before[0].window.clone().expect("form").id;
+
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let dialog = xdg.get_toplevel(&qh, ());
+        dialog.set_parent(Some(&form));
+        dialog.set_title("Session expiring".into());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("configure"));
+        attach_buffer(&surface, &app, &qh, 1);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let sent = sent(&received);
+        for name in ["agent", "observer"] {
+            let notices: Vec<Notice> = sent
+                .iter()
+                .filter(|message| message.to.iter().any(|to| to == name))
+                .map(|message| message.signal.clone())
+                .filter_map(|signal| match signal {
+                    Signal::Notice(notice) => Some(notice),
+                    Signal::Receipt(_) => None,
+                })
+                .collect();
+            let [
+                Notice::WindowMapped {
+                    window: mapped,
+                    parent,
+                    ..
+                },
+                Notice::FocusChanged {
+                    window: Some(focused),
+                    previous: Some(previous),
+                    cause,
+                    receipt,
+                    ..
+                },
+            ] = notices.as_slice()
+            else {
+                panic!("{name}: expected a mapped dialog and a focus change, got {notices:?}");
+            };
+            assert_eq!(mapped.title, "Session expiring", "{name}");
+            assert_eq!(
+                parent.as_ref().map(|p| p.id.as_str()),
+                Some(form_id.as_str())
+            );
+            assert_eq!(focused.id, mapped.id, "{name}: focus names the new dialog");
+            assert_eq!(previous.id, form_id);
+            assert_eq!(*cause, FocusCause::NewDialog);
+            assert_eq!(*receipt, None, "no input caused it");
+        }
+        press(&mut state, source);
+        let after = receipts(&delivered(&received, "agent"));
+        let window = after[0].window.clone().expect("dialog");
+        assert_eq!(window.title, "Session expiring");
+        assert_ne!(
+            window.id, form_id,
+            "keys now reach the dialog, not the form"
+        );
+    }
+
+    #[test]
+    fn a_window_activated_before_it_maps_is_reported_once_it_has_an_id() {
+        use crate::delivery::FocusCause;
+        use crate::delivery::Notice;
+        use crate::delivery::Signal;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let source = KeyboardSource::new_auxiliary();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Registration form",
+            "chromium",
+        );
+        let received = delivery_subscribers(&mut state, source);
+        let token = state.launch_token();
+
+        // Chromium's window.open popup: activated with a granted token
+        // before its first buffer, when it has no foreign-toplevel handle.
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let popup = xdg.get_toplevel(&qh, ());
+        popup.set_title("Session expiring".into());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        app.activation
+            .as_ref()
+            .expect("xdg_activation_v1")
+            .activate(token, &surface);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(
+            delivered(&received, "observer").is_empty(),
+            "nothing is reported for a window that has not mapped"
+        );
+        xdg.ack_configure(app.last_configure.expect("configure"));
+        attach_buffer(&surface, &app, &qh, 1);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let notices: Vec<Notice> = delivered(&received, "observer")
+            .into_iter()
+            .filter_map(|signal| match signal {
+                Signal::Notice(notice) => Some(notice),
+                Signal::Receipt(_) => None,
+            })
+            .filter(|notice| !matches!(notice, Notice::TextFieldChanged { .. }))
+            .collect();
+        let [
+            Notice::WindowMapped { window: mapped, .. },
+            Notice::FocusChanged {
+                window: Some(focused),
+                cause,
+                ..
+            },
+        ] = notices.as_slice()
+        else {
+            panic!("expected the popup to map and then take focus, got {notices:?}");
+        };
+        assert!(!mapped.id.is_empty(), "the mapped popup has its identifier");
+        assert_eq!(focused.id, mapped.id, "focus names the popup by that id");
+        assert_eq!(focused.title, "Session expiring");
+        assert_eq!(*cause, FocusCause::Activation, "the token moved focus");
+    }
+
+    #[test]
+    fn text_field_state_is_unknown_until_the_client_uses_text_input() {
+        use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ContentPurpose as Purpose;
+
+        use crate::delivery::Notice;
+        use crate::delivery::Signal;
+        use crate::delivery::TextField;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let source = KeyboardSource::new_auxiliary();
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Registration form",
+            "chromium",
+        );
+        let received = delivery_subscribers(&mut state, source);
+        let text_field = |received: &std::sync::mpsc::Receiver<_>, state: &mut crate::State| {
+            press(state, source);
+            receipts(&delivered(received, "agent"))[0].text_field
+        };
+        assert_eq!(text_field(&received, &mut state), Some(TextField::Unknown));
+
+        let text = app
+            .text_inputs
+            .as_ref()
+            .expect("text input manager")
+            .get_text_input(app.seat.as_ref().expect("seat"), &queue.handle(), ());
+        text.enable();
+        text.set_content_type(ContentHint::None, ContentPurpose::Phone);
+        text.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let changed: Vec<_> = delivered(&received, "observer")
+            .into_iter()
+            .filter_map(|signal| match signal {
+                Signal::Notice(Notice::TextFieldChanged { text_field, .. }) => Some(text_field),
+                Signal::Notice(_) | Signal::Receipt(_) => None,
+            })
+            .collect();
+        assert_eq!(changed, [TextField::Focused(Purpose::Phone)]);
+        assert_eq!(
+            text_field(&received, &mut state),
+            Some(TextField::Focused(Purpose::Phone))
+        );
+
+        // An in-window alert takes focus from the field: the client stays
+        // known to use text input, so this is \"none\", not \"unknown\".
+        text.disable();
+        text.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(text_field(&received, &mut state), Some(TextField::None));
+    }
+
+    #[test]
+    fn viewer_keys_get_receipts_on_the_gateway_pipe_by_input_sequence() {
+        use waywire_protocol::pipe;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Notes",
+            "org.gnome.TextEditor",
+        );
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        state.event_sink.take_events();
+        state
+            .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey {
+                key: pipe::KeyCode::new(30).expect("key"),
+                state: pipe::KeyState::Pressed,
+                sequence: pipe::InputSequence::new(41).expect("sequence"),
+            }))
+            .expect("key");
+        let receipts: Vec<_> = state
+            .event_sink
+            .take_events()
+            .into_iter()
+            .filter_map(|event| {
+                if let pipe::Event::InputReceipt(receipt) = event {
+                    Some(receipt)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 41);
+        assert_eq!(receipts[0].delivery, pipe::ReceiptDelivery::Window);
+        assert_eq!(receipts[0].title.as_str(), "Notes");
+        assert_eq!(receipts[0].window_id.as_str(), app.handles[0].identifier);
     }
 }

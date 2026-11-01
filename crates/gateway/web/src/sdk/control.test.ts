@@ -1224,3 +1224,49 @@ test("agent input state from the control socket reaches the session", async () =
     await session.dispose();
   }
 });
+
+test("input receipts from the control socket reach the session", async () => {
+  installBrowser();
+  const sockets = new Map<string, FakeWebSocket>();
+  const session = new WaywireSession({
+    endpoint: "https://desktop.example.com",
+    createWebSocket(path) {
+      const created = new FakeWebSocket();
+      sockets.set(path, created);
+      return socket(created);
+    },
+  });
+  session.attachSurface(surfaceOptions());
+  const receipts: unknown[] = [];
+  session.on("receipt", (receipt) => receipts.push(receipt));
+  try {
+    session.connect();
+    await flush();
+    const control = sockets.get("/control");
+    if (!control) throw new Error("control socket was not created");
+    control.readyState = FakeWebSocket.OPEN;
+    control.dispatch("open", {});
+    control.dispatch("message", {
+      data: JSON.stringify({
+        type: "input-receipt",
+        sequence: 41,
+        delivery: "window",
+        windowId: "a1b2",
+        appId: "org.gnome.TextEditor",
+        title: "Notes",
+      }),
+    });
+    assert.deepEqual(receipts, [
+      {
+        sequence: 41,
+        delivery: "window",
+        windowId: "a1b2",
+        appId: "org.gnome.TextEditor",
+        title: "Notes",
+      },
+    ]);
+    assert.equal(control.readyState, FakeWebSocket.OPEN);
+  } finally {
+    await session.dispose();
+  }
+});

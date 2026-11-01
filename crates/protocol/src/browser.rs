@@ -61,6 +61,15 @@ pub enum ClientEvent {
         connected: bool,
         dropped: bool,
     },
+    /// Where one of this viewer's input events went.
+    #[serde(rename_all = "camelCase")]
+    InputReceipt {
+        sequence: InputSequence,
+        delivery: pipe::ReceiptDelivery,
+        window_id: pipe::ReceiptText,
+        app_id: pipe::ReceiptText,
+        title: pipe::ReceiptText,
+    },
     #[serde(rename_all = "camelCase")]
     Pong {
         id: u64,
@@ -488,7 +497,7 @@ mod tests {
     }
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![11, kind, 0, 0];
+        let mut bytes = vec![12, kind, 0, 0];
         bytes.extend(
             u32::try_from(payload.len())
                 .expect("test payload length should fit u32")
@@ -508,7 +517,7 @@ mod tests {
             let event = ClientEvent::video_config(chroma.h264_profile().codec());
             assert_eq!(
                 json(&event),
-                format!(r#"{{"type":"video-config","version":11,"codec":"{codec}"}}"#)
+                format!(r#"{{"type":"video-config","version":12,"codec":"{codec}"}}"#)
             );
         }
     }
@@ -630,6 +639,20 @@ mod tests {
                 dropped: false,
             }),
             r#"{"type":"agent-input","connected":true,"dropped":false}"#
+        );
+    }
+
+    #[test]
+    fn input_receipt_json_is_exact() {
+        assert_eq!(
+            json(&ClientEvent::InputReceipt {
+                sequence: InputSequence::new(41).expect("sequence"),
+                delivery: pipe::ReceiptDelivery::Dropped,
+                window_id: pipe::ReceiptText::truncated("a1"),
+                app_id: pipe::ReceiptText::truncated("foot"),
+                title: pipe::ReceiptText::truncated("Terminal"),
+            }),
+            r#"{"type":"input-receipt","sequence":41,"delivery":"dropped","windowId":"a1","appId":"foot","title":"Terminal"}"#
         );
     }
 
@@ -904,7 +927,7 @@ mod tests {
             },
         };
         let bytes = vec![
-            11, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
+            12, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
             17, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 60, 0, 0, 0, 1, 1, 2,
         ];
         assert_eq!(sample.encode(), bytes);

@@ -1,4 +1,4 @@
-//! Gateway-to-compositor pipe vocabulary for protocol version 11.
+//! Gateway-to-compositor pipe vocabulary for protocol version 12.
 
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
@@ -15,6 +15,8 @@ use crate::wire::Writer;
 
 pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 4_000;
+/// Longest window id, app id or title an input receipt carries; longer ones are cut.
+pub const MAX_RECEIPT_TEXT_BYTES: usize = 512;
 pub const MAX_RAW_PIXELS: u64 = parse_pixel_cap(include_str!("../max-display-pixels.json"));
 
 const fn parse_pixel_cap(value: &str) -> u64 {
@@ -1490,6 +1492,120 @@ impl Wire for AgentInput {
     }
 }
 
+/// Where one browser input event went, reported back to the viewer that sent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReceiptDelivery {
+    /// A client window received it.
+    Window,
+    /// The compositor's own titlebars, taskbar or menus consumed it.
+    Compositor,
+    /// No window had focus or was under the pointer.
+    Nowhere,
+    /// Input control was not held, so the compositor dropped it.
+    Dropped,
+}
+
+impl Wire for ReceiptDelivery {
+    fn write(&self, out: &mut Writer) {
+        out.put(&match self {
+            Self::Window => 1_u8,
+            Self::Compositor => 2,
+            Self::Nowhere => 3,
+            Self::Dropped => 4,
+        });
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            1_u8 => Ok(Self::Window),
+            2 => Ok(Self::Compositor),
+            3 => Ok(Self::Nowhere),
+            4 => Ok(Self::Dropped),
+            _ => Err(InvalidValue("receipt delivery is unknown")),
+        }
+    }
+}
+
+/// A window id, app id or title in a receipt, at most
+/// [`MAX_RECEIPT_TEXT_BYTES`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ReceiptText(String);
+
+impl ReceiptText {
+    pub fn new(text: String) -> Result<Self, InvalidValue> {
+        if text.len() <= MAX_RECEIPT_TEXT_BYTES {
+            Ok(Self(text))
+        } else {
+            Err(InvalidValue("receipt text must be at most 512 bytes"))
+        }
+    }
+
+    /// `text`, cut at the last character boundary that fits.
+    #[must_use]
+    pub fn truncated(text: &str) -> Self {
+        let mut end = text.len().min(MAX_RECEIPT_TEXT_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self(text[..end].to_owned())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Wire for ReceiptText {
+    fn write(&self, out: &mut Writer) {
+        // At most MAX_RECEIPT_TEXT_BYTES, which fits a u16.
+        out.put(&u16::try_from(self.0.len()).unwrap_or(u16::MAX));
+        out.bytes(self.0.as_bytes());
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        let length: u16 = input.get()?;
+        let Ok(text) = std::str::from_utf8(input.slice(usize::from(length))?) else {
+            return Err(InvalidValue("receipt text is not UTF-8"));
+        };
+        Self::new(text.to_owned())
+    }
+}
+
+/// The receipt for one browser input event: its input sequence, and the window
+/// it reached, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputReceipt {
+    pub sequence: InputSequence,
+    pub delivery: ReceiptDelivery,
+    /// The window's ext-foreign-toplevel-list identifier, or empty.
+    pub window_id: ReceiptText,
+    pub app_id: ReceiptText,
+    pub title: ReceiptText,
+}
+
+impl Wire for InputReceipt {
+    fn write(&self, out: &mut Writer) {
+        out.put(&self.sequence);
+        out.put(&self.delivery);
+        out.put(&self.window_id);
+        out.put(&self.app_id);
+        out.put(&self.title);
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        Ok(Self {
+            sequence: input.get()?,
+            delivery: input.get()?,
+            window_id: input.get()?,
+            app_id: input.get()?,
+            title: input.get()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorImage {
     pub width: u8,
@@ -1583,6 +1699,7 @@ pub enum Event {
     CursorClick(CursorPosition),
     ResetVideoRefused(ResetVideoRefusal),
     AgentInput(AgentInput),
+    InputReceipt(InputReceipt),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1599,6 +1716,7 @@ pub enum EventKind {
     CursorImage = 9,
     CursorClick = 10,
     EncodedFrame = 11,
+    InputReceipt = 12,
 }
 
 impl RecordKind for EventKind {
@@ -1615,6 +1733,7 @@ impl RecordKind for EventKind {
             Self::CursorImage => 9,
             Self::CursorClick => 10,
             Self::EncodedFrame => 11,
+            Self::InputReceipt => 12,
         }
     }
 
@@ -1631,6 +1750,7 @@ impl RecordKind for EventKind {
             9 => Some(Self::CursorImage),
             10 => Some(Self::CursorClick),
             11 => Some(Self::EncodedFrame),
+            12 => Some(Self::InputReceipt),
             _ => None,
         }
     }
@@ -1646,6 +1766,8 @@ impl RecordKind for EventKind {
             Self::CursorImage => 128 * 128 * 8 + 6,
             // Key flag u8, 33-byte metadata, then the stripe container.
             Self::EncodedFrame => 34 + crate::browser::MAX_VIDEO_DATA_BYTES,
+            // Sequence, delivery, then three length-prefixed strings.
+            Self::InputReceipt => 5 + 3 * (2 + MAX_RECEIPT_TEXT_BYTES),
         }
     }
 }
@@ -1664,6 +1786,7 @@ impl Event {
             Self::CursorClick(_) => EventKind::CursorClick,
             Self::ResetVideoRefused(_) => EventKind::ResetVideoRefused,
             Self::AgentInput(_) => EventKind::AgentInput,
+            Self::InputReceipt(_) => EventKind::InputReceipt,
         }
     }
 }
@@ -1687,6 +1810,7 @@ impl Record for Event {
             Self::CursorPosition(payload) | Self::CursorClick(payload) => out.put(payload),
             Self::ResetVideoRefused(payload) => out.put(payload),
             Self::AgentInput(payload) => out.put(payload),
+            Self::InputReceipt(payload) => out.put(payload),
         }
     }
 
@@ -1703,6 +1827,7 @@ impl Record for Event {
             EventKind::CursorClick => Ok(Self::CursorClick(input.get()?)),
             EventKind::ResetVideoRefused => Ok(Self::ResetVideoRefused(input.get()?)),
             EventKind::AgentInput => Ok(Self::AgentInput(input.get()?)),
+            EventKind::InputReceipt => Ok(Self::InputReceipt(input.get()?)),
         }
     }
 }
@@ -1729,7 +1854,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    11, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
+                    12, 1, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 34, 0, 0, 0, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1739,7 +1864,7 @@ mod tests {
                     state: ButtonState::Pressed,
                     sequence,
                 }),
-                vec![11, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
+                vec![12, 2, 0, 0, 9, 0, 0, 0, 16, 1, 0, 0, 1, 7, 0, 0, 0],
             ),
             (
                 "pointer scroll",
@@ -1749,7 +1874,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    11, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    12, 3, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1760,7 +1885,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    11, 14, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 66, 7, 0, 0, 0,
+                    12, 14, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 66, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1771,7 +1896,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    11, 15, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 7, 0, 0, 0,
+                    12, 15, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1781,12 +1906,12 @@ mod tests {
                     state: KeyState::Repeated,
                     sequence,
                 }),
-                vec![11, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
+                vec![12, 4, 0, 0, 9, 0, 0, 0, 30, 0, 0, 0, 2, 7, 0, 0, 0],
             ),
             (
                 "release all",
                 Command::ReleaseAll(ReleaseAll),
-                vec![11, 5, 0, 0, 0, 0, 0, 0],
+                vec![12, 5, 0, 0, 0, 0, 0, 0],
             ),
             (
                 "resize",
@@ -1796,7 +1921,7 @@ mod tests {
                     request_id: value(RequestId::new(9)),
                 }),
                 vec![
-                    11, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
+                    12, 6, 0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 9, 0,
                 ],
             ),
         ]
@@ -1808,7 +1933,7 @@ mod tests {
             (
                 "clipboard",
                 Command::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![11, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![12, 7, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "pointer relative",
@@ -1818,7 +1943,7 @@ mod tests {
                     sequence,
                 }),
                 vec![
-                    11, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
+                    12, 8, 0, 0, 12, 0, 0, 0, 0, 0, 192, 63, 0, 0, 16, 192, 7, 0, 0, 0,
                 ],
             ),
             (
@@ -1831,7 +1956,7 @@ mod tests {
                     chroma: Chroma::Yuv420,
                 }),
                 vec![
-                    11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 1,
+                    12, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 1,
                 ],
             ),
             (
@@ -1841,7 +1966,7 @@ mod tests {
                     sequence,
                     text: value(InputText::new("hey".into())),
                 }),
-                vec![11, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
+                vec![12, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
             ),
             (
                 "keyframe readiness",
@@ -1849,22 +1974,22 @@ mod tests {
                     generation: value(Generation::new(4)),
                     state: KeyframeState::Cached,
                 }),
-                vec![11, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
+                vec![12, 11, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 1],
             ),
             (
                 "reset video",
                 Command::ResetVideo(ResetVideo),
-                vec![11, 12, 0, 0, 0, 0, 0, 0],
+                vec![12, 12, 0, 0, 0, 0, 0, 0],
             ),
             (
                 "browser input lease",
                 Command::InputLease(InputLease { held: true }),
-                vec![11, 13, 0, 0, 1, 0, 0, 0, 1],
+                vec![12, 13, 0, 0, 1, 0, 0, 0, 1],
             ),
             (
                 "browser input handback",
                 Command::InputLease(InputLease { held: false }),
-                vec![11, 13, 0, 0, 1, 0, 0, 0, 0],
+                vec![12, 13, 0, 0, 1, 0, 0, 0, 0],
             ),
         ]
     }
@@ -1876,11 +2001,17 @@ mod tests {
     }
 
     fn event_cases() -> Vec<(&'static str, Event, Vec<u8>)> {
+        let mut cases = first_event_cases();
+        cases.extend(remaining_event_cases());
+        cases
+    }
+
+    fn first_event_cases() -> Vec<(&'static str, Event, Vec<u8>)> {
         vec![
             (
                 "clipboard",
                 Event::Clipboard(value(ClipboardText::new("clip".into()))),
-                vec![11, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
+                vec![12, 1, 0, 0, 4, 0, 0, 0, 99, 108, 105, 112],
             ),
             (
                 "frame",
@@ -1895,7 +2026,7 @@ mod tests {
                     chroma: Chroma::Yuv420,
                 }),
                 vec![
-                    11, 2, 0, 0, 33, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
+                    12, 2, 0, 0, 33, 0, 0, 0, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0, 3,
                     0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0, 1,
                 ],
             ),
@@ -1916,7 +2047,7 @@ mod tests {
                     data: vec![0xaa, 0xbb],
                 }),
                 vec![
-                    11, 11, 0, 0, 36, 0, 0, 0, 1, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0,
+                    12, 11, 0, 0, 36, 0, 0, 0, 1, 1, 0, 0, 0, 0, 5, 208, 2, 2, 0, 0, 0, 0, 0, 0, 0,
                     3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 60, 0, 0, 0, 1, 0xaa, 0xbb,
                 ],
             ),
@@ -1929,18 +2060,18 @@ mod tests {
                     generation: value(Generation::new(4)),
                 }),
                 vec![
-                    11, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
+                    12, 3, 0, 0, 16, 0, 0, 0, 9, 0, 0, 5, 0, 0, 208, 2, 0, 0, 180, 0, 4, 0, 0, 0,
                 ],
             ),
             (
                 "cursor shape",
                 Event::CursorShape(CursorShape::Pointer),
-                vec![11, 4, 0, 0, 1, 0, 0, 0, 4],
+                vec![12, 4, 0, 0, 1, 0, 0, 0, 4],
             ),
             (
                 "cursor visibility",
                 Event::CursorVisibility(CursorVisibility::Hidden),
-                vec![11, 5, 0, 0, 1, 0, 0, 0, 0],
+                vec![12, 5, 0, 0, 1, 0, 0, 0, 0],
             ),
             (
                 "cursor position",
@@ -1949,7 +2080,7 @@ mod tests {
                     y: value(PointerCoordinate::new(20)),
                     source: CursorSource::Agent,
                 }),
-                vec![11, 6, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 1],
+                vec![12, 6, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 1],
             ),
             (
                 "cursor click",
@@ -1958,22 +2089,52 @@ mod tests {
                     y: value(PointerCoordinate::new(20)),
                     source: CursorSource::Agent,
                 }),
-                vec![11, 10, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 1],
+                vec![12, 10, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 1],
             ),
             (
                 "video reset refused",
                 Event::ResetVideoRefused(ResetVideoRefusal::CurrentModeUnknown),
-                vec![11, 7, 0, 0, 1, 0, 0, 0, 1],
+                vec![12, 7, 0, 0, 1, 0, 0, 0, 1],
             ),
+        ]
+    }
+
+    fn remaining_event_cases() -> Vec<(&'static str, Event, Vec<u8>)> {
+        vec![
             (
                 "agent input",
                 Event::AgentInput(AgentInput {
                     connected: true,
                     dropped: true,
                 }),
-                vec![11, 8, 0, 0, 2, 0, 0, 0, 1, 1],
+                vec![12, 8, 0, 0, 2, 0, 0, 0, 1, 1],
+            ),
+            (
+                "input receipt",
+                Event::InputReceipt(InputReceipt {
+                    sequence: value(InputSequence::new(7)),
+                    delivery: ReceiptDelivery::Window,
+                    window_id: value(ReceiptText::new("a1".into())),
+                    app_id: value(ReceiptText::new("foot".into())),
+                    title: value(ReceiptText::new("T".into())),
+                }),
+                vec![
+                    12, 12, 0, 0, 18, 0, 0, 0, 7, 0, 0, 0, 1, 2, 0, 97, 49, 4, 0, 102, 111, 111,
+                    116, 1, 0, 84,
+                ],
             ),
         ]
+    }
+
+    #[test]
+    fn receipt_text_is_cut_at_a_character_boundary() {
+        // 511 ASCII bytes and a two-byte character straddle the limit.
+        let title = format!("{}é", "a".repeat(MAX_RECEIPT_TEXT_BYTES - 1));
+        assert_eq!(
+            ReceiptText::truncated(&title).as_str(),
+            "a".repeat(MAX_RECEIPT_TEXT_BYTES - 1)
+        );
+        assert!(ReceiptText::new(title).is_err());
     }
 
     #[test]
@@ -2036,7 +2197,7 @@ mod tests {
     #[test]
     fn quality_wire_rejects_an_invalid_crf() {
         let record = [
-            11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 52, 0,
+            12, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 52, 0,
         ];
         assert!(matches!(
             Command::decode(&record),
@@ -2048,7 +2209,7 @@ mod tests {
     fn quality_wire_pins_all_component_representations() {
         for (byte, chroma) in [(0, Chroma::Yuv444), (1, Chroma::Yuv420), (2, Chroma::Rgb)] {
             let record = [
-                11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, byte,
+                12, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, byte,
             ];
             let command = Command::Quality(Quality {
                 bitrate_kbps: value(Kbps::new(8_000)),
@@ -2065,7 +2226,7 @@ mod tests {
     #[test]
     fn quality_wire_rejects_unknown_chroma() {
         let record = [
-            11, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 3,
+            12, 9, 0, 0, 14, 0, 0, 0, 64, 31, 0, 0, 60, 0, 0, 0, 75, 0, 0, 0, 23, 3,
         ];
         assert!(matches!(
             Command::decode(&record),
@@ -2075,8 +2236,8 @@ mod tests {
 
     #[test]
     fn record_length_uses_the_common_header() {
-        let clipboard = [11, 7, 0, 0, 0, 0, 0, 0];
-        let release_all = [11, 5, 0, 0, 0, 0, 0, 0];
+        let clipboard = [12, 7, 0, 0, 0, 0, 0, 0];
+        let release_all = [12, 5, 0, 0, 0, 0, 0, 0];
 
         assert_eq!(Command::record_len(&clipboard), Ok(HEADER_BYTES));
         assert_eq!(Command::record_len(&release_all), Ok(HEADER_BYTES));
@@ -2113,7 +2274,7 @@ mod tests {
 
     #[test]
     fn cursor_position_rejects_out_of_range_coordinates() {
-        let record = [11, 6, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0];
+        let record = [12, 6, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0];
         assert_eq!(
             Event::decode(&record),
             Ok(Event::CursorPosition(CursorPosition {
@@ -2143,7 +2304,7 @@ mod tests {
 
     #[test]
     fn unknown_command_kind_is_invalid_kind() {
-        let header = [11, 99, 0, 0, 0, 0, 0, 0];
+        let header = [12, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Command::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -2152,7 +2313,7 @@ mod tests {
 
     #[test]
     fn unknown_event_kind_is_invalid_kind() {
-        let header = [11, 99, 0, 0, 0, 0, 0, 0];
+        let header = [12, 99, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             Event::record_len(&header),
             Err(ProtocolError::InvalidKind { kind: 99 })
@@ -2161,7 +2322,7 @@ mod tests {
 
     #[test]
     fn command_text_payload_over_limit_is_too_large() {
-        let mut header = [11, 10, 0, 0, 0, 0, 0, 0];
+        let mut header = [12, 10, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_TEXT_BYTES + 6).expect("limit fits u32")).to_le_bytes(),
         );
@@ -2173,7 +2334,7 @@ mod tests {
 
     #[test]
     fn event_payload_over_limit_is_too_large() {
-        let mut header = [11, 1, 0, 0, 0, 0, 0, 0];
+        let mut header = [12, 1, 0, 0, 0, 0, 0, 0];
         header[4..8].copy_from_slice(
             &(u32::try_from(MAX_CLIPBOARD_BYTES + 1).expect("limit fits u32")).to_le_bytes(),
         );
@@ -2185,7 +2346,7 @@ mod tests {
 
     #[test]
     fn clipboard_payload_must_be_utf8() {
-        let record = [11, 1, 0, 0, 1, 0, 0, 0, 0xff];
+        let record = [12, 1, 0, 0, 1, 0, 0, 0, 0xff];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 1, .. })
@@ -2194,7 +2355,7 @@ mod tests {
 
     #[test]
     fn text_payload_must_not_contain_nul() {
-        let record = [11, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let record = [12, 10, 0, 0, 6, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         assert!(matches!(
             Command::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 10, .. })
@@ -2203,7 +2364,7 @@ mod tests {
 
     #[test]
     fn short_frame_payload_is_invalid() {
-        let mut record = vec![11, 2, 0, 0, 32, 0, 0, 0];
+        let mut record = vec![12, 2, 0, 0, 32, 0, 0, 0];
         let mut payload = [0; 32];
         payload[0] = 1;
         payload[4] = 1;
@@ -2269,7 +2430,7 @@ mod tests {
 
     #[test]
     fn command_payload_length_must_match_its_header() {
-        let record = [11, 7, 0, 0, 1, 0, 0, 0];
+        let record = [12, 7, 0, 0, 1, 0, 0, 0];
         assert_eq!(Command::decode(&record), Err(ProtocolError::Truncated));
     }
 
@@ -2327,7 +2488,7 @@ mod tests {
     fn every_cursor_shape_has_its_pinned_wire_byte() {
         for (index, shape) in CursorShape::ALL.into_iter().enumerate() {
             let wire = u8::try_from(index + 1).expect("36 cursor shapes fit in a byte");
-            let bytes = vec![11, 4, 0, 0, 1, 0, 0, 0, wire];
+            let bytes = vec![12, 4, 0, 0, 1, 0, 0, 0, wire];
             assert_eq!(Event::CursorShape(shape).encode(), bytes);
             assert_eq!(Event::decode(&bytes), Ok(Event::CursorShape(shape)));
         }
@@ -2335,7 +2496,7 @@ mod tests {
 
     #[test]
     fn unknown_cursor_shape_wire_byte_is_invalid() {
-        let record = [11, 4, 0, 0, 1, 0, 0, 0, 37];
+        let record = [12, 4, 0, 0, 1, 0, 0, 0, 37];
         assert!(matches!(
             Event::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 4, .. })
@@ -2378,7 +2539,7 @@ mod tests {
 
     /// The same for events. A cursor image is a six-byte header and a PNG of
     /// at most 8 bytes per pixel of a 128x128 cursor.
-    const EVENT_LIMITS: [(u8, u32); 11] = [
+    const EVENT_LIMITS: [(u8, u32); 12] = [
         (1, 1 << 20),           // clipboard
         (2, 33),                // frame metadata
         (11, 34 + (16 << 20)),  // encoded frame: key flag, metadata, stripes
@@ -2390,6 +2551,7 @@ mod tests {
         (8, 2),                 // agent input
         (9, 6 + 128 * 128 * 8), // cursor image
         (10, 9),                // cursor click
+        (12, 5 + 3 * 514),      // input receipt: sequence, delivery, three strings
     ];
 
     fn limit(table: &[(u8, u32)], kind: u8) -> Option<u32> {
@@ -2541,7 +2703,7 @@ mod tests {
         fn headers_with_another_version_or_nonzero_reserved_bytes_are_invalid(
             // Bias each checked byte toward its valid value so every
             // combination of one wrong byte with two right ones is common.
-            version in proptest::prop_oneof![proptest::strategy::Just(11_u8), proptest::prelude::any::<u8>()],
+            version in proptest::prop_oneof![proptest::strategy::Just(12_u8), proptest::prelude::any::<u8>()],
             reserved in proptest::array::uniform2(
                 proptest::prop_oneof![proptest::strategy::Just(0_u8), proptest::prelude::any::<u8>()],
             ),
@@ -2549,7 +2711,7 @@ mod tests {
             length in 0..=1_u32,
         ) {
             let mut reserved = reserved;
-            if version == 11 && reserved == [0, 0] {
+            if version == 12 && reserved == [0, 0] {
                 // Make one reserved byte wrong rather than discard the case.
                 reserved[usize::from(kind % 2)] = kind;
             }
@@ -2584,7 +2746,7 @@ mod tests {
                 ),
             ] {
                 let header = |length: u32| {
-                    let mut header = [11, kind, 0, 0, 0, 0, 0, 0];
+                    let mut header = [12, kind, 0, 0, 0, 0, 0, 0];
                     header[4..].copy_from_slice(&length.to_le_bytes());
                     header
                 };

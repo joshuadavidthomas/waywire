@@ -1,5 +1,5 @@
 // Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 export class ProtocolVersionMismatchError extends Error {
   constructor(
@@ -96,7 +96,19 @@ export type VideoConfiguration = {
   readonly codec: string;
 };
 
+export type InputReceiptMessage = {
+  readonly type: "input-receipt";
+  /** The input sequence of the browser event this receipt describes. */
+  readonly sequence: number;
+  readonly delivery: "window" | "compositor" | "nowhere" | "dropped";
+  /** The window's ext-foreign-toplevel-list identifier, or "". */
+  readonly windowId: string;
+  readonly appId: string;
+  readonly title: string;
+};
+
 export type ControlMessage =
+  | InputReceiptMessage
   | {
       readonly type: "control-state";
       readonly state: "active" | "busy" | "ready";
@@ -167,6 +179,26 @@ export function parseControlMessage(value: unknown): ControlMessage | null {
             type: value.type,
             connected: value.connected,
             dropped: value.dropped,
+          }
+        : null;
+    case "input-receipt":
+      return typeof value.sequence === "number" &&
+        Number.isInteger(value.sequence) &&
+        value.sequence > 0 &&
+        (value.delivery === "window" ||
+          value.delivery === "compositor" ||
+          value.delivery === "nowhere" ||
+          value.delivery === "dropped") &&
+        typeof value.windowId === "string" &&
+        typeof value.appId === "string" &&
+        typeof value.title === "string"
+        ? {
+            type: value.type,
+            sequence: value.sequence,
+            delivery: value.delivery,
+            windowId: value.windowId,
+            appId: value.appId,
+            title: value.title,
           }
         : null;
     case "pong":

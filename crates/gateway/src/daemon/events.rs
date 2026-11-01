@@ -212,6 +212,15 @@ pub(super) async fn read_events(
                         position_gate = CursorPositionGate::Open;
                         publish_cursor_click(&events, position);
                     }
+                    Event::InputReceipt(receipt) => {
+                        events.publish(ClientEvent::InputReceipt {
+                            sequence: receipt.sequence,
+                            delivery: receipt.delivery,
+                            window_id: receipt.window_id,
+                            app_id: receipt.app_id,
+                            title: receipt.title,
+                        });
+                    }
                     Event::AgentInput(agent) => {
                         *events
                             .latest_agent

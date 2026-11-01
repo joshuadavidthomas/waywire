@@ -2272,7 +2272,8 @@ fn data_control_copies_reach_x11_and_the_viewer_without_taking_focus() {
             | Event::CursorPosition(_)
             | Event::CursorClick(_)
             | Event::ResetVideoRefused(_)
-            | Event::AgentInput(_) => None,
+            | Event::AgentInput(_)
+            | Event::InputReceipt(_) => None,
         })
         .collect();
     assert_eq!(synced, ["data control α"], "viewer clipboard events");

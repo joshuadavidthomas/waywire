@@ -205,7 +205,13 @@ impl CompositorHandler for State {
                     self.constrain_window(&window);
                 }
                 if mapped && !previous {
-                    self.focus_window(Some(window.clone()));
+                    self.window_mapped(&window);
+                    let cause = if self.parent_window(&window).is_some() {
+                        crate::delivery::FocusCause::NewDialog
+                    } else {
+                        crate::delivery::FocusCause::NewWindow
+                    };
+                    self.focus_mapped_window(&window, cause);
                 } else if previous && !mapped {
                     self.window_unmapped(&window);
                 }
@@ -265,6 +271,7 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
+        self.keyboard_focus_changed(focus);
         let client = focus
             .and_then(WaylandFocus::wl_surface)
             .and_then(|s| s.client());
@@ -299,7 +306,26 @@ impl SeatHandler for State {
         }
     }
 }
-impl smithay::wayland::text_input::TextInputActivation for State {}
+/// Text-field focus inside the focused client feeds input delivery events.
+impl smithay::wayland::text_input::TextInputActivation for State {
+    fn activated(
+        &mut self,
+        content_type: Option<(
+            smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ContentHint,
+            smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ContentPurpose,
+        )>,
+    ) {
+        let purpose = content_type.map_or(
+            smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ContentPurpose::Normal,
+            |(_, purpose)| purpose,
+        );
+        self.text_input_changed(Some(purpose));
+    }
+
+    fn deactivated(&mut self) {
+        self.text_input_changed(None);
+    }
+}
 impl DataDeviceHandler for State {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
@@ -436,7 +462,9 @@ impl XdgShellHandler for State {
                 grab.ungrab(PopupUngrabStrategy::All);
                 return;
             }
-            keyboard.set_focus(self, grab.current_grab(), serial);
+            self.with_focus_cause(crate::delivery::FocusCause::Popup, |state| {
+                keyboard.set_focus(state, grab.current_grab(), serial);
+            });
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = seat.get_pointer() {
@@ -489,7 +517,10 @@ impl State {
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
         if focused.is_some() && focused == super::focus::KeyboardFocus::window(window) {
-            self.focus_window(self.topmost_focusable(Some(window)));
+            let next = self.topmost_focusable(Some(window));
+            self.with_focus_cause(crate::delivery::FocusCause::WindowClosed, |state| {
+                state.focus_window(next);
+            });
         }
         self.refresh_pointer_focus();
         if window.x11_surface().is_some() {

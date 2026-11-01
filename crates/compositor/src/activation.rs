@@ -58,7 +58,9 @@ impl XdgActivationHandler for State {
             data.timestamp.elapsed() < TOKEN_LIFETIME && data.user_data.get::<Granted>().is_some();
         tracing::debug!(granted, "xdg-activation request");
         if granted {
-            self.activate_window(&window);
+            self.with_focus_cause(crate::delivery::FocusCause::Activation, |state| {
+                state.activate_window(&window);
+            });
         } else if !self.window_focused(&window) {
             self.windows.entry(window).or_default().urgent = true;
             self.dirty = true;

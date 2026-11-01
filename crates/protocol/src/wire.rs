@@ -35,6 +35,15 @@ impl<'a> Reader<'a> {
         T::read(self)
     }
 
+    pub(crate) fn slice(&mut self, length: usize) -> Result<&'a [u8], InvalidValue> {
+        if self.0.len() < length {
+            return Err(InvalidValue("payload is too short"));
+        }
+        let (head, tail) = self.0.split_at(length);
+        self.0 = tail;
+        Ok(head)
+    }
+
     pub(crate) fn rest(&mut self) -> &'a [u8] {
         let rest = self.0;
         self.0 = &[];

@@ -160,6 +160,11 @@ impl VirtualKeyboardHandler for State {
     fn process_virtual_keyboard_event(&mut self, event: InputEvent<VirtualKeyboardBackend>) {
         match event {
             InputEvent::DeviceAdded { device } => {
+                self.describe_client_source(
+                    device.source(),
+                    crate::delivery::SourceKind::VirtualKeyboard,
+                    device.client(),
+                );
                 self.register_agent_source(device.source());
                 self.activate_virtual_keymap(device);
             }

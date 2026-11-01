@@ -24,6 +24,8 @@ use smithay::reexports::reis::calloop::EisListenerSource;
 use smithay::reexports::reis::eis;
 
 use crate::State;
+use crate::delivery::SourceInfo;
+use crate::delivery::SourceKind;
 
 /// The highest evdev key code (`KEY_MAX` in linux/input-event-codes.h).
 const KEY_MAX: u32 = 0x2ff;
@@ -43,8 +45,20 @@ pub(crate) fn listen(
     let listener = eis::Listener::bind(path)?;
     let handle_clone = handle.clone();
     handle.insert_source(EisListenerSource::new(listener), move |context, (), _| {
-        serve_connection(&handle_clone, context, layout.clone())
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let pid = peer_pid(&context);
+        // Xwayland opens one EI connection per X client that uses XTest.
+        let kind = if pid.is_some_and(is_own_xwayland) {
+            SourceKind::Xtest
+        } else {
+            SourceKind::Eis
+        };
+        serve_connection(
+            &handle_clone,
+            context,
+            layout.clone(),
+            SourceInfo::new(kind, pid),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(PostAction::Continue)
     })?;
     Ok(())
@@ -62,10 +76,14 @@ pub(crate) fn serve_connection(
     handle: &LoopHandle<'static, State>,
     context: eis::Context,
     layout: String,
+    info: SourceInfo,
 ) -> Result<()> {
     // Device ids are unique within a connection, not across connections.
     let connection_id = KeyboardSource::new_auxiliary();
-    let mut sources = HashMap::<String, KeyboardSource>::new();
+    let mut sources = Sources {
+        devices: HashMap::new(),
+        info,
+    };
     handle
         .insert_source(EiInput::new(context), move |event, connection, state| {
             match event {
@@ -100,26 +118,22 @@ pub(crate) fn serve_connection(
                 EiInputEvent::Disconnected => {
                     tracing::debug!("EI sender disconnected");
                     state.eis_seats.remove(&connection_id);
-                    for (_, source) in sources.drain() {
+                    for (_, source) in sources.devices.drain() {
                         state.disconnect_input_source(source);
                     }
                 }
                 EiInputEvent::Event(event) => match event {
                     InputEvent::DeviceAdded { device } => {
-                        let source = *sources
-                            .entry(device.id())
-                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        let source = sources.get(state, device.id());
                         state.register_agent_source(source);
                     }
                     InputEvent::DeviceRemoved { device } => {
-                        if let Some(source) = sources.remove(&device.id()) {
+                        if let Some(source) = sources.devices.remove(&device.id()) {
                             state.disconnect_input_source(source);
                         }
                     }
                     InputEvent::Keyboard { event } => {
-                        let source = *sources
-                            .entry(event.device().id())
-                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        let source = sources.get(state, event.device().id());
                         // EI sends evdev codes, which the shared entry point takes.
                         // Smithay's `key_code()` adds the XKB offset without
                         // overflow checks, so read the code as sent.
@@ -130,15 +144,11 @@ pub(crate) fn serve_connection(
                         state.keyboard_key(source, event.key, event.state());
                     }
                     InputEvent::PointerButton { event } => {
-                        let source = *sources
-                            .entry(event.device().id())
-                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        let source = sources.get(state, event.device().id());
                         state.pointer_button(source, event.button_code(), event.state());
                     }
                     InputEvent::PointerMotion { event } => {
-                        let source = *sources
-                            .entry(event.device().id())
-                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        let source = sources.get(state, event.device().id());
                         state.register_agent_source(source);
                         if let Some(pointer) = state.seat.get_pointer() {
                             state.pointer_motion_with_delta(
@@ -149,17 +159,13 @@ pub(crate) fn serve_connection(
                         }
                     }
                     InputEvent::PointerMotionAbsolute { event } => {
-                        let source = *sources
-                            .entry(event.device().id())
-                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        let source = sources.get(state, event.device().id());
                         state.register_agent_source(source);
                         // EI absolute coordinates are logical already, not normalized pixels.
                         state.pointer_motion(source, (event.x(), event.y()).into());
                     }
                     InputEvent::PointerAxis { event } => {
-                        let source = *sources
-                            .entry(event.device().id())
-                            .or_insert_with(KeyboardSource::new_auxiliary);
+                        let source = sources.get(state, event.device().id());
                         state.register_agent_source(source);
                         let mut frame = AxisFrame::new(event.time()).source(event.source());
                         for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -203,6 +209,44 @@ pub(crate) fn serve_connection(
         })
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(())
+}
+
+/// One connection's devices, each its own input source with the
+/// connection's origin.
+struct Sources {
+    devices: HashMap<String, KeyboardSource>,
+    info: SourceInfo,
+}
+
+impl Sources {
+    fn get(&mut self, state: &mut State, device: String) -> KeyboardSource {
+        *self.devices.entry(device).or_insert_with(|| {
+            let source = KeyboardSource::new_auxiliary();
+            state.delivery.describe(source, self.info.clone());
+            source
+        })
+    }
+}
+
+/// Whether `pid` is the Xwayland server this compositor started. Its Wayland
+/// connection is a socket pair the compositor created, so only the process
+/// table tells it apart from an EI client of the same name.
+fn is_own_xwayland(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((head, tail)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    head.ends_with("(Xwayland")
+        && tail.split_whitespace().nth(1) == Some(std::process::id().to_string().as_str())
+}
+
+/// The process on the other end of an EI socket.
+fn peer_pid(context: &eis::Context) -> Option<u32> {
+    let credentials =
+        nix::sys::socket::getsockopt(context, nix::sys::socket::sockopt::PeerCredentials).ok()?;
+    u32::try_from(credentials.pid()).ok()
 }
 
 /// EI regions are immutable per device. Smithay replaces the absolute devices,

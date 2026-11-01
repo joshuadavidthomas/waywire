@@ -78,6 +78,7 @@ function startViewer(): void {
   let surface: SurfaceHandle | undefined;
   let viewer: ViewerControls | undefined;
   let removeProtocolVersionListener: (() => void) | undefined;
+  let removeReceiptListener: (() => void) | undefined;
   let disposed = false;
   function dispose(): void {
     if (disposed) return;
@@ -85,6 +86,7 @@ function startViewer(): void {
     listeners.abort();
     viewer?.dispose();
     removeProtocolVersionListener?.();
+    removeReceiptListener?.();
     surface?.dispose();
     void session
       .dispose()
@@ -138,6 +140,13 @@ function startViewer(): void {
         // Reloading can still replace stale assets when storage is unavailable.
       }
       location.reload();
+    });
+    // Agents that drive the desktop through this page read where their
+    // input went from these events.
+    removeReceiptListener = session.on("receipt", (receipt) => {
+      window.dispatchEvent(
+        new CustomEvent("waywire-input-receipt", { detail: receipt }),
+      );
     });
     onPermissionClick(elements.pointerLockButton, async () => {
       if (document.pointerLockElement === elements.display) {

@@ -31,6 +31,13 @@ per-window capture, and screenshots on demand. Input arbitration is shared with
 agent sources: a browser takeover releases and pauses agent input, and handback
 resumes it. See [ROADMAP.md](ROADMAP.md).
 
+Drivers can learn where their input went. The compositor sends each input
+source's owner a receipt for every key, button and scroll, naming the window
+that received it, and tells every subscriber when focus moves or a window maps.
+The interface is on the desktop's session bus and is described in
+[docs/input-delivery.md](docs/input-delivery.md); `tools/receipts/receipts.py`
+prints it.
+
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while
 observers and pointer-locked clients show a positioned image or fallback arrow.

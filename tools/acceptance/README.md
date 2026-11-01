@@ -145,6 +145,7 @@ Build the host release binaries with `just build`, start Docker, and run one of:
 just acceptance computer-use-linux
 just acceptance cua-driver
 just acceptance fedora-x11
+just acceptance receipts-t6a
 ```
 
 The runner needs `sudo docker`, host networking, `agent-browser`, ImageMagick,
@@ -161,3 +162,14 @@ The runner records the private session bus and saves viewer screenshots in
 finds the during marker, or the paused notice is missing. Inspect the screenshots
 when diagnosing an OCR failure. A failed run can stop before all three images
 are captured; existing screenshots from earlier runs are not removed.
+
+`receipts-t6a` replays the dogfood run's surprise-dialog task (T6a) with
+cua-driver under `tools/receipts/receipts.py`, which records the compositor's
+input delivery receipts and focus events. It types into `t6a.html` in Chromium
+twice. In the first run, a page `alert()` opens 300 ms after Phone gains focus.
+In the second, a `window.open` popup opens instead. The scenario fails unless
+the receipts put the name and email keys in the form's focused text field. For
+the alert, the phone keys must land in the form with no text field focused. For
+the popup, `WindowMapped` and `FocusChanged` must name the popup, and the phone
+keys must land in it. The receipts are saved to `receipts-t6a.jsonl` in
+`.amp/in/artifacts/`.

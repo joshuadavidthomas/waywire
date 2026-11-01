@@ -53,7 +53,8 @@ impl Replacement {
             | Event::EncodedFrame(_)
             | Event::ResizeApplied(_)
             | Event::ResetVideoRefused(_)
-            | Event::CursorClick(_) => None,
+            | Event::CursorClick(_)
+            | Event::InputReceipt(_) => None,
             // The newest agent state is the only one that matters, so it
             // replaces an older queued update like clipboard contents do.
             Event::AgentInput(_) => Some(Self::AgentInput),

@@ -46,6 +46,8 @@ use zbus::zvariant::OwnedObjectPath;
 use zbus::zvariant::OwnedValue;
 
 use crate::State;
+use crate::delivery::SourceInfo;
+use crate::delivery::SourceKind;
 use crate::portal::PortalRequest;
 
 pub(crate) enum PortalInput {
@@ -262,6 +264,8 @@ const DEVICE_TYPES: u32 = KEYBOARD | POINTER;
 /// objects.
 struct PortalSession {
     source: KeyboardSource,
+    /// The process that opened the session, which owns its input receipts.
+    owner: Option<u32>,
     warned_keysyms: Mutex<HashSet<u32>>,
     /// Duplicate of the socket-pair end the EIS server holds. Shutting it
     /// down ends the EI connection even though the loop keeps its own
@@ -311,8 +315,10 @@ impl RemoteDesktop {
         _app_id: String,
         _options: HashMap<String, OwnedValue>,
     ) -> (u32, HashMap<String, OwnedValue>) {
+        let owner = session_owner(emitter.connection(), &session_handle).await;
         let session = Arc::new(PortalSession {
             source: KeyboardSource::new_auxiliary(),
+            owner,
             warned_keysyms: Mutex::new(HashSet::new()),
             eis_server: Mutex::new(None),
             stream: AtomicU32::new(super::screencast::STREAM_ID),
@@ -379,6 +385,7 @@ impl RemoteDesktop {
         self.requests
             .send(PortalRequest::RegisterSource {
                 source: session.source,
+                owner: session.owner,
             })
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         // See the module comment: approve without a dialog for now.
@@ -560,10 +567,16 @@ impl RemoteDesktop {
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<Fd<'static>> {
         tracing::debug!(%session_handle, %app_id, "connect to EIS");
+        let owner = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_handle)
+            .and_then(|session| session.owner);
         let (reply, wait) = oneshot::channel();
         if self
             .requests
-            .send(PortalRequest::ConnectToEis { reply })
+            .send(PortalRequest::ConnectToEis { reply, owner })
             .is_err()
         {
             return Err(zbus::fdo::Error::Failed("compositor loop is gone".into()));
@@ -645,6 +658,24 @@ impl Session {
     }
 }
 
+/// The process behind a portal session. The frontend names session handles
+/// after the caller's unique bus name, `:1.42` becoming `1_42`, so the
+/// caller is the connection with that name.
+async fn session_owner(connection: &zbus::Connection, handle: &OwnedObjectPath) -> Option<u32> {
+    let sender = handle
+        .as_str()
+        .strip_prefix("/org/freedesktop/portal/desktop/session/")?
+        .split('/')
+        .next()?;
+    let name = zbus::names::UniqueName::try_from(format!(":{}", sender.replace('_', "."))).ok()?;
+    zbus::fdo::DBusProxy::new(connection)
+        .await
+        .ok()?
+        .get_connection_unix_process_id(zbus::names::BusName::Unique(name))
+        .await
+        .ok()
+}
+
 /// End an EI connection through any descriptor of its server end.
 fn shut_down(stream: &UnixStream) {
     if let Err(error) = stream.shutdown(Shutdown::Both) {
@@ -659,14 +690,20 @@ fn shut_down(stream: &UnixStream) {
 pub(crate) fn connect_to_eis(
     handle: &smithay::reexports::calloop::LoopHandle<'static, crate::State>,
     layout: &str,
+    owner: Option<u32>,
 ) -> std::io::Result<(OwnedFd, UnixStream)> {
     use smithay::reexports::reis::eis;
 
     let (client, server) = UnixStream::pair()?;
     let server_handle = server.try_clone()?;
     let context = eis::Context::new(server)?;
-    crate::eis::serve_connection(handle, context, layout.to_owned())
-        .map_err(std::io::Error::other)?;
+    crate::eis::serve_connection(
+        handle,
+        context,
+        layout.to_owned(),
+        SourceInfo::new(SourceKind::PortalEis, owner),
+    )
+    .map_err(std::io::Error::other)?;
     Ok((client.into(), server_handle))
 }
 
@@ -795,7 +832,8 @@ mod tests {
         let mut event_loop =
             smithay::reexports::calloop::EventLoop::<State>::try_new().expect("event loop");
         let (_display, mut state) = crate::tests::test_state();
-        let (client, server) = connect_to_eis(&event_loop.handle(), "us").expect("connect to EIS");
+        let (client, server) =
+            connect_to_eis(&event_loop.handle(), "us", None).expect("connect to EIS");
         // u32::MAX is the largest code an EI sender can send; 30 is KEY_A.
         let sender = std::thread::spawn(move || {
             ei_key_presses(UnixStream::from(client), &[u32::MAX, 0x300, 30])
@@ -809,6 +847,44 @@ mod tests {
                 .expect("dispatch EIS");
         }
         assert_eq!(keyboard.pressed_keys(), [38u32.into()].into());
+        shut_down(&server);
+        sender.join().expect("EI sender").expect("EI connection");
+    }
+
+    #[test]
+    fn portal_eis_receipts_go_only_to_the_session_owner() {
+        let mut event_loop =
+            smithay::reexports::calloop::EventLoop::<State>::try_new().expect("event loop");
+        let (_display, mut state) = crate::tests::test_state();
+        let (outgoing, received) = std::sync::mpsc::channel();
+        state.delivery.set_outgoing(outgoing);
+        state
+            .delivery
+            .subscribe("owner".into(), Some(std::process::id()));
+        state.delivery.subscribe("stranger".into(), None);
+        let (client, server) = connect_to_eis(&event_loop.handle(), "us", Some(std::process::id()))
+            .expect("connect to EIS");
+        let sender = std::thread::spawn(move || ei_key_presses(UnixStream::from(client), &[30]));
+        let mut receipts = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while receipts.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no receipt arrived");
+            event_loop
+                .dispatch(std::time::Duration::from_millis(10), &mut state)
+                .expect("dispatch EIS");
+            for message in received.try_iter() {
+                if let crate::delivery::Message::Send(message) = message
+                    && let crate::delivery::Signal::Receipt(receipt) = message.signal
+                {
+                    receipts.push((message.to, receipt));
+                }
+            }
+        }
+        let (to, receipt) = &receipts[0];
+        assert_eq!(to, &["owner".to_owned()]);
+        assert_eq!(receipt.source, SourceKind::PortalEis);
+        assert_eq!(receipt.source_pid, Some(std::process::id()));
+        assert_eq!(receipt.delivery, "nowhere", "no window has focus");
         shut_down(&server);
         sender.join().expect("EI sender").expect("EI connection");
     }

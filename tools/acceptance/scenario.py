@@ -19,7 +19,8 @@ ARTIFACTS = ROOT / ".amp/in/artifacts"
 NAME = "waywire-acceptance"
 BROWSER_SESSION = f"ww-{os.getpid()}"
 PORT = "18925"
-SCENARIOS = ("computer-use-linux", "cua-driver", "fedora-x11")
+SCENARIOS = ("computer-use-linux", "cua-driver", "fedora-x11", "receipts-t6a")
+RECEIPTS = "/tmp/receipts.jsonl"
 
 
 def run(*args, **kwargs):
@@ -80,6 +81,189 @@ def capture(scenario, phase):
             stderr=subprocess.DEVNULL,
         ).stdout
     return re.sub(r"[^A-Z]", "", output.upper())
+
+
+def session(*args, **kwargs):
+    """Run a command in the container with the desktop session's environment."""
+    return docker(
+        "exec", NAME, "python3", "/repo/tools/acceptance/session_exec.py", *args, **kwargs
+    )
+
+
+def receipts():
+    output = docker("exec", NAME, "cat", RECEIPTS, stdout=subprocess.PIPE).stdout
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
+def settled():
+    """Return the receipts once every signal for earlier input has arrived."""
+    # GetFocus replies after the compositor has sent every earlier signal.
+    session(
+        "python3",
+        "/repo/tools/receipts/receipts.py",
+        "--focus",
+        stdout=subprocess.DEVNULL,
+    )
+    time.sleep(0.5)
+    return receipts()
+
+
+def title(record, key="window"):
+    return (record.get(key) or {}).get("title", "")
+
+
+def keys(records):
+    return [
+        record
+        for record in records
+        if record["signal"] == "Receipt" and record["event"] == "key"
+    ]
+
+
+def t6a(variant, action):
+    """Replay the dogfood run's T6a with cua-driver and check its receipts.
+
+    The agent types a name and an email, tabs to Phone, looks at the screen
+    for 1.5 s and types the phone number. Focusing Phone opens a dialog
+    300 ms later, so the number never reaches the field.
+    """
+    start = len(receipts())
+    chromium = subprocess.Popen(
+        [
+            "sudo",
+            "docker",
+            "exec",
+            NAME,
+            "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "chromium",
+            "--no-sandbox",
+            "--test-type",
+            "--ozone-platform=wayland",
+            f"--user-data-dir=/tmp/chromium-{variant}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-gpu",
+            "--disable-popup-blocking",
+            f"file:///repo/tools/acceptance/t6a.html?interrupt={variant}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+
+        def form_ready():
+            return any(
+                record["signal"] == "TextFieldChanged"
+                and title(record).startswith("Registration form")
+                and record["text_field"] == "focused"
+                for record in receipts()[start:]
+            )
+
+        wait_for(form_ready, f"{variant}: the form never focused its Name field")
+        action("type_text", {"scope": "desktop", "text": "Katherine Johnson"})
+        action("press_key", {"scope": "desktop", "key": "tab"})
+        action("type_text", {"scope": "desktop", "text": "kj@example.com"})
+        action("press_key", {"scope": "desktop", "key": "tab"})
+        time.sleep(1.5)
+        mark = len(settled())
+        action("type_text", {"scope": "desktop", "text": "555-0199"})
+        records = settled()
+    finally:
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "chromium"], check=False)
+        chromium.wait(timeout=20)
+    before, after = records[start:mark], records[mark:]
+    failures = []
+    form = next(
+        (
+            record["window"]
+            for record in before
+            if record["signal"] == "FocusChanged"
+            and title(record).startswith("Registration form")
+        ),
+        None,
+    )
+    if form is None:
+        failures.append("no FocusChanged event named the form")
+        form = {"id": None}
+    typed = keys(before)
+    phone = keys(after)
+    if len(typed) < 2 * len("Katherine Johnson"):
+        failures.append(f"{len(typed)} receipts for the name and email keys")
+    if len(phone) < 2 * len("555-0199"):
+        failures.append(f"{len(phone)} receipts for the phone keys")
+    early = [record for record in typed if record["window"].get("id") != form["id"]]
+    if early:
+        failures.append(f"name or email keys not in the form: {early[:2]}")
+    if not any(record.get("text_field") == "focused" for record in typed):
+        failures.append("no name or email key reported a focused text field")
+    if variant == "window":
+        # Chromium maps the popup as about:blank and titles it afterwards,
+        # so the events name it by window id and the receipts by its title.
+        mapped = [
+            record["window"]
+            for record in before
+            if record["signal"] == "WindowMapped"
+            and record["window"].get("id") not in ("", form["id"])
+        ]
+        popup = mapped[-1] if mapped else {}
+        focus = [
+            record
+            for record in before
+            if record["signal"] == "FocusChanged"
+            and popup.get("id")
+            and record["window"].get("id") == popup["id"]
+            and record["cause"] in ("new-window", "new-dialog", "activation")
+        ]
+        if not popup:
+            failures.append("no WindowMapped event announced the popup")
+        if not focus:
+            failures.append("no FocusChanged event moved focus to the popup")
+        stray = [
+            record
+            for record in phone
+            if record["delivery"] != "window"
+            or not popup.get("id")
+            or record["window"].get("id") != popup["id"]
+            or not title(record).startswith("Session expiring")
+        ]
+        landed = (
+            f"in {title(phone[0]) if phone else '?'!r}, the window that took focus "
+            f"({focus[0]['cause'] if focus else '?'})"
+        )
+    else:
+        cleared = [
+            record
+            for record in before
+            if record["signal"] == "TextFieldChanged"
+            and record["window"].get("id") == form["id"]
+            and record["text_field"] == "none"
+        ]
+        if not cleared:
+            failures.append("no TextFieldChanged event reported the field losing focus")
+        if any(
+            record["signal"] == "WindowMapped" and record["window"].get("id") != form["id"]
+            for record in before
+        ):
+            failures.append("a window mapped although alert() draws inside the page")
+        stray = [
+            record
+            for record in phone
+            if record["delivery"] != "window"
+            or record["window"].get("id") != form["id"]
+            or record.get("text_field") != "none"
+        ]
+        landed = f"in {form.get('title')!r} with no text field focused"
+    if stray:
+        failures.append(f"phone keys reported elsewhere: {stray[:2]}")
+    if failures:
+        return [f"{variant}: " + "; ".join(failures)]
+    sources = sorted({record["source"] for record in phone})
+    print(
+        f"PASS {variant}: the {len(phone)} phone key events from {', '.join(sources)} "
+        f"landed {landed}, not in the Phone field"
+    )
+    return []
 
 
 def main(scenario):
@@ -241,7 +425,21 @@ def main(scenario):
                 def command(marker):
                     action("type_text", text=f"echo {marker}")
                     action("press_key", key="Return")
-            elif scenario == "cua-driver":
+            elif scenario in ("cua-driver", "receipts-t6a"):
+                # The compositor sends receipts only to the driver's own
+                # process tree, so the reference consumer starts the driver.
+                watch = (
+                    [
+                        "python3",
+                        "/repo/tools/receipts/receipts.py",
+                        "--json",
+                        "--output",
+                        RECEIPTS,
+                        "--",
+                    ]
+                    if scenario == "receipts-t6a"
+                    else []
+                )
                 cua = subprocess.Popen(
                     [
                         "sudo",
@@ -250,6 +448,7 @@ def main(scenario):
                         NAME,
                         "python3",
                         "/repo/tools/acceptance/session_exec.py",
+                        *watch,
                         "/opt/cua/cua-driver",
                         "serve",
                         "--no-overlay",
@@ -305,6 +504,16 @@ def main(scenario):
                     action("type", f"echo {marker}")
                     action("key", "Return")
 
+            if scenario == "receipts-t6a":
+                try:
+                    failures = t6a("alert", action) + t6a("window", action)
+                    if failures:
+                        raise RuntimeError("receipts-t6a failed: " + " | ".join(failures))
+                finally:
+                    (ARTIFACTS / f"{scenario}.jsonl").write_text(
+                        "".join(json.dumps(record) + "\n" for record in receipts())
+                    )
+                return
             browser("open", f"http://127.0.0.1:{PORT}/")
             browser("set", "viewport", "1280", "720", "2")
             command("AGENT_BEFORE")

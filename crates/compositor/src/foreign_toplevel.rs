@@ -115,7 +115,11 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
             return;
         }
         match request {
-            Request::Activate { seat } => state.activate_foreign_toplevel(&self.window, &seat),
+            Request::Activate { seat } => {
+                state.with_focus_cause(crate::delivery::FocusCause::WindowRequest, |state| {
+                    state.activate_foreign_toplevel(&self.window, &seat);
+                });
+            }
             Request::Close => state.window_action(&self.window, WindowAction::Close),
             Request::SetMaximized => {
                 state.window_action(&self.window, WindowAction::Maximize);
