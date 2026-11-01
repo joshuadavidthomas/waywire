@@ -171,14 +171,14 @@ adapted to use grim, as in the acceptance scenario.
 
 By default the compositor encodes in process with OpenH264 (BSD-2-Clause, built
 from source), adapted from [pixelflux](https://github.com/selkies-project/pixelflux).
-Only damaged regions whose content changed are encoded, with a constant quantizer
-derived from the quality preset's CRF and no periodic key frames: a viewer that
-joins or falls behind asks for one. Once the screen holds still, it is re-encoded
-at high quality. `--stripes N` splits the output into horizontal stripes encoded
-in parallel, each decoded by its own WebCodecs decoder; the default is one,
-because motion search stops at a stripe's edge and scrolling then costs more
-bytes. This encoder ignores the encoded scale and the bitrate target, so under
-pressure automatic adaptation can only lower its frame rate.
+Only damaged regions whose content changed are encoded, no finer than a quantizer
+derived from the quality preset's CRF and within the adaptive bitrate target, with
+no periodic key frames: a viewer that joins or falls behind asks for one. Lower
+encoded scales are averaged down from the output before encoding. Once the screen
+holds still, it is re-encoded at high quality. `--stripes N` splits the output
+into horizontal stripes encoded in parallel, each decoded by its own WebCodecs
+decoder; the default is one, because motion search stops at a stripe's edge and
+scrolling then costs more bytes.
 
 `--encoder ffmpeg` runs FFmpeg in a separate process instead. Its default is
 H.264 High with YUV 4:2:0 (`libx264` ultrafast with CABAC and

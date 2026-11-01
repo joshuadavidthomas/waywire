@@ -2240,10 +2240,6 @@ impl State {
                 video.submit(CapturedFrame::new(image_pixels(image), metadata, config))?;
             }
             Some(Video::Striped(video)) => {
-                // The in-process encoder codes the output at its own size.
-                let mut metadata = metadata;
-                metadata.width = config.raw_width;
-                metadata.height = config.raw_height;
                 video.submit(&StripedFrame {
                     pixels: image_pixels(image),
                     width: image.width(),
@@ -2251,6 +2247,7 @@ impl State {
                     damage,
                     metadata,
                     crf: self.quality.crf,
+                    bitrate: self.quality.bitrate_kbps,
                     refresh,
                 })?;
             }

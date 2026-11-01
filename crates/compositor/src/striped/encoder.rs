@@ -23,7 +23,11 @@
 //! usage, which encoded recorded desktop frames three times faster than its
 //! screen-content usage. Output keeps waywire's color contract (BT.709 matrix, sRGB
 //! transfer, full range) and goes into the browser stripe container rather than
-//! `pixelflux`'s wire header.
+//! `pixelflux`'s wire header. A changing stripe's quantizer is a floor, not pinned:
+//! rate control holds the stripe to its share of the viewer's bitrate target and
+//! coarsens past the floor when the target is tight. The refresh quantizer stays
+//! pinned, and a stripe left at it moves back to the floor once it has spent a
+//! second of its budget there, not only after `QP_HYSTERESIS_LIMIT` frames.
 
 use std::ops::Range;
 
@@ -63,6 +67,8 @@ const INFINITE_INTRA_PERIOD: u32 = 300_000;
 /// The rate budget of a constant-quantizer session, large enough that the pinned
 /// quantizer, not the rate, shapes every frame.
 const BITRATE_CEILING_BPS: u32 = 100_000_000;
+/// H.264's coarsest quantizer: the bound of a rate-controlled session.
+const MAX_QP: u8 = 51;
 /// The frames a still screen's stripe refreshes are spread over, so no one frame
 /// carries the whole screen's refresh.
 pub(crate) const CLEANUP_STAGGER_FRAMES: usize = 4;
@@ -135,36 +141,42 @@ struct StripeEncoder {
     encoder: Encoder,
     qp: u8,
     hysteresis: u32,
+    /// Bytes coded since the quantizer last moved, while it was finer than asked for.
+    fine_bytes: usize,
     fps: f32,
 }
 
 impl StripeEncoder {
-    fn new(qp: u8, fps: f32) -> Option<Self> {
+    fn new(qp: u8, fps: f32, cap_bps: Option<u32>) -> Option<Self> {
         Some(Self {
-            encoder: build_encoder(qp, fps)?,
+            encoder: build_encoder(qp, fps, cap_bps)?,
             qp,
             hysteresis: 0,
+            fine_bytes: 0,
             fps,
         })
     }
 
-    /// Move the constant quantizer to `qp`. `OpenH264` applies a quantizer range only to
-    /// a new session, so a move rebuilds the encoder and its next frame is a key frame.
-    /// A finer quantizer applies at once; a coarser one only after
-    /// `QP_HYSTERESIS_LIMIT` consecutive requests. True when it rebuilt.
-    fn update_qp(&mut self, qp: u8) -> bool {
+    /// Move the quantizer to `qp`, rate-capped at `cap_bps` or pinned without a cap.
+    /// `OpenH264` applies a quantizer range only to a new session, so a move rebuilds the
+    /// encoder and its next frame is a key frame. A finer quantizer applies at once; a
+    /// coarser one only after `QP_HYSTERESIS_LIMIT` consecutive requests, or sooner once
+    /// the finer one has spent a second of `cap_bps`. True when it rebuilt.
+    fn update_qp(&mut self, qp: u8, cap_bps: Option<u32>) -> bool {
         if qp == self.qp {
             self.hysteresis = 0;
             return false;
         }
         if qp > self.qp {
             self.hysteresis += 1;
-            if self.hysteresis <= QP_HYSTERESIS_LIMIT {
+            let budget = cap_bps.map_or(usize::MAX, |bps| bps as usize / 8);
+            if self.hysteresis <= QP_HYSTERESIS_LIMIT && self.fine_bytes <= budget {
                 return false;
             }
         }
         self.hysteresis = 0;
-        match build_encoder(qp, self.fps) {
+        self.fine_bytes = 0;
+        match build_encoder(qp, self.fps, cap_bps) {
             Some(encoder) => {
                 self.encoder = encoder;
                 self.qp = qp;
@@ -175,10 +187,11 @@ impl StripeEncoder {
     }
 }
 
-/// An `OpenH264` session for one stripe: real-time camera usage at low complexity, the
-/// quantizer pinned to `qp` by a bitrate-mode rate control with a budget it never
-/// reaches, no frame skipping, and no periodic key frames.
-fn build_encoder(qp: u8, fps: f32) -> Option<Encoder> {
+/// An `OpenH264` session for one stripe: real-time camera usage at low complexity, no
+/// frame skipping, and no periodic key frames. With `cap_bps` rate control holds the
+/// stripe to that budget, never finer than `qp`; without it the quantizer is pinned to
+/// `qp` by a budget it never reaches.
+fn build_encoder(qp: u8, fps: f32, cap_bps: Option<u32>) -> Option<Encoder> {
     let config = EncoderConfig::new()
         .max_frame_rate(FrameRate::from_hz(fps))
         .usage_type(UsageType::CameraVideoRealTime)
@@ -190,9 +203,12 @@ fn build_encoder(qp: u8, fps: f32) -> Option<Encoder> {
         .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
         .vui(VuiConfig::srgb())
         .num_threads(1)
-        .bitrate(BitRate::from_bps(BITRATE_CEILING_BPS))
+        .bitrate(BitRate::from_bps(cap_bps.unwrap_or(BITRATE_CEILING_BPS)))
         .rate_control_mode(RateControlMode::Bitrate)
-        .qp(QpRange::new(qp, qp));
+        .qp(QpRange::new(
+            qp,
+            if cap_bps.is_some() { MAX_QP } else { qp },
+        ));
     Encoder::with_api_config(OpenH264API::from_source(), config).ok()
 }
 
@@ -255,10 +271,18 @@ pub(crate) struct Stripes {
     pub(crate) height: usize,
     pub(crate) states: Vec<StripeState>,
     fps: f32,
+    /// The whole picture's bitrate target; each stripe gets its share by rows.
+    pub(crate) bitrate_bps: u32,
 }
 
 impl Stripes {
-    pub(crate) fn new(width: usize, height: usize, requested: usize, fps: f32) -> Self {
+    pub(crate) fn new(
+        width: usize,
+        height: usize,
+        requested: usize,
+        fps: f32,
+        bitrate_bps: u32,
+    ) -> Self {
         let count = stripe_count(height, requested);
         Self {
             width,
@@ -268,12 +292,14 @@ impl Stripes {
                 .map(|rows| StripeState::new(rows, width))
                 .collect(),
             fps,
+            bitrate_bps,
         }
     }
 
     /// Drop every encoder, so each stripe's next frame starts a new stream on a key frame.
-    pub(crate) fn reset(&mut self, fps: f32) {
+    pub(crate) fn reset(&mut self, fps: f32, bitrate_bps: u32) {
         self.fps = fps;
+        self.bitrate_bps = bitrate_bps;
         for state in &mut self.states {
             state.encoder = None;
             state.clean = true;
@@ -311,8 +337,11 @@ impl Stripes {
             .collect();
         let width = self.width;
         let fps = self.fps;
+        let (height, bitrate) = (self.height as u64, u64::from(self.bitrate_bps));
         let body = |(state, refreshing): (&mut StripeState, bool)| {
-            encode_stripe(state, width, fps, key, refreshing, quantizers)
+            let share = bitrate * state.rows.len() as u64 / height;
+            let cap_bps = u32::try_from(share).unwrap_or(u32::MAX).max(1);
+            encode_stripe(state, width, fps, key, refreshing, quantizers, cap_bps)
         };
         let results: Vec<Result<Option<EncodedStripe>, String>> = if self.states.len() > 1 {
             self.states
@@ -334,6 +363,7 @@ fn encode_stripe(
     key: bool,
     refreshing: bool,
     quantizers: Quantizers,
+    cap_bps: u32,
 ) -> Result<Option<EncodedStripe>, String> {
     let mut changed = false;
     if state.dirty {
@@ -348,16 +378,18 @@ fn encode_stripe(
     let mut force_key = key;
     match state.encoder.as_mut() {
         None => {
-            state.encoder = Some(StripeEncoder::new(quantizers.base, fps).ok_or_else(|| {
-                format!("OpenH264 rejected a {width}x{} stripe", state.rows.len())
-            })?);
+            state.encoder = Some(
+                StripeEncoder::new(quantizers.base, fps, Some(cap_bps)).ok_or_else(|| {
+                    format!("OpenH264 rejected a {width}x{} stripe", state.rows.len())
+                })?,
+            );
             force_key = true;
         }
         Some(encoder) if refreshing => {
-            force_key |= encoder.update_qp(quantizers.refresh);
+            force_key |= encoder.update_qp(quantizers.refresh, None);
         }
         Some(encoder) if changed => {
-            force_key |= encoder.update_qp(quantizers.base);
+            force_key |= encoder.update_qp(quantizers.base, Some(cap_bps));
         }
         Some(_) => {}
     }
@@ -385,6 +417,9 @@ fn encode_stripe(
         .map_err(|error| format!("OpenH264 encode failed: {error}"))?;
     let key = matches!(bitstream.frame_type(), FrameType::IDR);
     let data = bitstream.to_vec();
+    if encoder.qp < quantizers.base {
+        encoder.fine_bytes += data.len();
+    }
     if data.is_empty() {
         return Ok(None);
     }
@@ -454,7 +489,7 @@ mod tests {
 
     #[test]
     fn only_changed_stripes_are_sent_and_each_decodes_to_its_rows() {
-        let mut stripes = Stripes::new(WIDTH, HEIGHT, 2, 30.0);
+        let mut stripes = Stripes::new(WIDTH, HEIGHT, 2, 30.0, 100_000_000);
         let mut decoders = [
             Decoder::new().expect("decoder"),
             Decoder::new().expect("decoder"),
@@ -498,6 +533,34 @@ mod tests {
             })
             .collect();
         assert_eq!(refreshed, [vec![0], vec![HALF], vec![]]);
+    }
+
+    #[test]
+    fn a_changing_stripe_keeps_to_its_share_of_the_bitrate_target() {
+        let bytes = |bitrate_bps| {
+            let mut stripes = Stripes::new(WIDTH, HEIGHT, 2, 30.0, bitrate_bps);
+            (0..60)
+                .map(|frame| {
+                    // Fresh texture each frame, so prediction cannot make it cheap.
+                    let noise: Vec<u8> = (0..WIDTH * HEIGHT)
+                        .map(|index| {
+                            let mixed = (index * 2_654_435_761 + frame * 40_503) >> 7;
+                            u8::try_from(mixed % 160 + 48).expect("byte")
+                        })
+                        .collect();
+                    load(&mut stripes, &noise);
+                    let sent = stripes.encode(false, false, QUANTIZERS).expect("encode");
+                    sent.iter().map(|stripe| stripe.data.len()).sum::<usize>()
+                })
+                .sum::<usize>()
+        };
+        let (ample, tight) = (bytes(100_000_000), bytes(1_000_000));
+        // Two seconds at 1 Mbps is 250,000 bytes; the first key frame may overshoot.
+        assert!(tight < 312_500, "{tight} bytes at 1 Mbps");
+        assert!(
+            ample > tight * 4,
+            "the quantizer floor alone sent {ample} bytes"
+        );
     }
 
     #[test]

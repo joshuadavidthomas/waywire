@@ -24,6 +24,7 @@ use waywire_protocol::pipe::Crf;
 use waywire_protocol::pipe::EncodedFrame;
 use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Generation;
+use waywire_protocol::pipe::Kbps;
 
 use self::encoder::Quantizers;
 use self::encoder::Stripes;
@@ -47,6 +48,8 @@ struct Staging {
     v: Vec<u8>,
     /// One flag per `BAND_ROWS` rows changed since the worker last copied them.
     bands: Vec<bool>,
+    /// Scaled BGRA rows on their way to I420.
+    scaled: Vec<u8>,
     pending: Option<Pending>,
     /// Code the next frame's stripes as key frames.
     key: bool,
@@ -57,6 +60,7 @@ struct Staging {
 struct Pending {
     metadata: FrameMetadata,
     crf: Crf,
+    bitrate: Kbps,
     refresh: bool,
 }
 
@@ -66,7 +70,8 @@ struct Shared {
 }
 
 /// A frame for the in-process encoder: the output's BGRA pixels and the rectangles
-/// that changed since the last submitted frame.
+/// that changed since the last submitted frame. The metadata's size is the encoded
+/// size; a smaller one scales the output down before encoding.
 pub(crate) struct StripedFrame<'a> {
     pub(crate) pixels: &'a [u8],
     pub(crate) width: usize,
@@ -74,6 +79,8 @@ pub(crate) struct StripedFrame<'a> {
     pub(crate) damage: &'a [Rectangle<i32, Physical>],
     pub(crate) metadata: FrameMetadata,
     pub(crate) crf: Crf,
+    /// The bitrate target the stripes share.
+    pub(crate) bitrate: Kbps,
     /// The screen held still: refresh stripes at the finer quantizer.
     pub(crate) refresh: bool,
 }
@@ -95,6 +102,7 @@ impl StripedEncoder {
                 u: Vec::new(),
                 v: Vec::new(),
                 bands: Vec::new(),
+                scaled: Vec::new(),
                 pending: None,
                 key: false,
                 generation,
@@ -117,10 +125,14 @@ impl StripedEncoder {
     }
 
     pub(crate) fn submit(&self, frame: &StripedFrame<'_>) -> Result<(), VideoError> {
-        if frame.width > encoder::MAX_WIDTH
+        let width = usize::from(frame.metadata.width.get());
+        let height = usize::from(frame.metadata.height.get());
+        if width > encoder::MAX_WIDTH
+            || width > frame.width
+            || height > frame.height
             || frame.pixels.len() != frame.width * frame.height * 4
-            || !frame.width.is_multiple_of(2)
-            || !frame.height.is_multiple_of(2)
+            || !width.is_multiple_of(2)
+            || !height.is_multiple_of(2)
         {
             return Err(VideoError::InvalidFrame);
         }
@@ -135,15 +147,15 @@ impl StripedEncoder {
         if frame.metadata.generation != staging.generation {
             return Err(VideoError::InvalidFrame);
         }
-        let resized = staging.width != frame.width || staging.height != frame.height;
+        let resized = staging.width != width || staging.height != height;
         if resized {
-            let pixels = frame.width * frame.height;
-            staging.width = frame.width;
-            staging.height = frame.height;
+            let pixels = width * height;
+            staging.width = width;
+            staging.height = height;
             staging.y = vec![0; pixels];
             staging.u = vec![0; pixels / 4];
             staging.v = vec![0; pixels / 4];
-            staging.bands = vec![false; frame.height.div_ceil(BAND_ROWS)];
+            staging.bands = vec![false; height.div_ceil(BAND_ROWS)];
         }
         let full = [Rectangle::from_size(
             (
@@ -153,21 +165,37 @@ impl StripedEncoder {
                 .into(),
         )];
         let damage = if resized { &full[..] } else { frame.damage };
+        let scaled = (width, height) != (frame.width, frame.height);
         for rectangle in damage {
             let top = usize::try_from(rectangle.loc.y.max(0)).unwrap_or(0);
             let bottom = usize::try_from(rectangle.loc.y.saturating_add(rectangle.size.h).max(0))
                 .unwrap_or(0)
                 .min(frame.height);
+            // The encoded rows whose source boxes overlap the damaged rows.
+            let (top, bottom) = if scaled {
+                (
+                    (top * height / frame.height).saturating_sub(1),
+                    ((bottom * height).div_ceil(frame.height) + 1).min(height),
+                )
+            } else {
+                (top, bottom)
+            };
             // 4:2:0 pairs rows; convert whole pairs.
             let (top, bottom) = (top & !1, (bottom + 1) & !1);
             if top >= bottom {
                 continue;
             }
-            let width = frame.width;
             let rows = bottom - top;
             let staging = &mut *staging;
+            let bgra = if scaled {
+                staging.scaled.resize(rows * width * 4, 0);
+                downscale_rows(frame, width, height, top..bottom, &mut staging.scaled);
+                &staging.scaled[..]
+            } else {
+                &frame.pixels[top * width * 4..bottom * width * 4]
+            };
             encoder::convert_rows(
-                &frame.pixels[top * width * 4..bottom * width * 4],
+                bgra,
                 width,
                 rows,
                 &mut staging.y[top * width..bottom * width],
@@ -182,6 +210,7 @@ impl StripedEncoder {
         staging.pending = Some(Pending {
             metadata: frame.metadata.clone(),
             crf: frame.crf,
+            bitrate: frame.bitrate,
             refresh: frame.refresh,
         });
         self.shared.work.notify_one();
@@ -292,14 +321,16 @@ fn run(
             let key = std::mem::take(&mut staging.key);
             #[expect(clippy::cast_precision_loss, reason = "a frame rate of at most 120")]
             let fps = pending.metadata.fps.get() as f32;
-            let current = stripes
-                .get_or_insert_with(|| Stripes::new(staging.width, staging.height, requested, fps));
-            if current.width != staging.width || current.height != staging.height {
-                *current = Stripes::new(staging.width, staging.height, requested, fps);
+            let bitrate = pending.bitrate.get().saturating_mul(1000);
+            let (width, height) = (staging.width, staging.height);
+            let current =
+                stripes.get_or_insert_with(|| Stripes::new(width, height, requested, fps, bitrate));
+            if current.width != width || current.height != height {
+                *current = Stripes::new(width, height, requested, fps, bitrate);
             }
-            if generation != Some(pending.metadata.generation) {
+            if generation != Some(pending.metadata.generation) || current.bitrate_bps != bitrate {
                 generation = Some(pending.metadata.generation);
-                current.reset(fps);
+                current.reset(fps, bitrate);
             }
             copy_changed_stripes(&mut staging, current);
             (pending, key)
@@ -347,6 +378,49 @@ fn run(
     }
 }
 
+/// Scale `frame` down to `width` x `height` and write the BGRA of output `rows` to
+/// `out`. Each output pixel averages the box of source pixels it covers, so text
+/// stays legible rather than aliasing as point sampling would.
+fn downscale_rows(
+    frame: &StripedFrame<'_>,
+    width: usize,
+    height: usize,
+    rows: std::ops::Range<usize>,
+    out: &mut [u8],
+) {
+    let span = |index: usize, source: usize, target: usize| {
+        let start = index * source / target;
+        start..((index + 1) * source / target).max(start + 1)
+    };
+    let columns: Vec<_> = (0..width).map(|x| span(x, frame.width, width)).collect();
+    let mut sums = vec![0_u32; width * 4];
+    for (row, out) in rows.zip(out.chunks_exact_mut(width * 4)) {
+        sums.fill(0);
+        let source_rows = span(row, frame.height, height);
+        let area_rows = source_rows.len();
+        for source_row in source_rows {
+            let line = &frame.pixels[source_row * frame.width * 4..][..frame.width * 4];
+            for (sum, columns) in sums.chunks_exact_mut(4).zip(&columns) {
+                for pixel in line[columns.start * 4..columns.end * 4].chunks_exact(4) {
+                    for (channel, value) in sum.iter_mut().zip(pixel) {
+                        *channel += u32::from(*value);
+                    }
+                }
+            }
+        }
+        for ((pixel, sum), columns) in out
+            .chunks_exact_mut(4)
+            .zip(sums.chunks_exact(4))
+            .zip(&columns)
+        {
+            let area = u32::try_from(area_rows * columns.len()).unwrap_or(u32::MAX);
+            for (value, channel) in pixel.iter_mut().zip(sum) {
+                *value = u8::try_from((channel + area / 2) / area).unwrap_or(u8::MAX);
+            }
+        }
+    }
+}
+
 /// Copy the stripes whose rows changed out of the staging picture.
 fn copy_changed_stripes(staging: &mut Staging, stripes: &mut Stripes) {
     let width = staging.width;
@@ -369,4 +443,83 @@ fn copy_changed_stripes(staging: &mut Staging, stripes: &mut Stripes) {
         state.dirty = true;
     }
     staging.bands.fill(false);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use openh264::decoder::Decoder;
+    use openh264::formats::YUVSource;
+    use waywire_protocol::pipe::Fps;
+    use waywire_protocol::pipe::FrameDimension;
+
+    use super::*;
+
+    #[test]
+    fn a_scaled_frame_is_encoded_at_its_encoded_size_from_averaged_pixels() {
+        // A one-pixel checkerboard: point sampling at half size keeps only black or only
+        // white; averaging each 2x2 box gives mid grey.
+        let (width, height) = (640, 360);
+        let pixels: Vec<u8> = (0..width * height)
+            .flat_map(|index| {
+                let value = if (index % width + index / width) % 2 == 0 {
+                    0
+                } else {
+                    255
+                };
+                [value, value, value, 255]
+            })
+            .collect();
+        let generation = Generation::new(1).expect("generation");
+        let encoder = StripedEncoder::start(1, generation).expect("start");
+        encoder
+            .submit(&StripedFrame {
+                pixels: &pixels,
+                width,
+                height,
+                damage: &[],
+                metadata: FrameMetadata {
+                    generation,
+                    width: FrameDimension::new(320).expect("width"),
+                    height: FrameDimension::new(180).expect("height"),
+                    capture_nanos: 1,
+                    sequence: 1,
+                    input_sequence: None,
+                    fps: Fps::new(30).expect("fps"),
+                    chroma: Chroma::Yuv420,
+                },
+                crf: Crf::new(27).expect("crf"),
+                bitrate: Kbps::new(12_000).expect("bitrate"),
+                refresh: false,
+            })
+            .expect("submit");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let frame = loop {
+            if let Some(frame) = encoder.try_frame() {
+                break frame.expect("encode");
+            }
+            assert!(Instant::now() < deadline, "no encoded frame");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(frame.key);
+        // One stripe: its row, its height, its key flag, its length, then its access unit.
+        assert_eq!(&frame.data[..5], &[0, 0, 180, 0, 1]);
+        let mut decoder = Decoder::new().expect("decoder");
+        let picture = decoder
+            .decode(&frame.data[9..])
+            .expect("decode")
+            .expect("picture");
+        assert_eq!(picture.dimensions(), (320, 180));
+        let pitch = picture.strides().0;
+        let plane = picture.y();
+        let luma: u64 = (0..180)
+            .flat_map(|row| &plane[row * pitch..][..320])
+            .map(|value| u64::from(*value))
+            .sum();
+        let mean = luma / (320 * 180);
+        assert!((120..=136).contains(&mean), "mean luma {mean}");
+        encoder.stop();
+    }
 }
