@@ -339,16 +339,17 @@ upstream code to local copies of it.
   keymap as a C string, and the libei seat still passes the sealed file's size,
   trailing NUL included, to the EIS keymap event. The bump does not fix the
   length that libxkbcommon before 1.6 rejects; fix it upstream.
-- **Crates.** Compatible updates landed on 2026-10-30; re-run `cargo update`
-  with the drift check below. `nix` is pinned exactly (`=0.31.3`); re-check it
-  against newer releases deliberately. `zbus` stays on 5.x: 6.0 drops the
-  `blocking-api` feature and reworks runtime selection, so moving the portal
-  thread to it is a port, not a bump.
+- **Crates.** Dependabot opens weekly grouped PRs for crates, npm packages,
+  GitHub Actions and prek hooks. It ignores Smithay: the latest crates.io
+  release, 0.7.0 (June 2025), lacks `backend_libei`, the virtual-pointer and
+  image-copy-capture modules and XWM drag-and-drop, so the git pin stays and
+  each bump is a deliberate port. Bump it when upstream has something waywire
+  needs, such as xdg-toplevel-drag. `nix` is pinned exactly (`=0.31.3`);
+  re-check it against newer releases deliberately. `zbus` stays on 5.x: 6.0
+  drops the `blocking-api` feature and reworks runtime selection, so moving the
+  portal thread to it is a port, not a bump.
 - **Xwayland.** `.agents/setup` builds 24.1.14. Track the 26.1 release for
   pointer-warp and libei changes.
-- **Check.** Add a periodic job or `just` recipe that reports how far the
-  Smithay revision, the crates and the Xwayland build are behind, so drift is
-  visible before it becomes a large migration.
 
 ## Tests
 
