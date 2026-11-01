@@ -18,12 +18,14 @@ use waywire_protocol::pipe::Kbps;
 struct Options {
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: String,
-    /// `ffmpeg` runs libx264 or libopenh264 in an `FFmpeg` process; `openh264` encodes
-    /// horizontal stripes in process.
-    #[arg(long, env = "WAYWIRE_ENCODER", default_value = "ffmpeg", value_parser = parse_encoder)]
+    /// `openh264` encodes horizontal stripes in process; `ffmpeg` runs libx264 or
+    /// libopenh264 in an `FFmpeg` process.
+    #[arg(long, env = "WAYWIRE_ENCODER", default_value = "openh264", value_parser = parse_encoder)]
     encoder: EncoderChoice,
-    /// Stripes for the in-process encoder; 0 picks one a core.
-    #[arg(long, env = "WAYWIRE_STRIPES", default_value = "0")]
+    /// Stripes for the in-process encoder; 0 picks one a core. One is the default:
+    /// motion search stops at a stripe's edge, so each stripe re-sends the rows that
+    /// scroll into it.
+    #[arg(long, env = "WAYWIRE_STRIPES", default_value = "1")]
     stripes: usize,
     #[arg(long, default_value = "60", value_parser = parse_fps)]
     frame_rate: Fps,

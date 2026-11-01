@@ -2,7 +2,7 @@
 
 waywire is an experimental remote desktop built around a headless Rust compositor.
 [Smithay](https://github.com/Smithay/smithay) manages Wayland applications and a
-single seat; Pixman renders on the CPU, and FFmpeg encodes H.264. A Rust gateway
+single seat; Pixman renders on the CPU, and OpenH264 encodes H.264 in process. A Rust gateway
 relays video, input, and clipboard messages to a browser using WebCodecs.
 No wlroots compositor, desktop environment, GPU, or physical display is required.
 The project began as a port of [waymote](https://github.com/rockorager/waymote).
@@ -62,8 +62,9 @@ Window decorations use Cairo and Pango shared libraries and the host's system
 fonts. Titles request generic Sans, with system fallback for other scripts; no
 font or desktop theme is bundled.
 
-At runtime, the compositor needs FFmpeg with libx264, Xwayland, and the application
-you choose to launch. It currently starts the X11 bridge even for native Wayland
+At runtime, the compositor needs Xwayland and the application you choose to
+launch; `--encoder ffmpeg` also needs FFmpeg with libx264. Building needs `nasm`
+on x86, so OpenH264 gets its assembly. It currently starts the X11 bridge even for native Wayland
 applications. The compositor links the PipeWire client library. When the
 `pipewire` daemon binary is installed, it starts a private daemon so the
 ScreenCast portal can deliver video. Without the binary, ScreenCast reports
@@ -168,7 +169,19 @@ adapted to use grim, as in the acceptance scenario.
 
 ## Video encoding
 
-The default is H.264 High with YUV 4:2:0 (`libx264` ultrafast with CABAC and
+By default the compositor encodes in process with OpenH264 (BSD-2-Clause, built
+from source), adapted from [pixelflux](https://github.com/selkies-project/pixelflux).
+Only damaged regions whose content changed are encoded, with a constant quantizer
+derived from the quality preset's CRF and no periodic key frames: a viewer that
+joins or falls behind asks for one. Once the screen holds still, it is re-encoded
+at high quality. `--stripes N` splits the output into horizontal stripes encoded
+in parallel, each decoded by its own WebCodecs decoder; the default is one,
+because motion search stops at a stripe's edge and scrolling then costs more
+bytes. This encoder ignores the encoded scale and the bitrate target, so under
+pressure automatic adaptation can only lower its frame rate.
+
+`--encoder ffmpeg` runs FFmpeg in a separate process instead. Its default is
+H.264 High with YUV 4:2:0 (`libx264` ultrafast with CABAC and
 the 8x8 transform re-enabled, CRF 27), including startup,
 quality presets, and automatic recovery. This works with browsers that reject
 High 4:4:4 Predictive, including the tested Amp macOS embedded viewer.

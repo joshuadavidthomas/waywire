@@ -184,6 +184,8 @@ fn idle_compositor_stops_rendering_and_emitting_frames() {
     let mut compositor = Compositor(
         ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
             .args([
+                "--encoder",
+                "ffmpeg",
                 "--rtp-port",
                 &port,
                 "--resolution",
