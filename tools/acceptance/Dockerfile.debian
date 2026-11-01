@@ -15,16 +15,13 @@ RUN curl -fsSL -o /tmp/cul.crate https://static.crates.io/crates/computer-use-li
     && mkdir /src && tar -xzf /tmp/cul.crate -C /src \
     && cargo install --locked --path /src/computer-use-linux-0.7.35 --root /opt/cul-stock \
     && rm -rf /src /tmp/cul.crate /root/.cargo/registry
-# Patched: upstream 3175c04 with the open pull requests #359 (wlr-foreign-toplevel
-# backend) and #360 (wtype chords) merged, checked by the merged tree's hash.
+# Patched: upstream main at 292376c, which carries #359 (wlr-foreign-toplevel
+# backend, c21b13b) and #360 (wtype chords) ahead of a release. The full commit
+# hash pins the exact source.
 RUN git clone -q https://github.com/agent-sh/computer-use-linux /src \
     && cd /src \
-    && git checkout -q 3175c045a68011235bcefb8b60305204c7a14729 \
-    && git fetch -q https://github.com/joshuadavidthomas/computer-use-linux \
-       78892cf21446bb1a2c424bf838c39d444015a486 27ca862c39287a349caf45fb201da4ec1f238172 \
-    && git -c user.name=acceptance -c user.email=acceptance@localhost merge -q --no-edit \
-       78892cf21446bb1a2c424bf838c39d444015a486 27ca862c39287a349caf45fb201da4ec1f238172 \
-    && test "$(git rev-parse 'HEAD^{tree}')" = ff768579c6901ad2779cbf4f443716eeb6a03818 \
+    && git checkout -q 292376c753457b73c31750430b8f0b61ffdc8815 \
+    && test "$(git rev-parse HEAD)" = 292376c753457b73c31750430b8f0b61ffdc8815 \
     && cargo install --locked --path . --root /opt/cul-patched \
     && rm -rf /src /root/.cargo/registry
 

@@ -35,7 +35,7 @@ image holds only Debian packages and the pinned drivers:
 | Driver                     | Pin                                                                                                                                                        |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | computer-use-linux stock   | 0.7.35 crate, sha256 `2868a912…1362` (crates.io)                                                                                                           |
-| computer-use-linux patched | upstream `3175c04` with #359 (`78892cf`) and #360 (`27ca862`) merged; merged tree `ff768579…3818`                                                          |
+| computer-use-linux patched | upstream main `292376c`, which carries #359 (`c21b13b`) and #360 ahead of a release                                                                        |
 | cua-driver                 | 0.38.0 archive sha256 `31ab9709…98dd`, binary sha256 `bf57b2f3…7934`                                                                                       |
 | xdotool loop               | Anthropic's `ComputerTool20250124` at anthropic-quickstarts `1a18c34`, `anthropic==2.3.0` from the hash-locked `x11-loop-requirements.txt`, Debian xdotool |
 
