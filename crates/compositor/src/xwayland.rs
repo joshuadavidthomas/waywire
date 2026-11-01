@@ -417,10 +417,6 @@ impl XwmHandler for State {
     fn new_override_redirect_window(&mut self, _: XwmId, _: X11Surface) {}
 
     fn map_window_request(&mut self, _: XwmId, surface: X11Surface) {
-        if let Err(error) = surface.set_mapped(true) {
-            tracing::warn!(%error, "X11 map failed");
-            return;
-        }
         let mut geometry = surface.last_configure();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Modulo 8.
         let offset = (self.space.elements().count() % 8) as i32 * 48;
@@ -458,6 +454,13 @@ impl XwmHandler for State {
         } else {
             self.center_dialog(&window);
             self.constrain_window(&window);
+        }
+        // Map only once placed, so the window never becomes viewable at the
+        // geometry its client requested before the window manager placed it.
+        if let Err(error) = surface.set_mapped(true) {
+            tracing::warn!(%error, "X11 map failed");
+            self.window_unmapped(&window);
+            self.space.unmap_elem(&window);
         }
     }
 
