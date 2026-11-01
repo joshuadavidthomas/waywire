@@ -63,8 +63,9 @@ async function presentation(context: TestContext, latency: number) {
     latency,
     0,
   );
+  const canvas = new FakeTarget();
   video.attach(
-    new FakeTarget() as unknown as HTMLCanvasElement,
+    canvas as unknown as HTMLCanvasElement,
     {
       drawImage(frame: VideoFrame) {
         draws.push({ timestamp: frame.timestamp, at: now });
@@ -83,6 +84,7 @@ async function presentation(context: TestContext, latency: number) {
   video.resetFeedbackInterval(0);
   return {
     video,
+    canvas,
     draws,
     published,
     closed: installed.closedTimestamps,
@@ -275,6 +277,85 @@ test("a striped frame answering this viewer's input skips the playout delay", as
     assert.deepEqual(h.draws, [{ timestamp: 20_000, at: 20 }]);
   } finally {
     h.video.disconnect();
+  }
+});
+
+test("where MediaStreamTrackGenerator exists, frames show through a <video> over the canvas", async (context) => {
+  const written: number[] = [];
+  let stopped = false;
+  installGlobal(
+    "MediaStreamTrackGenerator",
+    class {
+      readonly writable = {
+        getWriter: () => ({
+          write(frame: VideoFrame) {
+            written.push(frame.timestamp);
+            frame.close();
+            return Promise.resolve();
+          },
+          close: () => Promise.resolve(),
+        }),
+      };
+      stop() {
+        stopped = true;
+      }
+    },
+  );
+  installGlobal(
+    "MediaStream",
+    class {
+      constructor(readonly tracks: unknown[]) {}
+    },
+  );
+  installGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  installGlobal("getComputedStyle", () => ({
+    objectFit: "contain",
+    objectPosition: "center",
+  }));
+  const h = await presentation(context, 300);
+  (document as unknown as { createElement: () => FakeTarget }).createElement =
+    () => Object.assign(new FakeTarget(), { play: () => Promise.resolve() });
+  const stage = new FakeTarget();
+  stage.append(h.canvas);
+  Object.assign(h.canvas, {
+    after: (element: FakeTarget) => stage.append(element),
+  });
+  try {
+    await h.feed(0, { keyframe: true });
+    h.advance(300);
+    h.paint();
+    await h.feed(310_000, { inputSequence: 1 });
+    assert.deepEqual(written, [0, 310_000]);
+    assert.deepEqual(h.draws, [], "the canvas is not drawn");
+    const video = stage.children[1];
+    assert.equal(stage.children.length, 2);
+    assert.equal(
+      (video?.style as unknown as { pointerEvents: string }).pointerEvents,
+      "none",
+      "input stays on the canvas",
+    );
+    Object.assign(document, { fullscreenElement: h.canvas });
+    h.advance(10);
+    await h.feed(320_000, { inputSequence: 2 });
+    assert.deepEqual(
+      h.draws.map(({ timestamp }) => timestamp),
+      [320_000],
+      "a fullscreen canvas is drawn too",
+    );
+    assert.deepEqual(written, [0, 310_000, 320_000]);
+    h.video.detach();
+    assert.equal(stage.children.length, 1);
+    assert.ok(stopped);
+  } finally {
+    h.video.disconnect();
+    delete (globalThis as { MediaStreamTrackGenerator?: unknown })
+      .MediaStreamTrackGenerator;
   }
 });
 

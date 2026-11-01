@@ -134,7 +134,8 @@ below, where it measures about 19 ms and 25 ms.
 For waywire, the benchmark also splits each key's input-to-screen latency into
 stages, from the browser key event through the gateway, compositor, client
 commit, render, encoder (in-process OpenH264 or the FFmpeg process, each with
-its own stages), and back to the browser's decoder and canvas. The
+its own stages), and back to the browser's decoder and the canvas or `<video>`
+that shows the frame. The
 gateway and compositor log stage times on `CLOCK_MONOTONIC` under the
 `waywire_latency` tracing target (`RUST_LOG=waywire_latency=debug`), and the
 browser's times are shifted onto that clock with the control socket's

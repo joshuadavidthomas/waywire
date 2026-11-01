@@ -137,8 +137,8 @@ class LatencyBreakdownTest(unittest.TestCase):
                 "gateway send → browser receive": 1.0,
                 "browser receive → decode submit": 0.5,
                 "decode": 1.5,
-                "decoded → canvas paint": 25.0,
-                "canvas paint → changed pixel (harness readback)": 2.0,
+                "decoded → shown (canvas draw or track write)": 25.0,
+                "shown → changed pixel (harness readback)": 2.0,
             },
         )
         self.assertEqual(breakdown["encoder"], "ffmpeg")

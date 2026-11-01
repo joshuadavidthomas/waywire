@@ -248,8 +248,8 @@ _VIEWER_STAGES = (
     ("gateway send → browser receive", "gateway_send", "received"),
     ("browser receive → decode submit", "received", "decoding"),
     ("decode", "decoding", "decoded"),
-    ("decoded → canvas paint", "decoded", "drawn"),
-    ("canvas paint → changed pixel (harness readback)", "drawn", "detected"),
+    ("decoded → shown (canvas draw or track write)", "decoded", "drawn"),
+    ("shown → changed pixel (harness readback)", "drawn", "detected"),
 )
 # Each encoder's stages between the render and the gateway's WebSocket send.
 LATENCY_STAGES = {

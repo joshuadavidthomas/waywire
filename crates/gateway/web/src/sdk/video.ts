@@ -7,6 +7,7 @@ import {
 } from "./messages.ts";
 import type { WaywireStats } from "./session.ts";
 import { StripeCompositor } from "./stripes.ts";
+import { TrackSink } from "./track-sink.ts";
 import { decodeRecord, readFrameMetadata } from "./wire.ts";
 export const maximumVideoDecodeQueueSize = 24;
 const busyDecodeQueueSize = 5;
@@ -174,6 +175,8 @@ export class VideoRuntime {
   private decoderResets = 0;
   private lastDrawStats: WaywireStats | null = null;
   private presentedInput = 0;
+  // Undefined until the first frame decides whether this browser has a track sink.
+  private trackSink: TrackSink | null | undefined;
 
   constructor(
     private readonly owner: VideoOwner,
@@ -237,11 +240,13 @@ export class VideoRuntime {
   }
 
   attach(display: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
+    this.closeTrackSink();
     this.display = display;
     this.context = context;
   }
 
   detach(): void {
+    this.closeTrackSink();
     this.display = null;
     this.context = null;
   }
@@ -824,7 +829,11 @@ export class VideoRuntime {
       display.width = frame.displayWidth;
       display.height = frame.displayHeight;
     }
-    context.drawImage(frame, 0, 0, display.width, display.height);
+    if (this.trackSink === undefined) this.trackSink = TrackSink.over(display);
+    this.trackSink?.show(frame);
+    // A fullscreen canvas hides the <video> beside it, so it draws as well.
+    if (!this.trackSink || document.fullscreenElement === display)
+      context.drawImage(frame, 0, 0, display.width, display.height);
     const drawCompletedAtMs = performance.now();
     // Presented means rendered to the canvas, not physical display scanout.
     this.owner.presentResizeGeneration(
@@ -860,6 +869,11 @@ export class VideoRuntime {
       this.owner.publishStats(this.lastDrawStats);
     }
     this.schedulePresentation();
+  }
+
+  private closeTrackSink(): void {
+    this.trackSink?.close();
+    this.trackSink = undefined;
   }
 
   private readonly answersInput = ({ metadata }: PendingVideoFrame): boolean =>

@@ -290,6 +290,9 @@ export function installQueueVideoDecoder(): {
     readonly displayWidth = 1280;
     readonly displayHeight = 720;
     constructor(readonly timestamp: number) {}
+    clone(): FakeVideoFrame {
+      return new FakeVideoFrame(this.timestamp);
+    }
     close(): void {
       closedTimestamps.push(this.timestamp);
     }

@@ -28,16 +28,26 @@ const frameTime = (timestamp) => {
   return entry;
 };
 let pendingInput = null;
+// The last frame handed to a MediaStreamTrackGenerator, where the viewer shows
+// frames through a <video> instead of drawing the canvas.
+let lastShown = null;
 document.addEventListener(
   "keydown",
   () => {
     if (!window.benchmarkArmed) return;
     const canvas = document.querySelector("#display");
-    const context = canvas.getContext("2d", { willReadFrequently: true });
     const time = performance.now();
+    const viaTrack = lastShown !== null;
     pendingInput = {
       time,
-      pixels: context.getImageData(0, 0, canvas.width, canvas.height).data,
+      // A <video> has no cheap pixel readback: keep the shown frame and compare
+      // raw frame bytes once the next frames arrive.
+      pixels: viaTrack
+        ? null
+        : canvas
+            .getContext("2d", { willReadFrequently: true })
+            .getImageData(0, 0, canvas.width, canvas.height).data,
+      frame: viaTrack ? lastShown.clone() : null,
       width: canvas.width,
       height: canvas.height,
       sent: null,
@@ -50,47 +60,80 @@ document.addEventListener(
   },
   true,
 );
-const drawImage = CanvasRenderingContext2D.prototype.drawImage;
-CanvasRenderingContext2D.prototype.drawImage = function (...args) {
-  drawImage.apply(this, args);
-  if (this.canvas.id === "display") window.benchmarkDraws++;
-  const drawn = performance.now();
-  if (!pendingInput || this.canvas.id !== "display") return;
-  if (
-    this.canvas.width !== pendingInput.width ||
-    this.canvas.height !== pendingInput.height
-  )
-    return;
-  const pixels = this.getImageData(
-    0,
-    0,
-    this.canvas.width,
-    this.canvas.height,
-  ).data;
+// Record a key's trace when a shown frame first differs from its baseline.
+const detect = (input, before, after, frame, drawn) => {
+  if (pendingInput !== input || before.length !== after.length) return;
   let changed = 0;
-  for (let i = 0; i < pixels.length; i += 4) {
-    if (Math.abs(pixels[i] - pendingInput.pixels[i]) > 20 && ++changed >= 10) {
+  for (let i = 0; i < after.length; i += 4) {
+    if (Math.abs(after[i] - before[i]) > 20 && ++changed >= 10) {
       const detected = performance.now();
-      window.benchmarkLatencies.push(detected - pendingInput.time);
-      const source = args[0];
+      window.benchmarkLatencies.push(detected - input.time);
       const timestamp =
-        typeof VideoFrame !== "undefined" && source instanceof VideoFrame
-          ? source.timestamp
+        typeof VideoFrame !== "undefined" && frame instanceof VideoFrame
+          ? frame.timestamp
           : null;
       window.benchmarkTraces.push({
-        keydown: pendingInput.time,
-        armed: pendingInput.armed,
-        sent: pendingInput.sent,
-        input: pendingInput.input,
+        keydown: input.time,
+        armed: input.armed,
+        sent: input.sent,
+        input: input.input,
         captureMicros: timestamp,
         ...(timestamp === null ? {} : frameTimes.get(timestamp)),
         drawn,
         detected,
       });
+      input.frame?.close();
       pendingInput = null;
-      break;
+      return;
     }
   }
+};
+const drawImage = CanvasRenderingContext2D.prototype.drawImage;
+CanvasRenderingContext2D.prototype.drawImage = function (...args) {
+  drawImage.apply(this, args);
+  const drawn = performance.now();
+  if (this.canvas.id === "display") window.benchmarkDraws++;
+  if (!pendingInput?.pixels || this.canvas.id !== "display") return;
+  if (
+    this.canvas.width !== pendingInput.width ||
+    this.canvas.height !== pendingInput.height
+  )
+    return;
+  detect(
+    pendingInput,
+    pendingInput.pixels,
+    this.getImageData(0, 0, this.canvas.width, this.canvas.height).data,
+    args[0],
+    drawn,
+  );
+};
+const frameBytes = async (frame) => {
+  const bytes = new Uint8Array(frame.allocationSize());
+  await frame.copyTo(bytes);
+  return bytes;
+};
+const write = WritableStreamDefaultWriter.prototype.write;
+WritableStreamDefaultWriter.prototype.write = function (chunk) {
+  if (typeof VideoFrame === "undefined" || !(chunk instanceof VideoFrame))
+    return write.call(this, chunk);
+  // The writer takes the frame; keep a reference to compare after the hand-off.
+  const shown = chunk.clone();
+  const result = write.call(this, chunk);
+  const drawn = performance.now();
+  window.benchmarkDraws++;
+  const input = pendingInput;
+  if (input?.frame) {
+    const baseline = input.frame;
+    const frame = shown.clone();
+    Promise.all([frameBytes(baseline), frameBytes(frame)])
+      .then(([before, after]) => detect(input, before, after, frame, drawn))
+      // A frame detected first closes the baseline under later comparisons.
+      .catch(() => undefined)
+      .finally(() => frame.close());
+  }
+  lastShown?.close();
+  lastShown = shown;
+  return result;
 };
 // Waywire records: version u8, kind u8, reserved u16, length u32, payload.
 const recordKind = (data) =>
