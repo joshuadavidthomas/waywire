@@ -7,6 +7,9 @@ window.benchmarkSockets = {};
 window.benchmarkQuality = null;
 window.benchmarkLatencies = [];
 window.benchmarkArmed = false;
+window.benchmarkDraws = 0;
+// Decode wall time and capture timestamp (host CLOCK_MONOTONIC, microseconds).
+window.benchmarkDecodes = [];
 let pendingInput = null;
 document.addEventListener(
   "keydown",
@@ -27,6 +30,7 @@ document.addEventListener(
 const drawImage = CanvasRenderingContext2D.prototype.drawImage;
 CanvasRenderingContext2D.prototype.drawImage = function (...args) {
   drawImage.apply(this, args);
+  if (this.canvas.id === "display") window.benchmarkDraws++;
   if (!pendingInput || this.canvas.id !== "display") return;
   if (
     this.canvas.width !== pendingInput.width ||
@@ -74,6 +78,7 @@ window.VideoDecoder = class extends NativeVideoDecoder {
       ...init,
       output(frame) {
         window.benchmarkFrames++;
+        window.benchmarkDecodes.push([Date.now(), frame.timestamp]);
         window.benchmarkFirstFrame ??= Date.now();
         try {
           if (!window.benchmarkNonblank) {

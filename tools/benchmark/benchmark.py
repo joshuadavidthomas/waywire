@@ -15,6 +15,16 @@ points, 15% plus 10 MiB RSS, 25% plus 20 kbps stream traffic, 25% plus
 200 ms launch time, or 25% plus 10 ms latency. Each agent must pass if the
 corresponding Waymote agent passes. Missing comparisons fail the check.
 
+Slow link: with each encoder, waywire streams a full-screen animation in
+Chromium while the viewer's link drops to 500 kbps for 45 seconds, then clears.
+On the slow link the viewer must lower the encoded scale and the bitrate target,
+not only the frame rate. Over the last 15 seconds on the slow link it must
+still draw at least 4 frames a second, and the median decoded frame must be at
+most 5 seconds old, measured from capture on the host's monotonic clock. Once
+the link clears, quality must return to the full scale, bitrate and frame rate
+within 150 seconds. Both encoders drew about 5 frames a second about 3.5
+seconds old: the ladder stops at half the bitrate ceiling, far above 500 kbps.
+
 Requires release binaries (just build), agent-browser, xterm, ffmpeg, Xwayland,
 xdotool, grim, wlr-randr, Debian Chromium, git, uv and the Amp Waymote installation.
 The pinned Anthropic demo and Python dependency are downloaded to a temporary
@@ -36,12 +46,31 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from link import Link
+
 ROOT = Path(__file__).resolve().parents[2]
 WAYMOTE = Path("/opt/amp-wayland")
 PORT = 18925
 SESSION = f"benchmark-{os.getpid()}"
 URL = f"http://127.0.0.1:{PORT}"
 SECONDS = 8
+SLOW_LINK_KBPS = 500
+SLOW_LINK_SECONDS = 45
+SLOW_LINK_MIN_FPS = 4
+SLOW_LINK_MAX_AGE_MS = 5000
+RECOVERY_SECONDS = 150
+ENCODERS = ("ffmpeg", "openh264")
+MOTION_PAGE = (
+    "<!doctype html><title>Benchmark motion</title><style>"
+    "html,body{margin:0;overflow:hidden;font:15px sans-serif}"
+    "@keyframes m{from{transform:translateY(0)}to{transform:translateY(-3000px)}}"
+    "div{animation:m 20s linear infinite}</style><div>"
+    + "".join(
+        f"<p>Motion {i}: the quick brown fox jumps over the lazy dog.</p>"
+        for i in range(400)
+    )
+    + "</div>"
+)
 
 
 def evaluate(expression):
@@ -247,25 +276,52 @@ def agent_checks(app_env, window, directory, fixture):
     }
 
 
+def desktop_env(runtime):
+    env = os.environ.copy()
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    env.update(XDG_RUNTIME_DIR=runtime)
+    xwayland = (
+        Path(
+            os.environ.get(
+                "WAYWIRE_XWAYLAND_PREFIX",
+                Path.home() / ".local/share/waywire-xwayland",
+            )
+        )
+        / "bin"
+    )
+    if (xwayland / "Xwayland").exists():
+        env["PATH"] = f"{xwayland}:{env['PATH']}"
+    return env
+
+
+def waywire_command(public_url, app):
+    return [
+        str(ROOT / "target/release/waywire-gateway"),
+        "--listen",
+        f"127.0.0.1:{PORT}",
+        "--public-url",
+        public_url,
+        "--compositor",
+        str(ROOT / "target/release/waywire-compositor"),
+        "--resolution",
+        "1280x720",
+        "--frame-rate",
+        "30",
+        "--bitrate",
+        "12000",
+        "--",
+        "sh",
+        "-c",
+        app,
+    ]
+
+
 def run_desktop(name, fixture):
     with tempfile.TemporaryDirectory(prefix="waywire-benchmark-") as tmp:
         directory = Path(tmp)
         os.chmod(directory, 0o700)
-        env = os.environ.copy()
-        env.pop("DISPLAY", None)
-        env.pop("WAYLAND_DISPLAY", None)
-        env.update(XDG_RUNTIME_DIR=tmp)
-        xwayland = (
-            Path(
-                os.environ.get(
-                    "WAYWIRE_XWAYLAND_PREFIX",
-                    Path.home() / ".local/share/waywire-xwayland",
-                )
-            )
-            / "bin"
-        )
-        if (xwayland / "Xwayland").exists():
-            env["PATH"] = f"{xwayland}:{env['PATH']}"
+        env = desktop_env(tmp)
         session_env = directory / "session.env"
         app = f"env -0 > {shlex.quote(str(session_env))}; exec xterm"
         processes = []
@@ -273,26 +329,7 @@ def run_desktop(name, fixture):
             try:
                 launched = time.time() * 1000
                 if name == "waywire":
-                    command = [
-                        str(ROOT / "target/release/waywire-gateway"),
-                        "--listen",
-                        f"127.0.0.1:{PORT}",
-                        "--public-url",
-                        URL,
-                        "--compositor",
-                        str(ROOT / "target/release/waywire-compositor"),
-                        "--resolution",
-                        "1280x720",
-                        "--frame-rate",
-                        "30",
-                        "--bitrate",
-                        "12000",
-                        "--",
-                        "sh",
-                        "-c",
-                        app,
-                    ]
-                    processes.append(start(command, env, log))
+                    processes.append(start(waywire_command(URL, app), env, log))
                 else:
                     env.update(
                         WLR_BACKENDS="headless",
@@ -505,6 +542,157 @@ def run_desktop(name, fixture):
                         stop(process)
 
 
+def slow_link(encoder):
+    """Stream an animation with `encoder` while the viewer's link is slow, then clear it."""
+    viewer = f"http://127.0.0.1:{PORT + 1}"
+    with tempfile.TemporaryDirectory(prefix="waywire-slow-link-") as tmp:
+        directory = Path(tmp)
+        os.chmod(directory, 0o700)
+        env = desktop_env(tmp)
+        env["WAYWIRE_ENCODER"] = encoder
+        page = directory / "motion.html"
+        page.write_text(MOTION_PAGE)
+        app = (
+            "exec chromium --no-sandbox --disable-gpu --disable-dev-shm-usage "
+            f"--ozone-platform=x11 --user-data-dir={directory / 'chromium'} "
+            f"--start-maximized --app={page.as_uri()}"
+        )
+        link = Link(PORT + 1, ("127.0.0.1", PORT))
+        with (directory / "desktop.log").open("w+") as log:
+            gateway = start(waywire_command(viewer, app), env, log)
+            try:
+                wait_for(http_ready, "waywire gateway did not start")
+                browser("open", viewer)
+                browser("set", "viewport", "1280", "720", "2")
+                wait_for(
+                    lambda: evaluate("window.benchmarkNonblank"),
+                    "slow-link viewer did not decode a nonblank frame",
+                )
+                # Only the viewer with input control drives quality.
+                browser("click", "#display")
+                time.sleep(5)
+                full = evaluate("window.benchmarkQuality")
+                samples = []
+                # Capture times are the host's monotonic clock; the viewer runs on
+                # the same host, so wall time minus this offset dates each decode.
+                offset_ms = (time.time() - time.monotonic()) * 1000
+                decoded = evaluate("window.benchmarkDecodes.length")
+
+                def watch(phase, seconds, done=lambda quality: False):
+                    nonlocal decoded
+                    state = (
+                        "({time: performance.now(), draws: window.benchmarkDraws,"
+                        " bytes: window.benchmarkSockets['/stream'] ?? 0,"
+                        " quality: window.benchmarkQuality})"
+                    )
+                    previous = evaluate(state)
+                    started = time.monotonic()
+                    while time.monotonic() - started < seconds:
+                        time.sleep(1)
+                        current = evaluate(state)
+                        elapsed = (current["time"] - previous["time"]) / 1000
+                        quality = current["quality"]
+                        decodes = evaluate(f"window.benchmarkDecodes.slice({decoded})")
+                        decoded += len(decodes)
+                        ages = [
+                            wall - (capture / 1000 + offset_ms)
+                            for wall, capture in decodes
+                        ]
+                        samples.append(
+                            {
+                                "phase": phase,
+                                "seconds": round(time.monotonic() - started, 1),
+                                "fps": round(
+                                    (current["draws"] - previous["draws"]) / elapsed, 1
+                                ),
+                                "kbps": round(
+                                    (current["bytes"] - previous["bytes"])
+                                    * 8
+                                    / 1000
+                                    / elapsed
+                                ),
+                                "scale": quality["scale"],
+                                "bitrate": quality["bitrate"],
+                                "max_fps": quality["fps"],
+                                "age_ms": round(statistics.median(ages))
+                                if ages
+                                else None,
+                            }
+                        )
+                        previous = current
+                        if done(quality):
+                            return samples[-1]["seconds"]
+                    return None
+
+                link.limit(SLOW_LINK_KBPS)
+                watch("slow", SLOW_LINK_SECONDS)
+                link.limit(None)
+                recovery = watch(
+                    "recovery",
+                    RECOVERY_SECONDS,
+                    lambda quality: all(
+                        quality[key] == full[key] for key in ("scale", "bitrate", "fps")
+                    ),
+                )
+                slow = [sample for sample in samples if sample["phase"] == "slow"]
+                tail = slow[-15:]
+                result = {
+                    "lowest_scale": min(sample["scale"] for sample in slow),
+                    "full_scale": full["scale"],
+                    "lowest_bitrate": min(sample["bitrate"] for sample in slow),
+                    "full_bitrate": full["bitrate"],
+                    "slow_fps": round(statistics.mean(s["fps"] for s in tail), 1),
+                    "slow_kbps": round(statistics.mean(s["kbps"] for s in tail)),
+                    "slow_age_ms": round(statistics.median(ages))
+                    if (ages := [s["age_ms"] for s in tail if s["age_ms"] is not None])
+                    else None,
+                    "recovery_s": recovery,
+                    "samples": samples,
+                }
+                print(
+                    json.dumps(
+                        {f"slow link {encoder}": {**result, "samples": len(samples)}}
+                    ),
+                    flush=True,
+                )
+                return result
+            except Exception:
+                log.flush()
+                print((directory / "desktop.log").read_text(), flush=True)
+                raise
+            finally:
+                try:
+                    browser("open", "about:blank")
+                finally:
+                    stop(gateway)
+                    link.close()
+
+
+def check_slow_link(encoder, result):
+    if result is None:
+        return [f"slow link {encoder}: unavailable"]
+    failures = []
+    if result["lowest_scale"] >= result["full_scale"]:
+        failures.append(f"slow link {encoder}: scale stayed at {result['full_scale']}")
+    if result["lowest_bitrate"] >= result["full_bitrate"]:
+        failures.append(
+            f"slow link {encoder}: bitrate stayed at {result['full_bitrate']}"
+        )
+    if result["slow_fps"] < SLOW_LINK_MIN_FPS:
+        failures.append(
+            f"slow link {encoder} fps: {result['slow_fps']} < {SLOW_LINK_MIN_FPS}"
+        )
+    if result["slow_age_ms"] is None or result["slow_age_ms"] > SLOW_LINK_MAX_AGE_MS:
+        failures.append(
+            f"slow link {encoder} frame age: {result['slow_age_ms']} ms > {SLOW_LINK_MAX_AGE_MS} ms"
+        )
+    if result["recovery_s"] is None:
+        failures.append(
+            f"slow link {encoder}: quality did not recover within {RECOVERY_SECONDS} s"
+        )
+    return failures
+
+
 def check_regressions(results):
     waywire, waymote = results["waywire"], results["waymote"]
     comparisons = [
@@ -571,6 +759,10 @@ def check_regressions(results):
     for name, status in waymote["agents"].items():
         if status == "pass" and waywire["agents"][name] != "pass":
             failures.append(f"{name}: waywire failed, Waymote passed")
+    for encoder in ENCODERS:
+        failures.extend(
+            check_slow_link(encoder, results.get("slow_link", {}).get(encoder))
+        )
     return failures
 
 
@@ -629,6 +821,7 @@ def main():
             results = {
                 name: run_desktop(name, fixture) for name in ("waywire", "waymote")
             }
+            results["slow_link"] = {encoder: slow_link(encoder) for encoder in ENCODERS}
             if args.check:
                 failures = check_regressions(results)
                 if failures:
