@@ -1890,3 +1890,229 @@ Gtk.main()
         thread::sleep(Duration::from_millis(300));
     }
 }
+
+/// Every foreign toplevel a session showed, and each title that lost the
+/// activated state, as `zwlr_foreign_toplevel_manager_v1` reports them.
+#[derive(Default)]
+struct Toplevels {
+    pending: std::collections::HashMap<wayland_client::backend::ObjectId, (String, bool)>,
+    activated: std::collections::HashMap<wayland_client::backend::ObjectId, bool>,
+    titles: Vec<String>,
+    lost_focus: Vec<String>,
+}
+
+type ToplevelLog = std::sync::Arc<std::sync::Mutex<Toplevels>>;
+
+mod toplevel_watch {
+    use wayland_client::Connection;
+    use wayland_client::Dispatch;
+    use wayland_client::Proxy;
+    use wayland_client::QueueHandle;
+    use wayland_client::protocol::wl_registry;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1;
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
+
+    use super::ToplevelLog;
+
+    pub(super) struct Watch(pub(super) ToplevelLog);
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for Watch {
+        fn event(
+            _: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            (): &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name, interface, ..
+            } = event
+                && interface == ZwlrForeignToplevelManagerV1::interface().name
+            {
+                registry.bind::<ZwlrForeignToplevelManagerV1, _, _>(name, 3, qh, ());
+            }
+        }
+    }
+
+    impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Watch {
+        fn event(
+            _: &mut Self,
+            _: &ZwlrForeignToplevelManagerV1,
+            _: zwlr_foreign_toplevel_manager_v1::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+
+        wayland_client::event_created_child!(Watch, ZwlrForeignToplevelManagerV1, [
+            zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+        ]);
+    }
+
+    impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Watch {
+        #[expect(clippy::unwrap_used, reason = "the log mutex is never poisoned")]
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "other events change neither the title nor the activated state"
+        )]
+        fn event(
+            watch: &mut Self,
+            handle: &ZwlrForeignToplevelHandleV1,
+            event: zwlr_foreign_toplevel_handle_v1::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            let mut log = watch.0.lock().unwrap();
+            let id = handle.id();
+            match event {
+                zwlr_foreign_toplevel_handle_v1::Event::Title { title } => {
+                    log.pending.entry(id).or_default().0 = title;
+                }
+                zwlr_foreign_toplevel_handle_v1::Event::State { state } => {
+                    let activated = state
+                        .chunks_exact(4)
+                        .any(|value| value == 2u32.to_ne_bytes());
+                    log.pending.entry(id).or_default().1 = activated;
+                }
+                zwlr_foreign_toplevel_handle_v1::Event::Done => {
+                    let (title, activated) = log.pending.get(&id).cloned().unwrap_or_default();
+                    if !log.titles.contains(&title) {
+                        log.titles.push(title.clone());
+                    }
+                    if log.activated.insert(id, activated) == Some(true) && !activated {
+                        log.lost_focus.push(title);
+                    }
+                }
+                zwlr_foreign_toplevel_handle_v1::Event::Closed
+                    if log.activated.remove(&id) == Some(true) =>
+                {
+                    let title = log.pending.get(&id).cloned().unwrap_or_default().0;
+                    log.lost_focus.push(title);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Desktop {
+    /// Records the session's windows and focus changes until the compositor exits.
+    #[expect(clippy::expect_used, reason = "test helper requires the socket")]
+    fn watch_toplevels(&self) -> ToplevelLog {
+        let socket =
+            std::os::unix::net::UnixStream::connect(self.runtime.path().join(&self.wayland))
+                .expect("connect to the compositor");
+        let connection = wayland_client::Connection::from_socket(socket).expect("connection");
+        let mut queue = connection.new_event_queue();
+        connection.display().get_registry(&queue.handle(), ());
+        let log = ToplevelLog::default();
+        let mut watch = toplevel_watch::Watch(std::sync::Arc::clone(&log));
+        thread::spawn(move || while queue.blocking_dispatch(&mut watch).is_ok() {});
+        log
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings, wl-clipboard and xclip"]
+#[expect(clippy::unwrap_used, reason = "the log mutex is never poisoned")]
+fn data_control_copies_reach_x11_and_the_viewer_without_taking_focus() {
+    let mut desktop = desktop();
+    let log = desktop.watch_toplevels();
+    let mut focused = desktop
+        .command(&[
+            "/usr/bin/python3",
+            "-c",
+            "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk; \
+             w = Gtk.Window(title='waywire-focus'); w.connect('destroy', Gtk.main_quit); \
+             w.show_all(); Gtk.main()",
+        ])
+        .env("GDK_BACKEND", "wayland")
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("start the focused window");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !log
+        .lock()
+        .unwrap()
+        .activated
+        .values()
+        .any(|&activated| activated)
+    {
+        assert!(Instant::now() < deadline, "the GTK window was not focused");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut decoder = Decoder::<Event>::new();
+    events(&mut desktop.compositor.0, &mut decoder);
+
+    let mut clipboard = desktop.copy(&["wl-copy", "--foreground"], "data control α".as_bytes());
+    let mut primary = desktop.copy(
+        &["wl-copy", "--primary", "--foreground"],
+        "primary β".as_bytes(),
+    );
+    let x11 = ["xclip", "-o", "-selection", "clipboard"];
+    assert_eq!(
+        desktop.paste(&x11, "data control α".as_bytes()),
+        "data control α".as_bytes()
+    );
+    assert_eq!(
+        desktop.paste(&["wl-paste", "--no-newline"], "data control α".as_bytes()),
+        "data control α".as_bytes()
+    );
+    assert_eq!(
+        desktop.paste(
+            &["xclip", "-o", "-selection", "primary"],
+            "primary β".as_bytes()
+        ),
+        "primary β".as_bytes()
+    );
+    assert_eq!(
+        desktop.paste(
+            &["wl-paste", "--primary", "--no-newline"],
+            "primary β".as_bytes()
+        ),
+        "primary β".as_bytes()
+    );
+    let synced: Vec<_> = events(&mut desktop.compositor.0, &mut decoder)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Clipboard(text) => Some(text.as_str().to_owned()),
+            Event::Frame(_)
+            | Event::ResizeApplied(_)
+            | Event::CursorShape(_)
+            | Event::CursorImage(_)
+            | Event::CursorVisibility(_)
+            | Event::CursorPosition(_)
+            | Event::CursorClick(_)
+            | Event::ResetVideoRefused(_)
+            | Event::AgentInput(_) => None,
+        })
+        .collect();
+    assert_eq!(synced, ["data control α"], "viewer clipboard events");
+
+    // The copy outlives wl-copy, as clipboards from focused clients do.
+    drop(clipboard.kill());
+    drop(clipboard.wait());
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        desktop.paste(&x11, "data control α".as_bytes()),
+        "data control α".as_bytes()
+    );
+    {
+        let log = log.lock().unwrap();
+        assert_eq!(log.titles, ["waywire-focus"], "windows the session showed");
+        assert!(
+            log.lost_focus.is_empty(),
+            "lost focus: {:?}",
+            log.lost_focus
+        );
+    }
+    for child in [&mut primary, &mut focused] {
+        drop(child.kill());
+        drop(child.wait());
+    }
+}

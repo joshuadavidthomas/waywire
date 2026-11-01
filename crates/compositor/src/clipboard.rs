@@ -4,6 +4,12 @@
 //! owner. The compositor converts between UTF-8 types and X11 `STRING`
 //! (ISO 8859-1) for clients that only know one of them.
 //!
+//! Data-control clients (`ext-data-control-v1` and the wlr protocol that
+//! distribution wl-clipboard builds speak) read and set both selections
+//! without keyboard focus. Smithay routes their sources and offers through the
+//! same seat selections and `SelectionHandler` calls as focused clients, so the
+//! X11 bridge, viewer sync and kept text treat them like any Wayland owner.
+//!
 //! Transfers through the compositor are nonblocking, bounded by
 //! `MAX_CLIPBOARD_BYTES` and a timeout, and logged when dropped. Replacing an
 //! offer drops its read FD, so an obsolete producer can never overwrite a newer
@@ -30,6 +36,7 @@ use smithay::wayland::selection::data_device::clear_data_device_selection;
 use smithay::wayland::selection::data_device::current_data_device_selection_userdata;
 use smithay::wayland::selection::data_device::request_data_device_client_selection;
 use smithay::wayland::selection::data_device::set_data_device_selection;
+use smithay::wayland::selection::ext_data_control;
 use smithay::wayland::selection::primary_selection;
 use smithay::wayland::selection::primary_selection::PrimarySelectionHandler;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
@@ -37,6 +44,7 @@ use smithay::wayland::selection::primary_selection::clear_primary_selection;
 use smithay::wayland::selection::primary_selection::current_primary_selection_userdata;
 use smithay::wayland::selection::primary_selection::request_primary_client_selection;
 use smithay::wayland::selection::primary_selection::set_primary_selection;
+use smithay::wayland::selection::wlr_data_control;
 use waywire_protocol::pipe::ClipboardText;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::MAX_CLIPBOARD_BYTES;
@@ -96,6 +104,8 @@ struct Write {
 
 pub(super) struct Clipboard {
     primary_state: PrimarySelectionState,
+    ext_data_control: ext_data_control::DataControlState,
+    wlr_data_control: wlr_data_control::DataControlState,
     /// Owners of the clipboard and the primary selection.
     owners: [Owner; 2],
     pending_offer: Option<Vec<String>>,
@@ -112,8 +122,23 @@ pub(super) struct Clipboard {
 
 impl Clipboard {
     pub(super) fn new(display: &smithay::reexports::wayland_server::DisplayHandle) -> Self {
+        let primary_state = PrimarySelectionState::new::<State>(display);
+        // Every client may use data control: the session is a trusted single
+        // user's, like screencopy and the virtual input protocols.
+        let ext_data_control = ext_data_control::DataControlState::new::<State, _>(
+            display,
+            Some(&primary_state),
+            |_| true,
+        );
+        let wlr_data_control = wlr_data_control::DataControlState::new::<State, _>(
+            display,
+            Some(&primary_state),
+            |_| true,
+        );
         Self {
-            primary_state: PrimarySelectionState::new::<State>(display),
+            primary_state,
+            ext_data_control,
+            wlr_data_control,
             owners: [Owner::default(), Owner::default()],
             pending_offer: None,
             read: None,
@@ -279,6 +304,18 @@ impl SelectionHandler for State {
 impl PrimarySelectionHandler for State {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.clipboard.primary_state
+    }
+}
+
+impl ext_data_control::DataControlHandler for State {
+    fn data_control_state(&mut self) -> &mut ext_data_control::DataControlState {
+        &mut self.clipboard.ext_data_control
+    }
+}
+
+impl wlr_data_control::DataControlHandler for State {
+    fn data_control_state(&mut self) -> &mut wlr_data_control::DataControlState {
+        &mut self.clipboard.wlr_data_control
     }
 }
 
@@ -787,6 +824,383 @@ mod tests {
                 )]
             );
         }
+    }
+
+    /// A data-control client: a clipboard manager or wl-clipboard.
+    mod data_control {
+        use std::collections::HashMap;
+        use std::io::Write as _;
+
+        use wayland_client::Connection;
+        use wayland_client::Dispatch;
+        use wayland_client::Proxy;
+        use wayland_client::QueueHandle;
+        use wayland_client::backend::ObjectId;
+        use wayland_client::protocol::wl_registry;
+        use wayland_client::protocol::wl_seat::WlSeat;
+        use wayland_protocols::ext::data_control::v1::client as ext;
+        use wayland_protocols_wlr::data_control::v1::client as wlr;
+
+        pub(super) enum Offer {
+            Ext(ext::ext_data_control_offer_v1::ExtDataControlOfferV1),
+            Wlr(wlr::zwlr_data_control_offer_v1::ZwlrDataControlOfferV1),
+        }
+
+        pub(super) enum Device {
+            Ext(ext::ext_data_control_device_v1::ExtDataControlDeviceV1),
+            Wlr(wlr::zwlr_data_control_device_v1::ZwlrDataControlDeviceV1),
+        }
+
+        #[derive(Default)]
+        pub(super) struct App {
+            pub(super) ext: bool,
+            pub(super) seat: Option<WlSeat>,
+            pub(super) ext_manager:
+                Option<ext::ext_data_control_manager_v1::ExtDataControlManagerV1>,
+            pub(super) wlr_manager:
+                Option<wlr::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
+            pub(super) device: Option<Device>,
+            pub(super) mimes: HashMap<ObjectId, Vec<String>>,
+            /// The clipboard and primary offers, `None` once a selection is unset.
+            pub(super) selections: [Option<(Offer, Vec<String>)>; 2],
+            /// Text each source this client created serves.
+            pub(super) served: HashMap<ObjectId, String>,
+        }
+
+        impl App {
+            fn selected(&mut self, primary: bool, offer: Option<Offer>) {
+                let selection = offer.map(|offer| {
+                    let id = match &offer {
+                        Offer::Ext(offer) => offer.id(),
+                        Offer::Wlr(offer) => offer.id(),
+                    };
+                    let mimes = self.mimes.remove(&id).unwrap_or_default();
+                    (offer, mimes)
+                });
+                self.selections[usize::from(primary)] = selection;
+            }
+
+            fn serve(&self, source: &ObjectId, fd: std::os::fd::OwnedFd) {
+                let text = self.served.get(source).cloned().unwrap_or_default();
+                std::fs::File::from(fd)
+                    .write_all(text.as_bytes())
+                    .expect("serve the selection");
+            }
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, ()> for App {
+            fn event(
+                app: &mut Self,
+                registry: &wl_registry::WlRegistry,
+                event: wl_registry::Event,
+                (): &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                let wl_registry::Event::Global {
+                    name, interface, ..
+                } = event
+                else {
+                    return;
+                };
+                if interface == WlSeat::interface().name {
+                    app.seat = Some(registry.bind(name, 1, qh, ()));
+                } else if app.ext
+                    && interface
+                        == ext::ext_data_control_manager_v1::ExtDataControlManagerV1::interface()
+                            .name
+                {
+                    app.ext_manager = Some(registry.bind(name, 1, qh, ()));
+                } else if !app.ext
+                    && interface
+                        == wlr::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1::interface()
+                            .name
+                {
+                    app.wlr_manager = Some(registry.bind(name, 2, qh, ()));
+                }
+            }
+        }
+
+        wayland_client::delegate_noop!(App: ignore WlSeat);
+        wayland_client::delegate_noop!(App: ext::ext_data_control_manager_v1::ExtDataControlManagerV1);
+        wayland_client::delegate_noop!(App: wlr::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);
+
+        macro_rules! data_control_client {
+            ($variant:ident, $device:ident, $offer:ident, $source:ident) => {
+                impl Dispatch<$device::$device, ()> for App {
+                    fn event(
+                        app: &mut Self,
+                        _: &$device::$device,
+                        event: $device::Event,
+                        (): &(),
+                        _: &Connection,
+                        _: &QueueHandle<Self>,
+                    ) {
+                        match event {
+                            $device::Event::DataOffer { id } => {
+                                app.mimes.insert(id.id(), Vec::new());
+                            }
+                            $device::Event::Selection { id } => {
+                                app.selected(false, id.map(Offer::$variant));
+                            }
+                            $device::Event::PrimarySelection { id } => {
+                                app.selected(true, id.map(Offer::$variant));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    wayland_client::event_created_child!(App, $device::$device, [
+                        $device::EVT_DATA_OFFER_OPCODE => ($offer::$offer, ()),
+                    ]);
+                }
+
+                impl Dispatch<$offer::$offer, ()> for App {
+                    fn event(
+                        app: &mut Self,
+                        offer: &$offer::$offer,
+                        event: $offer::Event,
+                        (): &(),
+                        _: &Connection,
+                        _: &QueueHandle<Self>,
+                    ) {
+                        if let $offer::Event::Offer { mime_type } = event {
+                            app.mimes.entry(offer.id()).or_default().push(mime_type);
+                        }
+                    }
+                }
+
+                impl Dispatch<$source::$source, ()> for App {
+                    fn event(
+                        app: &mut Self,
+                        source: &$source::$source,
+                        event: $source::Event,
+                        (): &(),
+                        _: &Connection,
+                        _: &QueueHandle<Self>,
+                    ) {
+                        if let $source::Event::Send { fd, .. } = event {
+                            app.serve(&source.id(), fd);
+                        }
+                    }
+                }
+            };
+        }
+
+        use ext::ext_data_control_device_v1 as ExtDataControlDeviceV1;
+        use ext::ext_data_control_offer_v1 as ExtDataControlOfferV1;
+        use ext::ext_data_control_source_v1 as ExtDataControlSourceV1;
+        use wlr::zwlr_data_control_device_v1 as ZwlrDataControlDeviceV1;
+        use wlr::zwlr_data_control_offer_v1 as ZwlrDataControlOfferV1;
+        use wlr::zwlr_data_control_source_v1 as ZwlrDataControlSourceV1;
+        data_control_client!(
+            Ext,
+            ExtDataControlDeviceV1,
+            ExtDataControlOfferV1,
+            ExtDataControlSourceV1
+        );
+        data_control_client!(
+            Wlr,
+            ZwlrDataControlDeviceV1,
+            ZwlrDataControlOfferV1,
+            ZwlrDataControlSourceV1
+        );
+    }
+
+    use std::os::fd::AsFd as _;
+
+    use wayland_client::Proxy as _;
+
+    struct Client {
+        connection: wayland_client::Connection,
+        queue: wayland_client::EventQueue<data_control::App>,
+        app: data_control::App,
+    }
+
+    impl Client {
+        fn connect(
+            display: &mut smithay::reexports::wayland_server::Display<State>,
+            state: &mut State,
+            ext: bool,
+        ) -> Self {
+            let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+            display
+                .handle()
+                .insert_client(server, Arc::new(crate::shell::ClientState::default()))
+                .expect("insert client");
+            let connection =
+                wayland_client::Connection::from_socket(client).expect("client connection");
+            let queue = connection.new_event_queue();
+            connection.display().get_registry(&queue.handle(), ());
+            let mut client = Self {
+                connection,
+                queue,
+                app: data_control::App {
+                    ext,
+                    ..Default::default()
+                },
+            };
+            pump(display, state, &mut [&mut client]);
+            pump(display, state, &mut [&mut client]);
+            let qh = client.queue.handle();
+            let seat = client.app.seat.as_ref().expect("wl_seat");
+            let device = if ext {
+                data_control::Device::Ext(
+                    client
+                        .app
+                        .ext_manager
+                        .as_ref()
+                        .expect("ext-data-control global")
+                        .get_data_device(seat, &qh, ()),
+                )
+            } else {
+                data_control::Device::Wlr(
+                    client
+                        .app
+                        .wlr_manager
+                        .as_ref()
+                        .expect("wlr-data-control global")
+                        .get_data_device(seat, &qh, ()),
+                )
+            };
+            client.app.device = Some(device);
+            pump(display, state, &mut [&mut client]);
+            client
+        }
+
+        /// Owns the clipboard or the primary selection with `text`.
+        fn copy(&mut self, primary: bool, text: &str) {
+            let qh = self.queue.handle();
+            match self.app.device.as_ref().expect("device") {
+                data_control::Device::Ext(device) => {
+                    let manager = self.app.ext_manager.as_ref().expect("manager");
+                    let source = manager.create_data_source(&qh, ());
+                    source.offer(MIME.into());
+                    self.app.served.insert(source.id(), text.into());
+                    if primary {
+                        device.set_primary_selection(Some(&source));
+                    } else {
+                        device.set_selection(Some(&source));
+                    }
+                }
+                data_control::Device::Wlr(device) => {
+                    let manager = self.app.wlr_manager.as_ref().expect("manager");
+                    let source = manager.create_data_source(&qh, ());
+                    source.offer(MIME.into());
+                    self.app.served.insert(source.id(), text.into());
+                    if primary {
+                        device.set_primary_selection(Some(&source));
+                    } else {
+                        device.set_selection(Some(&source));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lets the server and every client exchange what they have queued.
+    fn pump(
+        display: &mut smithay::reexports::wayland_server::Display<State>,
+        state: &mut State,
+        clients: &mut [&mut Client],
+    ) {
+        for client in clients.iter_mut() {
+            client.connection.flush().expect("client flush");
+        }
+        display.dispatch_clients(state).expect("server dispatch");
+        display.flush_clients().expect("server flush");
+        state.clipboard_tick();
+        for client in clients.iter_mut() {
+            if let Some(guard) = client.connection.prepare_read() {
+                let mut poll = [nix::poll::PollFd::new(
+                    guard.connection_fd(),
+                    nix::poll::PollFlags::POLLIN,
+                )];
+                if nix::poll::poll(&mut poll, nix::poll::PollTimeout::ZERO).unwrap_or(0) > 0 {
+                    guard.read().expect("client read");
+                }
+            }
+            client
+                .queue
+                .dispatch_pending(&mut client.app)
+                .expect("client dispatch");
+            client.connection.flush().expect("client flush");
+        }
+    }
+
+    /// Pastes `primary` or the clipboard as `client`, while `others` keep
+    /// running; `None` when the selection is unset.
+    fn paste(
+        display: &mut smithay::reexports::wayland_server::Display<State>,
+        state: &mut State,
+        client: &mut Client,
+        others: &mut [&mut Client],
+        primary: bool,
+    ) -> Option<String> {
+        for _ in 0..4 {
+            pump(display, state, &mut [&mut *client]);
+            pump(display, state, others);
+        }
+        let (offer, mimes) = client.app.selections[usize::from(primary)].as_ref()?;
+        assert!(mimes.iter().any(|mime| mime == MIME), "offered {mimes:?}");
+        let (read, write) = nonblocking_pipe().expect("paste pipe");
+        match offer {
+            data_control::Offer::Ext(offer) => offer.receive(MIME.into(), write.as_fd()),
+            data_control::Offer::Wlr(offer) => offer.receive(MIME.into(), write.as_fd()),
+        }
+        drop(write);
+        let mut read = Read::new(read, false, "test paste");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(Instant::now() < deadline, "paste did not finish");
+            pump(display, state, &mut [&mut *client]);
+            pump(display, state, others);
+            match read.poll() {
+                Progress::Pending => std::thread::sleep(Duration::from_millis(1)),
+                Progress::Done(text) => return Some(text),
+                Progress::Failed => panic!("paste failed"),
+            }
+        }
+    }
+
+    #[test]
+    fn data_control_clients_share_the_selections_without_focus() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let mut ext = Client::connect(&mut display, &mut state, true);
+        let mut wlr = Client::connect(&mut display, &mut state, false);
+        let keyboard = state.seat.get_keyboard().expect("seat keyboard");
+        assert!(keyboard.current_focus().is_none());
+        state.event_sink.take_events();
+
+        ext.copy(false, "ext α");
+        ext.copy(true, "ext primary β");
+        let pasted = paste(&mut display, &mut state, &mut wlr, &mut [&mut ext], false);
+        assert_eq!(pasted.as_deref(), Some("ext α"));
+        let pasted = paste(&mut display, &mut state, &mut wlr, &mut [&mut ext], true);
+        assert_eq!(pasted.as_deref(), Some("ext primary β"));
+        // The viewer syncs the clipboard, never the primary selection.
+        assert_eq!(state.event_sink.take_events(), vec![clipboard("ext α")]);
+
+        wlr.copy(false, "wlr γ");
+        let pasted = paste(&mut display, &mut state, &mut ext, &mut [&mut wlr], false);
+        assert_eq!(pasted.as_deref(), Some("wlr γ"));
+        assert_eq!(state.event_sink.take_events(), vec![clipboard("wlr γ")]);
+        assert!(keyboard.current_focus().is_none());
+
+        // Owners exit: the clipboard keeps its text, the primary selection ends.
+        drop(ext);
+        drop(wlr);
+        for _ in 0..4 {
+            pump(&mut display, &mut state, &mut []);
+        }
+        let mut reader = Client::connect(&mut display, &mut state, true);
+        let pasted = paste(&mut display, &mut state, &mut reader, &mut [], false);
+        assert_eq!(pasted.as_deref(), Some("wlr γ"));
+        assert_eq!(
+            paste(&mut display, &mut state, &mut reader, &mut [], true),
+            None
+        );
+        assert!(state.event_sink.take_events().is_empty());
     }
 
     #[test]

@@ -101,6 +101,8 @@ virtual-keyboard protocols cover drivers that synthesize input directly.
 | wlr-virtual-pointer             | cua-driver                                                     | Done; upstream Smithay module                                     |
 | virtual-keyboard                | wtype, cua-driver, computer-use-linux fallback                 | Done                                                              |
 | ext-foreign-toplevel-list       | lswt                                                           | Done                                                              |
+| ext-data-control                | wl-clipboard 2.3 (Arch), clipboard managers                    | Done; clipboard and primary, no focus needed                      |
+| wlr-data-control                | wl-clipboard 2.1 and 2.2 (Debian 12 and 13, Fedora 42 and 43)  | Done; clipboard and primary, no focus needed                      |
 | wlr-foreign-toplevel-management | wlrctl window actions                                          | Done; activate, close, maximize, fullscreen, minimize and restore |
 | Pointer constraints + relative  | Xwayland's warp emulator, games                                | Done; locks, confines and relative motion                         |
 | XTest through EIS               | xdotool, pyautogui input                                       | Done; needs an Xwayland built with libei (see below)              |
@@ -313,8 +315,12 @@ Remaining:
   seat has no touch device; and dropping files from the viewer's own machine
   onto the remote desktop.
 - Audio, which the Amp orb Desktop already streams.
-- ext-data-control, for clipboard managers and agents. Without it, wl-clipboard
-  maps a window to take keyboard focus for each copy and paste.
+- Data control is served as `ext-data-control-v1` and
+  `zwlr_data_control_manager_v1` version 2, both with the primary selection.
+  wl-clipboard 2.3 (Arch) uses the ext protocol; 2.1 and 2.2 (Debian 12 and 13,
+  Fedora 42 and 43) know only the wlr one. Copies and pastes no longer map a
+  window or move keyboard focus, and they reach X11 and the viewer through the
+  same ownership as other Wayland clients. Access is under Decisions.
 - xdg-activation is served, with the focus policy under Decisions.
 
 Layer-shell, idle-inhibit and keyboard-shortcuts-inhibit can wait.
@@ -385,6 +391,14 @@ Add these alongside the phases above:
   viewer write replaces the kept text. A Wayland client that clears the
   selection clears it. X11 cannot tell an explicit release from an exit, so an
   X11 release keeps the text.
+- **Data control.** Every client may bind both data-control globals. The
+  session belongs to one trusted user, and screencopy, virtual input and
+  foreign-toplevel management are open to every client for the same reason.
+  A data-control source is an ordinary Wayland owner: its clipboard syncs to
+  the viewer and X11, its text is kept when it exits, and its primary
+  selection follows the primary-selection rules. If the compositor ever
+  serves security-context-v1, sandboxed clients should lose data control
+  together with those other privileged globals.
 - **Primary selection.** Wayland clients get primary-selection v1, bridged both
   ways to X11 `PRIMARY`. It stays on the desktop: it is never sent to or set
   from the viewer, because browsers have no primary-selection API and syncing
