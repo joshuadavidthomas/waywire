@@ -300,6 +300,11 @@ Remaining:
   a newer mapping after a spare keycode is reused, or is returned to its
   physical key, such as Zenkaku/Hankaku under a US layout, when that key is
   pressed.
+- **Low:** EI clients on libxkbcommon before 1.6 that compile the EIS keymap
+  at its advertised size reject it, because the size counts a trailing NUL.
+  Such clients cannot map characters to keycodes. Xwayland and cua-driver are
+  not affected. The fix belongs in Smithay's libei seat; see
+  [Dependency currency](#dependency-currency).
 
 ## 6. Parity and missing protocols
 
@@ -341,10 +346,23 @@ upstream code to local copies of it.
   returns on handback if it is still connected. Upstream's
   new Xwayland spawn variant, `spawn_with_inherited_env`, only controls
   environment inheritance and still has no pre-exec hook, so the signal-mask
-  workaround around `XWayland::spawn` stays. `KeymapFile` still seals the
-  keymap as a C string, and the libei seat still passes the sealed file's size,
-  trailing NUL included, to the EIS keymap event. The bump does not fix the
-  length that libxkbcommon before 1.6 rejects; fix it upstream.
+  workaround around `XWayland::spawn` stays.
+  Keymap sizes that count a trailing NUL break libxkbcommon before 1.6
+  (Debian 12 ships 1.5). `xkb_keymap_new_from_buffer` rejects such a buffer,
+  and xkbcommon-rs `Keymap::new_from_fd` passes the size through unchanged.
+  This affects both directions. Upstream's virtual-keyboard handler compiles
+  `wtype`'s keymap at the size `wtype` sends, which counts the NUL, so on
+  Debian 12 every `wtype` keymap failed and keys were dropped. The compositor
+  now leaves that NUL out of `zwp_virtual_keyboard_v1.keymap` requests before
+  Smithay dispatches them (`shell.rs`, `virtual_keyboard.rs`). In the other
+  direction, the libei seat still advertises the sealed `KeymapFile` size,
+  NUL included, in the EIS keymap event. EI clients that compile at that size
+  with libxkbcommon 1.5 fail, including reis's `type-text` example and a
+  libei 1.5 client using `new_from_buffer`. Xwayland ignores the EI keymap, and
+  cua-driver 0.38's EIS fallback typed correctly on Debian 12. Smithay's seat
+  exposes no hook for the size, so waywire does not work around it. Both
+  directions are fixed by one upstream Smithay change. When it lands, drop the
+  local `Dispatch` impl in `shell.rs`.
 - **Crates.** Dependabot opens weekly grouped PRs for crates, npm packages,
   GitHub Actions and prek hooks. It ignores Smithay: the latest crates.io
   release, 0.7.0 (June 2025), lacks `backend_libei`, the virtual-pointer and
