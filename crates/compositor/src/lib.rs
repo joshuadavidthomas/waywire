@@ -300,6 +300,23 @@ pub(crate) struct State {
     browser_holds_input: bool,
     pub(crate) dirty: bool,
     pub(crate) frame_pending: FrameRequest,
+    /// The content hash of the last submitted frame when that frame was a forced full
+    /// redraw, which reports the whole output damaged whether or not a pixel changed.
+    forced_frame_hash: Option<u64>,
+    refresh: Refresh,
+}
+
+/// Once nothing has changed for `REFRESH_DELAY`, the last frame is encoded
+/// `REFRESH_FRAMES` more times. x264's constant rate factor codes a still frame's
+/// remaining residual finer on each pass: a scrolled page gains about 2.5 dB after
+/// six. The delay keeps the refresh out of typing and pointer cadences.
+const REFRESH_DELAY: Duration = Duration::from_millis(500);
+const REFRESH_FRAMES: u8 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refresh {
+    Idle,
+    Due { at: Instant, left: u8 },
 }
 
 /// Advertise the globals whose server state `State` never needs to reach.
@@ -460,6 +477,8 @@ impl State {
             browser_holds_input: false,
             dirty: true,
             frame_pending: FrameRequest::Pending,
+            forced_frame_hash: None,
+            refresh: Refresh::Idle,
         })
     }
 
@@ -2022,55 +2041,22 @@ impl State {
                 .is_some()
         };
         if damaged || forced {
-            // Pixman finishes synchronously. Borrow our target instead of allocating
-            // and blitting a second full image through ExportMem::copy_framebuffer.
-            // SAFETY: create_buffer owns and initializes the complete image storage;
-            // the renderer's exclusive target borrow has ended.
-            let data = unsafe { image.data() };
-            // SAFETY: stride * height covers this live image's allocation. Nothing
-            // mutates it before submit finishes copying into worker-owned storage.
-            let pixels = unsafe {
-                std::slice::from_raw_parts(data.cast::<u8>(), image.stride() * image.height())
-            };
-            debug_assert_eq!(image.stride(), image.width() * 4);
-            let (width, height) = encoded_dimensions(
-                self.size.width(),
-                self.size.height(),
-                self.quality.scale_percent,
-                self.quality.fps,
-            );
-            let config = EncoderConfig {
-                raw_width: FrameDimension::new(self.size.width().try_into()?)?,
-                raw_height: FrameDimension::new(self.size.height().try_into()?)?,
-                encoded_width: FrameDimension::new(width)?,
-                encoded_height: FrameDimension::new(height)?,
-                fps: self.quality.fps,
-                bitrate_kbps: self.quality.bitrate_kbps,
-                crf: self.quality.crf,
-                chroma: self.quality.chroma,
-            };
-            let timestamp = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)?;
-            let metadata = FrameMetadata {
-                generation: self.generation,
-                width: config.encoded_width,
-                height: config.encoded_height,
-                capture_nanos: u64::try_from(timestamp.tv_sec())? * 1_000_000_000
-                    + u64::try_from(timestamp.tv_nsec())?,
-                sequence: self.sequence,
-                input_sequence: self.latest_input_sequence,
-                fps: self.quality.fps,
-                chroma: self.quality.chroma,
-            };
-            self.sequence = self
-                .sequence
-                .checked_add(1)
-                .context("frame sequence exhausted")?;
-            // ARGB8888 on little-endian hosts is packed BGRA; four-byte pixels have no row padding.
-            if let Some(video) = &self.video {
-                video.submit(CapturedFrame::new(pixels, metadata, config))?;
-            }
-            if let Some(screencast) = &self.screencast {
-                screencast.frame(image);
+            // A forced redraw reports the whole output damaged. Hash only those, so
+            // a redraw that changed no pixel is not encoded again.
+            let hash = forced.then(|| xxhash_rust::xxh3::xxh3_64(image_pixels(image)));
+            let unchanged = hash.is_some()
+                && hash == self.forced_frame_hash
+                && self.acknowledged == Some(self.generation);
+            self.forced_frame_hash = hash;
+            if !unchanged {
+                self.submit_video(image)?;
+                self.refresh = Refresh::Due {
+                    at: Instant::now() + REFRESH_DELAY,
+                    left: REFRESH_FRAMES,
+                };
+                if let Some(screencast) = &self.screencast {
+                    screencast.frame(image);
+                }
             }
         }
         capture::serve_pending(self, image);
@@ -2088,6 +2074,79 @@ impl State {
         }
         Ok(())
     }
+
+    /// Encode the unchanged output again once the screen has held still.
+    fn refresh_video(&mut self, image: &Image<'static, 'static>) -> Result<()> {
+        let Refresh::Due { at, left } = self.refresh else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < at {
+            return Ok(());
+        }
+        self.submit_video(image)?;
+        self.refresh = match left.checked_sub(1) {
+            Some(left @ 1..) => Refresh::Due {
+                at: now + Duration::from_secs_f64(1.0 / f64::from(self.quality.fps.get())),
+                left,
+            },
+            _ => Refresh::Idle,
+        };
+        Ok(())
+    }
+
+    fn submit_video(&mut self, image: &Image<'static, 'static>) -> Result<()> {
+        let (width, height) = encoded_dimensions(
+            self.size.width(),
+            self.size.height(),
+            self.quality.scale_percent,
+            self.quality.fps,
+        );
+        let config = EncoderConfig {
+            raw_width: FrameDimension::new(self.size.width().try_into()?)?,
+            raw_height: FrameDimension::new(self.size.height().try_into()?)?,
+            encoded_width: FrameDimension::new(width)?,
+            encoded_height: FrameDimension::new(height)?,
+            fps: self.quality.fps,
+            bitrate_kbps: self.quality.bitrate_kbps,
+            crf: self.quality.crf,
+            chroma: self.quality.chroma,
+        };
+        let timestamp = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)?;
+        let metadata = FrameMetadata {
+            generation: self.generation,
+            width: config.encoded_width,
+            height: config.encoded_height,
+            capture_nanos: u64::try_from(timestamp.tv_sec())? * 1_000_000_000
+                + u64::try_from(timestamp.tv_nsec())?,
+            sequence: self.sequence,
+            input_sequence: self.latest_input_sequence,
+            fps: self.quality.fps,
+            chroma: self.quality.chroma,
+        };
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .context("frame sequence exhausted")?;
+        // ARGB8888 on little-endian hosts is packed BGRA; four-byte pixels have no row padding.
+        if let Some(video) = &self.video {
+            video.submit(CapturedFrame::new(image_pixels(image), metadata, config))?;
+        }
+        Ok(())
+    }
+}
+
+/// The rendered output's packed BGRA bytes.
+fn image_pixels<'a>(image: &'a Image<'static, 'static>) -> &'a [u8] {
+    debug_assert_eq!(image.stride(), image.width() * 4);
+    // Pixman finishes synchronously. Borrow our target instead of allocating
+    // and blitting a second full image through ExportMem::copy_framebuffer.
+    // SAFETY: create_buffer owns and initializes the complete image storage;
+    // the renderer's exclusive target borrow has ended.
+    let data = unsafe { image.data() };
+    // SAFETY: stride * height covers this live image's allocation. Nothing
+    // mutates it while the returned borrow of the image lives.
+    unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image.stride() * image.height()) }
 }
 
 fn local_clock(time: SystemTime) -> Result<String> {
@@ -2304,6 +2363,9 @@ pub fn run(mut options: Config) -> Result<()> {
         if state.clipboard_active() {
             deadline = deadline.min(now + Duration::from_millis(20));
         }
+        if let Refresh::Due { at, .. } = state.refresh {
+            deadline = deadline.min(at);
+        }
         if let Err(error) = event_loop.dispatch(deadline.saturating_duration_since(now), &mut state)
         {
             state.fail(error.into());
@@ -2323,6 +2385,9 @@ pub fn run(mut options: Config) -> Result<()> {
                 Instant::now(),
                 Duration::from_secs_f64(1.0 / f64::from(state.quality.fps.get())),
             );
+        }
+        if let Err(error) = state.refresh_video(&image.borrow()) {
+            state.fail(error);
         }
         if Instant::now() >= next_housekeeping {
             next_housekeeping = Instant::now() + Duration::from_secs(2);

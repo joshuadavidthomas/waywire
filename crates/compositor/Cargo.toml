@@ -18,6 +18,7 @@ smithay = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wayland-protocols-wlr = { workspace = true }

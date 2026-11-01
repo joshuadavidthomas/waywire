@@ -232,7 +232,16 @@ fn idle_compositor_stops_rendering_and_emitting_frames() {
         assert!(Instant::now() < deadline, "first frame deadline");
         thread::sleep(Duration::from_millis(10));
     }
+    // A screen that holds still is encoded again a few times to refine it, then not at all.
     thread::sleep(Duration::from_secs(2));
+    let refreshes = events(&mut compositor.0, &mut decoder)
+        .iter()
+        .filter(|event| matches!(event, Event::Frame(_)))
+        .count();
+    assert!(
+        refreshes >= 6,
+        "still screen refreshed {refreshes} times, not at least 6"
+    );
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("wall clock");
