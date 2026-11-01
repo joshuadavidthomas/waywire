@@ -43,15 +43,6 @@ DISTRO = next(
     for line in Path("/etc/os-release").read_text().splitlines()
     if line.startswith("VERSION_CODENAME=")
 )
-# Debian 12's Xwayland 22.1 names each window's wl_surface with the WL_SURFACE_ID
-# client message. Smithay records the id but leaves matching it to the compositor,
-# and waywire never does, so X11 windows map without a surface and are never drawn.
-# Xwayland 23.1 and later use xwayland_shell_v1, which Smithay handles.
-OLD_XWAYLAND = (
-    "Xwayland 22.1 (Debian 12) associates surfaces by WL_SURFACE_ID, which waywire never "
-    "matches, so X11 windows are never drawn (crates/compositor/src/xwayland.rs; "
-    "fix in progress on branch xwayland-22)"
-)
 DRIVERS = {
     "cua": (
         ["/opt/cua/cua-driver", "mcp"],
@@ -969,11 +960,6 @@ def _(d, session, c):
     d("computer", action="type", text="- verified")
     d("computer", action="key", text="ctrl+s")
 
-
-# xdotool reaches X11 windows only; on Debian 12 waywire never draws them.
-for _c in CELLS:
-    if _c.driver == "x11demo" and _c.task != "T2":
-        _c.known.setdefault("bookworm", OLD_XWAYLAND)
 
 # Known failures on main. Each names its cause; see README.
 

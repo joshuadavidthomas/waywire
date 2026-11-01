@@ -376,9 +376,55 @@ fn compositor_exits_promptly_when_the_session_program_exits() {
 }
 
 #[test]
-#[ignore = "requires FFmpeg, Xwayland, xterm and xdotool"]
+#[ignore = "requires FFmpeg, Xwayland, xterm, xdotool and grim"]
 fn x11_requested_position_is_honored_and_constrained() {
+    x11_requested_position(None);
+}
+
+/// Xwayland before 23.1 has no xwayland-shell-v1 and names each window's
+/// `wl_surface` with a `WL_SURFACE_ID` message instead. Debian 12 ships 22.1.
+#[test]
+#[ignore = "requires FFmpeg, xterm, xdotool, grim and Xwayland 22 at /usr/bin/Xwayland or WAYWIRE_XWAYLAND_22"]
+fn x11_window_from_xwayland_22_is_drawn_where_requested() {
+    let xwayland = std::env::var_os("WAYWIRE_XWAYLAND_22")
+        .map_or_else(|| "/usr/bin/Xwayland".into(), std::path::PathBuf::from);
+    let output = ProcessCommand::new(&xwayland)
+        .arg("-version")
+        .output()
+        .expect("run Xwayland 22");
+    let banner = String::from_utf8_lossy(&output.stderr);
+    let version = banner
+        .split_once("Xwayland Version ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("Xwayland version");
+    let mut parts = version
+        .split('.')
+        .map(|part| part.parse::<u32>().expect("version number"));
+    let release = (parts.next().expect("major"), parts.next().expect("minor"));
+    assert!(
+        release < (23, 1),
+        "{} is Xwayland {version}; set WAYWIRE_XWAYLAND_22 to an Xwayland before 23.1",
+        xwayland.display()
+    );
+    x11_requested_position(Some(&xwayland));
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "placement, constraint and drawing checks form one X11 scenario"
+)]
+#[expect(clippy::expect_used, reason = "integration test requires live clients")]
+fn x11_requested_position(xwayland: Option<&std::path::Path>) {
     let runtime = tempfile::tempdir().expect("runtime directory");
+    // Smithay spawns `Xwayland` from PATH.
+    let mut path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(xwayland) = xwayland {
+        let bin = runtime.path().join("bin");
+        fs::create_dir(&bin).expect("Xwayland directory");
+        std::os::unix::fs::symlink(xwayland, bin.join("Xwayland")).expect("link Xwayland");
+        path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+            .expect("PATH");
+    }
     let marker = runtime.path().join("xterm-window");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
     let port = socket.local_addr().expect("RTP address").port().to_string();
@@ -389,7 +435,7 @@ fn x11_requested_position_is_honored_and_constrained() {
                 "sh",
                 "-c",
                 r#"
-                xterm -title waywire-position -geometry 40x10+120+100 &
+                xterm -title waywire-position -geometry 40x10+120+100 -bg '#3366cc' &
                 app=$!
                 trap 'kill "$app" 2>/dev/null' EXIT
                 while :; do
@@ -404,6 +450,7 @@ fn x11_requested_position_is_honored_and_constrained() {
             ])
             .arg(&marker)
             .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("PATH", path)
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .stdin(Stdio::piped())
@@ -457,6 +504,35 @@ fn x11_requested_position_is_honored_and_constrained() {
         } else {
             assert_eq!((actual_x, actual_y), (x, y), "requested position");
         }
+    }
+    // The X11 window must also be drawn where X11 says it is: its xterm
+    // background at its centre, not the desktop behind it.
+    let (x, y, width, height) = geometry();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = ProcessCommand::new("grim")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("WAYLAND_DISPLAY", wayland)
+            .args([
+                "-t",
+                "ppm",
+                "-g",
+                &format!("{},{} 1x1", x + width / 2, y + height / 2),
+                "-",
+            ])
+            .output()
+            .expect("capture window centre");
+        let drawn = output.status.success() && output.stdout.ends_with(&[0x33, 0x66, 0xcc]);
+        if drawn {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "X11 window is not drawn: grim {}, pixel {:?}",
+            output.status,
+            output.stdout.last_chunk::<3>()
+        );
+        thread::sleep(Duration::from_millis(50));
     }
     if let Some(path) = std::env::var_os("WAYWIRE_WM_SCREENSHOT") {
         let status = ProcessCommand::new("grim")

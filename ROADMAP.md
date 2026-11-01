@@ -428,6 +428,18 @@ upstream code to local copies of it.
   exposes no hook for the size, so waywire does not work around it. Both
   directions are fixed by one upstream Smithay change. When it lands, drop the
   local `Dispatch` impl in `shell.rs`.
+  The XWM pairs an X11 window with its `wl_surface` only through
+  xwayland-shell-v1, which Xwayland 23.1 added. Xwayland 22.1 (Debian 12)
+  names the surface with a `WL_SURFACE_ID` client message instead, which
+  `f581531` stores but never matches, and `X11Surface::set_wl_surface` is
+  crate-private, so the compositor cannot pair them itself. Every X11 window
+  was mapped but never drawn. `Cargo.toml` therefore patches Smithay with one
+  commit on top of `f581531`, branch `xwayland-wl-surface-id` of
+  `joshuadavidthomas/smithay`, that matches the message and the surface's
+  creation in either order. The message can also arrive after the surface's
+  first buffer commit, so `xwayland.rs` replays that commit once the surface
+  is associated. Drop the `[patch]`, but not the replay, when the Smithay
+  change is upstream.
 - **Crates.** Dependabot opens weekly grouped PRs for crates, npm packages,
   GitHub Actions and prek hooks. It ignores Smithay: the latest crates.io
   release, 0.7.0 (June 2025), lacks `backend_libei`, the virtual-pointer and

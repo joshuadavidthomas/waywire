@@ -69,3 +69,10 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io", "
 # Smithay provides no server state for wlr-screencopy; the compositor implements
 # that protocol directly over these generated bindings.
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
+
+# Smithay's XWM leaves windows from Xwayland before 23.1 (Debian 12 ships 22.1)
+# without a wl_surface, so they are never drawn. The fork adds one commit on top
+# of the pinned revision that pairs them by WL_SURFACE_ID; drop this patch once
+# the change is upstream. See ROADMAP.md, Dependency currency.
+[patch."https://github.com/Smithay/smithay"]
+smithay = { git = "https://github.com/joshuadavidthomas/smithay", rev = "50f58bbe45ea96d1abba5814670c361c550676b1" }

@@ -13,6 +13,7 @@ use anyhow::anyhow;
 use nix::sys::signal::SigSet;
 use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::desktop::Window;
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::calloop::LoopHandle;
@@ -22,6 +23,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::TimeoutAction;
 use smithay::reexports::calloop::timer::Timer;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::x11rb;
 use smithay::reexports::x11rb::connection::Connection;
 use smithay::reexports::x11rb::protocol::xproto::AtomEnum;
@@ -31,6 +33,7 @@ use smithay::reexports::x11rb::protocol::xproto::EventMask;
 use smithay::reexports::x11rb::protocol::xproto::PropMode;
 use smithay::utils::Logical;
 use smithay::utils::Rectangle;
+use smithay::wayland::compositor::CompositorHandler;
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::XWaylandShellHandler;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
@@ -400,6 +403,15 @@ impl State {
 impl XWaylandShellHandler for State {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
+    }
+
+    // Xwayland before 23.1 names a window's surface over X11, which can arrive
+    // after the surface committed its first buffer. That commit found no window,
+    // so replay it now that the surface belongs to one.
+    fn surface_associated(&mut self, _: XwmId, surface: WlSurface, _: X11Surface) {
+        if with_renderer_surface_state(&surface, |state| state.buffer().is_some()) == Some(true) {
+            CompositorHandler::commit(self, &surface);
+        }
     }
 }
 

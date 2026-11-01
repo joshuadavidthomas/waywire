@@ -120,14 +120,10 @@ bug. It reports `XFAIL` and does not fail the run. When the bug is fixed the
 cell reports `XPASS`, which does fail the run: remove the cause in the same
 change.
 
-| Cell                         | Distro    | Cause                                                                                                                                                                                                                                                                                              |
-| ---------------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| every x11demo cell except T2 | Debian 12 | Xwayland 22.1 names each window's surface with the `WL_SURFACE_ID` message. Smithay records the id but leaves matching it to the compositor, and waywire never does, so X11 windows map but are never drawn. Xwayland 23.1 and later use `xwayland_shell_v1`. Being fixed on branch `xwayland-22`. |
-| `T2/x11demo/r2`              | Debian 13 | GTK 4.18's file chooser location bar inserts its inline completion while xdotool is still typing, so the path becomes `t2-x11demo-r2.txtxt`. The dogfood run hit it in `T2/x11demo/r1`; it fails the same way at `0548b28`.                                                                        |
-| `typeloss/cul-patched`       | both      | Text typed through a Wayland virtual keyboard loses characters in Chromium (ROADMAP Pass 2, item 4). waywire's `NotifyKeyboardKeysym` path types it intact.                                                                                                                                        |
-
-`T2/x11demo` passes on Debian 12 although its window is not drawn: keyboard
-input still reaches it, and GTK 4.8 does not race.
+| Cell                   | Distro    | Cause                                                                                                                                                                                                                       |
+| ---------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `T2/x11demo/r2`        | Debian 13 | GTK 4.18's file chooser location bar inserts its inline completion while xdotool is still typing, so the path becomes `t2-x11demo-r2.txtxt`. The dogfood run hit it in `T2/x11demo/r1`; it fails the same way at `0548b28`. |
+| `typeloss/cul-patched` | both      | Text typed through a Wayland virtual keyboard loses characters in Chromium (ROADMAP Pass 2, item 4). waywire's `NotifyKeyboardKeysym` path types it intact.                                                                 |
 
 Flaky dogfood cells are not replayed: batched T2 and T6a sequences without the
 learned sleeps, whose outcome depends on timing in the application.
