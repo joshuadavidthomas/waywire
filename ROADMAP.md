@@ -465,6 +465,121 @@ in the same orb (an XTest key into the viewer's browser window to that window's 
 and 18.7–21.7 ms on Selkies. The benchmark fails if waywire's viewer latency exceeds 25 ms
 p50 or 35 ms p95.
 
+### Pass 3: drivers that use the interface (proposed)
+
+Pass 3 is ranked by a second dogfood run on November 2, 2026, at `b57ba38`. The run replayed the
+first run's passing call sequences against the same tasks, drivers and desktops, with patched
+computer-use-linux built from upstream `292376c`. It added an interface-aware driver: patched
+computer-use-linux behind an MCP wrapper that reads receipts, `GetWindows` and `WaitSettled`.
+
+- **What Pass 2 fixed.** The punctuation line now types correctly 10 of 10 times on waywire with
+  wtype, cua-driver and both computer-use-linux builds; on Waymote, cua still gets it right 0 of
+  10 times. A key reaches foot's pixels in 16.9 ms p50 without a viewer, down from 33.7 ms;
+  Waymote takes 34.1. Through the browser viewer, with the first run's method, it takes
+  17.0–19.4 ms p50, down from 92; Waymote's viewer takes 95.8 and noVNC 115.5. Selkies, run 1's
+  leader, takes 18.9 ms p50 and 33.5 ms p95, against waywire's 24.5 ms p95.
+- **What it did not fix by itself.** Drivers that do not read the interface fail exactly as
+  before:
+  - A mid-task dialog swallowed typed input in 19 of 24 naive T6a runs on waywire, and in every
+    naive run on Waymote (6 of 6) and Xvfb (13 of 13) and Selkies (13 of 13). Every call reported
+    success.
+  - Edits at a moved window's old coordinates were lost in 12 of 12 waywire T6b runs.
+  - 9.8% of stock-driver screenshots on waywire were taken before the screen settled (15 of 153).
+  - With the interface-aware driver, all 26 of 26 waywire runs passed. It reported the
+    misdirected keys in 6 of 6 T6a runs and recovered each time. No T6b edit used stale
+    coordinates. 1 of 32 screenshots was unsettled, and it slept 0 times. It raised no false
+    alarm in the 23 runs of other tasks.
+
+Backed, most important first:
+
+1. **Bring the interface to the drivers agents use.**
+   - **Measured cost:** every number in the second bullet above. On every desktop and every
+     stock driver, the agent cannot tell that its typing went into a dialog or that its click
+     hit the window underneath. Only waywire can answer that, and only for a driver that asks.
+   - **What it replaces:** a screenshot after every action, sleeps of 400–1500 ms, and
+     coordinates read off a full-desktop screenshot.
+   - **Work:**
+     - Offer the computer-use-linux input-delivery patch upstream: fail `type_text` and
+       `press_key` on a misdirected receipt, report `GetWindows` geometry for windows, and
+       call `WaitSettled` in place of fixed sleeps. Then offer the same for cua-driver.
+     - Keep a reference wrapper with the receipts tool, so any MCP driver gets the checks
+       without patches. The run's wrapper was about 300 lines.
+   - **Limit:**
+     - An in-window `alert()` is detected only as the text field turning `none` with no input
+       of the driver's own to explain it.
+     - X11 clients and Chromium on text-input v1 report `unknown`, so for them only
+       window-level misdirection is caught.
+     - Upstream may decline a waywire-only interface until another compositor implements it;
+       the wrapper is the fallback.
+   - **This is the item that makes waywire clearly better than the alternatives.** Xvfb,
+     Selkies and Waymote have no equivalent signal, and their naive runs failed the same way.
+2. **Settle without waiting out the text caret.**
+   - **Measured cost:** the aware driver's per-action overhead is 318 ms p50 in Chromium, which
+     is the 300 ms quiet window. In GTK 4 windows (gnome-text-editor and its file chooser) it is
+     776 ms p50, and 8 of 36 waits ran into the 5 s timeout. Tasks in GTK 4 windows took 2–8
+     times longer than with the stock driver and fixed sleeps: T2 14.6 s against 1.9 s, T5 7.0
+     against 1.0, T6b 9.7 against 1.7. A 400-frame capture shows the only damage between inputs
+     is a 1×17 px strip at the caret: GTK 4 fades the caret in bursts of about 4 frames every
+     600 ms, and the roughly 350 ms hold between bursts is barely longer than the 300 ms quiet
+     window. With quiet 500 ms one of two waits timed out after 156 frames; with quiet 150 ms, 4
+     of 4 settled.
+   - **What it replaces:** the caller's choice between a long quiet window and a timeout in
+     focused text views.
+   - **Work:** leave out of `WaitSettled` the damage inside the focused text field's caret
+     rectangle, which the compositor already has from text-input-v3, or report `settled` with
+     a `caret` flag. Also measure whether a shorter default quiet window, such as 150 ms, keeps
+     Chromium's early-screenshot rate at 1 in 32.
+   - **Limit:** apps without text-input-v3 cursor rectangles, X11 clients and spinners still
+     time out.
+3. **Viewer key repeat follows the browser.**
+   - **Measured cost:** one viewer keystroke became 268 characters in foot while the viewer
+     page was busy, because its key release arrived late.
+   - **What it replaces:** client-side repeat of a key whose release is late.
+   - **Work:** drive repeat for viewer-held keys from the viewer's `keyRepeated` records, or cap
+     how long a viewer key can be held without a fresh record.
+   - **Limit:** a genuinely held key repeats at the browser's rate, not the client's.
+4. **Close the one-frame tail in key to pixel.**
+   - **Measured cost:** without a viewer, waywire's p50 equals the X11 desktops' (16.9 ms
+     against 16.5–17.2). Its p95 is 32.8 ms against 18.2–18.6, because 3 of 30 keys waited one
+     extra frame.
+   - **What it replaces:** an occasional missed frame deadline after a client commit.
+   - **Work:** trace when the key's commit arrives relative to waywire's frame deadline and
+     fix the scheduling.
+   - **Limit:** worth about one frame on 10% of inputs. The viewer's p95 (24.5 ms) already beats
+     Selkies' (33.5 ms).
+5. **Faster portal screenshots.**
+   - **Measured cost:** a computer-use-linux screenshot takes 53 ms p50 on waywire against 31–33
+     on Xvfb and Selkies. waywire's Screenshot implementation takes 30 ms of that; grim takes
+     12.8 ms.
+   - **What it replaces:** about 17 ms of portal overhead above raw capture.
+   - **Limit:** about 20 ms per screenshot, under 0.1 s per task. Do it only if it is cheap.
+
+Not waywire's to fix, tracked here because they cost the runs:
+
+- agent-desktop has no input path on waywire. Its pointer and keyboard actions require
+  `org.gnome.Mutter.RemoteDesktop`, and Chromium fields expose no EditableText. It passed 4 of
+  18 cells on waywire, every one of them through AT-SPI actions alone, against 12 of 12 on Xvfb
+  and Selkies in the first run. The fix is an upstream portal or EIS backend in agent-desktop;
+  waywire already serves both. A Mutter D-Bus compatibility shim for one driver is not worth
+  its surface.
+- Stock computer-use-linux 0.7.35 has no window backend or `press_key` on waywire: T5 by title
+  passed 0 of 3, and the per-field T6a cell had to send keys as text. Upstream `292376c` fixes
+  both; it needs a release.
+
+Dropped, or shown not to matter by the runs:
+
+- **A network agent endpoint.** Still no measured need: every driver ran on the box.
+- **Window-aware or per-window streaming.** Still no driver reads the stream.
+- **Observations from the rendered scene.** Driver screenshots take 32–54 ms p50 on waywire;
+  grim's raw capture takes 11.8 ms.
+- **Titlebar and taskbar controls in an agent query API** (section 4). No task needed a chrome
+  control; window switching went through foreign-toplevel or `GetWindows` every time.
+- **Viewer latency work.** waywire's viewer is now the fastest of the four measured:
+  17.0/24.5 ms p50/p95, against Selkies' 18.9/33.5.
+- **Matching Selkies' encoder or transport.** Selkies is ahead of waywire only where every X11
+  desktop is: the key-to-pixel tail and screenshot speed (items 4 and 5), and stock-driver
+  success, whose causes are in the drivers.
+
 ## 3. Window-management policy
 
 The desktop has overlapping windows, so these policies decide whether
