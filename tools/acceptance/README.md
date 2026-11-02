@@ -146,6 +146,7 @@ just acceptance computer-use-linux
 just acceptance cua-driver
 just acceptance fedora-x11
 just acceptance receipts-t6a
+just acceptance window-query
 ```
 
 The runner needs `sudo docker`, host networking, `agent-browser`, ImageMagick,
@@ -173,3 +174,25 @@ the alert, the phone keys must land in the form with no text field focused. For
 the popup, `WindowMapped` and `FocusChanged` must name the popup, and the phone
 keys must land in it. The receipts are saved to `receipts-t6a.jsonl` in
 `.amp/in/artifacts/`.
+
+`window-query` checks the window list from `GetWindows`
+(`docs/input-delivery.md`) against the screen and against where clicks land.
+It opens Chromium on Wayland with a green page and a blue X11 xterm. The xterm
+moves itself to the work area's far corner with `xdotool windowmove`, then a
+RemoteDesktop portal driver (`portal_pointer.py`, run under
+`tools/receipts/receipts.py`) drags it by its titlebar until it covers the
+page's centre. After each move the scenario reads the list with
+`receipts.py --windows --json` and, for each window, picks the point nearest
+its reported centre that no window above it in the reported stacking covers,
+as a driver would. It fails unless, at that point:
+
+- grim shows the window's own colour;
+- the portal click's button receipt names the listed id, which must also be
+  the id `WindowMapped` announced;
+- the window is listed on top and focused afterwards;
+- the xterm's listed bounds equal `xdotool getwindowgeometry`, and it is
+  where it asked to be and where the drag left it.
+
+Geometry that goes stale after a move, window-relative geometry, ids that
+differ from the receipts' and reversed stacking each fail it. The receipts are
+saved to `window-query.jsonl` in `.amp/in/artifacts/`.

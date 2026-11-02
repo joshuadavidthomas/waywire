@@ -1,9 +1,10 @@
 # Input delivery receipts and focus events
 
-Version 1. A driver that injects input learns, for each key, button, scroll and
+Version 2. A driver that injects input learns, for each key, button, scroll and
 text event, which window received it. It also learns when keyboard focus moves
-and when windows appear. Any compositor that routes seat input can implement
-this interface. waywire serves it.
+and when windows appear, and it can list every window with its bounds on
+screen, its place in the stacking order and its state. Any compositor that
+routes seat input can implement this interface. waywire serves it.
 
 The interface exists because input injection reports success when it sends
 an event, not when a window receives it. When a dialog opens between a click
@@ -35,10 +36,14 @@ uses the RemoteDesktop portal or AT-SPI has a connection to that bus.
   compositor processed before the call. A driver can therefore call
   `GetFocus` after its input as a barrier: when the reply arrives, all of the
   input's receipts have arrived.
+- `GetWindows() → a{sv}`: every window, with its bounds on screen, stacking
+  and state; see [Window list](#window-list). Since version 2. Like
+  `GetFocus`, the reply follows every signal for earlier input, so it shows
+  where windows are after that input. It needs no `Subscribe`.
 
 ### Properties
 
-- `Version` (`u`): 1.
+- `Version` (`u`): 2. Version 1 had no `GetWindows` and no `WindowsChanged`.
 
 ### Signals
 
@@ -52,6 +57,7 @@ must ignore keys and signals they do not know.
 - `WindowMapped`: a window appeared.
 - `TextFieldChanged`: the focused client gained or lost a focused text field.
 - `WindowChanged`: a mapped window's title or app id changed.
+- `WindowsChanged`: the window list changed. Since version 2.
 
 ## Records
 
@@ -208,6 +214,74 @@ Sent when a window that has had `WindowMapped` changes its title or app id.
 | `serial`, `time_usec` | `t`     | As in a receipt.                           |
 | `window`              | `a{sv}` | The window, with its new title and app id. |
 
+## Window list
+
+`GetWindows` returns, and `WindowsChanged` carries, the window list. The list
+is read from the scene the compositor draws, so it matches the screen: after a
+move, a resize, a client's own placement request, a raise or a minimize, the
+next list shows the change before or with the frame that shows it.
+
+| Key         | Type     | Meaning                                                                                                                 |
+| ----------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `serial`    | `t`      | For `GetWindows`, the serial of the latest signal. For `WindowsChanged`, the signal's own serial.                       |
+| `time_usec` | `t`      | `WindowsChanged` only: as in a receipt.                                                                                 |
+| `width`     | `u`      | Output width in pixels.                                                                                                 |
+| `height`    | `u`      | Output height in pixels.                                                                                                |
+| `scale`     | `d`      | Output pixels per logical unit; see [Coordinates](#coordinates).                                                        |
+| `work_area` | `(iiii)` | The part of the output where windows are placed, as `(x, y, width, height)`: the output above the compositor's taskbar. |
+| `windows`   | `aa{sv}` | The windows, topmost first. Each is a [window](#window) record with the keys below.                                     |
+
+Each entry in `windows` has the window record's keys (`id`, `app_id`, `title`,
+`pid`, `x11`) and these:
+
+| Key          | Type     | Meaning                                                                                                                                                     |
+| ------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `geometry`   | `(iiii)` | The client's content on screen, as `(x, y, width, height)` in output pixels. A click inside it reaches the client, unless a window above covers that point. |
+| `frame`      | `(iiii)` | `geometry` plus the titlebar the compositor draws for the window, if any. Equal to `geometry` for windows that draw their own decorations.                  |
+| `stack`      | `u`      | Position in the stacking order; 0 is the topmost window. Equal to the entry's index in `windows`.                                                           |
+| `focused`    | `b`      | The window holds keyboard focus.                                                                                                                            |
+| `minimized`  | `b`      | The window is minimized. It is not drawn, and its `geometry` is where it reappears when restored. A click there reaches whatever is below.                  |
+| `maximized`  | `b`      | The window is maximized.                                                                                                                                    |
+| `fullscreen` | `b`      | The window is fullscreen.                                                                                                                                   |
+| `parent`     | `s`      | The `id` of the window this dialog belongs to. Empty for top-level windows.                                                                                 |
+| `modal`      | `b`      | The window is a modal dialog.                                                                                                                               |
+
+The list holds every window with an `id`: Wayland toplevels, including
+dialogs and `window.open` popups, and managed X11 windows, including X11
+dialogs. Menus, tooltips and other popups are not windows. They are part of
+the window that opened them and are drawn above it, inside or outside its
+`geometry`.
+
+### Coordinates
+
+`geometry`, `frame` and `work_area` are in output pixels with the origin at
+the output's top-left corner: the pixels of a full-screen screenshot from grim,
+`ext-image-copy-capture` or the Screenshot portal. X11 clients see the same
+values through Xwayland, so `xdotool getwindowgeometry` agrees with `geometry`
+for an X11 window. The RemoteDesktop portal's `NotifyPointerMotionAbsolute`
+takes logical coordinates in its stream: divide by `scale`. At scale 1 the two
+are the same.
+
+To click a window, click inside `geometry` at a point that no window with a
+lower `stack` covers. A dialog that belongs to the window is above it.
+
+### WindowsChanged
+
+Sent to every subscriber when the list differs from the one last sent: a
+window appeared, closed, moved, resized, changed stacking, focus or state, or
+changed its title or app id. The compositor compares lists once per pass of
+its event loop, so a drag that moves a window sends one signal per pass, not
+one per pointer event, and a change that is undone within one pass sends
+nothing. The signal carries the whole list, like `GetWindows`, so a consumer
+can keep the latest one and never call `GetWindows` again.
+
+A driver that moves a window, or acts on input that may move one, calls
+`GetWindows` after the input instead of sleeping. The reply arrives after any
+`WindowsChanged` for the change, and shows where the windows are now. A window
+that a client moves on its own after a delay, such as an application that
+places a dialog once its contents load, moves later; `WindowsChanged`
+announces it.
+
 ## Ordering
 
 Serials increase in the order the compositor processes events. Signals are
@@ -242,9 +316,11 @@ limits who receives each signal:
   client sent it.
 - Viewer receipts never go on the bus. Each one goes back to the viewer whose
   input it describes, over the gateway's control channel.
-- `FocusChanged`, `WindowMapped`, `WindowChanged` and `TextFieldChanged` go
-  to every subscriber. They describe window state that `ext-foreign-toplevel-list` and
-  the screen already show every client. `receipt` is present only for the
+- `FocusChanged`, `WindowMapped`, `WindowChanged`, `TextFieldChanged` and
+  `WindowsChanged` go to every subscriber, and any connection may call
+  `GetWindows`. They describe window state that `ext-foreign-toplevel-list`,
+  wlr-foreign-toplevel-management and the screen already show every client:
+  screencopy shows where each window is. `receipt` is present only for the
   input's owners.
 
 A driver must therefore subscribe from its own process, or from a process
@@ -272,7 +348,12 @@ event.
 
 ## Implementing elsewhere
 
-A compositor implements this interface by recording, at each seat entry
+A compositor implements the window list from the scene it renders: each
+window's position in that scene, its content size, the titlebar it draws, and
+the order it draws windows in. An X11 window manager can approximate it with
+`_NET_CLIENT_LIST_STACKING` and `XTranslateCoordinates` on the root window.
+
+A compositor implements receipts by recording, at each seat entry
 point, the surface that receives the event and the source that sent it. It
 emits focus events from its keyboard-focus hook and sets a cause around each
 code path that moves focus. An X11 desktop can approximate it with XInput 2

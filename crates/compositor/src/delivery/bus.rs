@@ -10,6 +10,8 @@ use std::sync::mpsc;
 use anyhow::Result;
 use calloop::LoopHandle;
 use calloop::channel::Event;
+use smithay::utils::Physical;
+use smithay::utils::Rectangle;
 use tokio::sync::oneshot;
 use zbus::interface;
 use zbus::message::Header;
@@ -26,6 +28,7 @@ use super::Outgoing;
 use super::Receipt;
 use super::Signal;
 use super::TextField;
+use super::WindowList;
 use super::WindowRecord;
 use crate::State;
 
@@ -46,6 +49,9 @@ pub(crate) enum Request {
         name: String,
     },
     Focus {
+        reply: oneshot::Sender<HashMap<String, OwnedValue>>,
+    },
+    Windows {
         reply: oneshot::Sender<HashMap<String, OwnedValue>>,
     },
 }
@@ -140,6 +146,19 @@ impl State {
                     }
                 }));
             }
+            Request::Windows { reply } => {
+                // Report a pending change first, so the reply never shows a
+                // list whose WindowsChanged a subscriber has not received.
+                self.publish_window_list();
+                let mut windows = list_dict(&self.window_list());
+                insert(&mut windows, "serial", self.delivery.last_serial());
+                let windows = owned(windows);
+                self.delivery.flush(Box::new(move || {
+                    if reply.send(windows).is_err() {
+                        tracing::debug!("input delivery requester hung up");
+                    }
+                }));
+            }
         }
     }
 }
@@ -202,10 +221,20 @@ impl InputDelivery {
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    /// Every window with its screen bounds, stacking and state.
+    async fn get_windows(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+        let (reply, wait) = oneshot::channel();
+        self.requests
+            .send(Request::Windows { reply })
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        wait.await
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     #[zbus(property)]
     #[expect(clippy::unused_self, reason = "zbus properties are methods")]
     fn version(&self) -> u32 {
-        1
+        2
     }
 }
 
@@ -229,6 +258,40 @@ fn window_dict(window: Option<&WindowRecord>) -> HashMap<String, Value<'static>>
         insert(&mut dict, "pid", window.pid.unwrap_or(0));
         insert(&mut dict, "x11", window.x11);
     }
+    dict
+}
+
+/// A rectangle as `(x, y, width, height)`.
+fn rect(rect: Rectangle<i32, Physical>) -> (i32, i32, i32, i32) {
+    (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
+}
+
+/// A window list: the output it is measured on and its windows, topmost
+/// first.
+fn list_dict(list: &WindowList) -> HashMap<String, Value<'static>> {
+    let mut dict = HashMap::new();
+    insert(&mut dict, "width", list.width);
+    insert(&mut dict, "height", list.height);
+    insert(&mut dict, "scale", list.scale);
+    insert(&mut dict, "work_area", rect(list.work_area));
+    let windows: Vec<HashMap<String, Value<'static>>> = list
+        .windows
+        .iter()
+        .map(|entry| {
+            let mut window = window_dict(Some(&entry.record));
+            insert(&mut window, "geometry", rect(entry.geometry));
+            insert(&mut window, "frame", rect(entry.frame));
+            insert(&mut window, "stack", entry.stack);
+            insert(&mut window, "focused", entry.focused);
+            insert(&mut window, "minimized", entry.minimized);
+            insert(&mut window, "maximized", entry.maximized);
+            insert(&mut window, "fullscreen", entry.fullscreen);
+            insert(&mut window, "parent", entry.parent.clone());
+            insert(&mut window, "modal", entry.modal);
+            window
+        })
+        .collect();
+    insert(&mut dict, "windows", windows);
     dict
 }
 
@@ -332,6 +395,12 @@ pub(crate) fn notice_dict(notice: &Notice) -> (&'static str, HashMap<String, Val
             insert(&mut dict, "time_usec", *time_usec);
             insert(&mut dict, "window", window_dict(Some(window)));
             ("WindowChanged", dict)
+        }
+        Notice::WindowsChanged(changed) => {
+            let mut dict = list_dict(&changed.list);
+            insert(&mut dict, "serial", changed.serial);
+            insert(&mut dict, "time_usec", changed.time_usec);
+            ("WindowsChanged", dict)
         }
     }
 }

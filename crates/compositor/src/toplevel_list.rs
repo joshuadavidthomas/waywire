@@ -310,6 +310,8 @@ mod tests {
         dialogs: Option<XdgWmDialogV1>,
         configured_size: Option<(i32, i32)>,
         text_inputs: Option<ZwpTextInputManagerV3>,
+        toplevels: Vec<XdgToplevel>,
+        xdg_surfaces: Vec<(WlSurface, XdgSurface)>,
     }
 
     /// Drag-and-drop events seen by a source or target client.
@@ -4728,5 +4730,294 @@ mod tests {
         assert_eq!(receipts[0].delivery, pipe::ReceiptDelivery::Window);
         assert_eq!(receipts[0].title.as_str(), "Notes");
         assert_eq!(receipts[0].window_id.as_str(), app.handles[0].identifier);
+    }
+
+    /// Attach a `width` by `height` buffer to `surface`.
+    fn attach_sized(
+        surface: &WlSurface,
+        app: &App,
+        qh: &QueueHandle<App>,
+        width: i32,
+        height: i32,
+    ) {
+        let shm = app.shm.as_ref().expect("wl_shm bound");
+        let fd: OwnedFd =
+            nix::sys::memfd::memfd_create("window-list-buffer", nix::sys::memfd::MFdFlags::empty())
+                .expect("memfd");
+        nix::unistd::ftruncate(&fd, 4 * i64::from(width) * i64::from(height)).expect("ftruncate");
+        let pool = shm.create_pool(fd.as_fd(), 4 * width * height, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width,
+            height,
+            4 * width,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, width, height);
+    }
+
+    /// The windows `name` was told about in its latest `WindowsChanged`.
+    fn latest_windows_changed(
+        signals: &[crate::delivery::Signal],
+    ) -> Option<crate::delivery::WindowList> {
+        signals.iter().rev().find_map(|signal| match signal {
+            crate::delivery::Signal::Notice(crate::delivery::Notice::WindowsChanged(changed)) => {
+                Some(changed.list.clone())
+            }
+            crate::delivery::Signal::Notice(_) | crate::delivery::Signal::Receipt(_) => None,
+        })
+    }
+
+    fn bounds(
+        rect: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    ) -> (i32, i32, i32, i32) {
+        (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
+    }
+
+    fn click(state: &mut crate::State, source: KeyboardSource, (x, y): (f64, f64)) {
+        state.pointer_motion(source, (x, y).into());
+        state.pointer_button(source, 0x110, ButtonState::Pressed);
+        state.pointer_button(source, 0x110, ButtonState::Released);
+    }
+
+    /// A decorated 400x300 editor behind an undecorated 200x100 terminal.
+    fn window_list_fixture() -> (
+        smithay::reexports::wayland_server::Display<crate::State>,
+        crate::State,
+        Connection,
+        EventQueue<App>,
+        App,
+        Window,
+        Window,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let qh = queue.handle();
+        let (editor_surface, editor_xdg, editor_top) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Editor",
+            "editor",
+        );
+        app.toplevels.push(editor_top);
+        app.xdg_surfaces
+            .push((editor_surface.clone(), editor_xdg.clone()));
+        let editor = top_window(&state);
+        let top = editor.toplevel().expect("toplevel");
+        top.with_pending_state(|pending| pending.decoration_mode = Some(Mode::ServerSide));
+        top.send_configure();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        editor_xdg.ack_configure(app.last_configure.expect("configure"));
+        attach_sized(&editor_surface, &app, &qh, 400, 300);
+        editor_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let (terminal_surface, _, _) = map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Terminal",
+            "foot",
+        );
+        let terminal = top_window(&state);
+        attach_sized(&terminal_surface, &app, &qh, 200, 100);
+        terminal_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        state.space.map_element(editor.clone(), (100, 100), false);
+        state.space.map_element(terminal.clone(), (700, 400), false);
+        (display, state, connection, queue, app, editor, terminal)
+    }
+
+    #[test]
+    fn window_list_reports_screen_bounds_that_follow_a_move_and_restack() {
+        let (_display, mut state, _connection, _queue, app, _editor, _terminal) =
+            window_list_fixture();
+        let source = KeyboardSource::new_auxiliary();
+        let received = delivery_subscribers(&mut state, source);
+
+        let list = state.window_list();
+        assert_eq!((list.width, list.height), (1920, 1080));
+        assert_eq!(bounds(list.work_area), (0, 0, 1920, 1048));
+        let titles: Vec<_> = list
+            .windows
+            .iter()
+            .map(|w| w.record.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Terminal", "Editor"], "topmost first");
+        let (terminal, editor) = (&list.windows[0], &list.windows[1]);
+        assert_eq!(terminal.record.id, app.handles[1].identifier);
+        assert_eq!(editor.record.id, app.handles[0].identifier);
+        assert_eq!((terminal.stack, editor.stack), (0, 1));
+        assert!(terminal.focused && !editor.focused);
+        assert_eq!(bounds(terminal.geometry), (700, 400, 200, 100));
+        assert_eq!(bounds(terminal.frame), (700, 400, 200, 100), "no titlebar");
+        assert_eq!(bounds(editor.geometry), (100, 100, 400, 300));
+        assert_eq!(
+            bounds(editor.frame),
+            (100, 72, 400, 328),
+            "with its titlebar"
+        );
+
+        // An agent drags the editor's titlebar by (300, 200), onto the
+        // terminal. Its old bounds are now bare desktop.
+        state.pointer_motion(source, (150.0, 86.0).into());
+        state.pointer_button(source, 0x110, ButtonState::Pressed);
+        for step in 1..=10 {
+            let step = f64::from(step);
+            state.pointer_motion(source, (150.0 + 30.0 * step, 86.0 + 20.0 * step).into());
+        }
+        state.pointer_button(source, 0x110, ButtonState::Released);
+        state.publish_window_list();
+
+        let list = state.window_list();
+        let titles: Vec<_> = list
+            .windows
+            .iter()
+            .map(|w| w.record.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["Editor", "Terminal"],
+            "the click raised the editor"
+        );
+        let editor = list.windows[0].clone();
+        assert!(editor.focused && !list.windows[1].focused);
+        assert_eq!(
+            bounds(editor.geometry),
+            (400, 300, 400, 300),
+            "bounds after the move"
+        );
+        assert_eq!(bounds(editor.frame), (400, 272, 400, 328));
+        let signals = delivered(&received, "observer");
+        assert_eq!(
+            latest_windows_changed(&signals).as_ref(),
+            Some(&list),
+            "every subscriber hears the new list"
+        );
+        state.publish_window_list();
+        assert!(
+            latest_windows_changed(&delivered(&received, "observer")).is_none(),
+            "an unchanged list is not sent again"
+        );
+
+        // A click at the centre of each window's reported bounds lands in
+        // the window on top there: the editor covers the terminal's centre.
+        for (target, expected) in [
+            (&editor, &editor.record.id),
+            (&list.windows[1], &editor.record.id),
+        ] {
+            let centre = (
+                f64::from(target.geometry.loc.x + target.geometry.size.w / 2),
+                f64::from(target.geometry.loc.y + target.geometry.size.h / 2),
+            );
+            click(&mut state, source, centre);
+            let receipts = receipts(&delivered(&received, "agent"));
+            let landed = receipts[0].window.clone().expect("a window took the click");
+            assert_eq!(&landed.id, expected, "click at {centre:?}");
+        }
+        // The editor's old centre is bare desktop.
+        click(&mut state, source, (300.0, 250.0));
+        let receipts = receipts(&delivered(&received, "agent"));
+        assert_eq!(receipts[0].delivery, "nowhere");
+    }
+
+    #[test]
+    fn window_list_bounds_are_output_pixels_at_any_scale() {
+        let (_display, state, _connection, _queue, _app, _editor, _terminal) =
+            window_list_fixture();
+        state.output.change_current_state(
+            None,
+            None,
+            Some(smithay::output::Scale::Fractional(1.5)),
+            None,
+        );
+        let list = state.window_list();
+        assert_eq!((list.width, list.height), (1920, 1080));
+        assert!((list.scale - 1.5).abs() < f64::EPSILON);
+        let editor = &list.windows[1];
+        assert_eq!(bounds(editor.geometry), (150, 150, 600, 450));
+        assert_eq!(bounds(editor.frame), (150, 108, 600, 492));
+        assert_eq!(bounds(list.windows[0].geometry), (1050, 600, 300, 150));
+    }
+
+    #[test]
+    fn window_list_reports_minimized_maximized_and_dialog_windows() {
+        let (mut display, mut state, connection, mut queue, mut app, editor, terminal) =
+            window_list_fixture();
+        state.window_action(&terminal, crate::WindowAction::Minimize);
+        let list = state.window_list();
+        let terminal_entry = list
+            .windows
+            .iter()
+            .find(|w| w.record.title == "Terminal")
+            .expect("a minimized window stays listed");
+        assert!(terminal_entry.minimized && !terminal_entry.focused);
+
+        // A dialog is its own toplevel, listed above its parent with the
+        // parent's id.
+        let editor_top = app.toplevels[0].clone();
+        let qh = queue.handle();
+        let surface = app
+            .compositor
+            .as_ref()
+            .expect("compositor")
+            .create_surface(&qh, ());
+        let xdg = app
+            .wm_base
+            .as_ref()
+            .expect("shell")
+            .get_xdg_surface(&surface, &qh, ());
+        let dialog = xdg.get_toplevel(&qh, ());
+        dialog.set_parent(Some(&editor_top));
+        dialog.set_title("Save changes?".into());
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        xdg.ack_configure(app.last_configure.expect("configure"));
+        attach_sized(&surface, &app, &qh, 100, 50);
+        surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let list = state.window_list();
+        let titles: Vec<_> = list
+            .windows
+            .iter()
+            .map(|w| w.record.title.as_str())
+            .collect();
+        assert_eq!(titles[..2], ["Save changes?", "Editor"]);
+        let dialog_entry = &list.windows[0];
+        assert_eq!(dialog_entry.parent, list.windows[1].record.id);
+        assert!(dialog_entry.focused);
+        assert_eq!(
+            bounds(dialog_entry.geometry),
+            (250, 225, 100, 50),
+            "centred on the editor's content"
+        );
+
+        state.window_action(&editor, crate::WindowAction::Maximize);
+        let (surface, xdg) = app.xdg_surfaces[0].clone();
+        app.last_surface = Some(surface);
+        app.last_xdg = Some(xdg);
+        commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let list = state.window_list();
+        let editor_entry = list
+            .windows
+            .iter()
+            .find(|w| w.record.title == "Editor")
+            .expect("editor");
+        assert!(editor_entry.maximized && !editor_entry.fullscreen);
+        assert_eq!(
+            editor_entry.frame.loc,
+            (0, 0).into(),
+            "maximized titlebar at the top"
+        );
     }
 }

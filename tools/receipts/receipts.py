@@ -3,12 +3,16 @@
 
     receipts.py [--json] [--output FILE] [-- COMMAND [ARG...]]
     receipts.py --focus
+    receipts.py --windows [--watch] [--json]
 
 The compositor sends a subscriber the receipts for input from its own process
 tree, so run the driver under this tool (receipts.py -- cua-driver serve), or
 use it to watch focus and window events, which every subscriber receives. With
 a command, the tool exits when the command does, with its status. --focus
-prints the focused window and its text-field state once.
+prints the focused window and its text-field state once. --windows prints
+every window, topmost first, with its bounds on screen in output pixels (the
+pixels of a full-screen screenshot), and with --watch prints the list again
+each time it changes.
 
 It connects to DBUS_SESSION_BUS_ADDRESS, the session bus the compositor
 exports to its applications. The interface is described in
@@ -50,6 +54,34 @@ def text_field_label(record):
     if field == "none":
         return "; text field: none focused"
     return "; text field: unknown"
+
+
+def box(rect):
+    x, y, width, height = rect
+    return f"{width}x{height}+{x}+{y}"
+
+
+def window_lines(listing):
+    """The window list as text: one line per window, topmost first."""
+    lines = [
+        f"output {listing['width']}x{listing['height']} scale {listing['scale']:g}"
+        f", work area {box(listing['work_area'])}"
+    ]
+    for window in listing["windows"]:
+        states = [
+            name
+            for name in ("focused", "minimized", "maximized", "fullscreen", "modal")
+            if window.get(name)
+        ]
+        if window.get("parent"):
+            states.append(f"dialog of {window['parent']}")
+        states.append("x11" if window.get("x11") else "wayland")
+        lines.append(
+            f"  {window['stack']:>2} {box(window['geometry']):<20}"
+            f" frame {box(window['frame']):<20} {window_label(window)}"
+            f" {', '.join(states)}"
+        )
+    return lines
 
 
 def describe(member, record):
@@ -94,6 +126,8 @@ def describe(member, record):
         return f"#{serial} new {kind} {window_label(record.get('window'))}{parent}"
     if member == "WindowChanged":
         return f"#{serial} window now {window_label(record.get('window'))}"
+    if member == "WindowsChanged":
+        return "\n".join([f"#{serial} windows:", *window_lines(record)[1:]])
     if member == "TextFieldChanged":
         return (
             f"#{serial} text field in {window_label(record.get('window'))}"
@@ -135,6 +169,14 @@ def main():
     parser.add_argument(
         "--focus", action="store_true", help="print the current focus and exit"
     )
+    parser.add_argument(
+        "--windows", action="store_true", help="print the window list and exit"
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="with --windows, print the list again whenever it changes",
+    )
     parser.add_argument("--output", help="write to FILE instead of standard output")
     parser.add_argument("command", nargs="*", help="run COMMAND under the tool")
     args = parser.parse_args()
@@ -150,6 +192,34 @@ def main():
                 file=out,
                 flush=True,
             )
+        return 0
+    if args.windows:
+
+        def show(listing):
+            if args.json:
+                print(json.dumps(listing), file=out, flush=True)
+            else:
+                print("\n".join(window_lines(listing)), file=out, flush=True)
+
+        if args.watch:
+            connection.signal_subscribe(
+                None,
+                NAME,
+                "WindowsChanged",
+                PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                lambda *signal: show(signal[-1].unpack()[0]),
+            )
+            call(connection, "Subscribe")
+        (listing,) = call(connection, "GetWindows")
+        show(listing)
+        if not args.watch:
+            return 0
+        loop = GLib.MainLoop()
+        for number in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, number, loop.quit)
+        loop.run()
         return 0
 
     def on_signal(_connection, _sender, _path, _interface, member, parameters):

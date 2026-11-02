@@ -17,6 +17,7 @@
 //! foreign-toplevel already tells every client, so every subscriber gets them.
 
 mod bus;
+mod windows;
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -35,6 +36,8 @@ use smithay::xwayland::X11Surface;
 use waywire_protocol::pipe;
 
 pub(crate) use self::bus::start;
+pub(crate) use self::windows::WindowList;
+pub(crate) use self::windows::WindowsChanged;
 use crate::State;
 use crate::focus::KeyboardFocus;
 use crate::focus::PointerFocus;
@@ -316,6 +319,9 @@ pub(crate) enum Notice {
         time_usec: u64,
         window: WindowRecord,
     },
+    /// The window list changed: a window moved, resized, restacked, changed
+    /// state or metadata, appeared or went away.
+    WindowsChanged(Box<WindowsChanged>),
 }
 
 /// A signal for the bus thread to send to each named connection.
@@ -370,6 +376,8 @@ pub(crate) struct Delivery {
     /// The focus last reported, so repeated `focus_changed` calls for the
     /// same target stay quiet.
     reported_focus: Option<(Option<WindowRecord>, bool)>,
+    /// The window list last sent in `WindowsChanged`.
+    reported_windows: Option<WindowList>,
     /// Clients that have enabled text input at least once, and the content
     /// purpose of their latest activation.
     text_clients: HashMap<ClientId, ContentPurpose>,

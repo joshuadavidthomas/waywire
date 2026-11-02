@@ -314,13 +314,41 @@ Backed, most important first:
        subscriber.
      - The driver patch has not been offered upstream, and no other compositor implements
        the interface yet.
-2. **A window query with stable ids, geometry, stacking, pid and focus.**
-   - **Measured cost.** On waywire no tool gives screen-space window bounds: foreign-toplevel
+2. **A window query with stable ids, geometry, stacking, pid and focus.** Done; see
+   [`docs/input-delivery.md`](docs/input-delivery.md#window-list).
+   - **Measured cost.** On waywire no tool gave screen-space window bounds: foreign-toplevel
      has none, and cua and agent-desktop report AT-SPI window-relative bounds as screen
-     positions. Every window-scoped click therefore had to be read off a full-desktop
-     screenshot. On Xvfb and Selkies, xdotool and wmctrl report real geometry.
-   - After a window moved, clicks at old coordinates hit the wrong window in 11 of 24 runs.
-     Recovery by identity worked every time.
+     positions. Every window-scoped click had to be read off a full-desktop screenshot. On
+     Xvfb and Selkies, xdotool and wmctrl report real geometry. After a window moved, clicks
+     at old coordinates hit the wrong window in 11 of 24 runs. Recovery by identity worked
+     every time.
+   - **What shipped.** `InputDelivery1` version 2 adds `GetWindows` and a `WindowsChanged`
+     signal. Each window has the receipts' foreign-toplevel id, title, app id, pid and X11 or
+     Wayland; its content and its compositor titlebar in output pixels, the pixels of a
+     full-screen screenshot; its stacking position, topmost first; focused, minimized,
+     maximized and fullscreen; and its parent and modality for dialogs. The list is read
+     from the scene the compositor draws. `GetWindows` replies after every signal for
+     earlier input and after any `WindowsChanged` it reflects, so a driver can call it after
+     a drag instead of sleeping.
+   - **Proof.** `receipts.py --windows` prints the list, and `--watch` prints each change.
+     Unit tests move a window by its titlebar, restack it and click its reported centre;
+     one fails when the list keeps the old position. An ignored compositor test checks an
+     xterm's listed bounds against `xdotool` and grim before and after it moves itself.
+     `just acceptance window-query` moves an xterm by its own request and by a portal drag
+     over Chromium, then clicks each window where the list says it shows. Each click's
+     receipt must name the listed id, and grim must show the window's colour there. It
+     fails with stale geometry, window-relative geometry, mismatched ids and reversed
+     stacking.
+   - **What remains.**
+     - No driver reads it yet. cua-driver and computer-use-linux still report AT-SPI
+       window-relative bounds; adding the window's `geometry` to them gives screen
+       positions. Offering that upstream is the next step.
+     - Popups, menus and tooltips are part of their window, not entries; their bounds are
+       not listed.
+     - The portal's absolute coordinates are logical, so drivers divide by `scale` at
+       fractional scales. Both are the same at scale 1.
+     - A client that moves its window on a timer, after the input that caused it, is
+       announced by `WindowsChanged`, but `GetWindows` cannot wait for it.
    - This is the window half of the agent query API in section 4. Control identity inside
      windows stays with AT-SPI, which worked on the session bus for cua and
      computer-use-linux.
@@ -379,8 +407,9 @@ Remaining:
   titlebar or taskbar when its inputs change.
 - The light palette is provisional and has no selector. Pass the selected
   colour scheme to applications when theme selection is supported.
-- Expose the node list to an agent query API so agents can find windows and
-  controls without searching pixels.
+- Expose the node list to an agent query API so agents can find controls
+  without searching pixels. Windows are listed by `GetWindows` (phase 2, Pass 2
+  item 2); the titlebar's and taskbar's own controls are not.
 - Clicking a pin does nothing when its child is alive but has no matching
   window, such as a wrapper that forks.
 - The gateway does not validate `--pin` quoting before starting the compositor.
@@ -573,6 +602,32 @@ the review are in place. Remaining gaps:
   - Extending the portal. The RemoteDesktop portal is a standard interface,
     and its backends live in each desktop. A private extension to it would
     work only with waywire's backend.
+- **Window query transport.** The window list is part of `InputDelivery1`
+  (version 2): a `GetWindows` method and a `WindowsChanged` signal on the same
+  session bus. Drivers already hold that connection for receipts, the list
+  names windows by the receipts' id, and `GetWindows` reuses the receipts'
+  barrier, so a driver can query after its input settles. Bounds are in output
+  pixels, the pixels of the screenshots drivers already click from, with the
+  scale to convert to portal coordinates. Rejected alternatives:
+  - A separate D-Bus service or interface. It would need its own name, its own
+    subscription and its own ordering with receipts; the barrier only holds
+    when both come from one queue.
+  - Adding geometry to wlr-foreign-toplevel-management or
+    ext-foreign-toplevel-list through a private protocol extension. Drivers
+    such as XTest loops hold no Wayland connection, and no released tool would
+    read it.
+  - Serving GNOME's `org.gnome.Shell.Introspect` or another desktop's API,
+    which computer-use-linux already reads. That would pose as that desktop.
+  - EWMH on the Xwayland root window. It would describe Wayland windows to X11
+    clients only, and Xwayland already reports X11 windows' own geometry.
+  - Per-window events instead of the whole list. A list of a few windows is a
+    few hundred bytes, and one message with every window keeps stacking and
+    geometry consistent with each other.
+- **Window query privacy.** Every connection may call `GetWindows`, and every
+  subscriber gets `WindowsChanged`. The list holds titles, app ids and pids
+  that foreign-toplevel already gives every client, and bounds and stacking
+  that screencopy already shows every client. It never carries window contents
+  or input. Like the receipts, this assumes one trusted user per session.
 - **Input delivery privacy.** A receipt reveals when a process sent each
   key and where it went, so the compositor sends it only to the input's
   owner: a subscriber whose process created the input source, or is one of

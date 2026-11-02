@@ -2648,6 +2648,7 @@ pub fn run(mut options: Config) -> Result<()> {
         state.reap_pins();
         state.space.refresh();
         crate::xwayland::sync_stacking(&mut state);
+        state.publish_window_list();
         if (state.dirty || state.frame_pending == FrameRequest::Pending)
             && Instant::now() >= next_frame
         {

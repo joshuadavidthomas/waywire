@@ -545,6 +545,197 @@ fn x11_requested_position(xwayland: Option<&std::path::Path>) {
     }
 }
 
+/// One window from `GetWindows`: title, `x11`, geometry, frame and pid.
+type ListedWindow = (
+    String,
+    bool,
+    (i32, i32, i32, i32),
+    (i32, i32, i32, i32),
+    u32,
+);
+
+#[expect(
+    clippy::expect_used,
+    reason = "integration test requires the compositor's bus"
+)]
+fn get_windows(bus: &zbus::blocking::Connection) -> Vec<ListedWindow> {
+    use std::collections::HashMap;
+
+    use zbus::zvariant::OwnedValue;
+    let reply = bus
+        .call_method(
+            Some("io.github.joshuadavidthomas.waywire.InputDelivery1"),
+            "/io/github/joshuadavidthomas/waywire/InputDelivery1",
+            Some("io.github.joshuadavidthomas.waywire.InputDelivery1"),
+            "GetWindows",
+            &(),
+        )
+        .expect("GetWindows");
+    let list: HashMap<String, OwnedValue> = reply.body().deserialize().expect("window list");
+    let windows: Vec<HashMap<String, OwnedValue>> = list["windows"]
+        .try_clone()
+        .expect("windows")
+        .try_into()
+        .expect("window dictionaries");
+    windows
+        .into_iter()
+        .map(|window| {
+            let text = |key: &str| -> String {
+                window[key].try_clone().expect(key).try_into().expect(key)
+            };
+            let rect = |key: &str| -> (i32, i32, i32, i32) {
+                window[key].try_clone().expect(key).try_into().expect(key)
+            };
+            (
+                text("title"),
+                window["x11"]
+                    .try_clone()
+                    .expect("x11")
+                    .try_into()
+                    .expect("x11"),
+                rect("geometry"),
+                rect("frame"),
+                window["pid"]
+                    .try_clone()
+                    .expect("pid")
+                    .try_into()
+                    .expect("pid"),
+            )
+        })
+        .collect()
+}
+
+/// `GetWindows` on the compositor's bus reports an X11 window where X11
+/// and the screen put it, before and after the client moves itself.
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, xterm, xdotool, grim and dbus-daemon"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the session, the X11 queries and the screen checks form one scenario"
+)]
+fn window_list_reports_x11_windows_where_they_are_drawn() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let marker = runtime.path().join("xterm-window");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"
+                xterm -title waywire-windows -geometry 40x10+120+100 -bg '#3366cc' &
+                app=$!
+                trap 'kill "$app" 2>/dev/null' EXIT
+                while :; do
+                    id=$(xdotool search --pid "$app" --onlyvisible 2>/dev/null | head -n 1)
+                    [ -n "$id" ] && break
+                    sleep 0.05
+                done
+                sleep 0.5
+                printf '%s %s %s %s' "$DISPLAY" "$WAYLAND_DISPLAY" "$id" "$DBUS_SESSION_BUS_ADDRESS" > "$0"
+                wait "$app"
+                "#,
+            ])
+            .arg(&marker)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let target = written_contents(&marker, deadline, "xterm did not map");
+    let mut target = target.split_whitespace();
+    let display = target.next().expect("display");
+    let wayland = target.next().expect("Wayland display");
+    let id = target.next().expect("window id");
+    let address = target.next().expect("session bus");
+    let bus = zbus::blocking::connection::Builder::address(address)
+        .expect("bus address")
+        .build()
+        .expect("connect to the session bus");
+    let xdotool = |args: &[&str]| {
+        let output = ProcessCommand::new("xdotool")
+            .env("DISPLAY", display)
+            .args(args)
+            .output()
+            .expect("xdotool");
+        assert!(output.status.success(), "xdotool {args:?}");
+        String::from_utf8(output.stdout).expect("xdotool UTF-8")
+    };
+    let x11_geometry = || {
+        let text = xdotool(&["getwindowgeometry", "--shell", id]);
+        let value = |name: &str| -> i32 {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .expect("geometry field")
+                .parse()
+                .expect("integer")
+        };
+        (value("X="), value("Y="), value("WIDTH="), value("HEIGHT="))
+    };
+    let pid: u32 = xdotool(&["getwindowpid", id]).trim().parse().expect("pid");
+    let pixel = |x: i32, y: i32| {
+        let output = ProcessCommand::new("grim")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("WAYLAND_DISPLAY", wayland)
+            .args(["-t", "ppm", "-g", &format!("{x},{y} 1x1"), "-"])
+            .output()
+            .expect("grim");
+        assert!(output.status.success(), "grim");
+        output.stdout.last_chunk::<3>().copied().expect("pixel")
+    };
+    for requested in [None, Some((300, 250))] {
+        if let Some((x, y)) = requested {
+            xdotool(&["windowmove", id, &x.to_string(), &y.to_string()]);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (title, x11, geometry, frame, listed_pid) = loop {
+            let windows = get_windows(&bus);
+            let xterm = windows
+                .into_iter()
+                .find(|window| window.0 == "waywire-windows")
+                .expect("the xterm is listed");
+            let expected = requested.unwrap_or((120, 100));
+            if (xterm.2.0, xterm.2.1) == expected {
+                break xterm;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "listed at {:?}, the client asked for {expected:?}",
+                xterm.2
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(title, "waywire-windows");
+        assert!(x11);
+        assert_eq!(listed_pid, pid);
+        assert_eq!(geometry, x11_geometry(), "the list agrees with X11");
+        assert_eq!(
+            frame,
+            (geometry.0, geometry.1 - 28, geometry.2, geometry.3 + 28),
+            "the frame adds the compositor's titlebar"
+        );
+        // Drawn there: the xterm's background at the centre of its bounds,
+        // and the titlebar, not the xterm, just above them.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pixel(geometry.0 + geometry.2 / 2, geometry.1 + geometry.3 / 2) != [0x33, 0x66, 0xcc]
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the xterm is not drawn at {geometry:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_ne!(pixel(geometry.0 + 4, geometry.1 - 14), [0x33, 0x66, 0xcc]);
+    }
+}
+
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
 fn x11_pre_map_maximize_fills_work_area() {

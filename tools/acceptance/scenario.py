@@ -19,7 +19,13 @@ ARTIFACTS = ROOT / ".amp/in/artifacts"
 NAME = "waywire-acceptance"
 BROWSER_SESSION = f"ww-{os.getpid()}"
 PORT = "18925"
-SCENARIOS = ("computer-use-linux", "cua-driver", "fedora-x11", "receipts-t6a")
+SCENARIOS = (
+    "computer-use-linux",
+    "cua-driver",
+    "fedora-x11",
+    "receipts-t6a",
+    "window-query",
+)
 RECEIPTS = "/tmp/receipts.jsonl"
 
 
@@ -280,6 +286,218 @@ def t6a(variant, action):
     return []
 
 
+# Window colours the scenario checks on screen with grim.
+PAGE = (0x00, 0xCC, 0x66)
+XTERM = (0x33, 0x66, 0xCC)
+
+
+def windows():
+    """The compositor's window list, as the reference consumer prints it."""
+    output = session(
+        "python3",
+        "/repo/tools/receipts/receipts.py",
+        "--windows",
+        "--json",
+        stdout=subprocess.PIPE,
+    ).stdout
+    return json.loads(output)
+
+
+def window(listing, prefix):
+    found = [w for w in listing["windows"] if w["title"].startswith(prefix)]
+    if len(found) != 1:
+        raise RuntimeError(f"expected one window titled {prefix!r}, got {listing}")
+    return found[0]
+
+
+def inside(point, rect):
+    x, y, width, height = rect
+    return x <= point[0] < x + width and y <= point[1] < y + height
+
+
+def visible_point(listing, target):
+    """A point in the target's content that no window above it covers,
+    preferring its centre, as a driver picks where to click."""
+    x, y, width, height = target["geometry"]
+    above = [
+        w["frame"]
+        for w in listing["windows"]
+        if w["stack"] < target["stack"] and not w["minimized"]
+    ]
+    candidates = [
+        (x + width * fx / 8, y + height * fy / 8)
+        for fx in range(1, 8)
+        for fy in range(1, 8)
+    ]
+    centre = (x + width / 2, y + height / 2)
+    candidates.sort(key=lambda p: (p[0] - centre[0]) ** 2 + (p[1] - centre[1]) ** 2)
+    for point in candidates:
+        if not any(inside(point, rect) for rect in above):
+            return round(point[0]), round(point[1])
+    raise RuntimeError(f"{target['title']!r} is entirely covered: {listing}")
+
+
+def pixel(x, y):
+    output = subprocess.run(
+        [
+            "sudo", "docker", "exec", NAME, "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "grim", "-t", "ppm", "-g", f"{x},{y} 1x1", "-",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    return tuple(output[-3:])
+
+
+def close_to(colour, expected):
+    return all(abs(a - b) <= 8 for a, b in zip(colour, expected))
+
+
+def window_query(pointer):
+    """Move a window by its own request and by a driver's drag, then click
+    each named window where its reported bounds and stacking say it shows,
+    and check the click landed in it."""
+    chromium = subprocess.Popen(
+        [
+            "sudo", "docker", "exec", NAME, "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "chromium", "--no-sandbox", "--test-type", "--ozone-platform=wayland",
+            "--user-data-dir=/tmp/chromium-window-query", "--no-first-run",
+            "--no-default-browser-check", "--disable-gpu", "--window-size=640,480",
+            "--app=data:text/html,<title>Target page</title>"
+            # rgb(), not #hex: '#' would start the data URL's fragment.
+            "<body style='margin:0;background:rgb(%d,%d,%d)'>" % PAGE,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    session(
+        "sh", "-c",
+        f"xterm -title xterm-target -bg '#{bytes(XTERM).hex()}' -geometry 50x16+700+60"
+        " >/dev/null 2>&1 &",
+    )
+    failures = []
+    try:
+        def ready():
+            names = [w["title"] for w in windows()["windows"]]
+            return any(n.startswith("Target page") for n in names) and any(
+                n.startswith("xterm-target") for n in names
+            )
+
+        wait_for(ready, "Chromium and xterm never both appeared in the window list")
+        time.sleep(1)
+        mapped = {
+            record["window"]["title"]: record["window"]["id"]
+            for record in receipts()
+            if record["signal"] in ("WindowMapped", "WindowChanged")
+        }
+        xid = session(
+            "xdotool", "search", "--name", "^xterm-target$", stdout=subprocess.PIPE
+        ).stdout.split()[0]
+
+        def check(listing, step):
+            ids = [w["id"] for w in listing["windows"]]
+            if "" in ids or len(set(ids)) != len(ids):
+                failures.append(f"{step}: ids are not unique and nonempty: {ids}")
+            if [w["stack"] for w in listing["windows"]] != list(range(len(ids))):
+                failures.append(f"{step}: stack positions are not 0..n topmost first")
+            # Click topmost first, as the list orders them: a click raises
+            # its window, which can cover one lower down entirely.
+            targets = sorted(
+                (("Target page", PAGE), ("xterm-target", XTERM)),
+                key=lambda target: window(listing, target[0])["stack"],
+            )
+            for prefix, colour in targets:
+                target = window(listing, prefix)
+                announced = [i for t, i in mapped.items() if t.startswith(prefix)]
+                if target["id"] not in announced:
+                    failures.append(
+                        f"{step}: {prefix!r} is listed as {target['id']!r},"
+                        f" but WindowMapped named it {announced}"
+                    )
+                point = visible_point(listing, target)
+                seen = pixel(*point)
+                if not close_to(seen, colour):
+                    failures.append(
+                        f"{step}: the screen at {point}, inside {prefix!r}'s reported"
+                        f" bounds {target['geometry']}, shows {seen}, not {colour}"
+                    )
+                start = len(receipts())
+                pointer("click", *point)
+                session(
+                    "python3", "/repo/tools/receipts/receipts.py", "--focus",
+                    stdout=subprocess.DEVNULL,
+                )
+                time.sleep(0.3)
+                presses = [
+                    r
+                    for r in receipts()[start:]
+                    if r["signal"] == "Receipt"
+                    and r["event"] == "button"
+                    and r["pressed"]
+                ]
+                landed = [r["window"].get("id") for r in presses]
+                if landed != [target["id"]]:
+                    failures.append(
+                        f"{step}: a click at {point} for {prefix!r} ({target['id']})"
+                        f" landed in {[r['window'].get('title') for r in presses]} {landed}"
+                    )
+                after = window(windows(), prefix)
+                if after["stack"] != 0 or not after["focused"]:
+                    failures.append(f"{step}: {prefix!r} is not on top and focused after its click")
+                listing = windows()
+            x11 = window(listing, "xterm-target")["geometry"]
+            shell = session(
+                "xdotool", "getwindowgeometry", "--shell", xid, stdout=subprocess.PIPE
+            ).stdout
+            fields = dict(line.split("=", 1) for line in shell.split())
+            own = [int(fields[k]) for k in ("X", "Y", "WIDTH", "HEIGHT")]
+            if own != list(x11):
+                failures.append(f"{step}: X11 says the xterm is at {own}, the list {x11}")
+            return listing
+
+        # The xterm moves itself, to the far corner.
+        listing = windows()
+        xterm = window(listing, "xterm-target")
+        area = listing["work_area"]
+        x = area[0] + area[2] - xterm["geometry"][2] - 20
+        y = area[1] + area[3] - xterm["geometry"][3] - 20
+        session("xdotool", "windowmove", xid, str(x), str(y))
+        time.sleep(0.5)
+        listing = check(windows(), "after the xterm's own move")
+        if window(listing, "xterm-target")["geometry"][:2] != [x, y]:
+            failures.append(f"the xterm asked for ({x}, {y}): {window(listing, 'xterm-target')}")
+
+        # A driver drags the xterm by its titlebar until it covers the
+        # page's centre, which leaves only the page's edges to click.
+        page = window(listing, "Target page")["geometry"]
+        xterm = window(listing, "xterm-target")
+        fx, fy, fw, _ = xterm["frame"]
+        gx, gy, gw, gh = xterm["geometry"]
+        grab = (fx + fw / 2, fy + (gy - fy) / 2)
+        dx = page[0] + page[2] / 2 - (gx + gw / 2)
+        dy = page[1] + page[3] / 2 - (gy + gh / 2)
+        pointer("drag", *grab, grab[0] + dx, grab[1] + dy)
+        time.sleep(0.5)
+        listing = windows()
+        moved = window(listing, "xterm-target")["geometry"]
+        if abs(moved[0] - (gx + dx)) > 2 or abs(moved[1] - (gy + dy)) > 2:
+            failures.append(f"the drag left the xterm at {moved}, not {(gx + dx, gy + dy)}")
+        check(listing, "after the driver's drag")
+    except Exception as error:
+        # A wrong list can make a later step impossible, such as a drag
+        # from a point off screen; report it with what failed before it.
+        failures.append(f"stopped: {error!r}"[:600])
+    finally:
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "chromium"], check=False)
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "xterm"], check=False)
+        chromium.wait(timeout=20)
+    if failures:
+        raise RuntimeError("window-query failed: " + " | ".join(failures))
+    print("PASS window-query: every click at a reported window's bounds landed in that window")
+
+
 def main(scenario):
     if scenario not in SCENARIOS:
         raise SystemExit(f"Choose one of: {', '.join(SCENARIOS)}")
@@ -404,6 +622,38 @@ def main(scenario):
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
+            if scenario == "window-query":
+                # The pointer driver runs under the reference consumer, which
+                # records its receipts and every window event.
+                driver = subprocess.Popen(
+                    [
+                        "sudo", "docker", "exec", "-i", NAME, "python3",
+                        "/repo/tools/acceptance/session_exec.py",
+                        "python3", "/repo/tools/receipts/receipts.py", "--json",
+                        "--output", RECEIPTS, "--",
+                        "python3", "/repo/tools/acceptance/portal_pointer.py",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                if driver.stdout.readline().strip() != "ok":
+                    raise RuntimeError("the portal pointer did not start")
+
+                def pointer(*command):
+                    driver.stdin.write(" ".join(str(part) for part in command) + "\n")
+                    driver.stdin.flush()
+                    if driver.stdout.readline().strip() != "ok":
+                        raise RuntimeError(f"portal pointer {command} failed")
+
+                try:
+                    window_query(pointer)
+                finally:
+                    (ARTIFACTS / f"{scenario}.jsonl").write_text(
+                        "".join(json.dumps(record) + "\n" for record in receipts())
+                    )
+                return
             if scenario == "computer-use-linux":
                 driver = subprocess.Popen(
                     [
