@@ -455,10 +455,15 @@ Dropped:
   the driver call takes 45–76 ms at p50, of which grim's raw capture is 13 ms. Most of the cost
   is PNG encoding and transfer in the driver, not the compositor.
 
-One gap outside these items: browser input-to-pixel in the viewer is 92 ms at p50 on waywire,
-against 20 ms on Selkies (x264 at 30 fps, CPU only). Until it is closed, Selkies is the
-better desktop for a person watching or taking over. The next step is a per-stage timestamp
-breakdown in the Waymote comparison benchmark.
+One gap outside these items is closed: viewer latency. The dogfood run measured a browser
+keydown to a changed pixel in the viewer at 92 ms p50 on waywire, against 20 ms on Selkies
+(x264 at 30 fps, CPU only). The Waymote comparison benchmark now times each stage of that
+path. Frames that answer input skip the playout delay, frames are drawn as soon as they
+decode, and Chromium shows them through a `<video>` element. Timed from outside both desktops
+in the same orb (an XTest key into the viewer's browser window to that window's X damage,
+40 keys), waywire with OpenH264 measured 14.0 ms p50 and 16.8 ms p95, against 15.7–16.1 ms
+and 18.7–21.7 ms on Selkies. The benchmark fails if waywire's viewer latency exceeds 25 ms
+p50 or 35 ms p95.
 
 ## 3. Window-management policy
 
