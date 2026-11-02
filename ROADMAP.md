@@ -492,7 +492,7 @@ computer-use-linux behind an MCP wrapper that reads receipts, `GetWindows` and `
 
 Backed, most important first:
 
-1. **Bring the interface to the drivers agents use.**
+1. **Bring the interface to agents through the reference wrapper.** Done.
    - **Measured cost:** every number in the second bullet above. On every desktop and every
      stock driver, the agent cannot tell that its typing went into a dialog or that its click
      hit the window underneath. Only waywire can answer that, and only for a driver that asks.
@@ -518,17 +518,18 @@ Backed, most important first:
        289 ms in gnome-text-editor at the default 300 ms, 154 and 138 ms with
        `--quiet-ms 150`, with no timeouts. On the orb, GTK 4's caret did not reproduce the
        dogfood run's 776 ms p50 (item 2).
-   - **Work:**
-     - Offer the computer-use-linux input-delivery patch upstream: fail `type_text` and
-       `press_key` on a misdirected receipt, report `GetWindows` geometry for windows, and
-       call `WaitSettled` in place of fixed sleeps. Then offer the same for cua-driver.
+   - **Deferred: driver patches.** The interface is waywire's own; no other compositor serves
+     it, so a patch to computer-use-linux or cua-driver would add a code path that does
+     nothing elsewhere. Offer one only once waywire has users who would ask for it. The
+     likeliest form then is a waywire window backend in computer-use-linux, which already
+     keeps one backend per compositor. A cross-compositor protocol or portal extension waits
+     on other compositors wanting the same signals.
    - **Limit:**
      - An in-window `alert()` is detected only as the text field turning `none` with no input
        of the driver's own to explain it.
      - X11 clients and Chromium on text-input v1 report `unknown`, so for them only
        window-level misdirection is caught.
-     - Upstream may decline a waywire-only interface until another compositor implements it;
-       the wrapper is the fallback.
+     - A driver gets the checks only when it runs behind the wrapper.
    - **This is the item that makes waywire clearly better than the alternatives.** Xvfb,
      Selkies and Waymote have no equivalent signal, and their naive runs failed the same way.
 2. **Settle without waiting out the text caret.**
