@@ -771,6 +771,12 @@ the review are in place. Remaining gaps:
   did not recur in 30 later paired suite runs or in 150 standalone starts. One
   unverified suspect is GTK blocking on `org.a11y.Bus` activation on the
   private session bus.
+- `just benchmark --check` sometimes fails with "waymote viewer did not decode
+  a nonblank frame" (4 of about 15 runs on one orb). Only the Waymote side is
+  affected. Waymote 0.1.7's `/waymote.js` resets its decoder when more than 6
+  chunks are queued during the GOP replay on connect, and an idle desktop never
+  sends another keyframe, so the viewer stays blank. The fix is upstream in
+  Waymote; a run that hits it is rerun.
 
 ## Decisions
 

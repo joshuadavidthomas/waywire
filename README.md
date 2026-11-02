@@ -152,6 +152,12 @@ below, where it measures about 19 ms and 25 ms. Keys typed through a viewer
 whose page is busy, and a key held in the viewer, must reach foot and xterm
 exactly.
 
+A run can fail with "waymote viewer did not decode a nonblank frame". This is
+a known defect on the Waymote side, not a waywire regression: Waymote 0.1.7's
+`/waymote.js` resets its decoder when more than 6 chunks are queued during the
+GOP replay on connect, and an idle desktop never sends another keyframe. The
+fix belongs upstream in Waymote; rerun a run that hits it.
+
 For waywire, the benchmark also splits each key's input-to-screen latency into
 stages, from the browser key event through the gateway, compositor, client
 commit, render, encoder (in-process OpenH264 or the FFmpeg process, each with
