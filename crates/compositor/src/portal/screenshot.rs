@@ -24,8 +24,6 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
-use cairo::Format;
-use cairo::ImageSurface;
 use calloop::channel::Sender;
 use smithay::reexports::pixman::Image;
 use zbus::interface;
@@ -142,7 +140,9 @@ impl Access {
 /// Copy the rendered frame into a PNG file under `directory` without
 /// triggering a render: the caller runs between loop iterations, so the image
 /// always holds the most recently rendered frame and the cursor is never in it.
-/// Both buffers are little-endian ARGB32, so pixels copy verbatim.
+/// The frame is little-endian ARGB32 and opaque, because every render clears
+/// it with an opaque color, so the file holds its RGB bytes, as screencopy's
+/// XRGB buffers do.
 pub(crate) fn write_screenshot(
     image: &Image<'static, 'static>,
     directory: &Path,
@@ -150,22 +150,16 @@ pub(crate) fn write_screenshot(
     std::fs::create_dir_all(directory)?;
     let width = image.width();
     let height = image.height();
-    let src_stride = image.stride();
+    let stride = image.stride();
     // SAFETY: create_buffer owns and initializes the complete image storage;
     // the renderer's exclusive target borrow has ended before this read.
     let data = unsafe { image.data() };
     // SAFETY: stride * height covers this live image's allocation.
-    let pixels = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), src_stride * height) };
-    let surface_width = i32::try_from(width).context("screenshot width exceeds Cairo's limit")?;
-    let surface_height =
-        i32::try_from(height).context("screenshot height exceeds Cairo's limit")?;
-    let mut surface = ImageSurface::create(Format::ARgb32, surface_width, surface_height)?;
-    let dst_stride = usize::try_from(surface.stride())?;
-    {
-        let mut buffer = surface.data()?;
-        for row in 0..height {
-            let src = &pixels[row * src_stride..row * src_stride + width * 4];
-            buffer[row * dst_stride..row * dst_stride + width * 4].copy_from_slice(src);
+    let pixels = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), stride * height) };
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for row in pixels.chunks_exact(stride) {
+        for pixel in row[..width * 4].chunks_exact(4) {
+            rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
     }
     let nanos = SystemTime::now()
@@ -173,7 +167,20 @@ pub(crate) fn write_screenshot(
         .map_or(0, |elapsed| elapsed.as_nanos());
     let path = directory.join(format!("waywire-{nanos:020}.png"));
     let mut file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    surface.write_to_png(&mut file)?;
+    let mut encoder = png::Encoder::new(
+        &mut file,
+        u32::try_from(width).context("screenshot width exceeds PNG's limit")?,
+        u32::try_from(height).context("screenshot height exceeds PNG's limit")?,
+    );
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    // Agents screenshot in a loop. At 1920x1080, fast deflate encodes a desktop
+    // in 4-7 ms where zlib's default level, which Cairo uses, takes 50-70 ms;
+    // the file is larger, by about 40% for a web page.
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&rgb)?;
+    writer.finish()?;
     if let Err(error) = file.sync_all() {
         tracing::warn!(%error, path = %path.display(), "screenshot fsync");
     }

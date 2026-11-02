@@ -647,12 +647,24 @@ Backed, most important first:
      fix the scheduling.
    - **Limit:** worth about one frame on 10% of inputs. The viewer's p95 (24.5 ms) already beats
      Selkies' (33.5 ms).
-5. **Faster portal screenshots.**
+5. **Faster portal screenshots.** Done.
    - **Measured cost:** a computer-use-linux screenshot takes 53 ms p50 on waywire against 31–33
      on Xvfb and Selkies. waywire's Screenshot implementation takes 30 ms of that; grim takes
      12.8 ms.
    - **What it replaces:** about 17 ms of portal overhead above raw capture.
    - **Limit:** about 20 ms per screenshot, under 0.1 s per task. Do it only if it is cheap.
+   - **Cause.** PNG encoding. Timed per stage over 30 calls on a 1920×1080 desktop in a 2-vCPU
+     orb, Cairo's `write_to_png` took 44.0 ms p50 of the backend's 45.8 ms. The frame copy took
+     0.9 ms, the fsync 0.8 ms and pruning 0.1 ms; xdg-desktop-portal 1.16 added about 1.5 ms.
+     Cairo uses zlib's default level and cannot be given another.
+   - **What shipped.** The backend encodes the frame as 8-bit RGB with the `png` crate's fast
+     deflate. The frame is opaque, so nothing is lost: the file is pixel-identical to grim's
+     capture of the same frame, as Cairo's was. Files are larger: 40 KB instead of 15 KB for a
+     terminal, 504 KB instead of 368 KB for a Wikipedia page.
+   - **Proof.** Same orb, 30 `org.freedesktop.portal.Screenshot` calls each, timed from the call
+     to reading the returned file: 44.8 → 6.5 ms p50 for a terminal, 52.4 → 8.6 ms for a
+     full-screen web page. grim took 52 ms there. Encoding a live Wikipedia frame alone went from
+     68.6 to 7.1 ms. computer-use-linux was not rerun on the benchmark host.
 
 Not waywire's to fix, tracked here because they cost the runs:
 

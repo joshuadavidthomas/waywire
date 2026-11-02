@@ -13,6 +13,7 @@ clap = { workspace = true }
 nix = { workspace = true }
 pangocairo = { workspace = true }
 pipewire = { workspace = true }
+png = "0.18.1"
 shlex = "2.0.1"
 smithay = { workspace = true }
 tempfile = { workspace = true }
