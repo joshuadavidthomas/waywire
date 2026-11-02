@@ -216,7 +216,8 @@ the next two seconds and sets the bitrate target to half of it, no lower than
 lowers the encoded scale one step; later jumps change only the bitrate.
 Recovery returns to 85% of the measured rate, which leaves room for key frames
 and the still-screen refresh, then probes 25% above it after 15 seconds. A probe
-that fails returns to 85% and doubles the wait, up to a minute; one that holds
+that fails drops to half the measured rate until what it queued drains, returns
+to 85% and doubles the wait, up to a minute; one that holds
 for 15 seconds means the link cleared, and the target then doubles at each step.
 Pressure the link does not explain, such as a busy decoder or dropped encoder
 frames, lowers encoded scale, then bitrate, then FPS one step at a time, and

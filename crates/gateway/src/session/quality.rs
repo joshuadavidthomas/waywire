@@ -194,7 +194,7 @@ struct LinkSample {
 /// How a streak of pressure lowers quality.
 #[derive(Clone, Copy)]
 enum Lowering {
-    /// A probe above the held rate failed: return to it.
+    /// A probe above the held rate failed: drain what it queued, then hold.
     FailedProbe,
     /// Meet the measured link.
     ToLink(Kbps),
@@ -214,6 +214,10 @@ struct LinkLimit {
 impl LinkLimit {
     fn held(self) -> Kbps {
         Kbps::saturating(self.delivered.get() * LINK_HOLD_PERCENT / 100)
+    }
+
+    fn drain(self) -> Kbps {
+        Kbps::saturating(self.delivered.get() * LINK_DRAIN_PERCENT / 100)
     }
 }
 
@@ -513,8 +517,14 @@ impl Quality {
         // A second without video is idle only when none is waiting: otherwise the
         // link stalled.
         let active = feedback.received() > 0 || self.queued >= LINK_BACKLOG_MIN_BYTES;
-        let backlog_bytes =
-            LINK_BACKLOG_MIN_BYTES.max(delivered.bytes * LINK_BACKLOG_MILLIS / delivered.millis);
+        // A probe tests a link already measured, by a small overshoot that queues
+        // slowly; waiting for half a second of backlog would let it build for many
+        // seconds. Any steady queue past the byte minimum fails it.
+        let backlog_bytes = if self.probing() {
+            LINK_BACKLOG_MIN_BYTES
+        } else {
+            LINK_BACKLOG_MIN_BYTES.max(delivered.bytes * LINK_BACKLOG_MILLIS / delivered.millis)
+        };
         let backlog =
             active && (self.queued >= backlog_bytes || self.congestion.is_some() && saturated);
         let loss = lossy && queued >= LINK_BACKLOG_MIN_BYTES;
@@ -548,10 +558,7 @@ impl Quality {
     ) -> Option<Lowering> {
         // A restart's key frame alone can back the link up for a second, but the
         // gateway discards video only when the link cannot keep up.
-        let probing = self
-            .link
-            .is_some_and(|link| self.levels.bitrate > link.held());
-        if probing && !local_pressure && (streak_lowers || sample.loss) {
+        if self.probing() && !local_pressure && (streak_lowers || sample.loss) {
             return Some(Lowering::FailedProbe);
         }
         if !streak_lowers {
@@ -566,6 +573,11 @@ impl Quality {
         })
     }
 
+    fn probing(&self) -> bool {
+        self.link
+            .is_some_and(|link| self.levels.bitrate > link.held())
+    }
+
     fn lower(&mut self, lowering: Lowering) {
         match lowering {
             Lowering::FailedProbe => self.fail_probe(),
@@ -577,11 +589,14 @@ impl Quality {
         self.streak = Streak::None;
     }
 
-    /// The link still carries what it did: go back to the held rate and wait twice
-    /// as long before the next probe.
+    /// The link still carries what it did. The probe's overshoot queued video that
+    /// the held rate, just under the link, would take many seconds to drain, so
+    /// drain it as the first jump does; recovery returns to the held rate. The next
+    /// probe waits twice as long.
     fn fail_probe(&mut self) {
+        let floor = self.bounds().bitrate_floor;
         if let Some(link) = self.link.as_mut() {
-            self.levels.bitrate = link.held().at_most(self.levels.bitrate);
+            self.levels.bitrate = link.drain().at_least(floor).at_most(self.levels.bitrate);
             link.patience = link
                 .patience
                 .saturating_mul(2)
@@ -624,11 +639,13 @@ impl Quality {
             self.levels.scale = self.levels.scale.lowered_by(SCALE_STEP, bounds.scale_floor);
             LINK_PROBE_PATIENCE
         };
-        self.link = Some(LinkLimit {
+        let link = LinkLimit {
             delivered,
             patience,
-        });
-        self.levels.bitrate = Kbps::saturating(delivered.get() * LINK_DRAIN_PERCENT / 100)
+        };
+        self.link = Some(link);
+        self.levels.bitrate = link
+            .drain()
             .at_least(bounds.bitrate_floor)
             .at_most(self.levels.bitrate);
     }
@@ -1522,8 +1539,9 @@ mod tests {
         let start = Instant::now();
 
         // Half of the 500 kbps it carried is below the floor, then 85% of it holds.
-        // A probe above it fails when the gateway discards video for the link, and
-        // returns to the held rate; the next waits twice as long.
+        // A probe above it fails when the gateway discards video for the link. It
+        // drains what the probe queued at the first jump's rate, then holds again;
+        // the next probe waits twice as long.
         assert_eq!(
             {
                 link.kbps = Some(500);
@@ -1533,7 +1551,8 @@ mod tests {
                 (3, 300, 30, 75),
                 (11, 425, 30, 75),
                 (26, 531, 30, 75),
-                (35, 425, 30, 75),
+                (32, 300, 30, 75),
+                (41, 425, 30, 75),
             ]
         );
         // Once the link clears, the waiting probe holds and recovery doubles.
@@ -1543,13 +1562,13 @@ mod tests {
                 drive(&mut quality, &mut link, start, 61..=200)
             },
             [
-                (65, 531, 30, 75),
-                (80, 1_062, 30, 75),
-                (88, 2_124, 30, 75),
-                (96, 4_248, 30, 75),
-                (104, 8_496, 30, 75),
-                (112, 12_000, 30, 75),
-                (120, 12_000, 30, 100),
+                (71, 531, 30, 75),
+                (86, 1_062, 30, 75),
+                (94, 2_124, 30, 75),
+                (102, 4_248, 30, 75),
+                (110, 8_496, 30, 75),
+                (118, 12_000, 30, 75),
+                (126, 12_000, 30, 100),
             ]
         );
     }
@@ -1566,7 +1585,7 @@ mod tests {
             .filter(|&(_, kbps, _, _)| kbps > 500)
             .map(|(second, ..)| second)
             .collect();
-        assert_eq!(probes, [26, 65, 134, 203, 272, 341]);
+        assert_eq!(probes, [26, 71, 146, 221, 296, 371]);
         assert_eq!(quality.levels().bitrate, value(Kbps::new(425)));
     }
 
