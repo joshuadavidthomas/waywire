@@ -151,6 +151,7 @@ just acceptance fedora-x11
 just acceptance receipts-t6a
 just acceptance window-query
 just acceptance settle
+just acceptance wrapper-t6a
 ```
 
 The runner needs `sudo docker`, host networking, `agent-browser`, ImageMagick,
@@ -221,3 +222,36 @@ xterm's window id settles with no changed frames. A wait that reports
 `settled` at once, ignores damage, or does not restart its quiet window at
 each repaint fails it. The screenshots right after the wait and 1.5 s later
 are saved as `settle-after.png` and `settle-later.png` in `.amp/in/artifacts/`.
+
+`wrapper-t6a` runs stock drivers behind `tools/receipts/mcp_wrapper.py`, the
+reference wrapper that brings receipts, `GetWindows` and `WaitSettled` to any
+stdio MCP driver (`docs/input-delivery.md#drivers`). It drives cua-driver
+0.38.0 and computer-use-linux `292376c` from the acceptance image through a
+plain MCP client (`mcp_client.py`), each run under
+`tools/receipts/receipts.py`, whose receipts are the ground truth. For each
+driver it replays T6a's alert and popup variants twice, once bare and once
+behind the wrapper: with the form's Name field focused, the agent types a
+name, Tab, an email and Tab, looks for 1.5 s and types the phone number. It
+fails unless, in every run:
+
+- the receipts put the name and email keys in the form's focused text field,
+  and the phone keys in the form with no text field focused (alert) or in the
+  popup that `WindowMapped` announced (popup);
+- the bare driver reports every call, the phone number included, as a
+  success;
+- behind the wrapper, every call before the phone number succeeds, and the
+  phone call fails with `isError` and a first block that starts with
+  `INPUT DELIVERY CHECK FAILED` and names the form and an in-window dialog
+  (alert) or the popup's id (popup);
+- every wrapped action reports a settle result, and `get_windows` gives the
+  form the geometry that `receipts.py --windows` reports.
+
+Then, behind the wrapper, the driver clicks the session's terminal at a point
+it picks from `get_windows`, types into it, and clicks `settle.html` twice,
+with a 1500 ms settle timeout. The typing must pass, because the driver's own
+click moved focus, and the receipts must show the click focusing the terminal
+and every key in its text field. The first page click must settle; the second
+starts an endless animation, and its result must report a `timeout` and say
+the screen was still changing. The scenario prints the wrapper's overhead per
+action. Each run's MCP responses, receipts and wrapper trace are saved as
+`wrapper-t6a-*` files in `.amp/in/artifacts/`.

@@ -498,12 +498,30 @@ Backed, most important first:
      hit the window underneath. Only waywire can answer that, and only for a driver that asks.
    - **What it replaces:** a screenshot after every action, sleeps of 400–1500 ms, and
      coordinates read off a full-desktop screenshot.
+   - **Shipped: the reference wrapper.** `tools/receipts/mcp_wrapper.py` runs any stdio MCP
+     driver as its child (`mcp_wrapper.py -- cua-driver mcp`), so it receives the driver's
+     receipts with no patch. It fails a typing or key call loudly when the keys reached
+     another window than the agent directed them to, reached no window, or reached a window
+     whose text field lost focus without the agent's input, and a typing call none of whose
+     keys reached a focused text field. It waits with `WaitSettled` from each action's first
+     receipt before it returns, and adds `get_windows` and `wait_settled` tools; see
+     [`docs/input-delivery.md`](docs/input-delivery.md#drivers).
+     - **Proof.** `just acceptance wrapper-t6a` replays T6a's alert and popup variants
+       through stock cua-driver 0.38.0 and computer-use-linux `292376c`, bare and wrapped.
+       Bare, every call reports success while the phone keys go to the alert or the popup.
+       Wrapped, the phone call fails and names the in-window dialog or the popup, and no
+       earlier call fails. Behind the wrapper, typing after the driver's own click into
+       another window passes, and a wait during an endless animation reports a timeout. It
+       passed 4 of 4 runs on the orb. Unit tests replay recorded traces of those runs
+       through the wrapper's decision logic; each fails with its check removed.
+     - **Cost.** The wait adds the quiet window to each action: 304 ms p50 in Chromium and
+       289 ms in gnome-text-editor at the default 300 ms, 154 and 138 ms with
+       `--quiet-ms 150`, with no timeouts. On the orb, GTK 4's caret did not reproduce the
+       dogfood run's 776 ms p50 (item 2).
    - **Work:**
      - Offer the computer-use-linux input-delivery patch upstream: fail `type_text` and
        `press_key` on a misdirected receipt, report `GetWindows` geometry for windows, and
        call `WaitSettled` in place of fixed sleeps. Then offer the same for cua-driver.
-     - Keep a reference wrapper with the receipts tool, so any MCP driver gets the checks
-       without patches. The run's wrapper was about 300 lines.
    - **Limit:**
      - An in-window `alert()` is detected only as the text field turning `none` with no input
        of the driver's own to explain it.

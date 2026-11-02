@@ -26,6 +26,7 @@ SCENARIOS = (
     "receipts-t6a",
     "window-query",
     "settle",
+    "wrapper-t6a",
 )
 RECEIPTS = "/tmp/receipts.jsonl"
 
@@ -650,6 +651,395 @@ def settle_scenario(pointer):
     print("PASS settle: the screenshot after WaitSettled showed the page's final state")
 
 
+# Stock MCP drivers for wrapper-t6a, with the arguments their T6a calls take.
+WRAPPED_DRIVERS = {
+    "cua-driver": (
+        ["env", "XDG_SESSION_TYPE=wayland", "/opt/cua/cua-driver", "mcp"],
+        lambda text: ("type_text", {"scope": "desktop", "text": text}),
+        ("press_key", {"scope": "desktop", "key": "tab"}),
+    ),
+    "computer-use-linux": (
+        [
+            "env", "XDG_SESSION_TYPE=wayland", "COMPUTER_USE_LINUX_INDICATOR=0",
+            "/opt/drivers/cul-patched", "mcp",
+        ],
+        lambda text: ("type_text", {"text": text}),
+        ("press_key", {"key": "Tab"}),
+    ),
+}
+WRAPPER_FAILED = "INPUT DELIVERY CHECK FAILED"
+
+
+def focus():
+    output = session(
+        "python3", "/repo/tools/receipts/receipts.py", "--focus", "--json",
+        stdout=subprocess.PIPE,
+    ).stdout
+    return json.loads(output)
+
+
+def recorded(path):
+    """The receipts recorded at `path`, once every earlier signal has arrived."""
+    focus()
+    time.sleep(0.5)
+    output = docker("exec", NAME, "cat", path, stdout=subprocess.PIPE).stdout
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
+def text_blocks(response):
+    return [
+        block.get("text", "")
+        for block in (response.get("result") or {}).get("content", [])
+        if block.get("type") == "text"
+    ]
+
+
+def delivery_summary(response):
+    for text in text_blocks(response):
+        if text.startswith("input_delivery: "):
+            return json.loads(text.removeprefix("input_delivery: "))
+    return None
+
+
+def wrapped_run(driver, variant, wrapped, overheads):
+    """Replay T6a through one stock driver, behind the wrapper or not.
+
+    The receipts that tools/receipts/receipts.py records around the whole
+    client are the ground truth for where the phone keys went. Returns the
+    run's failures."""
+    tag = f"{driver}/{variant}/{'wrapped' if wrapped else 'bare'}"
+    slug = tag.replace("/", "-")
+    command, type_text, tab = WRAPPED_DRIVERS[driver]
+    record = f"/tmp/{slug}.jsonl"
+    trace = f"/tmp/{slug}-trace.jsonl"
+    chromium = subprocess.Popen(
+        [
+            "sudo", "docker", "exec", NAME, "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "chromium", "--no-sandbox", "--test-type", "--ozone-platform=wayland",
+            f"--user-data-dir=/tmp/chromium-{slug}", "--no-first-run",
+            "--no-default-browser-check", "--disable-gpu", "--disable-popup-blocking",
+            f"file:///repo/tools/acceptance/t6a.html?interrupt={variant}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    client = None
+    failures = []
+    calls = []
+    try:
+        # The agent attaches to a desktop where the form is open and its Name
+        # field is focused.
+        def form_ready():
+            now = focus()
+            return (now.get("window") or {}).get("title", "").startswith(
+                "Registration form"
+            ) and now.get("text_field") == "focused"
+
+        wait_for(form_ready, f"{tag}: the form never focused its Name field")
+        form = focus()["window"]
+        wrapper = (
+            ["python3", "/repo/tools/receipts/mcp_wrapper.py", "--trace", trace, "--"]
+            if wrapped
+            else []
+        )
+        client = subprocess.Popen(
+            [
+                "sudo", "docker", "exec", "-i", NAME, "python3",
+                "/repo/tools/acceptance/session_exec.py",
+                "python3", "/repo/tools/receipts/receipts.py", "--json", "--output", record,
+                "--", "python3", "/repo/tools/acceptance/mcp_client.py",
+                *wrapper, *command,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        ready = json.loads(client.stdout.readline())
+        if not ready.get("ready"):
+            raise RuntimeError(f"{tag}: the MCP client did not start")
+        if wrapped and "get_windows" not in ready["tools"]:
+            failures.append("the wrapper did not add get_windows to tools/list")
+
+        def act(name, arguments):
+            client.stdin.write(json.dumps({"name": name, "arguments": arguments}) + "\n")
+            client.stdin.flush()
+            response = json.loads(client.stdout.readline())
+            calls.append({"tool": name, "response": response})
+            return response
+
+        if wrapped:
+            listed = json.loads(text_blocks(act("get_windows", {}))[0])
+            truth = window(windows(), "Registration form")
+            mine = next((w for w in listed["windows"] if w["id"] == form["id"]), None)
+            if not mine or list(mine["geometry"]) != list(truth["geometry"]):
+                failures.append(
+                    f"get_windows gave the form {mine and mine['geometry']},"
+                    f" GetWindows {truth['geometry']}"
+                )
+        steps = [
+            ("name", type_text("Katherine Johnson")),
+            ("tab", tab),
+            ("email", type_text("kj@example.com")),
+            ("tab", tab),
+        ]
+        answers = {}
+        for step, (name, arguments) in steps:
+            answers.setdefault(step, []).append(act(name, arguments))
+        # The agent looks at the screen for 1.5 s; the dialog opens meanwhile.
+        time.sleep(1.5)
+        mark = max((r.get("serial", 0) for r in recorded(record)), default=0)
+        phone = act(*type_text("555-0199"))
+        records = recorded(record)
+    except Exception as error:
+        failures.append(f"stopped: {error!r}"[:600])
+        records, phone, answers, mark, form = [], {}, {}, 0, {"id": None}
+    finally:
+        if client:
+            client.stdin.close()
+            try:
+                client.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                client.kill()
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "chromium"], check=False)
+        chromium.wait(timeout=20)
+        (ARTIFACTS / f"wrapper-t6a-{slug}-calls.json").write_text(json.dumps(calls, indent=1))
+        for path, name in ((record, "receipts"), (trace, "trace")):
+            if exists_in_container(path):
+                docker(
+                    "cp", f"{NAME}:{path}", str(ARTIFACTS / f"wrapper-t6a-{slug}-{name}.jsonl"),
+                    stdout=subprocess.DEVNULL,
+                )
+    if failures:
+        return [f"{tag}: " + "; ".join(failures)]
+
+    # Ground truth: where the phone keys went.
+    keys = [
+        r for r in records
+        if r["signal"] == "Receipt" and r["event"] == "key" and r.get("pressed")
+    ]
+    before = [r for r in keys if r["serial"] <= mark]
+    after = [r for r in keys if r["serial"] > mark]
+    if len(after) < len("555-0199"):
+        failures.append(f"{len(after)} phone key receipts")
+    if not any(r.get("text_field") == "focused" and r["window"].get("id") == form["id"]
+               for r in before):
+        failures.append("no name or email key reached the form's focused field")
+    if variant == "alert":
+        stray = [
+            r for r in after
+            if r["window"].get("id") != form["id"] or r.get("text_field") != "none"
+        ]
+        where = f"the form {form['id']} with no focused text field"
+    else:
+        popups = {
+            r["window"]["id"] for r in records
+            if r["signal"] == "WindowMapped" and r["window"].get("id") not in ("", form["id"])
+        }
+        stray = [r for r in after if r["window"].get("id") not in popups]
+        where = f"the popup {sorted(popups)}"
+    if stray:
+        failures.append(f"the phone keys did not all land in {where}: {stray[:2]}")
+
+    early = [
+        (step, r) for step, responses in answers.items() for r in responses
+        if r.get("error") or (r.get("result") or {}).get("isError")
+    ]
+    if early:
+        failures.append(f"a call before the dialog failed: {early[:1]}")
+    phone_failed = bool(phone.get("error") or (phone.get("result") or {}).get("isError"))
+    first = (text_blocks(phone) or [""])[0]
+    if not wrapped:
+        if phone_failed:
+            failures.append(f"the stock driver reported the phone call failing: {phone}")
+        else:
+            print(f"PASS {tag}: the driver reported success; the phone keys went to {where}")
+    else:
+        if not phone_failed or not first.startswith(WRAPPER_FAILED):
+            failures.append(f"the wrapper did not fail the phone call: {text_blocks(phone)}")
+        elif variant == "alert" and (
+            "alert()" not in first or f"id {form['id']}" not in first
+        ):
+            failures.append(f"the failure does not name the in-window dialog: {first}")
+        elif variant == "window" and not any(f"id {p}" in first for p in popups):
+            failures.append(f"the failure does not name the popup: {first}")
+        for responses in [*answers.values(), [phone]]:
+            for response in responses:
+                summary = delivery_summary(response)
+                if not summary or (summary.get("settle") or {}).get("result") not in (
+                    "settled", "timeout"
+                ):
+                    failures.append(f"a call has no settle result: {summary}")
+                else:
+                    overheads.append(summary["overhead_ms"])
+        if not failures:
+            print(f"PASS {tag}: {first}")
+    return [f"{tag}: " + "; ".join(failures)] if failures else []
+
+
+def wrapped_click_run(driver, overheads):
+    """Behind the wrapper, click the session's terminal and type into it, then
+    click settle.html twice. The click moves focus, so the typing is no false
+    alarm. The second click starts an endless animation, so the wait after it
+    must report a timeout."""
+    tag = f"{driver}/click/wrapped"
+    slug = tag.replace("/", "-")
+    command, type_text, _ = WRAPPED_DRIVERS[driver]
+    record = f"/tmp/{slug}.jsonl"
+    trace = f"/tmp/{slug}-trace.jsonl"
+    chromium = subprocess.Popen(
+        [
+            "sudo", "docker", "exec", NAME, "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "chromium", "--no-sandbox", "--test-type", "--ozone-platform=wayland",
+            f"--user-data-dir=/tmp/chromium-{slug}", "--no-first-run",
+            "--no-default-browser-check", "--disable-gpu", "--window-size=900,300",
+            "--app=file:///repo/tools/acceptance/settle.html",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    client = None
+    failures, calls, responses = [], [], {}
+    try:
+        wait_for(
+            lambda: (focus().get("window") or {}).get("title", "").startswith("Settle target"),
+            f"{tag}: the settle page never took focus",
+        )
+        client = subprocess.Popen(
+            [
+                "sudo", "docker", "exec", "-i", NAME, "python3",
+                "/repo/tools/acceptance/session_exec.py",
+                "python3", "/repo/tools/receipts/receipts.py", "--json", "--output", record,
+                "--", "python3", "/repo/tools/acceptance/mcp_client.py",
+                "python3", "/repo/tools/receipts/mcp_wrapper.py", "--trace", trace,
+                "--settle-timeout-ms", "1500", "--", *command,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        if not json.loads(client.stdout.readline()).get("ready"):
+            raise RuntimeError("the MCP client did not start")
+
+        def act(step, name, arguments):
+            client.stdin.write(json.dumps({"name": name, "arguments": arguments}) + "\n")
+            client.stdin.flush()
+            response = json.loads(client.stdout.readline())
+            calls.append({"tool": name, "response": response})
+            responses[step] = response
+            return response
+
+        def click(x, y):
+            arguments = {"x": x, "y": y}
+            if driver == "cua-driver":
+                arguments["scope"] = "desktop"
+            return "click", arguments
+
+        # The agent picks its click points from the wrapper's window list. The
+        # page is wider than the terminal and shorter, so each window keeps a
+        # part that the other does not cover.
+        listed = json.loads(text_blocks(act("windows", "get_windows", {}))[0])
+        terminal = window(listed, "acceptance")
+        act("terminal", *click(*visible_point(listed, terminal)))
+        act("type", *type_text("echo own-click"))
+        # The click raised the terminal, so read the list again.
+        listed = json.loads(text_blocks(act("windows", "get_windows", {}))[0])
+        point = visible_point(listed, window(listed, "Settle target"))
+        act("page", *click(*point))
+        act("animate", *click(*point))
+        records = recorded(record)
+    except Exception as error:
+        failures.append(f"stopped: {error!r}"[:600])
+        records = []
+    finally:
+        if client:
+            client.stdin.close()
+            try:
+                client.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                client.kill()
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "chromium"], check=False)
+        chromium.wait(timeout=20)
+        (ARTIFACTS / f"wrapper-t6a-{slug}-calls.json").write_text(json.dumps(calls, indent=1))
+        for path, name in ((record, "receipts"), (trace, "trace")):
+            if exists_in_container(path):
+                docker(
+                    "cp", f"{NAME}:{path}", str(ARTIFACTS / f"wrapper-t6a-{slug}-{name}.jsonl"),
+                    stdout=subprocess.DEVNULL,
+                )
+    if failures:
+        return [f"{tag}: " + "; ".join(failures)]
+
+    # Ground truth: the click focused the terminal and the keys reached it.
+    focused = [
+        r for r in records
+        if r["signal"] == "FocusChanged" and r.get("cause") == "click"
+        and title(r).startswith("acceptance")
+    ]
+    keys = [
+        r for r in records
+        if r["signal"] == "Receipt" and r["event"] == "key" and r.get("pressed")
+    ]
+    if not focused:
+        failures.append("no click moved focus to the terminal")
+    if len(keys) < len("echo own-click") or any(
+        not title(r).startswith("acceptance") or r.get("text_field") != "focused"
+        for r in keys
+    ):
+        failures.append(f"the keys did not all reach the terminal's text field: {keys[:2]}")
+    for step in ("terminal", "type", "page", "animate"):
+        result = responses.get(step, {}).get("result") or {}
+        if result.get("isError") or responses.get(step, {}).get("error"):
+            failures.append(f"the {step} call failed: {text_blocks(responses[step])}")
+        summary = delivery_summary(responses.get(step, {}))
+        if not summary:
+            failures.append(f"the {step} call has no input_delivery block")
+            continue
+        if step != "animate":
+            overheads.append(summary["overhead_ms"])
+        if step == "terminal" and not any(
+            "(click)" in move for move in summary.get("focus_changes", [])
+        ):
+            failures.append(f"the terminal click reported no focus change: {summary}")
+        if step == "page" and summary.get("settle", {}).get("result") != "settled":
+            failures.append(f"the page did not settle after its repaints: {summary}")
+        if step == "animate" and not (
+            summary.get("settle", {}).get("result") == "timeout"
+            and any(n.startswith("The screen was still changing") for n in summary.get("notes", []))
+        ):
+            failures.append(f"the endless animation did not report a timeout: {summary}")
+    if not failures:
+        print(f"PASS {tag}: typing after the driver's own click passed, and the wait during"
+              " an endless animation reported a timeout")
+    return [f"{tag}: " + "; ".join(failures)] if failures else []
+
+
+def wrapper_t6a():
+    """Replay T6a's alert and popup variants through stock cua-driver and
+    computer-use-linux, bare and behind tools/receipts/mcp_wrapper.py."""
+    docker("exec", NAME, "/opt/cua/cua-driver", "telemetry", "disable",
+           stdout=subprocess.DEVNULL)
+    failures, overheads = [], []
+    for driver in WRAPPED_DRIVERS:
+        for variant in ("alert", "window"):
+            for wrapped in (False, True):
+                failures += wrapped_run(driver, variant, wrapped, overheads)
+        failures += wrapped_click_run(driver, overheads)
+    if overheads:
+        overheads.sort()
+        print(
+            f"wrapper overhead per action: p50 {overheads[len(overheads) // 2]} ms,"
+            f" max {overheads[-1]} ms over {len(overheads)} actions"
+        )
+    if failures:
+        raise RuntimeError("wrapper-t6a failed: " + " | ".join(failures))
+    print("PASS wrapper-t6a: the wrapper failed every misdirected phone call that the"
+          " stock drivers reported as a success")
+
+
 def main(scenario):
     if scenario not in SCENARIOS:
         raise SystemExit(f"Choose one of: {', '.join(SCENARIOS)}")
@@ -810,6 +1200,9 @@ def main(scenario):
                     (ARTIFACTS / f"{scenario}.jsonl").write_text(
                         "".join(json.dumps(record) + "\n" for record in receipts())
                     )
+                return
+            if scenario == "wrapper-t6a":
+                wrapper_t6a()
                 return
             if scenario == "computer-use-linux":
                 driver = subprocess.Popen(
