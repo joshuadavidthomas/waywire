@@ -508,6 +508,86 @@ limits who receives each signal:
 A driver must therefore subscribe from its own process, or from a process
 that starts it, as the reference consumer `tools/receipts/receipts.py` does.
 
+## Drivers
+
+A driver uses the interface in three places:
+
+- **After typing or keys:** check the receipts. Fail the call when a key went
+  to a window other than the one the agent directed it to, reached no window,
+  was dropped, or went to a window whose text field turned `none` with no
+  input of the driver's own just before it (an in-window dialog such as a
+  page `alert()`). A typing call none of whose keys reached a focused
+  text field fails too. The agent directed keys to a window when its own click or key
+  moved focus there (`FocusChanged` with a `receipt`), when the driver
+  activated it, or when the call names it. Focus that a new window, dialog or
+  activation took by itself is not the agent's. Say in the failure that the
+  input was delivered, so the agent looks before it retries.
+- **After every action:** call `WaitSettled` with the action's first receipt
+  instead of sleeping, and take the screenshot after it. Report a `timeout`.
+- **For windows:** report `GetWindows` geometry, which is in screenshot
+  pixels, rather than AT-SPI window-relative bounds.
+
+`tools/receipts/mcp_wrapper.py` does all three for any stdio MCP driver
+without changes to the driver. It starts the driver as its child, so it
+receives the driver's receipts, and it relays MCP between the client and the
+driver:
+
+```sh
+# cua-driver
+python3 tools/receipts/mcp_wrapper.py -- cua-driver mcp
+# computer-use-linux
+python3 tools/receipts/mcp_wrapper.py -- computer-use-linux mcp
+```
+
+Put that command where the MCP client configures the driver's command, in
+the desktop session's environment (`DBUS_SESSION_BUS_ADDRESS`, and the
+`WAYLAND_DISPLAY` and `XDG_SESSION_TYPE=wayland` the driver needs; cua-driver
+also needs `CUA_DRIVER_RS_ENABLE_WAYLAND=1`). In a client that reads
+`mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "cua-driver": {
+      "command": "python3",
+      "args": ["tools/receipts/mcp_wrapper.py", "--", "cua-driver", "mcp"],
+      "env": {
+        "CUA_DRIVER_RS_ENABLE_WAYLAND": "1",
+        "XDG_SESSION_TYPE": "wayland"
+      }
+    },
+    "computer-use-linux": {
+      "command": "python3",
+      "args": [
+        "tools/receipts/mcp_wrapper.py",
+        "--",
+        "computer-use-linux",
+        "mcp"
+      ],
+      "env": { "XDG_SESSION_TYPE": "wayland" }
+    }
+  }
+}
+```
+
+Each action's result gains an
+`input_delivery:` text block with where its input went, focus changes, the
+focused window's geometry and the settle result; a misdirected one has
+`isError` and a first block that starts with `INPUT DELIVERY CHECK FAILED`.
+The wrapper adds the tools `get_windows` and `wait_settled`. `--quiet-ms` and
+`--settle-timeout-ms` set the `quiet_ms` and `timeout_ms` of the wait after
+each action, and `--trace FILE` records every signal and verdict. Tools that
+are marked `readOnlyHint` or named like queries (`screenshot`, `get_*`,
+`list_*`) are relayed without a check or a wait. On a desktop without the
+interface the wrapper relays everything unchanged.
+
+The checks can only be as good as the text-field state. For clients that
+report `unknown`, such as X11 clients, only keys that reach another window or
+no window are caught. A program that moves focus to a field without telling
+text input, as GTK 3 does, reports `none`, and typing into it fails the call.
+Typing shortcuts into a page with `type_text` also fails it; send them as
+keys.
+
 ## Limits
 
 A compositor sees surfaces, not widgets. A dialog drawn inside a window, such
