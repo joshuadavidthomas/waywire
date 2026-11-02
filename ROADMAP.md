@@ -638,15 +638,33 @@ Backed, most important first:
        version 10 would send them as repeats.
      - The dogfood run's probe did not stall the page enough to reproduce its ~11 s late release
        here; the reproduction busies the page at each keyup instead.
-4. **Close the one-frame tail in key to pixel.**
+4. **Close the one-frame tail in key to pixel.** Investigated; no scheduling fault, so no
+   change.
    - **Measured cost:** without a viewer, waywire's p50 equals the X11 desktops' (16.9 ms
      against 16.5–17.2). Its p95 is 32.8 ms against 18.2–18.6, because 3 of 30 keys waited one
      extra frame.
-   - **What it replaces:** an occasional missed frame deadline after a client commit.
-   - **Work:** trace when the key's commit arrives relative to waywire's frame deadline and
-     fix the scheduling.
-   - **Limit:** worth about one frame on 10% of inputs. The viewer's p95 (24.5 ms) already beats
-     Selkies' (33.5 ms).
+   - **Finding: the tail is the probe's own screenshots meeting the 60 Hz frame clock.** Traced
+     on `f7d8bfa` with a virtual-keyboard key into foot and the compositor's `commit` and render
+     trace:
+     - A commit that arrives 16.7 ms or more after the last render is drawn within 0.1 ms (key
+       to pixel 1.4–1.9 ms). A commit inside the interval waits for its end, 0–16.7 ms. A
+       sweep of keys 0–24 ms after a render matches that line to within 0.3 ms.
+     - The extra frame needs a screencopy request already pending. A render is due, so the
+       request's render runs at the interval's end. When foot's commit arrives just after it,
+       the key waits a whole interval: 17.5 ms instead of 1.5 ms for keys 16–24 ms after a
+       render. The dogfood probe polled with grim back to back, so its grim request raced foot's
+       commit; 3 of 30 lost.
+     - grim itself waits a frame: a copy completes at the next render, one interval after the
+       render that showed the key. On the orb, with wtype and grim as separate processes,
+       every key took 32.7–34.6 ms (p50 33.6, p95 34.5, 50 keys).
+     - X11 desktops have no frame clock: `XGetImage` reads the change as soon as the client
+       draws, so their p95 stays at about one xdotool start.
+   - **Why it stays:** rendering a commit at once even after a capture-only render would let a
+     client that captures in a loop drive renders as fast as it asks. That changes capture
+     pacing, and a probe that races its own capture against the key would still see the
+     quantization. Neither is worth a frame on a fraction of inputs while the viewer's p95
+     (24.5 ms) beats Selkies' (33.5 ms). Serving a plain copy from the current image when
+     nothing is pending would remove grim's own frame; that belongs with item 5.
 5. **Faster portal screenshots.** Done.
    - **Measured cost:** a computer-use-linux screenshot takes 53 ms p50 on waywire against 31–33
      on Xvfb and Selkies. waywire's Screenshot implementation takes 30 ms of that; grim takes
