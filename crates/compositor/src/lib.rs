@@ -2358,7 +2358,8 @@ impl State {
                 (damage, changed)
             }
         };
-        self.frame_rendered(delivery::monotonic_usec(), &changed);
+        let drawn = (!forced).then(|| damage.as_deref().unwrap_or_default());
+        self.frame_rendered(delivery::monotonic_usec(), &changed, image, drawn);
         if damage.is_some() || forced {
             let full = [Rectangle::<i32, Physical>::from_size(
                 (
@@ -2487,7 +2488,7 @@ impl State {
 }
 
 /// The rendered output's packed BGRA bytes.
-fn image_pixels<'a>(image: &'a Image<'static, 'static>) -> &'a [u8] {
+pub(crate) fn image_pixels<'a>(image: &'a Image<'static, 'static>) -> &'a [u8] {
     debug_assert_eq!(image.stride(), image.width() * 4);
     // Pixman finishes synchronously. Borrow our target instead of allocating
     // and blitting a second full image through ExportMem::copy_framebuffer.

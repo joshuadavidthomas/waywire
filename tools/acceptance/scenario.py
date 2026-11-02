@@ -26,6 +26,7 @@ SCENARIOS = (
     "receipts-t6a",
     "window-query",
     "settle",
+    "settle-gtk",
     "wrapper-t6a",
 )
 RECEIPTS = "/tmp/receipts.jsonl"
@@ -651,6 +652,87 @@ def settle_scenario(pointer):
     print("PASS settle: the screenshot after WaitSettled showed the page's final state")
 
 
+def changed_box(captures, rect):
+    """The smallest box, in screen pixels, holding every pixel of `rect` that
+    differs between any two of `captures`; None when none does."""
+    x, y = rect[0], rect[1]
+    regions = [region(capture, rect) for capture in captures]
+    columns, lines = set(), set()
+    for row in range(len(regions[0])):
+        rows = {pixels[row] for pixels in regions}
+        if len(rows) == 1:
+            continue
+        lines.add(y + row)
+        first = regions[0][row]
+        for other in rows:
+            columns.update(
+                x + index // 3 for index in range(len(first)) if first[index] != other[index]
+            )
+    if not lines:
+        return None
+    return (min(columns), min(lines), max(columns) - min(columns) + 1, max(lines) - min(lines) + 1)
+
+
+def settle_gtk_scenario(pointer):
+    """Click into gnome-text-editor's empty document, a GTK 4 text view whose
+    caret fades in and out for 300 ms at a time, and check that the screen
+    settles after the click and then stays settled for 500 ms with the caret
+    still blinking."""
+    session(
+        "sh", "-c",
+        "XDG_STATE_HOME=/tmp/settle-gtk-state XDG_DATA_HOME=/tmp/settle-gtk-data"
+        " gnome-text-editor --standalone --new-window --ignore-session >/dev/null 2>&1 &",
+    )
+    failures = []
+    try:
+        def editor_focused():
+            state = focus()
+            app_id = (state.get("window") or {}).get("app_id", "")
+            return app_id.startswith("org.gnome.TextEditor") and state.get("text_field") == "focused"
+
+        wait_for(editor_focused, "gnome-text-editor never focused its text view")
+        editor = next(
+            entry for entry in windows()["windows"]
+            if (entry.get("app_id") or "").startswith("org.gnome.TextEditor")
+        )
+        x, y, w, h = editor["geometry"]
+        # The click puts the caret at the start of the empty document and
+        # does not restart its blink, unlike a key typed into the view.
+        pointer("click", x + w // 2, y + h // 2)
+        clicked = json.loads(pointer("settle", 300, 5000, editor["id"], "/tmp/settle-gtk.ppm"))
+        print(
+            f"settle after the click: {clicked['result']},"
+            f" {(clicked['returned_usec'] - clicked['clicked_usec']) / 1000:.0f} ms after it"
+        )
+        if clicked["result"] != "settled":
+            failures.append(f"the wait after the click ended with {clicked['result']}: {clicked}")
+        # No input now: a quiet window longer than the caret's 300 ms holds
+        # between fades.
+        still = json.loads(pointer("settle", 500, 3000, editor["id"], "/tmp/settle-gtk.ppm"))
+        print(f"settle with the caret blinking: {still['result']}, {still['frames']} changed frames")
+        if still["result"] != "settled" or still["frames"]:
+            failures.append(f"the blinking caret kept the editor from settling: {still}")
+        # The caret did blink: over 1.2 s, one blink cycle, only a caret-sized
+        # part of the editor changes.
+        session(
+            "sh", "-c",
+            "for i in 0 1 2 3 4 5 6 7 8 9 10 11; do grim -t ppm /tmp/settle-gtk-$i.ppm; sleep 0.1; done",
+        )
+        box = changed_box([screen(f"/tmp/settle-gtk-{i}.ppm") for i in range(12)], editor["geometry"])
+        print(f"the editor's changing pixels over 1.2 s: {box}")
+        if box is None:
+            failures.append("the caret did not blink, so the check proves nothing")
+        elif box[2] > 4 or box[3] > 30:
+            failures.append(f"more than the caret changed: {box}")
+    except Exception as error:
+        failures.append(f"stopped: {error!r}"[:600])
+    finally:
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "gnome-text-edit"], check=False)
+    if failures:
+        raise RuntimeError("settle-gtk failed: " + " | ".join(failures))
+    print("PASS settle-gtk: a GTK 4 text view settled with its caret blinking")
+
+
 # Stock MCP drivers for wrapper-t6a, with the arguments their T6a calls take.
 WRAPPED_DRIVERS = {
     "cua-driver": (
@@ -1164,7 +1246,7 @@ def main(scenario):
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
-            if scenario in ("window-query", "settle"):
+            if scenario in ("window-query", "settle", "settle-gtk"):
                 # The pointer driver runs under the reference consumer, which
                 # records its receipts and every window event.
                 driver = subprocess.Popen(
@@ -1194,6 +1276,8 @@ def main(scenario):
                 try:
                     if scenario == "settle":
                         settle_scenario(pointer)
+                    elif scenario == "settle-gtk":
+                        settle_gtk_scenario(pointer)
                     else:
                         window_query(pointer)
                 finally:

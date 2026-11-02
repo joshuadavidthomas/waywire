@@ -752,8 +752,8 @@ impl State {
         });
     }
 }
-// Smithay's `delegate_dispatch2!`, with one request fix-up before dispatch:
-// see `exclude_keymap_nul`.
+// Smithay's `delegate_dispatch2!`, with one request fix-up before dispatch,
+// `exclude_keymap_nul`, and one observer, `observe_text_input`.
 impl<I, UserData> Dispatch<I, UserData> for State
 where
     I: Resource + 'static,
@@ -770,6 +770,7 @@ where
         data_init: &mut DataInit<'_, Self>,
     ) {
         crate::virtual_keyboard::exclude_keymap_nul(&mut request);
+        crate::delivery::settle::observe_text_input(state, resource, &request);
         data.request(state, client, resource, request, dhandle, data_init);
     }
 

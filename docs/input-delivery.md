@@ -322,10 +322,11 @@ driver that gets no receipts, such as an X11 loop that does not subscribe,
 omits `serial`; the call then works like `GetFocus`, measuring from after
 every input the compositor processed before the call.
 
-The default quiet window, 300 ms, is shorter than the blink phase of a text
-caret, about half a second or more by default in Chromium and GTK, so a page
-with a focused, blinking field settles. Pick a longer one for applications that pause between redraws,
-and a window scope to ignore animation elsewhere.
+The focused text field's blinking caret is not damage (see
+[What counts as damage](#what-counts-as-damage)), so a quiet window of any
+length settles while it blinks. Pick a longer one than the default 300 ms for
+applications that pause between redraws, and a window scope to ignore
+animation elsewhere.
 
 ### Reply
 
@@ -373,6 +374,19 @@ compositor's output damage tracker reports it for each frame it draws:
   its clock, and the icon under the pointer during a drag.
 - Not the cursor. The compositor never draws the cursor into frames or
   screenshots, so moving it or changing its image is not damage.
+- Not the focused text field's caret. A client that reports the field's
+  cursor rectangle through text-input-v3 (`set_cursor_rectangle`), as GTK
+  does, blinks its caret on a timer, not in answer to input. While the field
+  is enabled, a change in its window no wider and no taller than that
+  rectangle, widened by 2 logical pixels on each side, does not count. The
+  change is matched by its size, not its place, because GTK 4.8 reports
+  where the caret is only when the text changes, not after a click. Damage
+  in the window is first narrowed to the pixels that changed, because GTK
+  4.8 damages its whole surface for each frame of the caret. GTK 4 fades its
+  caret in and out for 300 ms at a time, with holds of one frame less than
+  300 ms between, so without this a focused GTK 4 text view seldom stays
+  quiet for 300 ms after a click. Changes larger than the caret still count,
+  such as a typed character together with the caret it moved.
 
 A frame is timed when the compositor renders it, at most once per output
 frame interval, which is also when screenshots start to show it. While a
@@ -413,9 +427,14 @@ Settling is a statement about pixels, not about the application:
   page timer settled about 600 ms after the screen went quiet. Choose a
   quiet window longer than the delays the application is known to use, or
   confirm the expected state from the screenshot or accessibility tree.
-- **Unrelated animation.** A spinner, a video or a blinking caret in the
-  watched area keeps changing it, and the wait ends with `timeout`. Watch one
-  window to ignore animation elsewhere.
+- **Unrelated animation.** A spinner, a video, a scroll bar fading out, or a
+  blinking caret that its client does not report through text-input-v3, such
+  as an X11 terminal's, keeps changing the watched area, and the wait ends
+  with `timeout` or later than the input's own redraw. Watch one window to
+  ignore animation elsewhere.
+- **Caret-sized changes.** While a text field has focus, a change in its
+  window no larger than its caret does not count, so a 1 px tick of a
+  progress bar in that window can settle early.
 - **Not attributed to input.** Any change after the input counts, whether the
   input caused it or not.
 - **Frame rate.** Changes are seen once per frame. When the viewer's link

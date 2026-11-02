@@ -151,6 +151,7 @@ just acceptance fedora-x11
 just acceptance receipts-t6a
 just acceptance window-query
 just acceptance settle
+just acceptance settle-gtk
 just acceptance wrapper-t6a
 ```
 
@@ -222,6 +223,16 @@ xterm's window id settles with no changed frames. A wait that reports
 `settled` at once, ignores damage, or does not restart its quiet window at
 each repaint fails it. The screenshots right after the wait and 1.5 s later
 are saved as `settle-after.png` and `settle-later.png` in `.amp/in/artifacts/`.
+
+`settle-gtk` checks that a GTK 4 text view settles while its caret blinks.
+The same portal driver clicks into gnome-text-editor's empty document. A
+click, unlike a key, does not restart GTK's blink, which fades the caret for
+300 ms at a time with holds just under 300 ms between. The scenario fails
+unless the wait after the click, with a 300 ms quiet window on the editor's
+window, reports `settled`; a following 500 ms wait with no input reports
+`settled` with no changed frames; and over 1.2 s of grim captures only a
+caret-sized part of the editor changes, so the caret did blink. On `1e4d8d7`
+both waits time out.
 
 `wrapper-t6a` runs stock drivers behind `tools/receipts/mcp_wrapper.py`, the
 reference wrapper that brings receipts, `GetWindows` and `WaitSettled` to any

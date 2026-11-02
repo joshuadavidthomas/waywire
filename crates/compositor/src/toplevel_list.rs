@@ -5076,11 +5076,46 @@ mod tests {
         width: i32,
         height: i32,
     ) {
+        attach_damaged(
+            surface,
+            app,
+            qh,
+            (width, height),
+            (0, 0, width, height),
+            &[],
+        );
+    }
+
+    /// A rectangle of a buffer, (x, y, width, height), and its ARGB colour.
+    type Paint = ((i32, i32, i32, i32), u32);
+
+    /// Attach a new `width`x`height` buffer that damages only `damage`. It
+    /// is transparent black except the rectangles in `paint`, each in one
+    /// colour.
+    fn attach_damaged(
+        surface: &WlSurface,
+        app: &App,
+        qh: &QueueHandle<App>,
+        (width, height): (i32, i32),
+        (x, y, damage_width, damage_height): (i32, i32, i32, i32),
+        paint: &[Paint],
+    ) {
+        use std::os::unix::fs::FileExt;
         let shm = app.shm.as_ref().expect("wl_shm bound");
         let fd: OwnedFd =
             nix::sys::memfd::memfd_create("window-list-buffer", nix::sys::memfd::MFdFlags::empty())
                 .expect("memfd");
         nix::unistd::ftruncate(&fd, 4 * i64::from(width) * i64::from(height)).expect("ftruncate");
+        let file = std::fs::File::from(fd.try_clone().expect("dup"));
+        for &((left, top, columns, rows), colour) in paint {
+            let line = colour
+                .to_ne_bytes()
+                .repeat(usize::try_from(columns).expect("width"));
+            for row in top..top + rows {
+                let offset = 4 * (u64::try_from(row * width + left).expect("offset"));
+                file.write_all_at(&line, offset).expect("paint");
+            }
+        }
         let pool = shm.create_pool(fd.as_fd(), 4 * width * height, qh, ());
         let buffer = pool.create_buffer(
             0,
@@ -5092,7 +5127,7 @@ mod tests {
             (),
         );
         surface.attach(Some(&buffer), 0, 0);
-        surface.damage_buffer(0, 0, width, height);
+        surface.damage_buffer(x, y, damage_width, damage_height);
     }
 
     /// The windows `name` was told about in its latest `WindowsChanged`.
@@ -5585,5 +5620,115 @@ mod tests {
             settle_answer(&received, &mut unknown),
             Some(Err(zbus::fdo::Error::InvalidArgs(_)))
         ));
+    }
+
+    #[test]
+    fn settle_leaves_out_the_focused_fields_caret() {
+        let (mut display, mut state, connection, mut queue, mut app, _editor, _terminal) =
+            window_list_fixture();
+        let source = KeyboardSource::new_auxiliary();
+        let received = delivery_subscribers(&mut state, source);
+        let mut frames = Frames::new(&state);
+        frames.render(&mut state);
+        // The terminal, which has keyboard focus, has a text field whose
+        // caret is the 17 px line at (50, 40) of its surface, as GTK reports
+        // it: zero wide.
+        let text = app
+            .text_inputs
+            .as_ref()
+            .expect("text input manager")
+            .get_text_input(app.seat.as_ref().expect("seat"), &queue.handle(), ());
+        text.enable();
+        text.set_cursor_rectangle(50, 40, 0, 17);
+        text.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        // A caret-sized change in another window counts.
+        let mut answer = wait_settled(&mut state, None, None, 300, 20_000, None);
+        let (editor_surface, _) = app.xdg_surfaces[0].clone();
+        attach_damaged(
+            &editor_surface,
+            &app,
+            &queue.handle(),
+            (400, 300),
+            (50, 40, 1, 17),
+            &[((50, 40, 1, 17), 0xff40_4040)],
+        );
+        editor_surface.commit();
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        frames.render(&mut state);
+        state.poll_settled(crate::delivery::monotonic_usec() + 300_000);
+        let answer = settle_answer(&received, &mut answer)
+            .expect("the wait ended")
+            .expect("an answer");
+        assert_eq!(
+            settle_field::<u32>(&answer, "frames"),
+            1,
+            "another window's change"
+        );
+        let strip = (50, 40, 1, 17);
+        let whole = (0, 0, 200, 100);
+        let mut frames_after_wait =
+            |state: &mut crate::State, app: &mut App, damage, paint: &[Paint]| {
+                let mut answer = wait_settled(state, None, None, 300, 20_000, None);
+                let surface = app.last_surface.clone().expect("terminal surface");
+                attach_damaged(&surface, app, &queue.handle(), (200, 100), damage, paint);
+                surface.commit();
+                sync(&mut display, state, &connection, &mut queue, app);
+                frames.render(state);
+                state.poll_settled(crate::delivery::monotonic_usec() + 300_000);
+                let answer = settle_answer(&received, &mut answer)
+                    .expect("the wait ended")
+                    .expect("an answer");
+                assert_eq!(settle_field::<String>(&answer, "result"), "settled");
+                settle_field::<u32>(&answer, "frames")
+            };
+
+        // GTK 4.18 fades its caret: only a 1x17 strip at the line is
+        // damaged and changes.
+        assert_eq!(
+            frames_after_wait(&mut state, &mut app, strip, &[(strip, 0xff40_4040)]),
+            0,
+            "the caret is left out"
+        );
+        // GTK 4.8 damages its whole surface for each caret frame, though
+        // only the caret changes.
+        assert_eq!(
+            frames_after_wait(&mut state, &mut app, whole, &[(strip, 0xff80_8080)]),
+            0,
+            "a damaged surface whose only change is the caret is left out"
+        );
+        // GTK 4.8 does not report the caret's new place after a click, so
+        // it blinks away from the reported rectangle.
+        assert_eq!(
+            frames_after_wait(
+                &mut state,
+                &mut app,
+                whole,
+                &[(strip, 0xff80_8080), ((120, 70, 1, 17), 0xff80_8080)]
+            ),
+            0,
+            "a caret-sized change elsewhere in the field's window is left out"
+        );
+        // A glyph typed just left of the caret counts, even when the whole
+        // surface is damaged.
+        assert_eq!(
+            frames_after_wait(
+                &mut state,
+                &mut app,
+                whole,
+                &[
+                    ((43, 40, 8, 17), 0xff80_8080),
+                    ((120, 70, 1, 17), 0xff80_8080)
+                ]
+            ),
+            1
+        );
+        // A field that is no longer enabled has no caret to leave out.
+        text.disable();
+        text.commit();
+        assert_eq!(
+            frames_after_wait(&mut state, &mut app, strip, &[(strip, 0xffc0_c0c0)]),
+            1
+        );
     }
 }

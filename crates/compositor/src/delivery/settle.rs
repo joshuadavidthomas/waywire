@@ -4,8 +4,9 @@
 //! Damage is what the output damage tracker reports for each rendered frame:
 //! committed client damage, Xwayland included, and the compositor's own
 //! chrome and drag icon, after occlusion. The cursor is never drawn into
-//! frames or screenshots, so it never counts. A frame is timed when it is
-//! rendered, which is when screenshots start to show it.
+//! frames or screenshots, so it never counts, and neither does a change no
+//! larger than the focused text field's caret, which blinks on a timer. A frame is timed
+//! when it is rendered, which is when screenshots start to show it.
 //!
 //! Serials name inputs. Each serial is remembered with its time and with who
 //! may see its receipt, so a caller can wait on its own input but cannot
@@ -13,10 +14,18 @@
 //! input, and the quiet window starts no earlier than the caller's own latest
 //! input, so naming a key press also waits out its release.
 
+use std::any::Any;
 use std::collections::VecDeque;
 
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3;
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3;
+use smithay::reexports::wayland_server::Resource;
+use smithay::utils::Logical;
 use smithay::utils::Physical;
 use smithay::utils::Rectangle;
+use smithay::utils::Size;
+use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::text_input::TextInputSeat;
 use tokio::sync::oneshot;
 use zbus::zvariant::OwnedValue;
 
@@ -25,14 +34,15 @@ use super::monotonic_usec;
 use crate::FrameRequest;
 use crate::State;
 
-/// The quiet window when the caller names none: shorter than a text caret's
-/// blink phase, about half a second in Chromium and GTK, so a focused field
-/// settles.
+/// The quiet window when the caller names none.
 pub(crate) const DEFAULT_QUIET_MS: u32 = 300;
 pub(crate) const QUIET_MS: std::ops::RangeInclusive<u32> = 10..=10_000;
 pub(crate) const DEFAULT_TIMEOUT_MS: u32 = 5_000;
 /// Below the 25 s method-call timeout of libdbus and `GDBus` clients.
 pub(crate) const TIMEOUT_MS: std::ops::RangeInclusive<u32> = 0..=20_000;
+/// How far beyond a text field's cursor rectangle, in logical pixels, its
+/// caret may draw on each side.
+const CARET_MARGIN: i32 = 2;
 /// Waits in progress at once, across every caller.
 const MAX_WAITERS: usize = 64;
 /// Serials remembered with their time.
@@ -146,9 +156,37 @@ impl Waiter {
     }
 }
 
+/// The cursor rectangle a text-input-v3 object set, in its surface's
+/// coordinates. Like the protocol's other state, it takes effect on commit.
+#[derive(Debug)]
+struct Caret {
+    text_input: ZwpTextInputV3,
+    pending: Option<Rectangle<i32, Logical>>,
+    /// Enable or disable since the last commit, which resets the state.
+    reset: bool,
+    current: Option<Rectangle<i32, Logical>>,
+}
+
+/// Where the focused text field's caret can blink, in output pixels.
+#[derive(Clone, Copy, Debug)]
+struct CaretArea {
+    size: Size<i32, Physical>,
+    window: Rectangle<i32, Physical>,
+}
+
+impl CaretArea {
+    /// Whether `rect` is no larger than the caret and inside its window.
+    fn holds(self, rect: Rectangle<i32, Physical>) -> bool {
+        rect.size.w <= self.size.w && rect.size.h <= self.size.h && self.window.contains_rect(rect)
+    }
+}
+
 /// Settle state owned by the compositor loop.
 #[derive(Default)]
 pub(crate) struct Settle {
+    carets: Vec<Caret>,
+    /// The previous frame's pixels, kept while a text field has a caret.
+    last: Option<Vec<u8>>,
     serials: VecDeque<Issued>,
     frames: VecDeque<Frame>,
     /// The newest frame dropped from `frames`: damage may have happened up
@@ -212,7 +250,99 @@ impl Settle {
     }
 }
 
+/// Track the cursor rectangle of each text-input-v3 object. Runs on every
+/// request before Smithay handles it, which keeps the rectangle to itself.
+pub(crate) fn observe_text_input(state: &mut State, resource: &dyn Any, request: &dyn Any) {
+    let (Some(text_input), Some(request)) = (
+        resource.downcast_ref::<ZwpTextInputV3>(),
+        request.downcast_ref::<zwp_text_input_v3::Request>(),
+    ) else {
+        return;
+    };
+    let carets = &mut state.delivery.settle.carets;
+    if let zwp_text_input_v3::Request::Destroy = request {
+        carets.retain(|caret| caret.text_input != *text_input);
+        return;
+    }
+    let index = carets
+        .iter()
+        .position(|caret| caret.text_input == *text_input)
+        .unwrap_or_else(|| {
+            carets.retain(|caret| caret.text_input.is_alive());
+            carets.push(Caret {
+                text_input: text_input.clone(),
+                pending: None,
+                reset: false,
+                current: None,
+            });
+            carets.len() - 1
+        });
+    let caret = &mut carets[index];
+    match request {
+        zwp_text_input_v3::Request::Enable | zwp_text_input_v3::Request::Disable => {
+            caret.reset = true;
+            caret.pending = None;
+        }
+        zwp_text_input_v3::Request::SetCursorRectangle {
+            x,
+            y,
+            width,
+            height,
+        } => caret.pending = Some(Rectangle::new((*x, *y).into(), (*width, *height).into())),
+        zwp_text_input_v3::Request::Commit => {
+            if std::mem::take(&mut caret.reset) {
+                caret.current = None;
+            }
+            if let Some(rect) = caret.pending.take() {
+                caret.current = Some(rect);
+            }
+        }
+        zwp_text_input_v3::Request::Destroy
+        | zwp_text_input_v3::Request::SetSurroundingText { .. }
+        | zwp_text_input_v3::Request::SetTextChangeCause { .. }
+        | zwp_text_input_v3::Request::SetContentType { .. }
+        | zwp_text_input_v3::Request::SetAvailableActions { .. }
+        | zwp_text_input_v3::Request::ShowInputPanel
+        | zwp_text_input_v3::Request::HideInputPanel
+        | _ => {}
+    }
+}
+
 impl State {
+    /// The focused text field's caret, in output pixels: the size of the
+    /// cursor rectangle its active text input set, widened by
+    /// `CARET_MARGIN` on each side, since clients report it as a zero-width
+    /// line and draw the caret around it, and the bounds of the field's
+    /// window. `None` unless the field is in a window's main surface.
+    fn caret(&self) -> Option<CaretArea> {
+        let mut active = None;
+        self.seat
+            .text_input()
+            .with_active_text_input(|text_input, surface| {
+                active = Some((text_input.clone(), surface.clone()));
+            });
+        let (text_input, surface) = active?;
+        let rect = self
+            .delivery
+            .settle
+            .carets
+            .iter()
+            .find(|caret| caret.text_input == text_input)?
+            .current?;
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().is_some_and(|own| *own == surface))?;
+        let scale = self.output.current_scale().fractional_scale();
+        let size = Rectangle::<i32, Logical>::from_size(
+            rect.size + Size::from((2 * CARET_MARGIN, 2 * CARET_MARGIN)),
+        );
+        Some(CaretArea {
+            size: super::windows::to_pixels(size, scale).size,
+            window: super::windows::to_pixels(self.space.element_bbox(window)?, scale),
+        })
+    }
+
     /// Start a `WaitSettled` call. `pid` is the caller's process.
     pub(crate) fn wait_settled(&mut self, pid: Option<u32>, options: SettleOptions, reply: Reply) {
         let now = monotonic_usec();
@@ -270,9 +400,59 @@ impl State {
         self.poll_settled(now);
     }
 
-    /// Record a rendered frame and its damage in output pixels.
-    pub(crate) fn frame_rendered(&mut self, now: u64, damage: &[Rectangle<i32, Physical>]) {
+    /// Record a rendered frame: its damage in output pixels, the image it
+    /// was rendered to and the parts of it that were drawn, `None` when all
+    /// of it was.
+    pub(crate) fn frame_rendered(
+        &mut self,
+        now: u64,
+        damage: &[Rectangle<i32, Physical>],
+        image: &smithay::reexports::pixman::Image<'static, 'static>,
+        drawn: Option<&[Rectangle<i32, Physical>]>,
+    ) {
         self.delivery.settle.rendered = now;
+        let pixels = Pixels {
+            data: crate::image_pixels(image),
+            width: image.width(),
+        };
+        // A blinking caret changes its pixels on a timer, not in answer to
+        // input, so a change no larger than the caret in the field's window
+        // is left out. GTK 4.8 reports where the caret is only when the
+        // text changes, not after a click, so the change is matched by its
+        // size, not its place. It also damages its whole surface for each
+        // caret frame, so damage in the window is first narrowed to the
+        // pixels that changed, which needs the previous frame.
+        let caret = self.caret();
+        let settle = &mut self.delivery.settle;
+        let last = settle
+            .last
+            .take()
+            .filter(|last| last.len() == pixels.data.len());
+        let damage: Vec<_> = damage
+            .iter()
+            .filter_map(|&rect| match (caret, &last) {
+                (Some(caret), Some(last)) if rect.overlaps(caret.window) => {
+                    changed_within(last, pixels, rect)
+                }
+                _ => Some(rect),
+            })
+            .filter(|rect| !caret.is_some_and(|caret| caret.holds(*rect)))
+            .collect();
+        settle.last = caret.map(|_| match (last, drawn) {
+            (Some(mut last), Some(drawn)) => {
+                for &rect in drawn {
+                    for range in pixels.rows(rect) {
+                        last[range.clone()].copy_from_slice(&pixels.data[range]);
+                    }
+                }
+                last
+            }
+            (Some(mut last), None) => {
+                last.copy_from_slice(pixels.data);
+                last
+            }
+            (None, _) => pixels.data.to_vec(),
+        });
         if damage.is_empty() {
             return;
         }
@@ -289,7 +469,7 @@ impl State {
             if let Some(None) = region {
                 continue;
             }
-            if touches(damage, region.flatten()) {
+            if touches(&damage, region.flatten()) {
                 waiter.damaged(now);
             }
         }
@@ -303,10 +483,7 @@ impl State {
                 settle.forgotten = frame.usec;
             }
         }
-        settle.frames.push_back(Frame {
-            usec: now,
-            damage: damage.to_vec(),
-        });
+        settle.frames.push_back(Frame { usec: now, damage });
     }
 
     /// Answer every wait that settled, timed out or lost its window by
@@ -401,6 +578,70 @@ impl State {
         let scale = self.output.current_scale().fractional_scale();
         Some(super::windows::to_pixels(frame.merge(popups), scale))
     }
+}
+
+/// A frame's packed 4-byte pixels, `width` pixels to a row.
+#[derive(Clone, Copy)]
+struct Pixels<'a> {
+    data: &'a [u8],
+    width: usize,
+}
+
+impl Pixels<'_> {
+    /// The byte range of each of `rect`'s rows, clipped to the frame.
+    fn rows(self, rect: Rectangle<i32, Physical>) -> impl Iterator<Item = std::ops::Range<usize>> {
+        let stride = self.width * 4;
+        let height = self.data.len().checked_div(stride).unwrap_or(0);
+        let clip = |value: i32, limit: usize| usize::try_from(value.max(0)).unwrap_or(0).min(limit);
+        let (left, right) = (
+            clip(rect.loc.x, self.width),
+            clip(rect.loc.x + rect.size.w, self.width),
+        );
+        let (top, bottom) = (
+            clip(rect.loc.y, height),
+            clip(rect.loc.y + rect.size.h, height),
+        );
+        (top..bottom).map(move |row| row * stride + left * 4..row * stride + right * 4)
+    }
+}
+
+/// The smallest rectangle inside `rect` that holds every pixel that differs
+/// between `last` and `now`, or `None` when none does.
+fn changed_within(
+    last: &[u8],
+    now: Pixels<'_>,
+    rect: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
+    for (index, range) in now.rows(rect).enumerate() {
+        let (old, new) = (&last[range.clone()], &now.data[range]);
+        if old == new {
+            continue;
+        }
+        let Some(first) = old.chunks(4).zip(new.chunks(4)).position(|(a, b)| a != b) else {
+            continue;
+        };
+        let after = old
+            .chunks(4)
+            .zip(new.chunks(4))
+            .rposition(|(a, b)| a != b)?
+            + 1;
+        bounds = Some(match bounds {
+            None => (first, after, index, index + 1),
+            Some((left, right, top, _)) => (left.min(first), right.max(after), top, index + 1),
+        });
+    }
+    let (left, right, top, bottom) = bounds?;
+    let at = |offset: usize, start: i32| start.max(0) + i32::try_from(offset).unwrap_or(i32::MAX);
+    let loc = (at(left, rect.loc.x), at(top, rect.loc.y));
+    Some(Rectangle::new(
+        loc.into(),
+        (
+            at(right, rect.loc.x) - loc.0,
+            at(bottom, rect.loc.y) - loc.1,
+        )
+            .into(),
+    ))
 }
 
 /// Whether `damage` reaches `region`, or anywhere when there is no region.

@@ -516,8 +516,8 @@ Backed, most important first:
        through the wrapper's decision logic; each fails with its check removed.
      - **Cost.** The wait adds the quiet window to each action: 304 ms p50 in Chromium and
        289 ms in gnome-text-editor at the default 300 ms, 154 and 138 ms with
-       `--quiet-ms 150`, with no timeouts. On the orb, GTK 4's caret did not reproduce the
-       dogfood run's 776 ms p50 (item 2).
+       `--quiet-ms 150`, with no timeouts. Those runs only typed; after a click, GTK 4's
+       blinking caret kept waits from settling until item 2 fixed it.
    - **Deferred: driver patches.** The interface is waywire's own; no other compositor serves
      it, so a patch to computer-use-linux or cua-driver would add a code path that does
      nothing elsewhere. Offer one only once waywire has users who would ask for it. The
@@ -532,24 +532,71 @@ Backed, most important first:
      - A driver gets the checks only when it runs behind the wrapper.
    - **This is the item that makes waywire clearly better than the alternatives.** Xvfb,
      Selkies and Waymote have no equivalent signal, and their naive runs failed the same way.
-2. **Settle without waiting out the text caret.**
+2. **Settle without waiting out the text caret.** Done.
    - **Measured cost:** the aware driver's per-action overhead is 318 ms p50 in Chromium, which
      is the 300 ms quiet window. In GTK 4 windows (gnome-text-editor and its file chooser) it is
      776 ms p50, and 8 of 36 waits ran into the 5 s timeout. Tasks in GTK 4 windows took 2–8
      times longer than with the stock driver and fixed sleeps: T2 14.6 s against 1.9 s, T5 7.0
      against 1.0, T6b 9.7 against 1.7. A 400-frame capture shows the only damage between inputs
-     is a 1×17 px strip at the caret: GTK 4 fades the caret in bursts of about 4 frames every
-     600 ms, and the roughly 350 ms hold between bursts is barely longer than the 300 ms quiet
-     window. With quiet 500 ms one of two waits timed out after 156 frames; with quiet 150 ms, 4
-     of 4 settled.
+     is a 1×17 px strip at the caret. The dogfood run's timeouts followed clicks, a window
+     activation and key presses.
    - **What it replaces:** the caller's choice between a long quiet window and a timeout in
      focused text views.
-   - **Work:** leave out of `WaitSettled` the damage inside the focused text field's caret
-     rectangle, which the compositor already has from text-input-v3, or report `settled` with
-     a `caret` flag. Also measure whether a shorter default quiet window, such as 150 ms, keeps
-     Chromium's early-screenshot rate at 1 in 32.
-   - **Limit:** apps without text-input-v3 cursor rectangles, X11 clients and spinners still
-     time out.
+   - **Why the wrapper's measurement disagreed: the input was keys, not clicks.** GTK 4 fades
+     its caret out and in over 300 ms each, with holds of 300 ms less one frame between
+     (`gtk-cursor-blink-time` 1200 in quarters; 284 ms p50 in a damage trace). A key that edits
+     a text view restarts the blink with the caret solid for 600 ms, so a wait after it settles
+     at 300 ms. A click does not, and a 300 ms quiet window seldom fits between fades. The
+     wrapper's measurement typed `ab` and pressed BackSpace only. In the acceptance image with
+     patched computer-use-linux behind the wrapper, 12 actions 0.4 s apart, before the fix:
+
+     | gnome-text-editor, before the fix | Debian 13 (GTK 4.18.6, 48.3) | Debian 12 (GTK 4.8.3, 43.2) |
+     | --------------------------------- | ---------------------------- | --------------------------- |
+     | Keys                              | 293 ms p50, 0 timeouts       | 265 ms, 0                   |
+     | Clicks into the text              | 5006 ms, 8 timeouts          | 5007 ms, 9                  |
+     | Clicks, `cursor-blink` false      | 302 ms, 0                    | 303 ms, 0                   |
+     | Clicks, quiet 150 ms              | 153 ms, 0                    | 153 ms, 0                   |
+
+     Turning the GNOME `cursor-blink` setting off turns the slow behaviour off, and the damage
+     traces show why: with blinking on, 1,057 of 1,377 damaged frames on Debian 13 changed only
+     the caret; with it off, 23 of 314. A pause of 2.5 s instead of 0.4 s changed nothing in the
+     wrapper's run. The distribution did not matter.
+
+   - **Real users hit it.** A session as waywire starts it has no settings portal, so GTK keeps
+     its default of a blinking caret, on both Debian releases the acceptance suite covers. An
+     agent clicks into text fields all the time.
+   - **What shipped.** The compositor tracks each text-input-v3 object's cursor rectangle. While
+     a text field is enabled, a change in its window no larger than that rectangle, widened by
+     2 px on each side, is not damage for `WaitSettled`. The change is matched by size, not by
+     place, because GTK 4.8 reports the caret's place only when the text changes, so after a
+     click it blinks one click away from where it was reported. Damage in that window is first
+     narrowed to the pixels that changed, against a copy of the previous frame kept only while
+     a field is focused, because GTK 4.8 damages its whole surface for each caret frame. The
+     default quiet window stays 300 ms (below). No message changed. Rejected: a `caret` flag on
+     `settled`, which would still leave the caller waiting out the timeout.
+   - **Proof.** A compositor unit test fails without the change: a 1×17 px caret change, a
+     whole-surface commit that changes only the caret, and a caret-sized change away from the
+     reported rectangle all leave the wait at 0 frames; a typed glyph beside the caret, a
+     caret-sized change in another window and one after the field is disabled count.
+     `just acceptance settle-gtk` clicks into gnome-text-editor and requires the wait after the
+     click to settle, a 500 ms quiet window to settle with no changed frame while the caret
+     blinks, and only a caret-sized area of the editor to change over 1.2 s. With the change,
+     clicks take 302 ms p50 with 0 timeouts in 12 on Debian 13 (max 319) and 306.5 ms with 0 on
+     Debian 12 (max 325);
+     keys are unchanged.
+   - **The default quiet window stays 300 ms.** In the dogfood T1 and T6a form, filled by keys
+     through the wrapper, half of the runs with the surprise alert, a screenshot after each of 13 or 14 actions,
+     compared with one 1.5 s later: at 300 ms no screenshot missed a change to the page in 216; the misses were
+     Chromium's toolbar sign-in chip collapsing and the taskbar clock. At 150 ms, 4 of 108
+     screenshots missed the page's `alert()`, which opens 300 ms after Phone takes focus: every
+     alert run. A 150 ms default would turn a page timer of 150–300 ms into a missed dialog.
+   - **Limit:**
+     - Applications without text-input-v3 cursor rectangles, such as X11 terminals and
+       Chromium on text-input v1, and spinners or fading scroll bars still keep the screen
+       changing.
+     - In the focused field's window, any change no larger than the caret is ignored, such as
+       a 1 px step of a progress bar.
+
 3. **Viewer key repeat follows the browser.** Done.
    - **Measured cost:** one viewer keystroke became 268 characters in foot while the viewer
      page was busy, because its key release arrived late.
