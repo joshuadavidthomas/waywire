@@ -907,7 +907,14 @@ def slow_link(encoder):
                                 "age_ms": round(statistics.median(ages))
                                 if ages
                                 else None,
+                                # Host load, to tell an fps drop caused by
+                                # other processes from one in waywire.
+                                "load": round(os.getloadavg()[0], 2),
                             }
+                        )
+                        print(
+                            f"slow link {encoder} sample: {json.dumps(samples[-1])}",
+                            flush=True,
                         )
                         previous = current
                         if done(quality):
