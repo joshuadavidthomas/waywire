@@ -372,6 +372,10 @@ pub(crate) struct State {
     refresh: Refresh,
 }
 
+/// The seat's key repeat, in keys per second after a delay in milliseconds,
+/// while no browser holds input. Clients repeat held keys on their own timer.
+const KEY_REPEAT_RATE: i32 = 25;
+const KEY_REPEAT_DELAY_MS: i32 = 200;
 /// Once nothing has changed for `REFRESH_DELAY`, the last frame is encoded
 /// `REFRESH_FRAMES` more times. x264's constant rate factor codes a still frame's
 /// remaining residual finer on each pass: a scrolled page gains about 2.5 dB after
@@ -427,8 +431,8 @@ impl State {
                 layout: &options.xkb_layout,
                 ..Default::default()
             },
-            200,
-            25,
+            KEY_REPEAT_DELAY_MS,
+            KEY_REPEAT_RATE,
         )?;
         seat.add_pointer();
         seat.text_input().set_compositor_input_method(true);
@@ -883,6 +887,12 @@ impl State {
     /// Apply a browser takeover or handback. On takeover, every agent source
     /// releases what it holds before its future input is dropped. On handback,
     /// the browser's own keys are released and agent input resumes.
+    ///
+    /// While a browser holds input, clients do not repeat keys themselves:
+    /// the browser's own repeats are replayed instead (see
+    /// [`Self::keyboard_repeat`]). A page whose main thread is busy sends a
+    /// key's release late, and a client repeating on its own timer would type
+    /// that key until the release arrived.
     pub(crate) fn set_browser_lease(&mut self, held: bool) {
         if self.browser_holds_input == held {
             return;
@@ -897,6 +907,10 @@ impl State {
             }
         }
         self.release_input(KeyboardSource::MAIN);
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard
+                .change_repeat_info(if held { 0 } else { KEY_REPEAT_RATE }, KEY_REPEAT_DELAY_MS);
+        }
         self.dropped_agent_sources.clear();
         self.toplevel_list.lease_changed();
         self.publish_agent_input();
@@ -904,6 +918,51 @@ impl State {
 
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
         self.keyboard_key_inner(source, key, state, true);
+    }
+
+    /// Replay one of the browser's repeats of a key it holds. While a browser
+    /// holds input the seat tells clients not to repeat keys, so a held key
+    /// repeats exactly as often as the browser does. Before `wl_keyboard`
+    /// version 10 there is no repeat event, so a repeat reaches the client as a
+    /// release and a press, as X11 autorepeat does. A key the compositor kept
+    /// for itself, a key no longer held, and a key the keymap does not repeat,
+    /// such as a modifier, are left alone.
+    fn keyboard_repeat(&mut self, source: KeyboardSource, key: u32) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let code = (key + 8).into();
+        let repeats = keyboard.with_xkb_state(self, |context| {
+            let xkb = context
+                .xkb()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: the reference does not outlive the lock.
+            unsafe { xkb.keymap() }.key_repeats(code)
+        });
+        if !self.browser_holds_input || !repeats || !keyboard.pressed_keys().contains(&code) {
+            return;
+        }
+        let serial = self.begin_input(source, delivery::FocusCause::Key);
+        let (target, text_field) = self.keyboard_target();
+        for state in [KeyState::Released, KeyState::Pressed] {
+            keyboard.input_from_source::<(), _>(
+                source,
+                self,
+                code,
+                state,
+                SERIAL_COUNTER.next_serial(),
+                InputTime::now(),
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        self.finish_input(
+            source,
+            serial,
+            delivery::InputKind::Key { pressed: true },
+            &target,
+            Some(text_field),
+        );
     }
 
     /// A key the compositor picked for its symbol, such as a spare keycode
@@ -2067,7 +2126,7 @@ impl State {
                 pipe::KeyState::Released => {
                     self.keyboard_key(source, p.key.get(), KeyState::Released);
                 }
-                pipe::KeyState::Repeated => {}
+                pipe::KeyState::Repeated => self.keyboard_repeat(source, p.key.get()),
             },
             Command::ReleaseAll(_) => self.release_input(source),
             Command::InputLease(p) => self.set_browser_lease(p.held),

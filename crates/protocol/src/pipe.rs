@@ -525,6 +525,8 @@ impl Wire for Button {
 pub enum KeyState {
     Released,
     Pressed,
+    /// The browser repeated a key it holds. While a browser holds input,
+    /// clients do not repeat keys themselves and this is the only repeat.
     Repeated,
 }
 

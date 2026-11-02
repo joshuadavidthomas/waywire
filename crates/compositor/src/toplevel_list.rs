@@ -297,6 +297,8 @@ mod tests {
         modifiers: [u32; 4],
         /// Each pressed key with the modifiers and keymap in force for it.
         presses: Vec<(u32, [u32; 4], usize)>,
+        /// The latest `wl_keyboard.repeat_info`: rate and delay.
+        repeat_info: Option<(i32, i32)>,
         virtual_keyboards: Option<ZwpVirtualKeyboardManagerV1>,
         pointer_focus: Option<WlSurface>,
         pointer_serial: Option<u32>,
@@ -388,7 +390,7 @@ mod tests {
                         state.list = Some(registry.bind(name, version.min(1), qh, ()));
                     }
                     "wl_seat" => {
-                        state.seat = Some(registry.bind(name, version.min(1), qh, ()));
+                        state.seat = Some(registry.bind(name, version.min(4), qh, ()));
                     }
                     "zwp_pointer_constraints_v1" => {
                         state.constraints = Some(registry.bind(name, 1, qh, ()));
@@ -641,7 +643,8 @@ mod tests {
                     group,
                     ..
                 } => state.modifiers = [mods_depressed, mods_latched, mods_locked, group],
-                Event::Enter { .. } | Event::Leave { .. } | Event::RepeatInfo { .. } | _ => {}
+                Event::RepeatInfo { rate, delay } => state.repeat_info = Some((rate, delay)),
+                Event::Enter { .. } | Event::Leave { .. } | _ => {}
             }
         }
     }
@@ -4981,6 +4984,88 @@ mod tests {
         assert_eq!(receipts[0].delivery, pipe::ReceiptDelivery::Window);
         assert_eq!(receipts[0].title.as_str(), "Notes");
         assert_eq!(receipts[0].window_id.as_str(), app.handles[0].identifier);
+    }
+
+    /// A busy viewer page sends a key's release late. While a browser holds
+    /// input, clients must not repeat keys on their own timer, or one
+    /// keystroke becomes hundreds; each of the browser's own repeats types
+    /// the key once more, with a receipt. Handback releases the browser's
+    /// keys and gives clients their repeat back.
+    #[test]
+    fn viewer_key_repeat_follows_the_browser() {
+        use waywire_protocol::pipe;
+        let (mut display, mut state, connection, mut queue, mut app, _keyboard) = typing_client();
+        assert_eq!(app.repeat_info, Some((25, 200)), "clients repeat keys");
+        state
+            .apply_command(pipe::Command::InputLease(pipe::InputLease { held: true }))
+            .expect("takeover");
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(
+            app.repeat_info,
+            Some((0, 200)),
+            "no client repeat while a browser holds input"
+        );
+
+        state.event_sink.take_events();
+        let mut sequence = 0;
+        let mut key = |state: &mut crate::State, key, key_state| {
+            sequence += 1;
+            state
+                .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey {
+                    key: pipe::KeyCode::new(key).expect("key"),
+                    state: key_state,
+                    sequence: pipe::InputSequence::new(sequence).expect("sequence"),
+                }))
+                .expect("key");
+        };
+        // Shift is held and the browser repeats it, as it does on Windows; A
+        // is held for two browser repeats. A repeat after the release, which
+        // a busy page can send, types nothing.
+        key(&mut state, 42, pipe::KeyState::Pressed);
+        key(&mut state, 42, pipe::KeyState::Repeated);
+        key(&mut state, 30, pipe::KeyState::Pressed);
+        key(&mut state, 30, pipe::KeyState::Repeated);
+        key(&mut state, 30, pipe::KeyState::Repeated);
+        key(&mut state, 30, pipe::KeyState::Released);
+        key(&mut state, 30, pipe::KeyState::Repeated);
+        key(&mut state, 42, pipe::KeyState::Released);
+        key(&mut state, 48, pipe::KeyState::Pressed);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(typed_text(&app), "AAAb");
+        let receipts: Vec<_> = state
+            .event_sink
+            .take_events()
+            .into_iter()
+            .filter_map(|event| {
+                if let pipe::Event::InputReceipt(receipt) = event {
+                    Some((
+                        receipt.sequence.get(),
+                        receipt.delivery,
+                        receipt.window_id.as_str().to_owned(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let window = &app.handles[0].identifier;
+        assert_eq!(
+            receipts,
+            [1, 3, 4, 5, 6, 8, 9].map(|sequence| (
+                sequence,
+                pipe::ReceiptDelivery::Window,
+                window.clone()
+            )),
+            "a receipt for each key and each repeat the client received"
+        );
+
+        let held = app.keys.len();
+        state
+            .apply_command(pipe::Command::InputLease(pipe::InputLease { held: false }))
+            .expect("handback");
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert_eq!(app.keys[held..], [48], "handback releases B");
+        assert_eq!(app.repeat_info, Some((25, 200)), "clients repeat again");
     }
 
     /// Attach a `width` by `height` buffer to `surface`.

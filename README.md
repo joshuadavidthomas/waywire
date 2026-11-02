@@ -103,7 +103,10 @@ focus or restore windows; clicking the focused chip minimizes it. Super+Shift+M
 restores the most recently minimized window. The bar also shows the local time
 and whether the agent or a browser viewer holds input. Interacting with the web
 viewer takes control when remote input is enabled; there is no in-desktop
-Take over button.
+Take over button. While a viewer holds input, applications do not repeat held
+keys on their own timer: a key held in the browser repeats once for each of the
+browser's repeats, so a key release that a busy viewer page sends late cannot
+type the key again.
 
 The gateway and compositor accept repeated `--pin 'COMMAND ARG...'` options
 for taskbar application commands. Pin arguments use shell-style quoting, without
@@ -145,7 +148,9 @@ into a temporary directory. `just benchmark --check` compares both results
 against the tolerances in the script and exits nonzero for a regression or a
 missing comparison. It also holds waywire's viewer latency, keydown to changed
 pixel, under absolute ceilings of 25 ms median and 35 ms p95 on the hardware
-below, where it measures about 19 ms and 25 ms.
+below, where it measures about 19 ms and 25 ms. Keys typed through a viewer
+whose page is busy, and a key held in the viewer, must reach foot and xterm
+exactly.
 
 For waywire, the benchmark also splits each key's input-to-screen latency into
 stages, from the browser key event through the gateway, compositor, client

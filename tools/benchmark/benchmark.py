@@ -28,8 +28,15 @@ scale, bitrate and frame rate within 150 seconds. In six runs each on the
 reference orb, FFmpeg drew 11 to 25 frames a second at most 464 ms old and
 OpenH264 drew 20 to 25 at most 552 ms old.
 
-Requires release binaries (just build), agent-browser, xterm, ffmpeg, Xwayland,
-xdotool, grim, wlr-randr, Debian Chromium, git, uv and the Amp Waymote installation.
+Viewer key repeat: in foot and in xterm, the viewer types "busy" while its
+page's main thread is busy for a second whenever a key is released, then holds
+x for 12 browser autorepeats. Each terminal must receive exactly "busy" and 13
+x: a release that reaches waywire late must not leave its key repeating, and a
+key held in the browser repeats once for each of the browser's repeats.
+
+Requires release binaries (just build), agent-browser, Node.js, xterm, foot,
+ffmpeg, Xwayland, xdotool, grim, wlr-randr, Debian Chromium, git, uv and the
+Amp Waymote installation.
 The pinned Anthropic demo and Python dependency are downloaded to a temporary
 directory on each run. Run one benchmark at a time.
 """
@@ -64,6 +71,11 @@ SLOW_LINK_MIN_FPS = {"ffmpeg": 8, "openh264": 15}
 SLOW_LINK_MAX_AGE_MS = 1000
 RECOVERY_SECONDS = 150
 ENCODERS = ("ffmpeg", "openh264")
+BUSY_KEYUP_MS = 1000
+BUSY_TEXT = "busy"
+HELD_KEY_REPEATS = 12
+# Each runs a program that writes what it reads to the file it is given, unechoed.
+TERMINALS = {"foot": ("foot", "sh", "-c"), "xterm": ("xterm", "-e", "sh", "-c")}
 MOTION_PAGE = (
     "<!doctype html><title>Benchmark motion</title><style>"
     "html,body{margin:0;overflow:hidden;font:15px sans-serif}"
@@ -946,6 +958,80 @@ def slow_link(encoder):
                     link.close()
 
 
+def viewer_key_repeat(terminal):
+    """Type through the viewer while its page is busy, then hold a key in the browser."""
+    with tempfile.TemporaryDirectory(prefix="waywire-key-repeat-") as tmp:
+        directory = Path(tmp)
+        os.chmod(directory, 0o700)
+        env = desktop_env(tmp)
+        received = directory / "received"
+        program = f"stty -icanon -echo; exec cat > {shlex.quote(str(received))}"
+        app = f"exec {shlex.join([*TERMINALS[terminal], program])}"
+        with (directory / "desktop.log").open("w+") as log:
+            gateway = start(waywire_command(URL, app), env, log)
+            try:
+                wait_for(http_ready, "waywire gateway did not start")
+                wait_for(received.exists, f"{terminal} did not start")
+                browser("open", URL)
+                browser("set", "viewport", "1280", "720", "2")
+                wait_for(
+                    lambda: evaluate("window.benchmarkNonblank"),
+                    "key-repeat viewer did not decode a nonblank frame",
+                )
+                browser("click", "#display")
+                time.sleep(1)
+                # Busy before the viewer's own keyup handler runs, so the
+                # release leaves the page a second after the key went up.
+                evaluate(
+                    f"window.benchmarkBusyKeyupMs = {BUSY_KEYUP_MS};"
+                    "addEventListener('keyup', () => {"
+                    " const end = performance.now() + window.benchmarkBusyKeyupMs;"
+                    " while (performance.now() < end); }, true)"
+                )
+                for character in BUSY_TEXT:
+                    browser("press", character)
+                evaluate("window.benchmarkBusyKeyupMs = 0")
+                subprocess.run(
+                    [
+                        "node",
+                        str(ROOT / "tools/benchmark/hold_key.mjs"),
+                        browser("get", "cdp-url").strip(),
+                        URL,
+                        "x",
+                        str(HELD_KEY_REPEATS),
+                    ],
+                    check=True,
+                )
+                # Leave time for repeats that should not come.
+                time.sleep(2)
+                result = {
+                    "expected": BUSY_TEXT + "x" * (HELD_KEY_REPEATS + 1),
+                    "received": received.read_text(),
+                }
+                print(json.dumps({f"viewer key repeat {terminal}": result}), flush=True)
+                return result
+            except Exception:
+                log.flush()
+                print((directory / "desktop.log").read_text(), flush=True)
+                raise
+            finally:
+                try:
+                    browser("open", "about:blank")
+                finally:
+                    stop(gateway)
+
+
+def check_key_repeat(terminal, result):
+    if result is None:
+        return [f"viewer key repeat {terminal}: unavailable"]
+    if result["received"] != result["expected"]:
+        return [
+            f"viewer key repeat {terminal}: received {result['received']!r}, "
+            f"expected {result['expected']!r}"
+        ]
+    return []
+
+
 def check_slow_link(encoder, result):
     if result is None:
         return [f"slow link {encoder}: unavailable"]
@@ -1047,6 +1133,10 @@ def check_regressions(results):
     for name, status in waymote["agents"].items():
         if status == "pass" and waywire["agents"][name] != "pass":
             failures.append(f"{name}: waywire failed, Waymote passed")
+    for terminal in TERMINALS:
+        failures.extend(
+            check_key_repeat(terminal, results.get("key_repeat", {}).get(terminal))
+        )
     for encoder in ENCODERS:
         failures.extend(
             check_slow_link(encoder, results.get("slow_link", {}).get(encoder))
@@ -1112,6 +1202,9 @@ def main():
                 run_desktop(name, fixture, warmup=True)
             results = {
                 name: run_desktop(name, fixture) for name in ("waywire", "waymote")
+            }
+            results["key_repeat"] = {
+                terminal: viewer_key_repeat(terminal) for terminal in TERMINALS
             }
             results["slow_link"] = {encoder: slow_link(encoder) for encoder in ENCODERS}
             if args.check:

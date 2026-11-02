@@ -531,13 +531,47 @@ Backed, most important first:
      Chromium's early-screenshot rate at 1 in 32.
    - **Limit:** apps without text-input-v3 cursor rectangles, X11 clients and spinners still
      time out.
-3. **Viewer key repeat follows the browser.**
+3. **Viewer key repeat follows the browser.** Done.
    - **Measured cost:** one viewer keystroke became 268 characters in foot while the viewer
      page was busy, because its key release arrived late.
    - **What it replaces:** client-side repeat of a key whose release is late.
-   - **Work:** drive repeat for viewer-held keys from the viewer's `keyRepeated` records, or cap
-     how long a viewer key can be held without a fresh record.
-   - **Limit:** a genuinely held key repeats at the browser's rate, not the client's.
+   - **Cause.** The viewer sends a key's press from its `keydown` handler and its release from
+     its `keyup` handler. When the page's main thread is busy as the key goes up, the `keyup`
+     handler runs late and the release leaves the browser late; the gateway and compositor
+     passed it on within 1 ms. Until then the client repeated the key on its own timer, from
+     the seat's repeat info of 25 a second after 200 ms. The compositor ignored the viewer's
+     `keyRepeated` records. With the page busy for 3 s at each keyup, `abcd` reached foot as
+     288 characters, 72 per key: 1 + (3000 − 200) / 40.
+   - **What shipped.** While a browser holds input, the seat's repeat info is rate 0, so
+     Wayland clients and Xwayland do not repeat keys themselves. Each `keyRepeated` record
+     types its key once more, with a receipt like any key. `wl_keyboard` before version 10 has
+     no repeat event, so a repeat reaches the client as a release and a press, as X11
+     autorepeat does. Modifiers, keys the compositor kept for itself and keys already released
+     are not repeated. Handback, including a viewer disconnecting, releases the browser's keys
+     and restores client repeat. Agent input is dropped while a browser holds input, so no
+     agent key loses its repeat. No message changed. A cap on how long a key can be held
+     without a fresh record was rejected: the client would still repeat for the length of the
+     cap, so a late release would still type extra characters.
+   - **Proof.** A compositor unit test fails without the change: a client must be told rate 0
+     on takeover, receive one character per browser repeat with a receipt for each, nothing for
+     a repeated modifier or a repeat after the release, and get its repeat back on handback.
+     `just benchmark --check` now types `busy` through the viewer while every keyup reaches the
+     page a second late, then holds `x` in the browser for 12 autorepeats over the DevTools
+     protocol, and requires exactly `busy` and 13 `x` in foot and in xterm. On `6688c5e` foot
+     received 22 of each letter and 7 `x`, and xterm 21 and 7; with the change both receive the
+     exact text. The benchmark passed twice with the change. Viewer keydown to changed pixel
+     took 10.4 and 10.2 ms p50, 13.3 and 21.0 ms p95; at `6688c5e` on the same orb it took 10.8
+     and 11.0 ms p50, 20.2 and 27.6 ms p95.
+   - **What remains.**
+     - A held key repeats at the browser's delay and rate, not the desktop's.
+     - A key held while the page is busy repeats only as the page handles the browser's
+       repeats, so it pauses during the stall.
+     - A late release still keeps the key logically down until it arrives, which an app that
+       acts on held keys, such as a game, sees.
+     - Applications see each repeat as a release and a press. Smithay's seat is version 9;
+       version 10 would send them as repeats.
+     - The dogfood run's probe did not stall the page enough to reproduce its ~11 s late release
+       here; the reproduction busies the page at each keyup instead.
 4. **Close the one-frame tail in key to pixel.**
    - **Measured cost:** without a viewer, waywire's p50 equals the X11 desktops' (16.9 ms
      against 16.5–17.2). Its p95 is 32.8 ms against 18.2–18.6, because 3 of 30 keys waited one

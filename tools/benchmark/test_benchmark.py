@@ -10,7 +10,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from benchmark import ENCODERS, latency_breakdown, main, process_snapshot
+from benchmark import ENCODERS, TERMINALS, latency_breakdown, main, process_snapshot
 
 
 def result():
@@ -44,6 +44,10 @@ def slow_link_result():
         "recovery_s": 90.0,
         "samples": [],
     }
+
+
+def key_repeat_result():
+    return {"expected": "busyxxxxxxxxxxxxx", "received": "busyxxxxxxxxxxxxx"}
 
 
 class ProcessSnapshotTest(unittest.TestCase):
@@ -202,6 +206,7 @@ class RegressionCheckTest(unittest.TestCase):
         self.results = {
             "waywire": result(),
             "waymote": result(),
+            "key_repeat": {terminal: key_repeat_result() for terminal in TERMINALS},
             "slow_link": {encoder: slow_link_result() for encoder in ENCODERS},
         }
 
@@ -212,7 +217,12 @@ class RegressionCheckTest(unittest.TestCase):
             patch("benchmark.subprocess.run"),
             patch("benchmark.browser"),
             patch(
-                "benchmark.run_desktop", side_effect=lambda name, _: self.results[name]
+                "benchmark.run_desktop",
+                side_effect=lambda name, _, warmup=False: self.results[name],
+            ),
+            patch(
+                "benchmark.viewer_key_repeat",
+                side_effect=lambda terminal: self.results["key_repeat"].get(terminal),
             ),
             patch(
                 "benchmark.slow_link",
@@ -272,6 +282,20 @@ class RegressionCheckTest(unittest.TestCase):
         self.results["waymote"]["agents"]["xdotool"] = "fail"
         self.results["waywire"]["agents"]["xdotool"] = "fail"
         self.assertEqual(self.run_check(), (0, "Regression check passed"))
+
+    def test_viewer_key_repeat_must_type_exactly_and_be_measured(self):
+        # One keystroke with a late release, repeated by the client.
+        self.results["key_repeat"]["foot"]["received"] = "busyyyyyyxxxxxxxxxxxxx"
+        del self.results["key_repeat"]["xterm"]
+        self.assertEqual(
+            self.run_check(),
+            (
+                1,
+                "Regression check failed:\nviewer key repeat foot: received "
+                "'busyyyyyyxxxxxxxxxxxxx', expected 'busyxxxxxxxxxxxxx'"
+                "\nviewer key repeat xterm: unavailable",
+            ),
+        )
 
     def test_slow_link_must_adapt_scale_and_bitrate_not_only_frame_rate(self):
         only_fps = self.results["slow_link"]["openh264"]
