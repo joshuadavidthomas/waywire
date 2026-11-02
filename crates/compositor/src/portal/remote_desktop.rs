@@ -173,30 +173,8 @@ fn apply_keysym(
     let altgr_index = keymap.mod_get_index("Mod5");
     let shift_mask = 1u32.checked_shl(shift_index).unwrap_or(0);
     let altgr_mask = 1u32.checked_shl(altgr_index).unwrap_or(0);
-    let mut found = None;
-    'search: for code in 8..=255 {
-        let key = xkb::Keycode::new(code);
-        for group in 0..keymap.num_layouts_for_key(key) {
-            for level in 0..keymap.num_levels_for_key(key, group) {
-                if !keymap
-                    .key_get_syms_by_level(key, group, level)
-                    .contains(&xkb::Keysym::new(keysym))
-                {
-                    continue;
-                }
-                let mut masks = [0; 32];
-                let count = keymap.key_get_mods_for_level(key, group, level, &mut masks);
-                if let Some(mask) = masks[..count.min(masks.len())]
-                    .iter()
-                    .copied()
-                    .find(|mask| mask & !(shift_mask | altgr_mask) == 0)
-                {
-                    found = Some((code - 8, group, mask));
-                    break 'search;
-                }
-            }
-        }
-    }
+    let found =
+        crate::virtual_keyboard::seat_key(&keymap, xkb::Keysym::new(keysym), original_layout.0);
     let (key, group, mask) =
         found.ok_or_else(|| format!("keysym {keysym:#x} is not available in the keymap"))?;
     if state.browser_holds_input {

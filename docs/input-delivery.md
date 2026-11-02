@@ -421,6 +421,44 @@ Settling is a statement about pixels, not about the application:
 - **Frame rate.** Changes are seen once per frame. When the viewer's link
   lowers the frame rate, a change is timed up to one frame interval late.
 
+## Typing text
+
+Every input path reaches applications as keys on the seat's keymap: the
+RemoteDesktop portal's `NotifyKeyboardKeysym` and `NotifyKeyboardKeycode`,
+EIS with the keymap the compositor sends, XTest, and `zwp_virtual_keyboard_v1`
+keyboards such as the one `wtype` creates. Drivers need no changes.
+
+A virtual keyboard uploads a keymap of its own, and its key codes need not
+be where a real keyboard has those keys. `wtype` numbers the distinct
+characters of each string from evdev code 1: Escape, the digit row,
+Backspace, Tab, Control, the F keys. Some applications read the key's
+position as well as its symbol. Chromium takes the DOM `code`, the legacy
+`keyCode` and editing commands from it, so a `:` on Backspace's code erases
+the character before it. The compositor therefore never gives clients a
+virtual keyboard's keymap. It reads each key's keysym from the driver's
+keymap, with the driver's modifiers, and presses the key that has that
+keysym in the seat's keymap:
+
+- When that key's level needs Shift or AltGr, the compositor sets it as
+  modifier state for the key, as `wl_keyboard.modifiers` shows it. It sends
+  no Shift key event, so each key the driver sends gets exactly one receipt.
+- Modifiers that the driver holds, through its own modifier keys or the
+  `modifiers` request, apply under the seat's modifier names: `wtype -M ctrl c`
+  sends Control and C. A modifier that the keysym does not consume stays, as
+  on a real keyboard, so Shift with a key whose only symbol is `1` types `!`.
+- A character that the seat's keymap lacks, such as `é` under a US layout,
+  goes on a key that the layout leaves empty, and the keymap that clients see
+  changes. For Wayland clients that is the RO or YEN key of Japanese
+  keyboards when the layout has them empty; Chromium drops key codes that no
+  real keyboard has. Characters outside the Basic Multilingual Plane, such as
+  emoji, do not reach Chromium as keys.
+- A driver that sends the `no_keymap` format already uses the seat's key
+  codes; its keys pass through unchanged.
+
+Other compositors may pass a virtual keyboard's codes through. A driver that
+needs the same result everywhere should type keysyms through the portal's
+`NotifyKeyboardKeysym`, or use the keymap that EIS gives it.
+
 ## Ordering
 
 Serials increase in the order the compositor processes events. Signals are

@@ -5,26 +5,38 @@
 //! sends key and modifier events to the same seat entry points as browser and
 //! EI input.
 //!
-//! Smithay also hands the compositor the client's keymap. Activating it on the
-//! seat before routing keys is required, because the keycodes belong to that
-//! keymap. With several virtual keyboards the newest one's keymap is active,
-//! and the seat's own keymap returns when the last one goes away. While a
-//! browser holds the input lease the seat keymap stays active, so browser keys
-//! are decoded with the browser's layout; the newest virtual keyboard's keymap
-//! returns on handback if that keyboard is still connected.
+//! A client's key codes belong to the keymap it uploads, and they need not
+//! be where a real keyboard has them. `wtype` builds a keymap per string and
+//! gives its first distinct character evdev code 1, its second code 2, and so
+//! on: the positions of Escape, the digit row, Backspace, Tab, Control and
+//! F1 to F10. Clients that read the position as well as the keysym then act on
+//! it. Chromium takes a key's DOM `code`, `keyCode` and editing commands from
+//! the position, so a `:` on code 14 deletes the character before it as
+//! Backspace, and a character on F5 reloads the page.
+//!
+//! The compositor therefore never activates a client's keymap. It decodes each
+//! key with the client's keymap and the client's own modifiers, and presses the
+//! key that has the same keysym in the seat's keymap, with the Shift or `AltGr`
+//! that its level needs, as a real keyboard would. A keysym the seat's keymap
+//! lacks goes on a spare keycode, as composed viewer text does. Clients keep
+//! the seat's keymap, and a receipt follows each key the client sent. A client
+//! that sends `no_keymap` already uses the seat's keycodes, so its keys pass
+//! through.
 //!
 //! Key, modifier and keymap input from these devices shares the one ownership
 //! model: a browser takeover releases held keys and drops later virtual-keyboard
 //! input at the seat entry points in `lib.rs`.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 use smithay::backend::input::Event;
 use smithay::backend::input::InputEvent;
+use smithay::backend::input::KeyState;
 use smithay::backend::input::KeyboardKeyEvent;
-use smithay::input::keyboard::KeymapFile;
+use smithay::input::keyboard::xkb;
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::protocol::wl_keyboard::KeymapFormat;
@@ -66,92 +78,321 @@ pub(crate) fn init(display_handle: &DisplayHandle) {
     VirtualKeyboardManagerState::new::<State, _>(display_handle, |_client| true);
 }
 
-/// Virtual keyboards connected now, and the seat keymap to restore after the
-/// last one leaves. The most recently connected or re-keymapped device's
-/// keymap is the active one, because its keycodes are the ones arriving.
+/// The key that types `keysym` in `keymap`: its evdev code, its layout, and
+/// the modifiers its level needs, which are only ever Shift and `AltGr` (Mod5).
+/// Keys in `layout` come first, then lower key codes. Only codes that X11
+/// clients can receive are considered.
+pub(crate) fn seat_key(
+    keymap: &xkb::Keymap,
+    keysym: xkb::Keysym,
+    layout: u32,
+) -> Option<(u32, u32, u32)> {
+    let level_mods = [xkb::MOD_NAME_SHIFT, "Mod5"]
+        .into_iter()
+        .map(|name| 1u32.checked_shl(keymap.mod_get_index(name)).unwrap_or(0))
+        .fold(0, |mask, bit| mask | bit);
+    let layouts = keymap.num_layouts();
+    (0..layouts)
+        .map(|offset| (layout + offset) % layouts)
+        .find_map(|group| {
+            (8..=255).find_map(|code| {
+                let key = xkb::Keycode::new(code);
+                if group >= keymap.num_layouts_for_key(key) {
+                    return None;
+                }
+                (0..keymap.num_levels_for_key(key, group)).find_map(|level| {
+                    if !keymap
+                        .key_get_syms_by_level(key, group, level)
+                        .contains(&keysym)
+                    {
+                        return None;
+                    }
+                    let mut masks = [0; 32];
+                    let count = keymap.key_get_mods_for_level(key, group, level, &mut masks);
+                    masks[..count.min(masks.len())]
+                        .iter()
+                        .find(|mask| *mask & !level_mods == 0)
+                        .map(|mask| (code - 8, group, *mask))
+                })
+            })
+        })
+}
+
+/// `mask`, a set of `from`'s modifiers, as the same-named modifiers of `to`.
+fn translate_mods(mask: u32, from: &xkb::Keymap, to: &xkb::Keymap) -> u32 {
+    (0..from.num_mods().min(32))
+        .filter(|index| mask & (1 << index) != 0)
+        .filter_map(|index| 1u32.checked_shl(to.mod_get_index(from.mod_get_name(index))))
+        .fold(0, |mask, bit| mask | bit)
+}
+
+/// Compile the keymap a client uploaded, or `None` when it uses the seat's.
+fn client_state(device: &VirtualKeyboardDevice) -> Option<xkb::State> {
+    let keymap = device.keymap()?;
+    let mut text = Vec::new();
+    let read = keymap.with_fd(false, |fd, size| {
+        text.resize(size, 0);
+        if let Err(error) = fd
+            .try_clone_to_owned()
+            .map(File::from)
+            .and_then(|file| file.read_exact_at(&mut text, 0))
+        {
+            tracing::warn!(%error, "virtual keyboard keymap unreadable");
+            text.clear();
+        }
+    });
+    if let Err(error) = read {
+        tracing::warn!(%error, "virtual keyboard keymap unreadable");
+        return None;
+    }
+    while text.last() == Some(&0) {
+        text.pop();
+    }
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        String::from_utf8_lossy(&text).into_owned(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )?;
+    Some(xkb::State::new(&keymap))
+}
+
+/// Virtual keyboards connected now.
 #[derive(Default)]
 pub(crate) struct VirtualKeyboards {
-    devices: Vec<VirtualKeyboardDevice>,
-    seat_keymap: Option<KeymapFile>,
+    devices: Vec<VirtualKeyboard>,
+}
+
+struct VirtualKeyboard {
+    device: VirtualKeyboardDevice,
+    /// The client's keymap, in the state its keys and `modifiers` requests
+    /// have put it in. `None` when the client sends seat key codes.
+    client: Option<xkb::State>,
+    /// Seat keys this device holds down, by the client key that pressed them.
+    held: HashMap<u32, u32>,
+    /// The seat modifiers this device last set: depressed, latched, locked.
+    modifiers: [u32; 3],
 }
 
 impl State {
-    /// Make `device` the newest virtual keyboard. Its keymap is activated only
-    /// when no browser holds the input lease; during a lease the seat keymap
-    /// must stay in force for the browser's keys.
-    fn activate_virtual_keymap(&mut self, device: VirtualKeyboardDevice) {
-        let (Some(keymap), Some(keyboard)) = (device.keymap(), self.seat.get_keyboard()) else {
-            return;
-        };
-        let browser_holds_input = self.browser_holds_input;
-        let keyboards = &mut self.virtual_keyboards;
-        keyboards.devices.retain(|known| *known != device);
-        keyboards.devices.push(device);
-        keyboards
-            .seat_keymap
-            .get_or_insert_with(|| keyboard.keymap_file());
-        if browser_holds_input {
-            return;
+    fn virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) -> Option<&mut VirtualKeyboard> {
+        self.virtual_keyboards
+            .devices
+            .iter_mut()
+            .find(|known| known.device == *device)
+    }
+
+    fn add_virtual_keyboard(&mut self, device: VirtualKeyboardDevice) {
+        let client = client_state(&device);
+        if device.keymap().is_some() && client.is_none() {
+            tracing::warn!("virtual keyboard keymap does not compile; its keys are dropped");
         }
-        if let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap) {
-            tracing::warn!(%error, "virtual keyboard keymap activation failed");
+        self.virtual_keyboards.devices.push(VirtualKeyboard {
+            device,
+            client,
+            held: HashMap::new(),
+            modifiers: [0; 3],
+        });
+    }
+
+    /// A new keymap from a connected client. Keys it holds stay held on the
+    /// seat keys they pressed.
+    fn rekey_virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) {
+        let client = client_state(device);
+        if let Some(keyboard) = self.virtual_keyboard(device) {
+            keyboard.client = client;
         }
     }
 
-    /// Drop `device` and activate the keymap that applies without it: the
-    /// next newest virtual keyboard's, or the seat's own after the last.
+    /// The device is gone: release what it holds and clear the modifiers it
+    /// set, which no key release will clear.
     fn remove_virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) {
-        let browser_holds_input = self.browser_holds_input;
-        let keyboards = &mut self.virtual_keyboards;
-        let Some(index) = keyboards.devices.iter().position(|known| known == device) else {
-            return;
-        };
-        let was_active = index + 1 == keyboards.devices.len();
-        keyboards.devices.remove(index);
-        if !was_active || browser_holds_input {
-            return;
-        }
-        let keymap = match keyboards.devices.last() {
-            Some(next) => next.keymap(),
-            None => keyboards.seat_keymap.take(),
-        };
-        if let (Some(keymap), Some(keyboard)) = (keymap, self.seat.get_keyboard())
-            && let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap)
-        {
-            tracing::warn!(%error, "virtual keyboard keymap restore failed");
-        }
-    }
-
-    /// Put the seat's own keymap back for the duration of a browser lease.
-    pub(crate) fn suspend_virtual_keymap(&mut self) {
-        if self.virtual_keyboards.devices.is_empty() {
-            return;
-        }
-        let Some(keymap) = self.virtual_keyboards.seat_keymap.clone() else {
-            return;
-        };
-        if let Some(keyboard) = self.seat.get_keyboard()
-            && let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap)
-        {
-            tracing::warn!(%error, "virtual keyboard keymap suspension failed");
-        }
-    }
-
-    /// Re-activate the newest connected virtual keyboard's keymap after a
-    /// browser handback.
-    pub(crate) fn resume_virtual_keymap(&mut self) {
-        let Some(keymap) = self
+        self.disconnect_input_source(device.source());
+        let Some(index) = self
             .virtual_keyboards
             .devices
-            .last()
-            .and_then(VirtualKeyboardDevice::keymap)
+            .iter()
+            .position(|known| known.device == *device)
         else {
             return;
         };
-        if let Some(keyboard) = self.seat.get_keyboard()
-            && let Err(error) = keyboard.set_keymap_from_keymap_file(self, keymap)
-        {
-            tracing::warn!(%error, "virtual keyboard keymap resumption failed");
+        let removed = self.virtual_keyboards.devices.remove(index);
+        if removed.modifiers != [0; 3] && !self.browser_holds_input {
+            self.set_seat_modifiers([0; 3]);
+        }
+    }
+
+    /// Set the seat's modifier masks, keeping its layout, and tell the
+    /// focused client.
+    fn set_seat_modifiers(&mut self, [depressed, latched, locked]: [u32; 3]) {
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.with_xkb_state(self, |mut context| {
+                let layout = context
+                    .xkb()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_layout();
+                context.set_modifier_mask(depressed, latched, locked, layout.0);
+            });
+        }
+    }
+
+    /// Give the seat the modifiers the client holds, under the seat's names,
+    /// when they changed since this device last set them.
+    fn follow_client_modifiers(&mut self, device: &VirtualKeyboardDevice) {
+        if self.browser_holds_input {
+            return;
+        }
+        let Some(entry) = self.virtual_keyboard(device) else {
+            return;
+        };
+        let Some(client) = &entry.client else {
+            return;
+        };
+        let client_keymap = client.get_keymap();
+        let client_mods = [
+            xkb::STATE_MODS_DEPRESSED,
+            xkb::STATE_MODS_LATCHED,
+            xkb::STATE_MODS_LOCKED,
+        ]
+        .map(|component| client.serialize_mods(component));
+        let previous = entry.modifiers;
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let modifiers = keyboard.with_xkb_state(self, |context| {
+            let xkb = context
+                .xkb()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: the reference does not outlive the lock.
+            let keymap = unsafe { xkb.keymap() };
+            client_mods.map(|mask| translate_mods(mask, &client_keymap, keymap))
+        });
+        if modifiers == previous {
+            return;
+        }
+        if let Some(entry) = self.virtual_keyboard(device) {
+            entry.modifiers = modifiers;
+        }
+        self.set_seat_modifiers(modifiers);
+    }
+
+    /// Press or release the seat key with the keysym that the client's key
+    /// has, under the client's modifiers. A press sets the modifiers that
+    /// key needs only for itself, then puts the seat's back.
+    fn virtual_key(&mut self, device: &VirtualKeyboardDevice, key: u32, key_state: KeyState) {
+        let source = device.source();
+        let Some(entry) = self.virtual_keyboard(device) else {
+            return;
+        };
+        let Some(client) = &mut entry.client else {
+            if device.keymap().is_none() {
+                self.keyboard_key(source, key, key_state);
+            }
+            return;
+        };
+        let code = xkb::Keycode::new(key + 8);
+        if key_state == KeyState::Released {
+            client.update_key(code, xkb::KeyDirection::Up);
+            let keysym = client.key_get_one_sym(code);
+            if let Some(seat_key) = entry.held.remove(&key) {
+                self.keyboard_symbol_key(source, seat_key, KeyState::Released);
+            }
+            if keysym.is_modifier_key() {
+                self.follow_client_modifiers(device);
+            }
+            return;
+        }
+        if let Some(&seat_key) = entry.held.get(&key) {
+            // A repeated press of a held key.
+            self.keyboard_symbol_key(source, seat_key, KeyState::Pressed);
+            return;
+        }
+        self.virtual_key_press(device, key);
+    }
+
+    fn virtual_key_press(&mut self, device: &VirtualKeyboardDevice, key: u32) {
+        let source = device.source();
+        let Some(client) = self
+            .virtual_keyboard(device)
+            .and_then(|entry| entry.client.as_mut())
+        else {
+            return;
+        };
+        let code = xkb::Keycode::new(key + 8);
+        let keysym = client.key_get_one_sym(code);
+        let consumed = client.key_get_consumed_mods(code);
+        let client_mods = [
+            xkb::STATE_MODS_DEPRESSED,
+            xkb::STATE_MODS_LATCHED,
+            xkb::STATE_MODS_LOCKED,
+        ]
+        .map(|component| client.serialize_mods(component) & !consumed);
+        let client_keymap = client.get_keymap();
+        client.update_key(code, xkb::KeyDirection::Down);
+        if keysym == xkb::Keysym::NoSymbol {
+            tracing::debug!(key, "virtual key has no symbol in its keymap");
+            return;
+        }
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let (found, seat_mods, layout, translated) = keyboard.with_xkb_state(self, |context| {
+            let xkb = context
+                .xkb()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: the reference does not outlive the lock.
+            let keymap = unsafe { xkb.keymap() };
+            let layout = xkb.active_layout().0;
+            // SAFETY: as above.
+            let state = unsafe { xkb.state() };
+            let seat_mods = [
+                xkb::STATE_MODS_DEPRESSED,
+                xkb::STATE_MODS_LATCHED,
+                xkb::STATE_MODS_LOCKED,
+            ]
+            .map(|component| state.serialize_mods(component));
+            let translated = client_mods.map(|mask| translate_mods(mask, &client_keymap, keymap));
+            (
+                seat_key(keymap, keysym, layout),
+                seat_mods,
+                layout,
+                translated,
+            )
+        });
+        let found = found.or_else(|| {
+            let character = keysym.key_char().filter(|c| !c.is_control())?;
+            let code = self.text_keycode(character)?;
+            Some((code - 8, layout, 0))
+        });
+        let Some((seat_key, group, level)) = found else {
+            tracing::debug!(keysym = keysym.raw(), "virtual keysym has no seat key");
+            return;
+        };
+        if let Some(entry) = self.virtual_keyboard(device) {
+            entry.held.insert(key, seat_key);
+        }
+        if keysym.is_modifier_key() {
+            self.keyboard_symbol_key(source, seat_key, KeyState::Pressed);
+            self.follow_client_modifiers(device);
+            return;
+        }
+        let [depressed, latched, locked] = translated;
+        let wanted = [depressed | level, latched, locked];
+        let change = !self.browser_holds_input && (wanted != seat_mods || group != layout);
+        if change && let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.with_xkb_state(self, |mut context| {
+                context.set_modifier_mask(wanted[0], wanted[1], wanted[2], group);
+            });
+        }
+        self.keyboard_symbol_key(source, seat_key, KeyState::Pressed);
+        if change && let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.with_xkb_state(self, |mut context| {
+                context.set_modifier_mask(seat_mods[0], seat_mods[1], seat_mods[2], layout);
+            });
         }
     }
 }
@@ -166,20 +407,17 @@ impl VirtualKeyboardHandler for State {
                     device.client(),
                 );
                 self.register_agent_source(device.source());
-                self.activate_virtual_keymap(device);
+                self.add_virtual_keyboard(device);
             }
             InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
-                self.activate_virtual_keymap(device);
+                self.rekey_virtual_keyboard(&device);
             }
             InputEvent::DeviceRemoved { device } => {
-                // Release held keys while the device's keymap is still active.
-                self.disconnect_input_source(device.source());
                 self.remove_virtual_keyboard(&device);
             }
             InputEvent::Keyboard { event } => {
-                // The event's key code is the protocol key plus the XKB offset;
-                // the shared entry point expects the evdev key. Codes below the
-                // offset are not keys, as in the EI adapter.
+                // The event's key code is the protocol key plus the XKB offset.
+                // Codes below the offset are not keys, as in the EI adapter.
                 let Some(key) = u32::from(event.key_code()).checked_sub(8) else {
                     tracing::debug!(
                         key_code = u32::from(event.key_code()),
@@ -187,7 +425,7 @@ impl VirtualKeyboardHandler for State {
                     );
                     return;
                 };
-                self.keyboard_key(event.device().source(), key, event.state());
+                self.virtual_key(&event.device(), key, event.state());
             }
             InputEvent::Special(VirtualKeyboardSpecialEvent::Modifiers {
                 device,
@@ -197,13 +435,22 @@ impl VirtualKeyboardHandler for State {
                 group,
                 ..
             }) => {
-                self.keyboard_modifiers(
-                    device.source(),
-                    mods_depressed,
-                    mods_latched,
-                    mods_locked,
-                    group,
-                );
+                let Some(entry) = self.virtual_keyboard(&device) else {
+                    return;
+                };
+                match &mut entry.client {
+                    Some(client) => {
+                        client.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                        self.follow_client_modifiers(&device);
+                    }
+                    None => self.keyboard_modifiers(
+                        device.source(),
+                        mods_depressed,
+                        mods_latched,
+                        mods_locked,
+                        group,
+                    ),
+                }
             }
             // This backend only produces keyboard events.
             InputEvent::PointerMotion { .. }
@@ -236,7 +483,6 @@ impl VirtualKeyboardHandler for State {
 mod tests {
     use std::io::Write;
     use std::os::fd::AsFd;
-    use std::os::unix::fs::FileExt;
 
     use smithay::input::keyboard::xkb;
     use smithay::reexports::wayland_server::Display;
@@ -346,9 +592,10 @@ mod tests {
         keyboard
     }
 
-    #[test]
-    fn a_browser_lease_swaps_the_virtual_keymap_out_and_back() {
-        let (mut display, mut state) = crate::tests::test_state();
+    fn connect(
+        display: &mut Display<State>,
+        state: &mut State,
+    ) -> (Connection, EventQueue<App>, App) {
         let (client_socket, server_socket) =
             std::os::unix::net::UnixStream::pair().expect("socket pair");
         display
@@ -360,148 +607,61 @@ mod tests {
             .expect("insert client");
         let connection = Connection::from_socket(client_socket).expect("client connection");
         let mut queue: EventQueue<App> = connection.new_event_queue();
-        let qh = queue.handle();
         let mut app = App::default();
-        connection.display().get_registry(&qh, ());
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-
-        let keymap_id = |state: &State| {
-            state
-                .seat
-                .get_keyboard()
-                .expect("seat keyboard")
-                .keymap_file()
-                .id()
-        };
-        let seat_keymap = keymap_id(&state);
-        let keyboard = keyboard_with_keymap(&app, &qh, "de", false);
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        let virtual_keymap = keymap_id(&state);
-        assert_ne!(virtual_keymap, seat_keymap);
-
-        state.set_browser_lease(true);
-        assert_eq!(
-            keymap_id(&state),
-            seat_keymap,
-            "a browser lease uses the seat's own keymap"
-        );
-
-        state.set_browser_lease(false);
-        assert_eq!(
-            keymap_id(&state),
-            virtual_keymap,
-            "handback restores the connected virtual keyboard's keymap"
-        );
-
-        keyboard.destroy();
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert_eq!(
-            keymap_id(&state),
-            seat_keymap,
-            "the seat keymap still returns after the keyboard leaves"
-        );
-    }
-
-    #[test]
-    fn the_seat_keymap_returns_after_overlapping_virtual_keyboards_leave() {
-        let (mut display, mut state) = crate::tests::test_state();
-        let (client_socket, server_socket) =
-            std::os::unix::net::UnixStream::pair().expect("socket pair");
-        display
-            .handle()
-            .insert_client(
-                server_socket,
-                std::sync::Arc::new(crate::shell::ClientState::default()),
-            )
-            .expect("insert client");
-        let connection = Connection::from_socket(client_socket).expect("client connection");
-        let mut queue: EventQueue<App> = connection.new_event_queue();
-        let qh = queue.handle();
-        let mut app = App::default();
-        connection.display().get_registry(&qh, ());
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-
-        let keymap_id = |state: &State| {
-            state
-                .seat
-                .get_keyboard()
-                .expect("seat keyboard")
-                .keymap_file()
-                .id()
-        };
-        let seat_keymap = keymap_id(&state);
-
-        let first = keyboard_with_keymap(&app, &qh, "de", false);
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        let second = keyboard_with_keymap(&app, &qh, "fr", false);
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        let second_keymap = keymap_id(&state);
-        assert_ne!(
-            second_keymap, seat_keymap,
-            "the newest keyboard's keymap is active"
-        );
-
-        // The older keyboard leaving must not disturb the one still typing.
-        first.destroy();
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert_eq!(keymap_id(&state), second_keymap);
-
-        second.destroy();
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert_eq!(
-            keymap_id(&state),
-            seat_keymap,
-            "the seat keymap is restored"
-        );
+        connection.display().get_registry(&queue.handle(), ());
+        round_trip(display, state, &connection, &mut queue, &mut app);
+        (connection, queue, app)
     }
 
     /// `wtype` counts the keymap's NUL terminator in its size, which
-    /// libxkbcommon before 1.6 refuses to compile from a buffer.
+    /// libxkbcommon before 1.6 refuses to compile from a buffer. The keymap
+    /// still decodes the keys, and they arrive as the seat's keys: the key a
+    /// German keymap has `z` on presses the seat's Z key.
     #[test]
-    fn a_keymap_size_counting_its_nul_terminator_activates() {
+    fn a_keymap_size_counting_its_nul_terminator_types_on_the_seat_keymap() {
         let (mut display, mut state) = crate::tests::test_state();
-        let (client_socket, server_socket) =
-            std::os::unix::net::UnixStream::pair().expect("socket pair");
-        display
-            .handle()
-            .insert_client(
-                server_socket,
-                std::sync::Arc::new(crate::shell::ClientState::default()),
-            )
-            .expect("insert client");
-        let connection = Connection::from_socket(client_socket).expect("client connection");
-        let mut queue: EventQueue<App> = connection.new_event_queue();
+        let (connection, mut queue, mut app) = connect(&mut display, &mut state);
         let qh = queue.handle();
-        let mut app = App::default();
-        connection.display().get_registry(&qh, ());
+        let seat_keymap = state
+            .seat
+            .get_keyboard()
+            .expect("keyboard")
+            .keymap_file()
+            .id();
+        let keyboard = keyboard_with_keymap(&app, &qh, "de", true);
+        keyboard.key(0, 21, 1);
         round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-
-        let keymap = |state: &State| {
-            state
-                .seat
-                .get_keyboard()
-                .expect("seat keyboard")
-                .keymap_file()
-        };
-        let seat_keymap = keymap(&state).id();
-        let _keyboard = keyboard_with_keymap(&app, &qh, "de", true);
-        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-        let active = keymap(&state);
-        assert_ne!(
-            active.id(),
+        let seat = state.seat.get_keyboard().expect("keyboard");
+        assert_eq!(
+            seat.keymap_file().id(),
             seat_keymap,
-            "the virtual keyboard's keymap is active"
+            "the seat keeps its keymap"
         );
-        let mut german = None;
-        active
-            .with_fd(false, |fd, size| {
-                let mut text = vec![0; size];
-                std::fs::File::from(fd.try_clone_to_owned().expect("keymap fd"))
-                    .read_exact_at(&mut text, 0)
-                    .expect("keymap read");
-                german = Some(String::from_utf8_lossy(&text).contains("German"));
-            })
-            .expect("keymap file");
-        assert_eq!(german, Some(true), "the active keymap is the uploaded one");
+        assert!(
+            seat.pressed_keys().contains(&(44u32 + 8).into()),
+            "Z is down"
+        );
+        assert!(
+            !seat.pressed_keys().contains(&(21u32 + 8).into()),
+            "Y is not"
+        );
+    }
+
+    /// Modifiers a client sets with the `modifiers` request reach the seat
+    /// under the seat's names, and end when the keyboard goes away.
+    #[test]
+    fn client_modifiers_reach_the_seat_and_end_with_the_keyboard() {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect(&mut display, &mut state);
+        let qh = queue.handle();
+        let keyboard = keyboard_with_keymap(&app, &qh, "us", false);
+        // Control, as `wtype -M ctrl` sends it.
+        keyboard.modifiers(4, 0, 0, 0);
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let seat = state.seat.get_keyboard().expect("keyboard");
+        assert!(seat.modifier_state().ctrl);
+        keyboard.destroy();
+        round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
+        assert!(!seat.modifier_state().ctrl);
     }
 }

@@ -961,28 +961,29 @@ def _(d, session, c):
     d("computer", action="key", text="ctrl+s")
 
 
-# Known failures on main. Each names its cause; see README.
+# Text typed through a Wayland virtual keyboard into Chromium (ROADMAP Pass 2
+# item 4). wtype puts a string's characters on evdev codes 1, 2, 3 and so on,
+# and Chromium reads those positions: `:` landed on Backspace.
 
 PUNCTUATION = 'a?b(c)d!e:f"g{h}i<j>k_l+m~n'
+# Blank fields are not part of a submission; terms stays unchecked.
+TYPELOSS_FORM = expect_submission("form", name=f"TL1 {PUNCTUATION}", plan="Basic")
 
 
-@cell(
-    "typeloss",
-    "cul-patched",
-    1,
-    "2181-2193",
-    # Blank fields are not part of a submission; terms stays unchecked.
-    expect_submission("form", name=f"TL1 {PUNCTUATION}", plan="Basic"),
-    setup=form_start,
-    known=dict.fromkeys(
-        ("bookworm", "trixie"),
-        "Wayland virtual-keyboard text loses characters in Chromium (ROADMAP Pass 2 item 4); "
-        "waywire's own NotifyKeyboardKeysym path types it intact",
-    ),
-)
+@cell("typeloss", "cul-patched", 1, "2181-2193", TYPELOSS_FORM, setup=form_start)
 def _(d, session, c):
     d("click", **xy(c.page.at("name")))
     d("type_text", text=f"TL1 {PUNCTUATION}\n")
+
+
+def focused_form_start(session, cell):
+    form_start(session, cell, "/form?focus=name")
+
+
+@cell("typeloss", "wtype", 1, "-", TYPELOSS_FORM, setup=focused_form_start)
+def _(d, session, c):
+    # Debian's wtype, which cua-driver and computer-use-linux run for text.
+    session.run("wtype", f"TL1 {PUNCTUATION}\n")
 
 
 def screencopy_check(session, cell):

@@ -11,6 +11,10 @@ use smithay::utils::SERIAL_COUNTER;
 
 use crate::State;
 
+/// The XKB codes of the RO and YEN keys: character keys of real keyboards
+/// that layouts without them leave empty.
+const CHARACTER_KEYS: [u32; 2] = [89 + 8, 124 + 8];
+
 #[derive(Default)]
 pub(crate) struct TextKeyboard {
     pub(crate) pending: VecDeque<String>,
@@ -29,8 +33,10 @@ struct Slot {
 }
 
 impl TextKeyboard {
-    fn assign(&mut self, text: &str, wayland: bool) -> (Vec<u32>, bool) {
-        let eligible = |slot: &Slot| (slot.code > 255) == wayland;
+    /// Spare keycodes, among those `usable` allows, that type `text`, and
+    /// whether the keymap has to change for them.
+    fn assign(&mut self, text: &str, usable: impl Fn(u32) -> bool) -> (Vec<u32>, bool) {
+        let eligible = |slot: &Slot| usable(slot.code);
         let capacity = self.slots.iter().filter(|slot| eligible(slot)).count();
         let mut characters = HashSet::new();
         for character in text.chars() {
@@ -195,18 +201,44 @@ impl State {
         self.install_text_keymap();
     }
 
-    pub(crate) fn flush_text_keyboard(&mut self) {
-        let Some(keyboard) = self.seat.get_keyboard() else {
-            return;
-        };
-        if !keyboard.pressed_keys().is_empty() || self.text_keyboard.pending.is_empty() {
-            return;
-        }
-        if self
-            .text_keyboard
-            .installed
-            .is_some_and(|id| keyboard.keymap_file().id() != id)
+    /// A seat keycode whose first level types `character`, holding it in a
+    /// spare keycode. Installs the keymap when the character is new to it.
+    ///
+    /// Chromium drops key codes that no real keyboard has, such as the
+    /// Wayland spare keycodes above 255, so Wayland clients get the RO and
+    /// YEN keys of Japanese keyboards when the seat's layout leaves them
+    /// empty, as US and most European layouts do. X11 clients keep the larger
+    /// pool, because they can decode a key with a mapping that replaced it.
+    pub(crate) fn text_keycode(&mut self, character: char) -> Option<u32> {
+        let keyboard = self.seat.get_keyboard()?;
+        self.prepare_text_keyboard(keyboard.keymap_file().id());
+        let wayland = matches!(
+            keyboard.current_focus(),
+            Some(crate::focus::KeyboardFocus::Wayland(_))
+        );
+        let real_key = |code| CHARACTER_KEYS.contains(&code);
+        let usable: &dyn Fn(u32) -> bool = if wayland
+            && self
+                .text_keyboard
+                .slots
+                .iter()
+                .any(|slot| real_key(slot.code))
         {
+            &real_key
+        } else {
+            &|code| (code > 255) == wayland
+        };
+        let (codes, changed) = self.text_keyboard.assign(&character.to_string(), usable);
+        if changed && !self.install_text_keymap() {
+            return None;
+        }
+        codes.first().copied()
+    }
+
+    /// Start over from the seat's keymap when something else replaced the
+    /// one this installed.
+    fn prepare_text_keyboard(&mut self, active: KeymapFileId) {
+        if self.text_keyboard.installed.is_some_and(|id| active != id) {
             self.text_keyboard.base = None;
             self.text_keyboard.installed = None;
             self.text_keyboard.slots.clear();
@@ -214,12 +246,24 @@ impl State {
         if self.text_keyboard.base.is_none() {
             self.init_text_keyboard();
         }
+    }
+
+    pub(crate) fn flush_text_keyboard(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if !keyboard.pressed_keys().is_empty() || self.text_keyboard.pending.is_empty() {
+            return;
+        }
+        self.prepare_text_keyboard(keyboard.keymap_file().id());
         let wayland = matches!(
             keyboard.current_focus(),
             Some(crate::focus::KeyboardFocus::Wayland(_))
         );
         while let Some(text) = self.text_keyboard.pending.pop_front() {
-            let (codes, changed) = self.text_keyboard.assign(&text, wayland);
+            let (codes, changed) = self
+                .text_keyboard
+                .assign(&text, |code| (code > 255) == wayland);
             if changed && !self.install_text_keymap() {
                 return;
             }

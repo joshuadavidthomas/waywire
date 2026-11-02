@@ -103,15 +103,19 @@ Two cells differ from their recorded calls:
 
 ### Bug regressions
 
-Two cells check bugs the dogfood run found, outside any task:
+These cells check bugs the dogfood run found, outside any task:
 
 | Cell                       | Ground truth                                                                                                                                                                        |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `screencopy-destroy/probe` | A wlr-screencopy client captures a frame, destroys it after `ready`, and its connection survives two round trips (fixed in `71e4772`).                                              |
 | `chip-leak/probe`          | After the dogfood repro (`chipleak4.sh`: 15 `foot` clients killed with SIGKILL while mapped), the taskbar pixels and the toplevel count equal the ones before (fixed in `ffa52c6`). |
+| `typeloss/cul-patched`     | Patched computer-use-linux clicks the T1 form's name field and types `TL1 a?b(c)d!e:f"g{h}i<j>k_l+m~n` and Enter; exactly one `form` submission has that name.                      |
+| `typeloss/wtype`           | Debian's `wtype` types the same line and Enter into the same field, focused by the page; exactly one `form` submission has that name.                                               |
 
-`T2/cul-stock/r3` covers the third: a click right after the GTK file chooser
-closes must land where it was sent (fixed in `86cd002`).
+`T2/cul-stock/r3` covers another: a click right after the GTK file chooser
+closes must land where it was sent (fixed in `86cd002`). Both `typeloss` cells
+fail at `207e2be` with `d!f` for `d!e:f`: wtype put `:` on Backspace's key code
+(ROADMAP Pass 2, item 4).
 
 ### Known failures
 
@@ -120,10 +124,9 @@ bug. It reports `XFAIL` and does not fail the run. When the bug is fixed the
 cell reports `XPASS`, which does fail the run: remove the cause in the same
 change.
 
-| Cell                   | Distro    | Cause                                                                                                                                                                                                                       |
-| ---------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `T2/x11demo/r2`        | Debian 13 | GTK 4.18's file chooser location bar inserts its inline completion while xdotool is still typing, so the path becomes `t2-x11demo-r2.txtxt`. The dogfood run hit it in `T2/x11demo/r1`; it fails the same way at `0548b28`. |
-| `typeloss/cul-patched` | both      | Text typed through a Wayland virtual keyboard loses characters in Chromium (ROADMAP Pass 2, item 4). waywire's `NotifyKeyboardKeysym` path types it intact.                                                                 |
+| Cell            | Distro    | Cause                                                                                                                                                                                                                       |
+| --------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `T2/x11demo/r2` | Debian 13 | GTK 4.18's file chooser location bar inserts its inline completion while xdotool is still typing, so the path becomes `t2-x11demo-r2.txtxt`. The dogfood run hit it in `T2/x11demo/r1`; it fails the same way at `0548b28`. |
 
 Flaky dogfood cells are not replayed: batched T2 and T6a sequences without the
 learned sleeps, whose outcome depends on timing in the application.

@@ -259,6 +259,8 @@ mod tests {
     use wayland_protocols::xdg::shell::client::xdg_surface::XdgSurface;
     use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
     use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
+    use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+    use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
     use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::State as WlrState;
     use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1;
     use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::{
@@ -289,6 +291,13 @@ mod tests {
         managed: Vec<ManagedToplevelEvents>,
         close_requests: usize,
         keys: Vec<u32>,
+        /// Every keymap the client's keyboard received, as text.
+        keymaps: Vec<String>,
+        /// The latest `wl_keyboard.modifiers`: depressed, latched, locked, group.
+        modifiers: [u32; 4],
+        /// Each pressed key with the modifiers and keymap in force for it.
+        presses: Vec<(u32, [u32; 4], usize)>,
+        virtual_keyboards: Option<ZwpVirtualKeyboardManagerV1>,
         pointer_focus: Option<WlSurface>,
         pointer_serial: Option<u32>,
         button_targets: Vec<WlSurface>,
@@ -403,6 +412,9 @@ mod tests {
                     "zwp_text_input_manager_v3" => {
                         state.text_inputs = Some(registry.bind(name, 1, qh, ()));
                     }
+                    "zwp_virtual_keyboard_manager_v1" => {
+                        state.virtual_keyboards = Some(registry.bind(name, 1, qh, ()));
+                    }
                     _ => {}
                 }
             }
@@ -514,6 +526,8 @@ mod tests {
     }
 
     wayland_client::delegate_noop!(App: ignore WlSeat);
+    wayland_client::delegate_noop!(App: ZwpVirtualKeyboardManagerV1);
+    wayland_client::delegate_noop!(App: ZwpVirtualKeyboardV1);
     wayland_client::delegate_noop!(App: ignore XdgPositioner);
     wayland_client::delegate_noop!(App: ignore ZwpPointerConstraintsV1);
     wayland_client::delegate_noop!(App: ignore ZwpRelativePointerManagerV1);
@@ -596,8 +610,38 @@ mod tests {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            if let wayland_client::protocol::wl_keyboard::Event::Key { key, .. } = event {
-                state.keys.push(key);
+            use wayland_client::protocol::wl_keyboard::Event;
+            use wayland_client::protocol::wl_keyboard::KeyState;
+            match event {
+                Event::Key {
+                    key,
+                    state: key_state,
+                    ..
+                } => {
+                    state.keys.push(key);
+                    if key_state == wayland_client::WEnum::Value(KeyState::Pressed) {
+                        state
+                            .presses
+                            .push((key, state.modifiers, state.keymaps.len() - 1));
+                    }
+                }
+                Event::Keymap { fd, size, .. } => {
+                    use std::os::unix::fs::FileExt;
+                    let mut text = vec![0; usize::try_from(size).expect("keymap size")];
+                    std::fs::File::from(fd)
+                        .read_exact_at(&mut text, 0)
+                        .expect("keymap read");
+                    let text = String::from_utf8_lossy(&text);
+                    state.keymaps.push(text.trim_end_matches('\0').to_owned());
+                }
+                Event::Modifiers {
+                    mods_depressed,
+                    mods_latched,
+                    mods_locked,
+                    group,
+                    ..
+                } => state.modifiers = [mods_depressed, mods_latched, mods_locked, group],
+                Event::Enter { .. } | Event::Leave { .. } | Event::RepeatInfo { .. } | _ => {}
             }
         }
     }
@@ -4407,6 +4451,213 @@ mod tests {
             nowhere.iter().map(|r| r.delivery).collect::<Vec<_>>(),
             ["nowhere", "nowhere"]
         );
+    }
+
+    /// A keymap the way `wtype` builds one for `text`: one key per distinct
+    /// character, numbered from evdev code 1 in order of appearance.
+    fn wtype_keymap(text: &str) -> (Vec<char>, String) {
+        use std::fmt::Write;
+
+        use smithay::input::keyboard::xkb;
+        let mut characters: Vec<char> = Vec::new();
+        for character in text.chars() {
+            if !characters.contains(&character) {
+                characters.push(character);
+            }
+        }
+        let mut keymap = format!(
+            "xkb_keymap {{\nxkb_keycodes \"(unnamed)\" {{\nminimum = 8;\nmaximum = {};\n",
+            characters.len() + 9
+        );
+        for index in 1..=characters.len() {
+            writeln!(keymap, "<K{index}> = {};", index + 8).expect("string write");
+        }
+        keymap += "};\nxkb_types \"(unnamed)\" { include \"complete\" };\n";
+        keymap += "xkb_compatibility \"(unnamed)\" { include \"complete\" };\n";
+        keymap += "xkb_symbols \"(unnamed)\" {\n";
+        for (index, character) in characters.iter().enumerate() {
+            let keysym = xkb::utf32_to_keysym(u32::from(*character));
+            let name = xkb::keysym_get_name(keysym);
+            writeln!(keymap, "key <K{}> {{[{name}]}};", index + 1).expect("string write");
+        }
+        keymap += "};\n};\n";
+        (characters, keymap)
+    }
+
+    /// Upload `keymap` to `keyboard`, with the NUL terminator `wtype` counts.
+    fn upload_keymap(keyboard: &ZwpVirtualKeyboardV1, keymap: &str) {
+        use std::io::Write;
+        let mut file = tempfile::tempfile().expect("keymap file");
+        file.write_all(keymap.as_bytes()).expect("keymap written");
+        file.write_all(b"\0").expect("keymap terminated");
+        let size = u32::try_from(keymap.len() + 1).expect("keymap length fits");
+        keyboard.keymap(1, file.as_fd(), size);
+    }
+
+    /// The text a client reads from its presses with the keymaps and
+    /// modifiers it received.
+    fn typed_text(app: &App) -> String {
+        use smithay::input::keyboard::xkb;
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        app.presses
+            .iter()
+            .map(|(key, [depressed, latched, locked, group], keymap)| {
+                let keymap = xkb::Keymap::new_from_string(
+                    &context,
+                    app.keymaps[*keymap].clone(),
+                    xkb::KEYMAP_FORMAT_TEXT_V1,
+                    xkb::KEYMAP_COMPILE_NO_FLAGS,
+                )
+                .expect("received keymap compiles");
+                let mut state = xkb::State::new(&keymap);
+                state.update_mask(*depressed, *latched, *locked, 0, 0, *group);
+                state.key_get_utf8(xkb::Keycode::new(key + 8))
+            })
+            .collect()
+    }
+
+    /// A client with a focused window that records its keyboard events, and
+    /// a virtual keyboard on the same connection.
+    fn typing_client() -> (
+        smithay::reexports::wayland_server::Display<crate::State>,
+        crate::State,
+        Connection,
+        EventQueue<App>,
+        App,
+        ZwpVirtualKeyboardV1,
+    ) {
+        let (mut display, mut state) = crate::tests::test_state();
+        let (connection, mut queue, mut app) = connect_client(&mut display.handle());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let seat = app.seat.clone().expect("seat bound");
+        let _client_keyboard = seat.get_keyboard(&queue.handle(), ());
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        map_toplevel(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            "Registration form",
+            "chromium",
+        );
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        let keyboard = app
+            .virtual_keyboards
+            .as_ref()
+            .expect("virtual keyboard manager bound")
+            .create_virtual_keyboard(&seat, &queue.handle(), ());
+        (display, state, connection, queue, app, keyboard)
+    }
+
+    /// `wtype` puts each string's characters on evdev codes 1, 2, 3 and so on,
+    /// which are Escape, the digit row, Backspace, Tab and Control on a real
+    /// keyboard. Chromium acts on those positions: in this line `:` lands on
+    /// Backspace and erases the `e` before it. The client must see the keys a
+    /// US keyboard would press, on the seat's keymap, with one receipt each.
+    #[test]
+    fn virtual_keyboard_text_reaches_the_client_on_the_seat_keymap() {
+        use crate::delivery::InputKind;
+        use crate::delivery::SourceKind;
+        let (mut display, mut state, connection, mut queue, mut app, keyboard) = typing_client();
+        let identifier = app.handles[0].identifier.clone();
+        let (outgoing, received) = std::sync::mpsc::channel();
+        state.delivery.set_outgoing(outgoing);
+        state
+            .delivery
+            .subscribe("agent".into(), Some(std::process::id()));
+        assert_eq!(app.keymaps.len(), 1, "the seat keymap on focus");
+
+        let line = "TL1 a?b(c)d!e:f\"g{h}i<j>k_l+m~n";
+        let (characters, keymap) = wtype_keymap(line);
+        assert_eq!(characters.iter().position(|c| *c == ':'), Some(13));
+        upload_keymap(&keyboard, &keymap);
+        for character in line.chars() {
+            let index = characters.iter().position(|c| *c == character);
+            let key = u32::try_from(index.expect("mapped") + 1).expect("key fits");
+            keyboard.key(0, key, 1);
+            keyboard.key(0, key, 0);
+        }
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        assert_eq!(typed_text(&app), line);
+        assert_eq!(app.keymaps.len(), 1, "the client keeps the seat keymap");
+        // A US keyboard types "a?b(c)d!e:f" with these keys; Shift is 1.
+        let typed: Vec<(u32, u32)> = app.presses[4..15]
+            .iter()
+            .map(|(key, [depressed, ..], _)| (*key, *depressed))
+            .collect();
+        assert_eq!(
+            typed,
+            [
+                (30, 0),
+                (53, 1),
+                (48, 0),
+                (10, 1),
+                (46, 0),
+                (11, 1),
+                (32, 0),
+                (2, 1),
+                (18, 0),
+                (39, 1),
+                (33, 0)
+            ]
+        );
+        assert!(
+            !app.keys.contains(&14),
+            "no key arrives on Backspace's position"
+        );
+
+        let signals: Vec<_> = sent(&received)
+            .into_iter()
+            .map(|message| message.signal)
+            .collect();
+        let receipts = receipts(&signals);
+        assert_eq!(
+            receipts.len(),
+            2 * line.chars().count(),
+            "one receipt per key event"
+        );
+        assert!(receipts.iter().all(|receipt| {
+            receipt.source == SourceKind::VirtualKeyboard
+                && receipt.delivery == "window"
+                && receipt
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.id == identifier)
+        }));
+        assert_eq!(receipts[0].input, InputKind::Key { pressed: true });
+        assert_eq!(receipts[1].input, InputKind::Key { pressed: false });
+    }
+
+    /// `wtype -M ctrl c -m ctrl` reaches the client as Control+C, and a
+    /// character the seat's US keymap lacks arrives on a key Chromium keeps.
+    #[test]
+    fn virtual_keyboard_chords_and_foreign_characters_use_seat_keys() {
+        let (mut display, mut state, connection, mut queue, mut app, keyboard) = typing_client();
+        upload_keymap(&keyboard, &wtype_keymap("c").1);
+        keyboard.modifiers(4, 0, 0, 0);
+        keyboard.key(0, 1, 1);
+        keyboard.key(0, 1, 0);
+        keyboard.modifiers(0, 0, 0, 0);
+        upload_keymap(&keyboard, &wtype_keymap("é").1);
+        keyboard.key(0, 1, 1);
+        keyboard.key(0, 1, 0);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+        sync(&mut display, &mut state, &connection, &mut queue, &mut app);
+
+        let (key, [depressed, ..], _) = app.presses[0];
+        assert_eq!((key, depressed), (46, 4), "Control+C on the C key");
+        assert_eq!(typed_text(&app), "\u{3}é", "Control+C, then é");
+        assert_eq!(
+            app.presses.last().map(|press| press.0),
+            Some(89),
+            "é is on the RO key; Chromium drops key codes above 255"
+        );
+        let seat = state.seat.get_keyboard().expect("keyboard");
+        assert!(!seat.modifier_state().ctrl, "Control ends with the chord");
     }
 
     #[test]

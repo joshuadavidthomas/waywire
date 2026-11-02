@@ -895,20 +895,38 @@ impl State {
             for source in sources {
                 self.release_input(source);
             }
-            self.release_input(KeyboardSource::MAIN);
-            self.suspend_virtual_keymap();
-        } else {
-            self.release_input(KeyboardSource::MAIN);
-            self.resume_virtual_keymap();
         }
+        self.release_input(KeyboardSource::MAIN);
         self.dropped_agent_sources.clear();
         self.toplevel_list.lease_changed();
         self.publish_agent_input();
     }
 
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
+        self.keyboard_key_inner(source, key, state, true);
+    }
+
+    /// A key the compositor picked for its symbol, such as a spare keycode
+    /// that holds the character a virtual keyboard typed: pressing it keeps
+    /// that character.
+    pub(crate) fn keyboard_symbol_key(
+        &mut self,
+        source: KeyboardSource,
+        key: u32,
+        state: KeyState,
+    ) {
+        self.keyboard_key_inner(source, key, state, false);
+    }
+
+    fn keyboard_key_inner(
+        &mut self,
+        source: KeyboardSource,
+        key: u32,
+        state: KeyState,
+        reclaim: bool,
+    ) {
         let serial = self.begin_input(source, delivery::FocusCause::Key);
-        let (target, text_field) = self.dispatch_key(source, key, state);
+        let (target, text_field) = self.dispatch_key(source, key, state, reclaim);
         let input = delivery::InputKind::Key {
             pressed: state == KeyState::Pressed,
         };
@@ -921,6 +939,7 @@ impl State {
         source: KeyboardSource,
         key: u32,
         state: KeyState,
+        reclaim: bool,
     ) -> (delivery::Target, Option<delivery::TextField>) {
         use delivery::Chrome;
         use delivery::Target;
@@ -982,7 +1001,7 @@ impl State {
                 None,
             );
         }
-        if state == KeyState::Pressed {
+        if reclaim && state == KeyState::Pressed {
             self.reclaim_text_keycode(key + 8);
         }
         let (target, text_field) = if self.delivery.wanted(source) {

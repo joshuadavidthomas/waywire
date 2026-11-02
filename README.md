@@ -42,6 +42,10 @@ is on the desktop's session bus and is described in
 [docs/input-delivery.md](docs/input-delivery.md); `tools/receipts/receipts.py`
 prints it, `receipts.py --windows` prints the window list, and
 `receipts.py --settle` times how long the screen takes to settle.
+Text that a driver types through a virtual keyboard, as `wtype` does,
+reaches applications as keys of the desktop's own keymap, so Chromium gets the
+keys a real keyboard would send; see
+[Typing text](docs/input-delivery.md#typing-text).
 
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while

@@ -395,13 +395,49 @@ Backed, most important first:
      - No driver calls it yet. cua-driver and computer-use-linux would call it after each
        action, before their screenshot, in place of their sleeps; offering that upstream is the
        next step.
-4. **Text input through the compositor's keymap.**
+4. **Text input through the compositor's keymap.** Done; see
+   [`docs/input-delivery.md`](docs/input-delivery.md#typing-text).
    - **Measured cost.** wtype and cua type through per-string virtual keyboards, and Chromium
      drops characters from them. A punctuation-heavy line came back wrong 10 times out of 10 on
      waywire and on Waymote, and correct 10 times out of 10 with xdotool on X11.
-   - **What already works.** waywire's RemoteDesktop `NotifyKeyboardKeysym` typed the same
-     line correctly 5 times out of 5. Drivers should use that path or EIS for text. The agent
-     endpoint should offer only that path.
+   - **Cause.** wtype uploads a keymap per string and numbers its distinct characters from
+     evdev code 1, in order of appearance; cua-driver and patched computer-use-linux type
+     through wtype. Those codes are the positions of Escape, the digit row, Backspace, Tab,
+     Control and the F keys, and the compositor passed them through with wtype's keymap.
+     Chromium takes a key's DOM `code`, `keyCode` and editing commands from the position. In
+     `TL1 a?b(c)d!e:f"g{h}i<j>k_l+m~n`, `:` is the 14th distinct character, on Backspace, and
+     erased the `e` before it in 10 of 10 runs; moving `:` to 14th place in another string
+     erased whatever preceded it. An all-ASCII string also lost characters on Escape,
+     ControlLeft and F1, and one on F5 reloaded the page. A Wayland protocol trace of Chromium
+     showed wtype's keymap arriving before every key, no modifiers and no key repeat, so it was
+     not a keymap race, a missing keysym, modifier state or repeat.
+   - **What shipped.** The compositor no longer activates a virtual keyboard's keymap. It
+     decodes each key with the client's keymap and modifiers, and presses the key that has the
+     same keysym in the seat's keymap, with the Shift or AltGr its level needs as modifier
+     state, as a real keyboard would. Characters the seat's keymap lacks go on its empty RO and
+     YEN keys for Wayland clients, because Chromium drops key codes above 255, and on the spare
+     keycode pool for X11 clients. wtype, cua-driver and computer-use-linux type correctly with
+     no driver change, and each key the driver sends still gets one receipt.
+   - **Proof.** A unit test types the line through a wtype-style keymap and decodes what the
+     client receives with the keymap the client has: the keys are a US keyboard's, `:` is
+     Shift+`;`, nothing lands on Backspace, and each key gets one receipt. It fails without the
+     change. `typeloss/cul-patched`, no longer a known failure, and a new `typeloss/wtype` cell,
+     which types the line with Debian's wtype, passed 5 of 5 suite runs on Debian 12 and 13; with
+     the change reverted both submit `d!f` for `d!e:f`. In the orb, wtype typed the line
+     correctly 10 of 10 times into Chromium and all of printable ASCII intact, typed `é€ü` and
+     Greek into Chromium, foot and xterm, and `wtype -M ctrl a` selected all.
+   - **What remains.**
+     - Chromium drops characters outside the Basic Multilingual Plane, such as emoji, typed as
+       keys, as it did before.
+     - Only two empty character keys exist under a US layout, so text with many characters
+       outside the seat's keymap changes the keymap often. A layout that uses RO and YEN, such
+       as Japanese, falls back to key codes above 255, which Chromium drops.
+     - A modifier a driver sets that the keysym does not consume applies on the seat's key:
+       `wtype -M shift 1` types `!`, as on a real keyboard, not `1` with Shift held.
+     - Other compositors still pass a virtual keyboard's codes through, so drivers that want
+       the same result everywhere should type keysyms through the RemoteDesktop portal's
+       `NotifyKeyboardKeysym`, which typed the line correctly 5 times out of 5 before this
+       change, or EIS. The agent endpoint should offer only that path.
 
 Not a goal on its own:
 
@@ -498,10 +534,9 @@ upstream code to local copies of it.
   `crates/compositor/src/virtual_pointer.rs` now adapts upstream
   `wayland::virtual_pointer` events to the seat's input entry points instead of
   porting the protocol by hand. Virtual keyboards likewise route through
-  upstream's `VirtualKeyboardHandler`; the newest virtual keyboard's keymap is
-  active on the seat, the seat's own keymap is used for browser keys while a
-  browser holds the input lease, and the newest virtual keyboard's keymap
-  returns on handback if it is still connected. Upstream's
+  upstream's `VirtualKeyboardHandler`; the compositor reads each key's keysym
+  from the client's keymap and presses the seat key that has it, so the seat's
+  keymap stays active (Pass 2 item 4). Upstream's
   new Xwayland spawn variant, `spawn_with_inherited_env`, only controls
   environment inheritance and still has no pre-exec hook, so the signal-mask
   workaround around `XWayland::spawn` stays.

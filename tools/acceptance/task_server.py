@@ -42,6 +42,7 @@ FORM = f"""<!doctype html><title>Registration form</title>{STYLE}
 </form>
 <script>
 const p=new URLSearchParams(location.search);
+if(p.get('focus'))addEventListener('load',()=>document.getElementById(p.get('focus')).focus());
 if(p.get('interrupt')){{let fired=false;document.getElementById('phone').addEventListener('focus',()=>{{if(!fired){{fired=true;setTimeout(()=>alert('Session expiring soon. Click OK to continue.'),300)}}}})}}
 </script>{LAYOUT}"""
 
