@@ -1,9 +1,10 @@
 # Input delivery receipts and focus events
 
-Version 2. A driver that injects input learns, for each key, button, scroll and
+Version 3. A driver that injects input learns, for each key, button, scroll and
 text event, which window received it. It also learns when keyboard focus moves
-and when windows appear, and it can list every window with its bounds on
-screen, its place in the stacking order and its state. Any compositor that
+and when windows appear, it can list every window with its bounds on screen,
+its place in the stacking order and its state, and it can wait until the
+screen stops changing after its input instead of sleeping. Any compositor that
 routes seat input can implement this interface. waywire serves it.
 
 The interface exists because input injection reports success when it sends
@@ -40,10 +41,15 @@ uses the RemoteDesktop portal or AT-SPI has a connection to that bus.
   and state; see [Window list](#window-list). Since version 2. Like
   `GetFocus`, the reply follows every signal for earlier input, so it shows
   where windows are after that input. It needs no `Subscribe`.
+- `WaitSettled(a{sv} options) → a{sv}`: reply once the screen, or one
+  window, has had no damage for a quiet window since an input, or once a
+  timeout passes; see [Settling](#settling). Since version 3. It needs no
+  `Subscribe`.
 
 ### Properties
 
-- `Version` (`u`): 2. Version 1 had no `GetWindows` and no `WindowsChanged`.
+- `Version` (`u`): 3. Version 2 had no `WaitSettled`; version 1 had no
+  `GetWindows` and no `WindowsChanged`.
 
 ### Signals
 
@@ -282,6 +288,139 @@ that a client moves on its own after a delay, such as an application that
 places a dialog once its contents load, moves later; `WindowsChanged`
 announces it.
 
+## Settling
+
+A driver that takes a screenshot right after its input can capture the screen
+before the application has redrawn. `WaitSettled` replaces the fixed sleep
+that drivers use instead: it replies when nothing on the screen has changed
+for a quiet window since the input, so a screenshot taken after the reply
+shows what the input led to.
+
+### Options
+
+`options` is an `a{sv}`. Every key is optional. A known key with the wrong
+type or a value out of range is refused with
+`org.freedesktop.DBus.Error.InvalidArgs`. Unknown keys are ignored; check
+`Version` before relying on a key.
+
+| Key          | Type | Default | Meaning                                                                                                                                         |
+| ------------ | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serial`     | `t`  | none    | The input to measure from: a receipt's `serial`, or any signal's. Without it, the compositor measures from when it handles the call.            |
+| `quiet_ms`   | `u`  | 300     | How long the screen must stay unchanged, in milliseconds, from 10 to 10000.                                                                     |
+| `timeout_ms` | `u`  | 5000    | How long to wait, in milliseconds from when the compositor handles the call, from 0 to 20000. 0 answers at once: settled already, or a timeout. |
+| `window`     | `s`  | none    | A window `id` from the [window list](#window-list). Only damage inside that window's part of the screen counts. Without it, the whole output.   |
+
+Name the input by the `serial` of the first receipt of the action: for a
+click or a key, the press; for typed text, the first key. Applications often
+redraw on the press, before the release arrives, and damage is counted from
+the named input, so the reply reports that redraw. The quiet window starts no
+earlier than the caller's own latest input before the call either, so the
+rest of the action, such as the release or the last key, is waited out too.
+Measuring from the input, not from the call, counts a redraw that happened
+before the call arrived, so the reply does not wait longer than it must. A
+driver that gets no receipts, such as an X11 loop that does not subscribe,
+omits `serial`; the call then works like `GetFocus`, measuring from after
+every input the compositor processed before the call.
+
+The default quiet window, 300 ms, is shorter than the blink phase of a text
+caret, about half a second or more by default in Chromium and GTK, so a page
+with a focused, blinking field settles. Pick a longer one for applications that pause between redraws,
+and a window scope to ignore animation elsewhere.
+
+### Reply
+
+The reply is an `a{sv}`:
+
+| Key           | Type | Meaning                                                                                                                             |
+| ------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `result`      | `s`  | `settled`, `timeout` or `closed`; see below.                                                                                        |
+| `serial`      | `t`  | The serial of the latest signal, as in `GetFocus`.                                                                                  |
+| `time_usec`   | `t`  | When the compositor answered, as `CLOCK_MONOTONIC` microseconds like a receipt's `time_usec`.                                       |
+| `input_usec`  | `t`  | The time measured from: when the named input was dispatched, or when the call was handled.                                          |
+| `damage_usec` | `t`  | The last frame after `input_usec` that changed the watched area, or 0 when none did. `damage_usec - input_usec` is the settle time. |
+| `frames`      | `u`  | How many frames after `input_usec` changed the watched area.                                                                        |
+| `quiet_ms`    | `u`  | The quiet window used.                                                                                                              |
+
+The `result` values are:
+
+- `settled`: no frame changed the watched area for `quiet_ms`, counted from
+  the latest of `input_usec`, `damage_usec` and the caller's own latest
+  input before the call. The compositor answers as soon as that is true, so
+  `time_usec` is about `quiet_ms` after the latest of them.
+- `timeout`: `timeout_ms` passed first. The area was still changing, or had
+  not been quiet for long enough. A screenshot now may show an intermediate
+  state. `damage_usec` says when it last changed.
+- `closed`: the watched window closed or unmapped during the wait.
+
+A `serial` that has not been issued, or a `window` that no listed window has,
+is refused with `InvalidArgs`. A receipt's serial is refused with
+`org.freedesktop.DBus.Error.AccessDenied` unless the caller may receive that
+receipt; see [Privacy](#privacy). A serial too old for the compositor to
+remember (it keeps the latest few thousand) is measured from the oldest one
+it remembers, which can only make the wait longer. At most 64 waits may be in
+progress at once; more are refused with `LimitsExceeded`.
+
+### What counts as damage
+
+Damage is a change to the pixels that a full-screen screenshot shows, as the
+compositor's output damage tracker reports it for each frame it draws:
+
+- Committed surface damage from any client, including X11 windows through
+  Xwayland, that reaches the output. Damage hidden behind an opaque window or
+  outside the output does not count.
+- Windows appearing, closing, moving, resizing and restacking.
+- The compositor's own drawing: titlebars, the window menu, the taskbar and
+  its clock, and the icon under the pointer during a drag.
+- Not the cursor. The compositor never draws the cursor into frames or
+  screenshots, so moving it or changing its image is not damage.
+
+A frame is timed when the compositor renders it, at most once per output
+frame interval, which is also when screenshots start to show it. While a
+client's commit waits for the next frame, the compositor does not answer
+`settled`: it waits for that frame, then decides.
+
+With `window`, a frame counts when its damage overlaps the window's frame (its
+content and titlebar) or its popups. A frame drawn during the wait is checked
+against where the window is then; one drawn between the input and the call,
+against where the window is when the call arrives. Another window drawn over that area counts too, because it changes
+what a screenshot of the area shows. X11 override-redirect menus are separate
+surfaces, not popups of a window; they count only where they overlap it.
+
+### With the other calls
+
+`WaitSettled` replies after every signal sent before the reply, like
+`GetFocus` and `GetWindows`, and publishes any pending `WindowsChanged`
+first. When it returns, the driver has every receipt for its input, and the
+window list it holds is current. A driver that acted on a window can call
+`GetWindows` after `WaitSettled` to read where windows ended up.
+
+A typical step:
+
+1. Send the input and keep the serial of its first receipt.
+2. `WaitSettled({"serial": <serial>})`.
+3. On `settled`, take the screenshot. On `timeout`, take it anyway and treat
+   it as possibly incomplete, or wait again.
+
+### Limits
+
+Settling is a statement about pixels, not about the application:
+
+- **Application timers.** An application that waits before it redraws looks
+  settled while it waits. A page that opens `alert()` 300 ms after a click,
+  or loads data over the network before drawing it, can settle before the
+  change if the gap is longer than the quiet window, and a driver's
+  screenshot then misses it. In the dogfood run, an alert behind a 300 ms
+  page timer settled about 600 ms after the screen went quiet. Choose a
+  quiet window longer than the delays the application is known to use, or
+  confirm the expected state from the screenshot or accessibility tree.
+- **Unrelated animation.** A spinner, a video or a blinking caret in the
+  watched area keeps changing it, and the wait ends with `timeout`. Watch one
+  window to ignore animation elsewhere.
+- **Not attributed to input.** Any change after the input counts, whether the
+  input caused it or not.
+- **Frame rate.** Changes are seen once per frame. When the viewer's link
+  lowers the frame rate, a change is timed up to one frame interval late.
+
 ## Ordering
 
 Serials increase in the order the compositor processes events. Signals are
@@ -322,6 +461,11 @@ limits who receives each signal:
   wlr-foreign-toplevel-management and the screen already show every client:
   screencopy shows where each window is. `receipt` is present only for the
   input's owners.
+- Any connection may call `WaitSettled`: when the screen changes is something
+  screencopy already shows every client. A `serial` names a receipt only for
+  the processes that receive that receipt, so a caller cannot use it to learn
+  when another process's input happened. Serials of other signals, and
+  `XTest` receipts, may be named by anyone.
 
 A driver must therefore subscribe from its own process, or from a process
 that starts it, as the reference consumer `tools/receipts/receipts.py` does.

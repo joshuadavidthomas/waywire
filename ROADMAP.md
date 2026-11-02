@@ -259,7 +259,8 @@ ydotool (uinput needs libinput) cannot work on this desktop.
 
 Add a settled-frame signal or a custom endpoint only when a measured gap in
 these tools calls for one. No vendor offers a settled signal; they use fixed
-sleeps.
+sleeps. The Pass 2 dogfood run measured that gap for screenshots taken too
+early, and `WaitSettled` (Pass 2 item 3) is the settled signal.
 
 ### Pass 2: remote
 
@@ -352,14 +353,48 @@ Backed, most important first:
    - This is the window half of the agent query API in section 4. Control identity inside
      windows stays with AT-SPI, which worked on the session bus for cua and
      computer-use-linux.
-3. **A per-input settle signal:** no damage for N ms since input X.
+3. **A per-input settle signal:** no damage for N ms since input X. Done; see
+   [`docs/input-delivery.md`](docs/input-delivery.md#settling).
    - **Measured cost.** 7.7% of waywire screenshots (12 of 156) were taken before the screen
      settled. waywire itself settles quickly: the file chooser settles in 288 ms at p50, against
      622–683 ms elsewhere. The early screenshots came from cua returning in 96 ms on waywire,
      against 466 ms on Xvfb.
    - **What it replaces.** Fixed sleeps of 400–800 ms; 67 sleeps in the waywire runs.
-   - **Limit.** It cannot see app timers: an alert behind a 300 ms page timer settled at about
-     600 ms after a quiet screen.
+   - **What shipped.** `InputDelivery1` version 3 adds `WaitSettled`. A driver names its input
+     by its first receipt's serial, such as a key press, and the compositor replies once the
+     output, or one window from `GetWindows`, has had no damage for a quiet window since that
+     input: 300 ms by default, 10 ms to 10 s. A separate `timeout` result says the screen was
+     still changing. Damage is the output damage tracker's per-frame damage after occlusion,
+     from every client including Xwayland and from the compositor's chrome; the cursor never
+     counts, because it is never in a screenshot. A commit that has not reached a frame yet
+     holds the answer until that frame, and the quiet window starts no earlier than the
+     caller's own latest input, so a key's release is waited out too. The reply follows every
+     earlier signal, like `GetFocus`, so it is also a barrier.
+   - **Proof.** `receipts.py --settle -- COMMAND` runs an input and prints the settle time. In a
+     live session on the orb, an xterm keystroke settled 0–1 ms after the key's receipt (10 of
+     10), a shell loop that printed every 200 ms settled after 1013 ms, and Chromium page loads
+     settled after 1.4–2.9 s (Wikipedia, debian.org, GitHub), fully drawn in the screenshot
+     taken after the wait. Unit tests check that a repaint after the input restarts the quiet
+     window, that a timeout is reported as `timeout`, that a wait from a press also waits out
+     the release, that a window wait ignores damage elsewhere, and that a receipt's serial is
+     refused to other processes. An ignored compositor test times an xterm keystroke over the
+     bus. `just acceptance settle` clicks a page that repaints every 150 ms for 1200 ms, waits
+     on the click's receipt and takes a grim screenshot as soon as the wait returns: it must
+     show the final colour and match a screenshot 1.5 s later. It also checks that an endless
+     animation times out while a still xterm settles. It fails when the wait answers at once,
+     ignores damage, or keeps the quiet window from the input.
+   - **What remains.**
+     - It cannot see app timers: an alert behind a 300 ms page timer settled about 600 ms after
+       the screen went quiet. Anything that pauses longer than the quiet window before it
+       redraws, such as a page waiting on the network, settles early; so did a shell command
+       that slept 500 ms before printing. The spec says so; drivers still check the screenshot.
+     - A blinking caret, a spinner or a video in the watched area keeps it changing. The
+       default quiet window is below Chromium's and GTK's caret blink phase, and a window
+       scope ignores animation elsewhere, but a busy area ends in `timeout`.
+     - Changes are timed per rendered frame, so a lower viewer frame rate times them later.
+     - No driver calls it yet. cua-driver and computer-use-linux would call it after each
+       action, before their screenshot, in place of their sleeps; offering that upstream is the
+       next step.
 4. **Text input through the compositor's keymap.**
    - **Measured cost.** wtype and cua type through per-string virtual keyboards, and Chromium
      drops characters from them. A punctuation-heavy line came back wrong 10 times out of 10 on
@@ -628,6 +663,36 @@ the review are in place. Remaining gaps:
   that foreign-toplevel already gives every client, and bounds and stacking
   that screencopy already shows every client. It never carries window contents
   or input. Like the receipts, this assumes one trusted user per session.
+- **Settle signal.** Settling is a method on `InputDelivery1` (version 3),
+  `WaitSettled`, that replies once the output, or one window from
+  `GetWindows`, has had no damage for a quiet window since an input, or with
+  a distinct `timeout` result. The caller names the input by its receipt's
+  serial, so a redraw before the call still counts, and picks the quiet
+  window (default 300 ms, 10 ms to 10 s) and timeout (default 5 s, at most
+  20 s, under the 25 s D-Bus call timeout). Damage is the output damage
+  tracker's per-frame damage, which covers every client including Xwayland
+  and the compositor's chrome after occlusion; the cursor is excluded because
+  it is never in frames or screenshots. The reply follows every earlier
+  signal, so it is also a barrier like `GetFocus`. Any connection may call
+  it, but a receipt's serial only from the processes that receive that
+  receipt. Rejected alternatives:
+  - A `Settled` signal per input. The compositor would have to pick one quiet
+    window for every consumer and time every input, including those nobody
+    waits on, and a driver would still block until the signal arrived.
+  - Settling inside `GetFocus` or `GetWindows`. Their replies are immediate
+    barriers that drivers already call after input; a wait of hundreds of
+    milliseconds would slow every caller that does not want it.
+  - Waiting on client commits instead of output damage. A minimized,
+    covered or off-screen window that animates would hold every wait open,
+    although no screenshot shows it.
+  - Wayland frame callbacks or presentation-time. A client sees them only for
+    its own surfaces, and drivers such as XTest loops hold no Wayland
+    connection.
+  - Comparing screenshots in the driver. Each capture costs at least the raw
+    copy (13 ms for grim) plus encoding, and two equal captures in a row only
+    show that nothing changed between them.
+  - A separate interface. Its replies could not follow the receipts it names,
+    for the reason given under the window query transport.
 - **Input delivery privacy.** A receipt reveals when a process sent each
   key and where it went, so the compositor sends it only to the input's
   owner: a subscriber whose process created the input source, or is one of

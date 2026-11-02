@@ -1,0 +1,51 @@
+<!doctype html>
+<title>Settle target</title>
+<!-- The settle scenario's page. The first click repaints the page every
+     150 ms for 1200 ms, each time in a new colour, and then paints it the
+     final green once. Every gap is shorter than WaitSettled's default 300 ms
+     quiet window, so only a wait that restarts at each repaint ends after
+     the green. The second click repaints it every 100 ms until the page
+     closes. -->
+<style>
+  html,
+  body {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    background: rgb(40, 40, 40);
+  }
+</style>
+<script>
+  const STEPS = [
+    "rgb(200, 40, 40)",
+    "rgb(200, 120, 40)",
+    "rgb(200, 200, 40)",
+    "rgb(120, 40, 200)",
+    "rgb(40, 40, 200)",
+    "rgb(200, 40, 200)",
+    "rgb(40, 200, 200)",
+    "rgb(120, 120, 120)",
+  ];
+  const FINAL = "rgb(0, 204, 102)";
+  let clicks = 0;
+  addEventListener("mousedown", () => {
+    clicks += 1;
+    if (clicks === 1) {
+      STEPS.forEach((colour, step) =>
+        setTimeout(() => {
+          document.body.style.background = colour;
+        }, step * 150),
+      );
+      setTimeout(() => {
+        document.body.style.background = FINAL;
+      }, STEPS.length * 150);
+    } else if (clicks === 2) {
+      let step = 0;
+      setInterval(() => {
+        step += 1;
+        document.body.style.background = STEPS[step % STEPS.length];
+      }, 100);
+    }
+  });
+</script>

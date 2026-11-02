@@ -5020,4 +5020,234 @@ mod tests {
             "maximized titlebar at the top"
         );
     }
+
+    /// A renderer and target that keep their damage state across frames,
+    /// as the compositor loop's do.
+    struct Frames {
+        renderer: smithay::backend::renderer::pixman::PixmanRenderer,
+        image: smithay::reexports::pixman::Image<'static, 'static>,
+        tracker: smithay::backend::renderer::damage::OutputDamageTracker,
+    }
+
+    impl Frames {
+        fn new(state: &crate::State) -> Self {
+            Self {
+                renderer: smithay::backend::renderer::pixman::PixmanRenderer::new()
+                    .expect("renderer"),
+                image: smithay::reexports::pixman::Image::new(
+                    smithay::reexports::pixman::FormatCode::A8R8G8B8,
+                    1920,
+                    1080,
+                    true,
+                )
+                .expect("render target"),
+                tracker: smithay::backend::renderer::damage::OutputDamageTracker::from_output(
+                    &state.output,
+                ),
+            }
+        }
+
+        fn render(&mut self, state: &mut crate::State) {
+            state
+                .render(&mut self.renderer, &mut self.image, &mut self.tracker)
+                .expect("render a frame");
+        }
+    }
+
+    type SettleAnswer = std::collections::HashMap<String, zbus::zvariant::OwnedValue>;
+
+    /// Start a `WaitSettled` call as the bus would, from process `pid`.
+    fn wait_settled(
+        state: &mut crate::State,
+        pid: Option<u32>,
+        serial: Option<u64>,
+        quiet_ms: u32,
+        timeout_ms: u32,
+        window: Option<String>,
+    ) -> tokio::sync::oneshot::Receiver<zbus::fdo::Result<SettleAnswer>> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        state.wait_settled(
+            pid,
+            crate::delivery::settle::SettleOptions {
+                serial,
+                quiet_ms,
+                timeout_ms,
+                window,
+            },
+            reply,
+        );
+        answer
+    }
+
+    /// The answer to a wait, once the bus thread has sent what was queued
+    /// before it; `None` while it is still waiting.
+    fn settle_answer(
+        received: &std::sync::mpsc::Receiver<crate::delivery::Message>,
+        answer: &mut tokio::sync::oneshot::Receiver<zbus::fdo::Result<SettleAnswer>>,
+    ) -> Option<zbus::fdo::Result<SettleAnswer>> {
+        sent(received);
+        answer.try_recv().ok()
+    }
+
+    fn settle_field<T: TryFrom<zbus::zvariant::OwnedValue>>(answer: &SettleAnswer, key: &str) -> T {
+        T::try_from(answer[key].try_clone().expect("value")).unwrap_or_else(|_| panic!("{key}"))
+    }
+
+    /// Repaint the terminal and render the frame that shows it; return the
+    /// times just before and after the frame.
+    fn repaint_terminal(
+        display: &mut smithay::reexports::wayland_server::Display<crate::State>,
+        state: &mut crate::State,
+        connection: &Connection,
+        queue: &mut EventQueue<App>,
+        app: &mut App,
+        frames: &mut Frames,
+    ) -> (u64, u64) {
+        let surface = app.last_surface.clone().expect("terminal surface");
+        attach_sized(&surface, app, &queue.handle(), 200, 100);
+        surface.commit();
+        sync(display, state, connection, queue, app);
+        let before = crate::delivery::monotonic_usec();
+        frames.render(state);
+        (before, crate::delivery::monotonic_usec())
+    }
+
+    #[test]
+    fn settle_restarts_its_quiet_window_at_each_damage_after_the_input() {
+        let (mut display, mut state, connection, mut queue, mut app, _editor, _terminal) =
+            window_list_fixture();
+        let source = KeyboardSource::new_auxiliary();
+        let received = delivery_subscribers(&mut state, source);
+        let mut frames = Frames::new(&state);
+        frames.render(&mut state);
+        press(&mut state, source);
+        let serial = receipts(&delivered(&received, "agent"))[0].serial;
+
+        // Only the input's owner may name it.
+        let mut refused = wait_settled(&mut state, None, Some(serial), 1000, 20_000, None);
+        assert!(matches!(
+            settle_answer(&received, &mut refused),
+            Some(Err(zbus::fdo::Error::AccessDenied(_)))
+        ));
+        let agent = Some(std::process::id());
+        let mut answer = wait_settled(&mut state, agent, Some(serial), 1000, 20_000, None);
+        assert!(settle_answer(&received, &mut answer).is_none());
+
+        // The terminal repaints 50 ms after the input, inside the quiet
+        // window. A quiet window kept from the input would end 1 s after it,
+        // before 1 s after the repaint.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (before, after) = repaint_terminal(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &mut frames,
+        );
+        state.poll_settled(before + 990_000);
+        assert!(
+            settle_answer(&received, &mut answer).is_none(),
+            "a damage after the input restarts the quiet window"
+        );
+        state.poll_settled(after + 1_000_000);
+        let answer = settle_answer(&received, &mut answer)
+            .expect("settled 1 s after the repaint")
+            .expect("an answer");
+        assert_eq!(settle_field::<String>(&answer, "result"), "settled");
+        let damage: u64 = settle_field(&answer, "damage_usec");
+        assert!((before..=after).contains(&damage), "the repaint's frame");
+        assert_eq!(settle_field::<u32>(&answer, "frames"), 1);
+        assert!(settle_field::<u64>(&answer, "input_usec") <= before - 50_000);
+        assert_eq!(settle_field::<u32>(&answer, "quiet_ms"), 1000);
+    }
+
+    #[test]
+    fn settle_from_a_press_also_waits_out_the_callers_later_input() {
+        let (_display, mut state, _connection, _queue, _app, _editor, _terminal) =
+            window_list_fixture();
+        let source = KeyboardSource::new_auxiliary();
+        let received = delivery_subscribers(&mut state, source);
+        let mut frames = Frames::new(&state);
+        frames.render(&mut state);
+        state.keyboard_key(source, 30, smithay::backend::input::KeyState::Pressed);
+        let pressed = receipts(&delivered(&received, "agent"))[0].serial;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let releasing = crate::delivery::monotonic_usec();
+        state.keyboard_key(source, 30, smithay::backend::input::KeyState::Released);
+        frames.render(&mut state);
+
+        let agent = Some(std::process::id());
+        let mut answer = wait_settled(&mut state, agent, Some(pressed), 1000, 20_000, None);
+        // A quiet window from the press would end 50 ms before this.
+        state.poll_settled(releasing + 990_000);
+        assert!(
+            settle_answer(&received, &mut answer).is_none(),
+            "the release starts the quiet window"
+        );
+        state.poll_settled(crate::delivery::monotonic_usec() + 1_000_000);
+        let answer = settle_answer(&received, &mut answer)
+            .expect("settled after the release")
+            .expect("an answer");
+        assert_eq!(settle_field::<String>(&answer, "result"), "settled");
+        assert!(
+            settle_field::<u64>(&answer, "input_usec") <= releasing - 50_000,
+            "measured from the press"
+        );
+    }
+
+    #[test]
+    fn settle_reports_a_timeout_and_watches_only_its_window() {
+        let (mut display, mut state, connection, mut queue, mut app, _editor, _terminal) =
+            window_list_fixture();
+        let source = KeyboardSource::new_auxiliary();
+        let received = delivery_subscribers(&mut state, source);
+        let mut frames = Frames::new(&state);
+        frames.render(&mut state);
+        let editor = state
+            .window_list()
+            .windows
+            .into_iter()
+            .find(|window| window.record.title == "Editor")
+            .expect("editor")
+            .record
+            .id;
+
+        let called = crate::delivery::monotonic_usec();
+        let mut screen = wait_settled(&mut state, None, None, 1000, 500, None);
+        let mut window = wait_settled(&mut state, None, None, 500, 20_000, Some(editor));
+        // The terminal repaints; the editor does not.
+        repaint_terminal(
+            &mut display,
+            &mut state,
+            &connection,
+            &mut queue,
+            &mut app,
+            &mut frames,
+        );
+        let now = crate::delivery::monotonic_usec() + 600_000;
+        state.poll_settled(now);
+        let screen = settle_answer(&received, &mut screen)
+            .expect("the screen's wait ended")
+            .expect("an answer");
+        assert_eq!(
+            settle_field::<String>(&screen, "result"),
+            "timeout",
+            "the screen changed 0.6 s ago: not quiet for 1 s, and past its 0.5 s timeout"
+        );
+        assert_eq!(settle_field::<u32>(&screen, "frames"), 1);
+        assert!(settle_field::<u64>(&screen, "damage_usec") >= called);
+        let window = settle_answer(&received, &mut window)
+            .expect("the editor's wait ended")
+            .expect("an answer");
+        assert_eq!(settle_field::<String>(&window, "result"), "settled");
+        assert_eq!(settle_field::<u32>(&window, "frames"), 0);
+        assert_eq!(settle_field::<u64>(&window, "damage_usec"), 0);
+
+        let mut unknown = wait_settled(&mut state, None, None, 500, 500, Some("nope".into()));
+        assert!(matches!(
+            settle_answer(&received, &mut unknown),
+            Some(Err(zbus::fdo::Error::InvalidArgs(_)))
+        ));
+    }
 }

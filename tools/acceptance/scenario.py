@@ -25,6 +25,7 @@ SCENARIOS = (
     "fedora-x11",
     "receipts-t6a",
     "window-query",
+    "settle",
 )
 RECEIPTS = "/tmp/receipts.jsonl"
 
@@ -498,6 +499,157 @@ def window_query(pointer):
     print("PASS window-query: every click at a reported window's bounds landed in that window")
 
 
+# The settle page: its colour before a click, the colour it ends on, and how
+# long after the click it keeps repainting before it does.
+GREY = (40, 40, 40)
+FINAL = (0, 204, 102)
+REPAINT_MS = 1200
+
+
+def screen(path):
+    """A grim PPM capture saved in the container: (width, rows of pixels)."""
+    data = subprocess.run(
+        ["sudo", "docker", "exec", NAME, "cat", path], check=True, stdout=subprocess.PIPE
+    ).stdout
+    fields = data.split(maxsplit=4)
+    width, height = int(fields[1]), int(fields[2])
+    pixels = fields[4][: width * height * 3]
+    return width, [pixels[row * width * 3 : (row + 1) * width * 3] for row in range(height)]
+
+
+def region(capture, rect):
+    width, rows = capture
+    x, y, w, h = rect
+    return [row[x * 3 : (x + w) * 3] for row in rows[y : y + h]]
+
+
+def at(capture, point):
+    width, rows = capture
+    x, y = point
+    return tuple(rows[y][x * 3 : x * 3 + 3])
+
+
+def overlap(a, b):
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def settle_scenario(pointer):
+    """Click a page that repaints for 1.2 s, wait on WaitSettled, and check
+    that the screenshot taken right after it returns shows the page's final
+    state and that nothing changed afterwards. Then start an endless
+    animation and check that the page's wait times out while a quiet window
+    elsewhere settles."""
+    chromium = subprocess.Popen(
+        [
+            "sudo", "docker", "exec", NAME, "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "chromium", "--no-sandbox", "--test-type", "--ozone-platform=wayland",
+            "--user-data-dir=/tmp/chromium-settle", "--no-first-run",
+            "--no-default-browser-check", "--disable-gpu", "--window-size=640,480",
+            "--app=file:///repo/tools/acceptance/settle.html",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    session(
+        "sh", "-c",
+        f"xterm -title xterm-quiet -bg '#{bytes(XTERM).hex()}' -geometry 30x8+0+0"
+        " >/dev/null 2>&1 &",
+    )
+    failures = []
+    try:
+        def ready():
+            names = [w["title"] for w in windows()["windows"]]
+            return any(n.startswith("Settle target") for n in names) and any(
+                n.startswith("xterm-quiet") for n in names
+            )
+
+        wait_for(ready, "Chromium and xterm never both appeared in the window list")
+        listing = windows()
+        # Keep the xterm clear of the page, so the page's repaints are
+        # outside the xterm's part of the screen.
+        area = listing["work_area"]
+        x = area[0] + area[2] - window(listing, "xterm-quiet")["geometry"][2] - 20
+        xid = session(
+            "xdotool", "search", "--name", "^xterm-quiet$", stdout=subprocess.PIPE
+        ).stdout.split()[0]
+        session("xdotool", "windowmove", xid, str(x), str(area[1] + 20))
+
+        def painted():
+            listing = windows()
+            point = visible_point(listing, window(listing, "Settle target"))
+            return close_to(pixel(*point), GREY) and not overlap(
+                window(listing, "Settle target")["frame"],
+                window(listing, "xterm-quiet")["frame"],
+            )
+
+        wait_for(painted, "the page never painted its first colour clear of the xterm")
+        listing = windows()
+        page = window(listing, "Settle target")
+        xterm = window(listing, "xterm-quiet")
+        point = visible_point(listing, page)
+
+        # The click starts 1.2 s of repaints that end in green.
+        pointer("click", *point)
+        answer = json.loads(pointer("settle", 300, 5000, "-", "/tmp/settle-after.ppm"))
+        time.sleep(1.5)
+        session("grim", "-t", "ppm", "/tmp/settle-later.ppm")
+        after, later = screen("/tmp/settle-after.ppm"), screen("/tmp/settle-later.ppm")
+        for name in ("after", "later"):
+            ppm = ARTIFACTS / f"settle-{name}.ppm"
+            docker("cp", f"{NAME}:/tmp/settle-{name}.ppm", str(ppm), stdout=subprocess.DEVNULL)
+            run("magick", str(ppm), str(ppm.with_suffix(".png")))
+            ppm.unlink()
+        waited = (answer["returned_usec"] - answer["clicked_usec"]) / 1000
+        last = answer["damage_usec"] and (answer["damage_usec"] - answer["input_usec"]) / 1000
+        print(
+            f"settle: {answer['result']} {waited:.0f} ms after the click;"
+            f" the compositor saw {answer['frames']} changed frames"
+            + (f", the last {last:.0f} ms after the input" if last else "")
+        )
+        if answer["result"] != "settled":
+            failures.append(f"the page's wait ended with {answer['result']}: {answer}")
+        if not close_to(at(after, point), FINAL):
+            failures.append(
+                f"the screenshot right after the wait shows {at(after, point)} at {point},"
+                f" not the final {FINAL}: it settled before the page stopped repainting"
+            )
+        if region(after, page["geometry"]) != region(later, page["geometry"]):
+            failures.append("the page changed after the wait said it had settled")
+        if waited < REPAINT_MS:
+            failures.append(
+                f"the wait returned {waited:.0f} ms after the click, before the page's"
+                f" {REPAINT_MS} ms of repaints ended"
+            )
+
+        # The second click starts an endless animation: the page never holds
+        # still, but the xterm does.
+        pointer("click", *point)
+        busy = json.loads(pointer("settle", 300, 1500, "-", "/tmp/settle-busy.ppm"))
+        spent = (busy["returned_usec"] - busy["called_usec"]) / 1000
+        print(f"settle while animating: {busy['result']} after {spent:.0f} ms")
+        if busy["result"] != "timeout":
+            failures.append(f"an endless animation ended with {busy['result']}, not timeout")
+        if not 1500 <= spent < 3000:
+            failures.append(f"a 1500 ms timeout returned after {spent:.0f} ms")
+        quiet = json.loads(pointer("settle", 300, 3000, xterm["id"], "/tmp/settle-quiet.ppm"))
+        print(
+            f"settle on the xterm while the page animates: {quiet['result']},"
+            f" {quiet['frames']} changed frames"
+        )
+        if quiet["result"] != "settled" or quiet["frames"]:
+            failures.append(f"the still xterm did not settle while the page animated: {quiet}")
+    except Exception as error:
+        failures.append(f"stopped: {error!r}"[:600])
+    finally:
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "chromium"], check=False)
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "xterm"], check=False)
+        chromium.wait(timeout=20)
+    if failures:
+        raise RuntimeError("settle failed: " + " | ".join(failures))
+    print("PASS settle: the screenshot after WaitSettled showed the page's final state")
+
+
 def main(scenario):
     if scenario not in SCENARIOS:
         raise SystemExit(f"Choose one of: {', '.join(SCENARIOS)}")
@@ -622,7 +774,7 @@ def main(scenario):
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
-            if scenario == "window-query":
+            if scenario in ("window-query", "settle"):
                 # The pointer driver runs under the reference consumer, which
                 # records its receipts and every window event.
                 driver = subprocess.Popen(
@@ -644,11 +796,16 @@ def main(scenario):
                 def pointer(*command):
                     driver.stdin.write(" ".join(str(part) for part in command) + "\n")
                     driver.stdin.flush()
-                    if driver.stdout.readline().strip() != "ok":
+                    status, _, result = driver.stdout.readline().strip().partition(" ")
+                    if status != "ok":
                         raise RuntimeError(f"portal pointer {command} failed")
+                    return result
 
                 try:
-                    window_query(pointer)
+                    if scenario == "settle":
+                        settle_scenario(pointer)
+                    else:
+                        window_query(pointer)
                 finally:
                     (ARTIFACTS / f"{scenario}.jsonl").write_text(
                         "".join(json.dumps(record) + "\n" for record in receipts())

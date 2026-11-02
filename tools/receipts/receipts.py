@@ -4,6 +4,8 @@
     receipts.py [--json] [--output FILE] [-- COMMAND [ARG...]]
     receipts.py --focus
     receipts.py --windows [--watch] [--json]
+    receipts.py --settle [--quiet MS] [--timeout MS] [--window ID]
+                [--serial N] [--json] [-- COMMAND [ARG...]]
 
 The compositor sends a subscriber the receipts for input from its own process
 tree, so run the driver under this tool (receipts.py -- cua-driver serve), or
@@ -13,6 +15,15 @@ prints the focused window and its text-field state once. --windows prints
 every window, topmost first, with its bounds on screen in output pixels (the
 pixels of a full-screen screenshot), and with --watch prints the list again
 each time it changes.
+
+--settle waits until the screen stops changing and prints how long that took.
+With a command, it runs the command, then waits from the command's first input
+receipt: `receipts.py --settle -- xdotool key Return` times what one key
+press redraws. With --serial, it waits from that receipt; with neither, from
+now. --quiet sets how long the screen must stay unchanged (default 300 ms),
+--window watches one window id from --windows instead of the whole screen,
+and --timeout bounds the wait (default 5000 ms). It exits 0 when the screen
+settled and 1 on a timeout, unless the command failed.
 
 It connects to DBUS_SESSION_BUS_ADDRESS, the session bus the compositor
 exports to its applications. The interface is described in
@@ -136,6 +147,28 @@ def describe(member, record):
     return f"#{serial} {member} {record}"
 
 
+def settle_line(answer):
+    """A WaitSettled reply as text."""
+    since = answer["input_usec"]
+    changed = answer["damage_usec"]
+    settle_ms = (max(changed, since) - since) / 1000
+    waited_ms = (answer["time_usec"] - since) / 1000
+    frames = f"{answer['frames']} frame{'s' if answer['frames'] != 1 else ''}"
+    if answer["result"] == "settled":
+        return (
+            f"settled {settle_ms:.0f} ms after the input: {frames} changed the"
+            f" screen, then it held still for {answer['quiet_ms']} ms"
+            f" (answered after {waited_ms:.0f} ms)"
+        )
+    if answer["result"] == "timeout":
+        last = f", last {settle_ms:.0f} ms after the input" if changed else ""
+        return (
+            f"TIMEOUT after {waited_ms:.0f} ms: {frames} changed the screen{last};"
+            f" it never held still for {answer['quiet_ms']} ms"
+        )
+    return f"{answer['result'].upper()} after {waited_ms:.0f} ms: the window went away"
+
+
 def connect():
     address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
     if not address:
@@ -149,13 +182,13 @@ def connect():
     )
 
 
-def call(connection, method, timeout=5000):
+def call(connection, method, timeout=5000, parameters=None):
     return connection.call_sync(
         NAME,
         PATH,
         NAME,
         method,
-        None,
+        parameters,
         None,
         Gio.DBusCallFlags.NONE,
         timeout,
@@ -176,6 +209,21 @@ def main():
         "--watch",
         action="store_true",
         help="with --windows, print the list again whenever it changes",
+    )
+    parser.add_argument(
+        "--settle",
+        action="store_true",
+        help="wait until the screen stops changing after the input, and print how long",
+    )
+    parser.add_argument(
+        "--quiet", type=int, help="with --settle, the quiet window in ms (default 300)"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=5000, help="with --settle, the longest wait in ms"
+    )
+    parser.add_argument("--window", help="with --settle, watch only this window id")
+    parser.add_argument(
+        "--serial", type=int, help="with --settle, wait from this receipt's serial"
     )
     parser.add_argument("--output", help="write to FILE instead of standard output")
     parser.add_argument("command", nargs="*", help="run COMMAND under the tool")
@@ -222,8 +270,37 @@ def main():
         loop.run()
         return 0
 
+    serials = []
+
+    def settle(serial):
+        options = {"timeout_ms": GLib.Variant("u", args.timeout)}
+        if serial:
+            options["serial"] = GLib.Variant("t", serial)
+        if args.quiet is not None:
+            options["quiet_ms"] = GLib.Variant("u", args.quiet)
+        if args.window:
+            options["window"] = GLib.Variant("s", args.window)
+        (answer,) = call(
+            connection,
+            "WaitSettled",
+            args.timeout + 5000,
+            GLib.Variant("(a{sv})", (options,)),
+        )
+        if args.json:
+            print(json.dumps(answer), file=out, flush=True)
+        else:
+            print(settle_line(answer), file=out, flush=True)
+        return 0 if answer["result"] == "settled" else 1
+
+    if args.settle and not args.command:
+        return settle(args.serial)
+
     def on_signal(_connection, _sender, _path, _interface, member, parameters):
         (record,) = parameters.unpack()
+        if member == "Receipt":
+            serials.append(record["serial"])
+        if args.settle:
+            return
         if args.json:
             print(json.dumps({"signal": member, **record}), file=out, flush=True)
         else:
@@ -249,6 +326,17 @@ def main():
             status = os.waitstatus_to_exitcode(wait_status)
             # GetFocus replies after every signal for earlier input, so the
             # command's last receipts have arrived when it returns.
+            if args.settle:
+                call(connection, "GetFocus")
+                # Run the signal handlers for receipts that arrived first.
+                context = GLib.MainContext.default()
+                while context.pending():
+                    context.iteration(False)
+                result = settle(serials[0] if serials else args.serial)
+                if status == 0:
+                    status = result
+                loop.quit()
+                return
             connection.call(
                 NAME,
                 PATH,

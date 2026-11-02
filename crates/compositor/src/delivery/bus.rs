@@ -30,6 +30,8 @@ use super::Signal;
 use super::TextField;
 use super::WindowList;
 use super::WindowRecord;
+use super::settle;
+use super::settle::SettleOptions;
 use crate::State;
 
 /// Well-known name the compositor owns on its private bus.
@@ -53,6 +55,11 @@ pub(crate) enum Request {
     },
     Windows {
         reply: oneshot::Sender<HashMap<String, OwnedValue>>,
+    },
+    Settle {
+        pid: Option<u32>,
+        options: SettleOptions,
+        reply: settle::Reply,
     },
 }
 
@@ -159,6 +166,11 @@ impl State {
                     }
                 }));
             }
+            Request::Settle {
+                pid,
+                options,
+                reply,
+            } => self.wait_settled(pid, options, reply),
         }
     }
 }
@@ -231,21 +243,105 @@ impl InputDelivery {
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    /// Wait until the output, or one window, has had no damage for a quiet
+    /// window since an input.
+    async fn wait_settled(
+        &self,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+        let options = settle_options(&options)?;
+        let pid = match header.sender() {
+            Some(sender) => zbus::fdo::DBusProxy::new(connection)
+                .await?
+                .get_connection_unix_process_id(BusName::Unique(sender.clone()))
+                .await
+                .ok(),
+            None => None,
+        };
+        let (reply, wait) = oneshot::channel();
+        self.requests
+            .send(Request::Settle {
+                pid,
+                options,
+                reply,
+            })
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        wait.await
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+    }
+
     #[zbus(property)]
     #[expect(clippy::unused_self, reason = "zbus properties are methods")]
     fn version(&self) -> u32 {
-        2
+        3
     }
 }
 
-fn insert<'a>(dict: &mut HashMap<String, Value<'a>>, key: &str, value: impl Into<Value<'a>>) {
+pub(super) fn insert<'a>(
+    dict: &mut HashMap<String, Value<'a>>,
+    key: &str,
+    value: impl Into<Value<'a>>,
+) {
     dict.insert(key.to_owned(), value.into());
 }
 
-fn owned(dict: HashMap<String, Value<'_>>) -> HashMap<String, OwnedValue> {
+pub(super) fn owned(dict: HashMap<String, Value<'_>>) -> HashMap<String, OwnedValue> {
     dict.into_iter()
         .filter_map(|(key, value)| Some((key, OwnedValue::try_from(value).ok()?)))
         .collect()
+}
+
+/// `WaitSettled` options: known keys with the wrong type or out of range
+/// are refused; unknown keys are ignored, like the records' keys.
+fn settle_options(options: &HashMap<String, OwnedValue>) -> zbus::fdo::Result<SettleOptions> {
+    fn get<T>(options: &HashMap<String, OwnedValue>, key: &str) -> zbus::fdo::Result<Option<T>>
+    where
+        T: TryFrom<OwnedValue>,
+    {
+        options
+            .get(key)
+            .map(|value| {
+                value
+                    .try_clone()
+                    .ok()
+                    .and_then(|value| T::try_from(value).ok())
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::InvalidArgs(format!("option {key} has the wrong type"))
+                    })
+            })
+            .transpose()
+    }
+    fn within(
+        key: &str,
+        value: u32,
+        range: &std::ops::RangeInclusive<u32>,
+    ) -> zbus::fdo::Result<u32> {
+        if range.contains(&value) {
+            Ok(value)
+        } else {
+            Err(zbus::fdo::Error::InvalidArgs(format!(
+                "{key} {value} is outside {}..={}",
+                range.start(),
+                range.end()
+            )))
+        }
+    }
+    Ok(SettleOptions {
+        serial: get::<u64>(options, "serial")?,
+        quiet_ms: within(
+            "quiet_ms",
+            get::<u32>(options, "quiet_ms")?.unwrap_or(settle::DEFAULT_QUIET_MS),
+            &settle::QUIET_MS,
+        )?,
+        timeout_ms: within(
+            "timeout_ms",
+            get::<u32>(options, "timeout_ms")?.unwrap_or(settle::DEFAULT_TIMEOUT_MS),
+            &settle::TIMEOUT_MS,
+        )?,
+        window: get::<String>(options, "window")?.filter(|id| !id.is_empty()),
+    })
 }
 
 /// A window record; an empty dictionary means no window.

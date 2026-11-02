@@ -26,8 +26,8 @@ the gateway needs belongs to the compositor, so waywire owns it directly:
 - Agent operations and desktop controls should share one implementation. A
   titlebar click and an automation command perform the same window operation.
 
-Agent queries beyond the window list are planned but not built: a settled-frame
-signal, per-window capture, and screenshots on demand. Input arbitration is shared with
+Agent queries beyond the window list and the settle wait are planned but not
+built: per-window capture and screenshots on demand. Input arbitration is shared with
 agent sources: a browser takeover releases and pauses agent input, and handback
 resumes it. See [ROADMAP.md](ROADMAP.md).
 
@@ -36,9 +36,12 @@ source's owner a receipt for every key, button and scroll, naming the window
 that received it, and tells every subscriber when focus moves or a window maps.
 They can also list every window with the same id, its bounds on screen in
 output pixels, its stacking position, pid and state, and hear when the list
-changes. The interface is on the desktop's session bus and is described in
+changes. Instead of sleeping before a screenshot, they can wait until the
+screen, or one window, has stopped changing since their input. The interface
+is on the desktop's session bus and is described in
 [docs/input-delivery.md](docs/input-delivery.md); `tools/receipts/receipts.py`
-prints it, and `receipts.py --windows` prints the window list.
+prints it, `receipts.py --windows` prints the window list, and
+`receipts.py --settle` times how long the screen takes to settle.
 
 The compositor owns the windows, output, and cursor directly. Cursor images are
 not baked into the video: the controlling browser uses its native cursor, while

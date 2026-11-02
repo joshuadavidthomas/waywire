@@ -2258,19 +2258,29 @@ impl State {
         }
         let elements = self.scene_elements(renderer);
         let forced = self.dirty || self.acknowledged != Some(self.generation);
-        let damage = {
+        let clear = [0.08, 0.09, 0.12, 1.0];
+        let (damage, changed) = {
             let mut target = renderer.bind(image)?;
-            tracker
-                .render_output(
-                    renderer,
-                    &mut target,
-                    usize::from(!forced),
-                    &elements,
-                    [0.08, 0.09, 0.12, 1.0],
-                )?
-                .damage
-                .cloned()
+            if forced {
+                // A forced redraw repaints everything, but settle waits need
+                // what changed since the last frame.
+                let (changed, states) = tracker.damage_output(1, &elements)?;
+                let changed = changed.cloned().unwrap_or_default();
+                let damage = tracker
+                    .render_output_with_states(renderer, &mut target, 0, &elements, clear, states)?
+                    .damage
+                    .cloned();
+                (damage, changed)
+            } else {
+                let damage = tracker
+                    .render_output(renderer, &mut target, 1, &elements, clear)?
+                    .damage
+                    .cloned();
+                let changed = damage.clone().unwrap_or_default();
+                (damage, changed)
+            }
         };
+        self.frame_rendered(delivery::monotonic_usec(), &changed);
         if damage.is_some() || forced {
             let full = [Rectangle::<i32, Physical>::from_size(
                 (
@@ -2641,6 +2651,10 @@ pub fn run(mut options: Config) -> Result<()> {
         if let Refresh::Due { at, .. } = state.refresh {
             deadline = deadline.min(at);
         }
+        if let Some(at) = state.settle_wake() {
+            let wait = at.saturating_sub(delivery::monotonic_usec());
+            deadline = deadline.min(now + Duration::from_micros(wait));
+        }
         if let Err(error) = event_loop.dispatch(deadline.saturating_duration_since(now), &mut state)
         {
             state.fail(error.into());
@@ -2662,6 +2676,7 @@ pub fn run(mut options: Config) -> Result<()> {
                 Duration::from_secs_f64(1.0 / f64::from(state.quality.fps.get())),
             );
         }
+        state.poll_settled(delivery::monotonic_usec());
         if let Err(error) = state.refresh_video(&image.borrow()) {
             state.fail(error);
         }

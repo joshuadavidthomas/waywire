@@ -67,7 +67,7 @@ pub(crate) struct WindowsChanged {
 
 /// Logical bounds in output pixels. Both edges are rounded, so adjacent
 /// rectangles stay adjacent at fractional scales.
-fn to_pixels(rect: Rectangle<i32, Logical>, scale: f64) -> Rectangle<i32, Physical> {
+pub(super) fn to_pixels(rect: Rectangle<i32, Logical>, scale: f64) -> Rectangle<i32, Physical> {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "coordinates are bounded by the output size"
@@ -83,6 +83,21 @@ fn to_pixels(rect: Rectangle<i32, Logical>, scale: f64) -> Rectangle<i32, Physic
         )
             .into(),
     )
+}
+
+/// A window's content and its frame, the content plus the titlebar the
+/// compositor draws, when the window's content is at `location`.
+pub(super) fn bounds(
+    window: &Window,
+    location: smithay::utils::Point<i32, Logical>,
+) -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
+    let geometry = Rectangle::new(location, window.geometry().size);
+    let mut frame = geometry;
+    if decorations::decorated(window) {
+        frame.loc.y -= decorations::BAR;
+        frame.size.h += decorations::BAR;
+    }
+    (geometry, frame)
 }
 
 impl State {
@@ -123,12 +138,7 @@ impl State {
         focus: Option<&KeyboardFocus>,
         scale: f64,
     ) -> Option<WindowEntry> {
-        let geometry = Rectangle::new(self.space.element_location(window)?, window.geometry().size);
-        let mut frame = geometry;
-        if decorations::decorated(window) {
-            frame.loc.y -= decorations::BAR;
-            frame.size.h += decorations::BAR;
-        }
+        let (geometry, frame) = bounds(window, self.space.element_location(window)?);
         let (_, maximized) = decorations::window_flags(window);
         let fullscreen = window.toplevel().map_or_else(
             || {

@@ -736,6 +736,142 @@ fn window_list_reports_x11_windows_where_they_are_drawn() {
     }
 }
 
+/// Call `WaitSettled` on the compositor's bus.
+fn wait_settled(
+    bus: &zbus::blocking::Connection,
+    options: &std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
+) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>> {
+    bus.call_method(
+        Some("io.github.joshuadavidthomas.waywire.InputDelivery1"),
+        "/io/github/joshuadavidthomas/waywire/InputDelivery1",
+        Some("io.github.joshuadavidthomas.waywire.InputDelivery1"),
+        "WaitSettled",
+        &(options,),
+    )?
+    .body()
+    .deserialize()
+}
+
+/// `WaitSettled` on the compositor's bus times what an X11 keystroke
+/// redraws: it waits from the key's receipt, sees the xterm's echo, and
+/// refuses options out of range.
+#[test]
+#[ignore = "requires FFmpeg, Xwayland, xterm, xdotool and dbus-daemon"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the session, the keystroke and the bus calls form one scenario"
+)]
+fn wait_settled_times_an_xterm_keystroke() {
+    use std::collections::HashMap;
+
+    use zbus::zvariant::OwnedValue;
+    use zbus::zvariant::Value;
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let marker = runtime.path().join("xterm-window");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP socket");
+    let port = socket.local_addr().expect("RTP address").port().to_string();
+    let _compositor = Compositor(
+        ProcessCommand::new(env!("CARGO_BIN_EXE_waywire-compositor"))
+            .args(["--rtp-port", &port, "--resolution", "800x600", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"
+                xterm -title waywire-settle -geometry 40x10+120+100 &
+                app=$!
+                trap 'kill "$app" 2>/dev/null' EXIT
+                while :; do
+                    id=$(xdotool search --pid "$app" --onlyvisible 2>/dev/null | head -n 1)
+                    [ -n "$id" ] && break
+                    sleep 0.05
+                done
+                printf '%s %s' "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" > "$0"
+                wait "$app"
+                "#,
+            ])
+            .arg(&marker)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start compositor"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let target = written_contents(&marker, deadline, "xterm did not map");
+    let mut target = target.split_whitespace();
+    let display = target.next().expect("display");
+    let address = target.next().expect("session bus");
+    let bus = zbus::blocking::connection::Builder::address(address)
+        .expect("bus address")
+        .build()
+        .expect("connect to the session bus");
+    let field = |answer: &HashMap<String, OwnedValue>, key: &str| -> u64 {
+        let value = answer[key].try_clone().expect(key);
+        u64::try_from(value.try_clone().expect(key))
+            .or_else(|_| u32::try_from(value).map(u64::from))
+            .expect(key)
+    };
+    let result = |answer: &HashMap<String, OwnedValue>| -> String {
+        answer["result"]
+            .try_clone()
+            .expect("result")
+            .try_into()
+            .expect("result")
+    };
+
+    let refused = wait_settled(&bus, &HashMap::from([("quiet_ms", Value::U32(5))]))
+        .expect_err("a 5 ms quiet window is out of range");
+    assert!(
+        matches!(&refused, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs"),
+        "{refused:?}"
+    );
+
+    // Let the new window finish drawing, then note the latest serial.
+    let idle = wait_settled(&bus, &HashMap::new()).expect("WaitSettled");
+    assert_eq!(result(&idle), "settled");
+    let before = field(&idle, "serial");
+    let output = ProcessCommand::new("xdotool")
+        .env("DISPLAY", display)
+        .args(["type", "--delay", "0", "w"])
+        .output()
+        .expect("xdotool");
+    assert!(output.status.success(), "xdotool type");
+    // XTest reaches the compositor through Xwayland after xdotool returns;
+    // its receipts take the next serials, and every subscriber may name them.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        match wait_settled(
+            &bus,
+            &HashMap::from([
+                ("serial", Value::U64(before + 1)),
+                ("timeout_ms", Value::U32(5000)),
+            ]),
+        ) {
+            Ok(answer) => break answer,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the key never arrived: {error:?}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    assert_eq!(result(&answer), "settled");
+    assert!(field(&answer, "frames") >= 1, "the echo changed the screen");
+    let input = field(&answer, "input_usec");
+    let damage = field(&answer, "damage_usec");
+    let answered = field(&answer, "time_usec");
+    assert!(damage > input, "the echo came after the key");
+    assert!(
+        answered >= damage + 300_000,
+        "it answered only after a 300 ms quiet window: {answer:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, GTK3 Python bindings and xdotool"]
 fn x11_pre_map_maximize_fills_work_area() {

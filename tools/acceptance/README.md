@@ -147,6 +147,7 @@ just acceptance cua-driver
 just acceptance fedora-x11
 just acceptance receipts-t6a
 just acceptance window-query
+just acceptance settle
 ```
 
 The runner needs `sudo docker`, host networking, `agent-browser`, ImageMagick,
@@ -196,3 +197,24 @@ as a driver would. It fails unless, at that point:
 Geometry that goes stale after a move, window-relative geometry, ids that
 differ from the receipts' and reversed stacking each fail it. The receipts are
 saved to `window-query.jsonl` in `.amp/in/artifacts/`.
+
+`settle` checks `WaitSettled` (`docs/input-delivery.md#settling`) from
+outside. It opens `settle.html` in Chromium on Wayland and a still X11 xterm
+beside it. A RemoteDesktop portal driver (`portal_pointer.py`, run under
+`tools/receipts/receipts.py`) clicks the page, which then repaints in a new
+colour every 150 ms for 1200 ms and ends green. Each gap is shorter than the
+300 ms quiet window. The driver calls `WaitSettled` with its click's receipt
+serial and runs grim as soon as the call returns. The scenario fails unless:
+
+- the wait reports `settled`;
+- that screenshot shows the final green, and the page looks the same in a
+  screenshot taken 1.5 s later;
+- the wait returned at least 1200 ms after the click, by the driver's own
+  clock.
+
+A second click starts an endless animation. A 1500 ms wait on the whole
+screen must then report `timeout`, after 1.5 to 3 s, while a wait on the
+xterm's window id settles with no changed frames. A wait that reports
+`settled` at once, ignores damage, or does not restart its quiet window at
+each repaint fails it. The screenshots right after the wait and 1.5 s later
+are saved as `settle-after.png` and `settle-later.png` in `.amp/in/artifacts/`.

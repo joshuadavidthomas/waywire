@@ -17,6 +17,7 @@
 //! foreign-toplevel already tells every client, so every subscriber gets them.
 
 mod bus;
+pub(crate) mod settle;
 mod windows;
 
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ use smithay::xwayland::X11Surface;
 use waywire_protocol::pipe;
 
 pub(crate) use self::bus::start;
+use self::settle::Settle;
 pub(crate) use self::windows::WindowList;
 pub(crate) use self::windows::WindowsChanged;
 use crate::State;
@@ -384,6 +386,8 @@ pub(crate) struct Delivery {
     /// Why focus moved to a window that has not mapped yet. The change is
     /// reported when the window maps and has a foreign-toplevel identifier.
     deferred: Option<FocusCause>,
+    /// Serial times, recent damage and `WaitSettled` calls in progress.
+    settle: Settle,
 }
 
 impl Delivery {
@@ -419,7 +423,14 @@ impl Delivery {
     }
 
     fn next_serial(&mut self) -> u64 {
+        self.issue(settle::Audience::Everyone, false)
+    }
+
+    /// Allocate a serial that `audience` may name in `WaitSettled`;
+    /// `input` for a receipt's.
+    fn issue(&mut self, audience: settle::Audience, input: bool) -> u64 {
         self.serial += 1;
+        self.settle.issue(self.serial, audience, input);
         self.serial
     }
 
@@ -503,7 +514,7 @@ impl Delivery {
     }
 }
 
-fn monotonic_usec() -> u64 {
+pub(crate) fn monotonic_usec() -> u64 {
     nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map_or(0, |time| {
         u64::try_from(time.tv_sec()).unwrap_or(0) * 1_000_000
             + u64::try_from(time.tv_nsec()).unwrap_or(0) / 1000
@@ -527,7 +538,13 @@ impl State {
     /// Start dispatching one input event and return its receipt serial.
     /// Focus changes until [`Self::finish_input`] name this input.
     pub(crate) fn begin_input(&mut self, source: KeyboardSource, cause: FocusCause) -> u64 {
-        let serial = self.delivery.next_serial();
+        let lineage = self
+            .delivery
+            .sources
+            .get(&source)
+            .map_or(&[][..], |info| &info.lineage);
+        let audience = settle::Audience::of(self.delivery.kind(source), lineage);
+        let serial = self.delivery.issue(audience, true);
         self.delivery.dispatching = Some(Dispatching {
             source,
             serial,
