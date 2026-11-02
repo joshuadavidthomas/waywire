@@ -105,7 +105,7 @@ jobs:
       # Reuses the debug binaries `cargo test` built and the runner's Chrome.
       - name: Install viewer end-to-end tools
         run: |
-          sudo apt-get install -y --no-install-recommends foot xwayland
+          sudo apt-get install -y --no-install-recommends foot xwayland libegl1 libegl-mesa0
           npm install --prefix "$RUNNER_TEMP/agent-browser" --no-package-lock --no-audit --no-fund \
             agent-browser@0.38.1
           echo "$RUNNER_TEMP/agent-browser/node_modules/.bin" >> "$GITHUB_PATH"
