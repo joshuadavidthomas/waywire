@@ -18,6 +18,10 @@ acceptance-tasks *ARGS:
 benchmark *ARGS:
     python3 tools/benchmark/benchmark.py {{ ARGS }}
 
+# Drive the browser viewer through a live gateway and compositor with foot.
+e2e BIN_DIR="target/release":
+    python3 tools/e2e/viewer.py {{ BIN_DIR }}
+
 build-web:
     pnpm --filter @waywire/web build
 

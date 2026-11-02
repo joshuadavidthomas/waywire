@@ -16,6 +16,7 @@ on:
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
       - rust-toolchain.toml
+      - tools/e2e/**
   push:
     branches: [main]
     paths:
@@ -31,6 +32,7 @@ on:
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
       - rust-toolchain.toml
+      - tools/e2e/**
 
 concurrency:
   group: test-${{ github.ref }}
@@ -99,3 +101,18 @@ jobs:
 
       - name: Test
         run: just test
+
+      # Reuses the debug binaries `cargo test` built and the runner's Chrome.
+      - name: Install viewer end-to-end tools
+        run: |
+          sudo apt-get install -y --no-install-recommends foot
+          npm install --prefix "$RUNNER_TEMP/agent-browser" --no-package-lock --no-audit --no-fund \
+            agent-browser@0.38.1
+          echo "$RUNNER_TEMP/agent-browser/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Viewer end-to-end
+        timeout-minutes: 5
+        env:
+          AGENT_BROWSER_EXECUTABLE_PATH: /usr/bin/google-chrome
+          AGENT_BROWSER_ARGS: --no-sandbox
+        run: just e2e target/debug

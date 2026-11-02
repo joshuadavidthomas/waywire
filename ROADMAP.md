@@ -823,8 +823,12 @@ the review are in place. Remaining gaps:
   stable 1.97.1 rejects. The browser JSON parser
   (`ClientMessage::parse_json`) has only example tests.
 - The WebSocket tests run the gateway binary against a stub compositor that
-  records the command pipe. No test drives the browser viewer through a live
-  gateway and compositor.
+  records the command pipe. `just e2e` (`tools/e2e`), run by the test
+  workflow, drives the browser viewer through a live gateway and compositor
+  with one foot in headless Chromium: a nonblank frame, a click at an exact
+  desktop pixel, exact typed text, and Remote input off and back on. It uses
+  one viewer in Chromium only; no live test covers Firefox or Safari, or two
+  viewers contending for control.
 - `composed_text_reaches_wayland_client_without_text_input` failed once in a
   full ignored run because its GTK client never started within 15 seconds. It
   did not recur in 30 later paired suite runs or in 150 standalone starts. One
