@@ -320,7 +320,11 @@ test("where MediaStreamTrackGenerator exists, frames show through a <video> over
   }));
   const h = await presentation(context, 300);
   (document as unknown as { createElement: () => FakeTarget }).createElement =
-    () => Object.assign(new FakeTarget(), { play: () => Promise.resolve() });
+    () =>
+      Object.assign(new FakeTarget(), {
+        play: () => Promise.resolve(),
+        readyState: 0,
+      });
   const stage = new FakeTarget();
   stage.append(h.canvas);
   Object.assign(h.canvas, {
@@ -330,11 +334,21 @@ test("where MediaStreamTrackGenerator exists, frames show through a <video> over
     await h.feed(0, { keyframe: true });
     h.advance(300);
     h.paint();
-    await h.feed(310_000, { inputSequence: 1 });
-    assert.deepEqual(written, [0, 310_000]);
-    assert.deepEqual(h.draws, [], "the canvas is not drawn");
+    assert.deepEqual(
+      h.draws.map(({ timestamp }) => timestamp),
+      [0],
+      "the canvas shows frames until the <video> has one",
+    );
     const video = stage.children[1];
     assert.equal(stage.children.length, 2);
+    Object.assign(video!, { readyState: 2 });
+    await h.feed(310_000, { inputSequence: 1 });
+    assert.deepEqual(written, [0, 310_000]);
+    assert.deepEqual(
+      h.draws.map(({ timestamp }) => timestamp),
+      [0],
+      "the canvas is not drawn once the <video> shows frames",
+    );
     assert.equal(
       (video?.style as unknown as { pointerEvents: string }).pointerEvents,
       "none",
@@ -345,7 +359,7 @@ test("where MediaStreamTrackGenerator exists, frames show through a <video> over
     await h.feed(320_000, { inputSequence: 2 });
     assert.deepEqual(
       h.draws.map(({ timestamp }) => timestamp),
-      [320_000],
+      [0, 320_000],
       "a fullscreen canvas is drawn too",
     );
     assert.deepEqual(written, [0, 310_000, 320_000]);

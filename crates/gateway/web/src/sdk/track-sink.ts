@@ -55,6 +55,15 @@ export class TrackSink {
     return new TrackSink(element, track, track.writable.getWriter(), observer);
   }
 
+  /**
+   * Whether the `<video>` has a frame to show. Chromium drops frames written
+   * before the element starts playing, and an idle desktop sends no more, so
+   * the canvas has to show them until then.
+   */
+  get showing(): boolean {
+    return this.element.readyState >= 2; // HAVE_CURRENT_DATA
+  }
+
   /** Show the frame; the caller keeps its own reference. */
   show(frame: VideoFrame): void {
     this.writer.write(frame.clone()).catch(() => undefined);

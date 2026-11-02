@@ -838,7 +838,7 @@ export class VideoRuntime {
     if (this.trackSink === undefined) this.trackSink = TrackSink.over(display);
     this.trackSink?.show(frame);
     // A fullscreen canvas hides the <video> beside it, so it draws as well.
-    if (!this.trackSink || document.fullscreenElement === display)
+    if (!this.trackSink?.showing || document.fullscreenElement === display)
       context.drawImage(frame, 0, 0, display.width, display.height);
     const drawCompletedAtMs = performance.now();
     // Presented means rendered to the canvas, not physical display scanout.
