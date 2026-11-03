@@ -78,7 +78,7 @@ test: build-web
     shellcheck .agents/setup .agents/serve-desktop
 
 test-ffmpeg *ARGS:
-    cargo test --locked -p waywire-compositor -- --ignored {{ ARGS }}
+    cargo test --locked -p waywire-compositor -p waywire-encoder -- --ignored {{ ARGS }}
 
 typecheck:
     pnpm --filter @waywire/web check

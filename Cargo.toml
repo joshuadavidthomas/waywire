@@ -33,6 +33,7 @@ unwrap_used = "warn"
 wildcard_enum_match_arm = "warn"
 
 [workspace.dependencies]
+waywire-encoder = { path = "crates/encoder" }
 waywire-protocol = { path = "crates/protocol" }
 
 anyhow = "1.0.104"
@@ -69,6 +70,7 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io", "
 # Smithay provides no server state for wlr-screencopy; the compositor implements
 # that protocol directly over these generated bindings.
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 # Smithay's XWM leaves windows from Xwayland before 23.1 (Debian 12 ships 22.1)
 # without a wl_surface, so they are never drawn. The fork adds one commit on top

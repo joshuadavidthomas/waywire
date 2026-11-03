@@ -5,6 +5,7 @@
 
 mod encoder;
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -15,8 +16,6 @@ use std::thread;
 use calloop::ping::Ping;
 use calloop::ping::PingSource;
 use calloop::ping::make_ping;
-use smithay::utils::Physical;
-use smithay::utils::Rectangle;
 use tracing::error;
 use waywire_protocol::browser::push_stripe;
 use waywire_protocol::pipe::Chroma;
@@ -36,7 +35,7 @@ const BAND_ROWS: usize = 16;
 /// tenths of a dB of the 4:2:0 ceiling; 18 left a scrolled page 4 dB short of it.
 const REFRESH_QP: u8 = 14;
 /// Frames a still screen's refresh is spread over: every stripe gets one.
-pub(crate) const REFRESH_FRAMES: usize = encoder::CLEANUP_STAGGER_FRAMES;
+pub const REFRESH_FRAMES: usize = encoder::CLEANUP_STAGGER_FRAMES;
 
 /// The newest output in I420, shared between the event loop, which converts damaged
 /// rows into it, and the worker, which copies the changed stripes out.
@@ -69,23 +68,24 @@ struct Shared {
     work: Condvar,
 }
 
-/// A frame for the in-process encoder: the output's BGRA pixels and the rectangles
+/// A frame for the in-process encoder: the output's BGRA pixels and the row spans
 /// that changed since the last submitted frame. The metadata's size is the encoded
 /// size; a smaller one scales the output down before encoding.
-pub(crate) struct StripedFrame<'a> {
-    pub(crate) pixels: &'a [u8],
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    pub(crate) damage: &'a [Rectangle<i32, Physical>],
-    pub(crate) metadata: FrameMetadata,
-    pub(crate) crf: Crf,
+pub struct StripedFrame<'a> {
+    pub pixels: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    /// Damaged rows, `top..bottom` in output pixels; they may extend past the output.
+    pub damage: &'a [Range<i32>],
+    pub metadata: FrameMetadata,
+    pub crf: Crf,
     /// The bitrate target the stripes share.
-    pub(crate) bitrate: Kbps,
+    pub bitrate: Kbps,
     /// The screen held still: refresh stripes at the finer quantizer.
-    pub(crate) refresh: bool,
+    pub refresh: bool,
 }
 
-pub(crate) struct StripedEncoder {
+pub struct StripedEncoder {
     shared: Arc<Shared>,
     notifications: mpsc::Receiver<Result<EncodedFrame, String>>,
     notification_source: Option<PingSource>,
@@ -93,7 +93,7 @@ pub(crate) struct StripedEncoder {
 }
 
 impl StripedEncoder {
-    pub(crate) fn start(stripes: usize, generation: Generation) -> Result<Self, VideoError> {
+    pub fn start(stripes: usize, generation: Generation) -> Result<Self, VideoError> {
         let shared = Arc::new(Shared {
             staging: Mutex::new(Staging {
                 width: 0,
@@ -124,7 +124,7 @@ impl StripedEncoder {
         })
     }
 
-    pub(crate) fn submit(&self, frame: &StripedFrame<'_>) -> Result<(), VideoError> {
+    pub fn submit(&self, frame: &StripedFrame<'_>) -> Result<(), VideoError> {
         let width = usize::from(frame.metadata.width.get());
         let height = usize::from(frame.metadata.height.get());
         if width > encoder::MAX_WIDTH
@@ -136,7 +136,7 @@ impl StripedEncoder {
         {
             return Err(VideoError::InvalidFrame);
         }
-        let submitted_ns = crate::capture::monotonic_nanos();
+        let submitted_ns = crate::latency::monotonic_nanos();
         let mut staging = self
             .shared
             .staging
@@ -158,18 +158,16 @@ impl StripedEncoder {
             staging.v = vec![0; pixels / 4];
             staging.bands = vec![false; height.div_ceil(BAND_ROWS)];
         }
-        let full = [Rectangle::from_size(
-            (
-                i32::try_from(frame.width).unwrap_or(i32::MAX),
-                i32::try_from(frame.height).unwrap_or(i32::MAX),
-            )
-                .into(),
-        )];
-        let damage = if resized { &full[..] } else { frame.damage };
+        let full = 0..i32::try_from(frame.height).unwrap_or(i32::MAX);
+        let damage = if resized {
+            std::slice::from_ref(&full)
+        } else {
+            frame.damage
+        };
         let scaled = (width, height) != (frame.width, frame.height);
-        for rectangle in damage {
-            let top = usize::try_from(rectangle.loc.y.max(0)).unwrap_or(0);
-            let bottom = usize::try_from(rectangle.loc.y.saturating_add(rectangle.size.h).max(0))
+        for rows in damage {
+            let top = usize::try_from(rows.start.max(0)).unwrap_or(0);
+            let bottom = usize::try_from(rows.end.max(0))
                 .unwrap_or(0)
                 .min(frame.height);
             // The encoded rows whose source boxes overlap the damaged rows.
@@ -208,7 +206,7 @@ impl StripedEncoder {
                 *band = true;
             }
         }
-        crate::capture::trace_frame("converted", frame.metadata.sequence, submitted_ns);
+        crate::latency::trace_frame("converted", frame.metadata.sequence, submitted_ns);
         staging.pending = Some(Pending {
             metadata: frame.metadata.clone(),
             crf: frame.crf,
@@ -220,7 +218,7 @@ impl StripedEncoder {
     }
 
     /// Code the next submitted frame's stripes as key frames.
-    pub(crate) fn request_key(&self) {
+    pub fn request_key(&self) {
         self.shared
             .staging
             .lock()
@@ -228,7 +226,7 @@ impl StripedEncoder {
             .key = true;
     }
 
-    pub(crate) fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
+    pub fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
         let mut staging = self
             .shared
             .staging
@@ -248,12 +246,12 @@ impl StripedEncoder {
         Ok(())
     }
 
-    pub(crate) fn take_notification_source(&mut self) -> Option<PingSource> {
+    pub fn take_notification_source(&mut self) -> Option<PingSource> {
         self.notification_source.take()
     }
 
     /// The next encoded frame, or the error that stopped the encoder.
-    pub(crate) fn try_frame(&self) -> Option<Result<EncodedFrame, String>> {
+    pub fn try_frame(&self) -> Option<Result<EncodedFrame, String>> {
         match self.notifications.try_recv() {
             Ok(frame) => Some(frame),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -269,7 +267,7 @@ impl StripedEncoder {
         }
     }
 
-    pub(crate) fn stop(mut self) {
+    pub fn stop(mut self) {
         self.stop_inner();
     }
 
@@ -337,7 +335,7 @@ fn run(
             copy_changed_stripes(&mut staging, current);
             (pending, key)
         };
-        let taken_ns = crate::capture::monotonic_nanos();
+        let taken_ns = crate::latency::monotonic_nanos();
         let Some(current) = stripes.as_mut() else {
             continue;
         };
@@ -371,7 +369,7 @@ fn run(
             Err(error) => Err(error),
         };
         if let Ok(frame) = &notification {
-            crate::capture::trace_frame("encoder_output", frame.metadata.sequence, taken_ns);
+            crate::latency::trace_frame("encoder_output", frame.metadata.sequence, taken_ns);
         }
         let fatal = notification.is_err();
         if sender.send(notification).is_err() {

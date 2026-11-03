@@ -19,10 +19,8 @@ mod portal;
 mod screencopy;
 mod session_bus;
 mod shell;
-mod striped;
 mod text_keyboard;
 mod toplevel_list;
-mod video;
 mod virtual_keyboard;
 mod virtual_pointer;
 mod xwayland;
@@ -118,6 +116,16 @@ use smithay::wayland::text_input::TextInputSeat;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_pointer::VirtualPointerDevice;
 use smithay::wayland::xdg_activation::XdgActivationState;
+use waywire_encoder::latency;
+use waywire_encoder::striped;
+use waywire_encoder::striped::StripedEncoder;
+use waywire_encoder::striped::StripedFrame;
+use waywire_encoder::video;
+use waywire_encoder::video::CapturedFrame;
+use waywire_encoder::video::EncoderConfig;
+use waywire_encoder::video::Notification;
+use waywire_encoder::video::VideoEncoder;
+use waywire_encoder::video::encoded_dimensions;
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
@@ -135,13 +143,6 @@ use waywire_protocol::pipe::{
 
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
-use crate::striped::StripedEncoder;
-use crate::striped::StripedFrame;
-use crate::video::CapturedFrame;
-use crate::video::EncoderConfig;
-use crate::video::Notification;
-use crate::video::VideoEncoder;
-use crate::video::encoded_dimensions;
 
 /// Startup settings for the compositor and its initial video stream.
 #[derive(Debug)]
@@ -2085,7 +2086,7 @@ impl State {
                 target: "waywire_latency",
                 stage = "compositor_input",
                 input = sequence.get(),
-                at_ns = capture::monotonic_nanos(),
+                at_ns = latency::monotonic_nanos(),
             );
         }
         let source = KeyboardSource::MAIN;
@@ -2275,7 +2276,7 @@ impl State {
                 Ok(frame) => {
                     let sequence = frame.metadata.sequence;
                     match self.event_sink.send(&Event::EncodedFrame(frame)) {
-                        Ok(()) => capture::trace_frame("emitted", sequence, 0),
+                        Ok(()) => latency::trace_frame("emitted", sequence, 0),
                         Err(event_writer::EventWriterError::QueueFull) => {
                             self.request_key();
                             self.frame_pending = FrameRequest::Pending;
@@ -2306,7 +2307,7 @@ impl State {
         image: &mut Image<'static, 'static>,
         tracker: &mut OutputDamageTracker,
     ) -> Result<()> {
-        let render_started_ns = capture::monotonic_nanos();
+        let render_started_ns = latency::monotonic_nanos();
         let size = (
             i32::try_from(self.size.width())?,
             i32::try_from(self.size.height())?,
@@ -2382,7 +2383,7 @@ impl State {
                 && self.acknowledged == Some(self.generation);
             self.forced_frame_hash = hash;
             if !unchanged {
-                capture::trace_frame("render", self.sequence, render_started_ns);
+                latency::trace_frame("render", self.sequence, render_started_ns);
                 self.submit_video(image, damage, false)?;
                 self.refresh = Refresh::Due {
                     at: Instant::now() + REFRESH_DELAY,
@@ -2455,7 +2456,7 @@ impl State {
             generation: self.generation,
             width: config.encoded_width,
             height: config.encoded_height,
-            capture_nanos: capture::monotonic_nanos(),
+            capture_nanos: latency::monotonic_nanos(),
             sequence: self.sequence,
             input_sequence: self.latest_input_sequence,
             fps: self.quality.fps,
@@ -2471,11 +2472,17 @@ impl State {
                 video.submit(CapturedFrame::new(image_pixels(image), metadata, config))?;
             }
             Some(Video::Striped(video)) => {
+                let damage: Vec<_> = damage
+                    .iter()
+                    .map(|rectangle| {
+                        rectangle.loc.y..rectangle.loc.y.saturating_add(rectangle.size.h)
+                    })
+                    .collect();
                 video.submit(&StripedFrame {
                     pixels: image_pixels(image),
                     width: image.width(),
                     height: image.height(),
-                    damage,
+                    damage: &damage,
                     metadata,
                     crf: self.quality.crf,
                     bitrate: self.quality.bitrate_kbps,

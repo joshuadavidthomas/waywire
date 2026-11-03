@@ -142,7 +142,7 @@ impl CompositorHandler for State {
             target: "waywire_latency",
             stage = "commit",
             cursor = self.cursor_surface.as_ref() == Some(surface),
-            at_ns = crate::capture::monotonic_nanos(),
+            at_ns = waywire_encoder::latency::monotonic_nanos(),
         );
         on_commit_buffer_handler::<Self>(surface);
         if self.cursor_surface.as_ref() == Some(surface) {

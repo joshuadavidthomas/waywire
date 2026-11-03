@@ -1,0 +1,26 @@
+[package]
+name = "waywire-encoder"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Lets the compositor's tests build a video encoder that never starts FFmpeg.
+test-support = []
+
+[dependencies]
+waywire-protocol = { workspace = true }
+
+calloop = { workspace = true }
+nix = { workspace = true }
+# In-process striped H.264 (BSD-2-Clause Cisco OpenH264, built from vendored source).
+# Its x86 assembly builds only when nasm is on PATH; without it the encoder silently
+# falls back to C and the benchmark scroll costs about 50% more CPU.
+openh264 = "0.9.9"
+rayon = "1.11.0"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }
+yuv = { version = "0.8.20", features = ["fast_mode"] }
+
+[lints]
+workspace = true

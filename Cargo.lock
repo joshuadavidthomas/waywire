@@ -2882,11 +2882,9 @@ dependencies = [
  "clap",
  "libloading",
  "nix",
- "openh264",
  "pangocairo",
  "pipewire",
  "png",
- "rayon",
  "shlex 2.0.1",
  "smithay",
  "tempfile",
@@ -2898,10 +2896,25 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
+ "waywire-encoder",
+ "waywire-protocol",
+ "xxhash-rust",
+ "zbus",
+]
+
+[[package]]
+name = "waywire-encoder"
+version = "0.1.0-rc.1"
+dependencies = [
+ "calloop",
+ "nix",
+ "openh264",
+ "rayon",
+ "thiserror 2.0.21",
+ "tracing",
  "waywire-protocol",
  "xxhash-rust",
  "yuv",
- "zbus",
 ]
 
 [[package]]

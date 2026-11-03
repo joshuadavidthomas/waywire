@@ -103,19 +103,19 @@ fn probe_encoder(ffmpeg: &str) -> Result<Encoder, VideoError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EncoderConfig {
-    pub(crate) raw_width: FrameDimension,
-    pub(crate) raw_height: FrameDimension,
-    pub(crate) encoded_width: FrameDimension,
-    pub(crate) encoded_height: FrameDimension,
-    pub(crate) fps: Fps,
-    pub(crate) bitrate_kbps: Kbps,
-    pub(crate) crf: Crf,
-    pub(crate) chroma: Chroma,
+pub struct EncoderConfig {
+    pub raw_width: FrameDimension,
+    pub raw_height: FrameDimension,
+    pub encoded_width: FrameDimension,
+    pub encoded_height: FrameDimension,
+    pub fps: Fps,
+    pub bitrate_kbps: Kbps,
+    pub crf: Crf,
+    pub chroma: Chroma,
 }
 
 impl EncoderConfig {
-    pub(crate) fn validate(self) -> Result<usize, VideoError> {
+    pub fn validate(self) -> Result<usize, VideoError> {
         let pixels = u64::from(self.raw_width.get()) * u64::from(self.raw_height.get());
         if pixels > MAX_RAW_PIXELS {
             return Err(VideoError::InvalidFrame);
@@ -126,14 +126,15 @@ impl EncoderConfig {
 }
 
 #[derive(Debug)]
-pub(crate) struct CapturedFrame<'a> {
+pub struct CapturedFrame<'a> {
     pixels: &'a [u8],
     metadata: FrameMetadata,
     config: EncoderConfig,
 }
 
 impl<'a> CapturedFrame<'a> {
-    pub(crate) fn new(pixels: &'a [u8], metadata: FrameMetadata, config: EncoderConfig) -> Self {
+    #[must_use]
+    pub fn new(pixels: &'a [u8], metadata: FrameMetadata, config: EncoderConfig) -> Self {
         Self {
             pixels,
             metadata,
@@ -183,20 +184,20 @@ impl RawFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Notification {
+pub enum Notification {
     Submitted(FrameMetadata),
     RestartRequired { generation: Generation },
     Fatal(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubmitResult {
+pub enum SubmitResult {
     Queued,
     ReplacedPending,
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum VideoError {
+pub enum VideoError {
     #[error("raw frame or encoder configuration is invalid")]
     InvalidFrame,
     #[error("video encoder stopped")]
@@ -234,7 +235,7 @@ struct Shared {
     work: Condvar,
 }
 
-pub(crate) struct VideoEncoder {
+pub struct VideoEncoder {
     shared: Arc<Shared>,
     notifications: mpsc::Receiver<Notification>,
     notification_source: Option<PingSource>,
@@ -243,8 +244,9 @@ pub(crate) struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    #[cfg(test)]
-    pub(crate) fn idle_for_test() -> Result<Self, VideoError> {
+    /// An encoder whose `FFmpeg` never starts, for tests that need a `VideoEncoder`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn idle_for_test() -> Result<Self, VideoError> {
         Self::start_with_spawner(
             String::new(),
             0,
@@ -254,7 +256,7 @@ impl VideoEncoder {
         )
     }
 
-    pub(crate) fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
+    pub fn start(ffmpeg: String, rtp_port: u16) -> Result<Self, VideoError> {
         let encoder = probe_encoder(&ffmpeg)?;
         let mut video = Self::start_with_spawner(
             ffmpeg,
@@ -334,7 +336,7 @@ impl VideoEncoder {
         })
     }
 
-    pub(crate) fn submit(&self, mut frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
+    pub fn submit(&self, mut frame: CapturedFrame<'_>) -> Result<SubmitResult, VideoError> {
         frame.validate()?;
         if self.encoder == Encoder::OpenH264 {
             frame.config.chroma = Chroma::Yuv420;
@@ -379,7 +381,7 @@ impl VideoEncoder {
         Ok(result)
     }
 
-    pub(crate) fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
+    pub fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
         let mut pool = self
             .shared
             .pool
@@ -414,11 +416,11 @@ impl VideoEncoder {
         Ok(())
     }
 
-    pub(crate) fn take_notification_source(&mut self) -> Option<PingSource> {
+    pub fn take_notification_source(&mut self) -> Option<PingSource> {
         self.notification_source.take()
     }
 
-    pub(crate) fn try_notification(&self) -> Option<Notification> {
+    pub fn try_notification(&self) -> Option<Notification> {
         match self.notifications.try_recv() {
             Ok(notification) => Some(notification),
             Err(mpsc::TryRecvError::Empty) => self
@@ -450,7 +452,7 @@ impl VideoEncoder {
         }
     }
 
-    pub(crate) fn stop(mut self) {
+    pub fn stop(mut self) {
         self.stop_inner();
     }
 
@@ -839,7 +841,7 @@ impl Worker<'_> {
             let Some((slot, frame)) = take_pending_frame(self.shared) else {
                 continue;
             };
-            let taken_ns = crate::capture::monotonic_nanos();
+            let taken_ns = crate::latency::monotonic_nanos();
 
             if frame.metadata.generation != current_generation(self.shared) {
                 release_slot(self.shared, slot, frame);
@@ -905,7 +907,7 @@ impl Worker<'_> {
                 }
             }
 
-            crate::capture::trace_frame("encoder_input", frame.metadata.sequence, taken_ns);
+            crate::latency::trace_frame("encoder_input", frame.metadata.sequence, taken_ns);
             // Correlation metadata follows only a complete raw-frame pipe write.
             if !send_notification(
                 self.shared,
@@ -1114,7 +1116,7 @@ fn watch_process(
 }
 
 fn watch_child(shared: Arc<Shared>, wake: Ping, pid: u32) -> io::Result<()> {
-    let fd = crate::pidfd(pid)?;
+    let fd = pidfd(pid)?;
     thread::Builder::new()
         .name("ffmpeg-exit".into())
         .spawn(move || {
@@ -1139,6 +1141,18 @@ fn watch_child(shared: Arc<Shared>, wake: Ping, pid: u32) -> io::Result<()> {
             }
         })?;
     Ok(())
+}
+
+/// Open a pidfd, which becomes readable when the process exits.
+fn pidfd(pid: u32) -> io::Result<std::os::fd::OwnedFd> {
+    // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
+    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = i32::try_from(fd).map_err(io::Error::other)?;
+    // SAFETY: the successful syscall returned a new descriptor we now own.
+    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
 }
 
 fn spawn_ffmpeg(
@@ -1398,7 +1412,8 @@ fn write_frame(
     Ok(())
 }
 
-pub(crate) fn encoded_dimensions(
+#[must_use]
+pub fn encoded_dimensions(
     raw_width: u32,
     raw_height: u32,
     requested_scale: ScalePercent,

@@ -237,32 +237,7 @@ pub(crate) fn copy_pixels(
 }
 
 pub(crate) fn monotonic() -> Duration {
-    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map_or(
-        Duration::ZERO,
-        |timestamp| {
-            Duration::new(
-                u64::try_from(timestamp.tv_sec()).unwrap_or(0),
-                u32::try_from(timestamp.tv_nsec()).unwrap_or(0),
-            )
-        },
-    )
-}
-
-/// The same clock as frame capture timestamps, for `waywire_latency` traces.
-pub(crate) fn monotonic_nanos() -> u64 {
-    u64::try_from(monotonic().as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Trace a frame stage that began at `start_ns` and ends now, for the benchmark's
-/// viewer latency breakdown.
-pub(crate) fn trace_frame(stage: &'static str, sequence: u64, start_ns: u64) {
-    tracing::debug!(
-        target: "waywire_latency",
-        stage,
-        sequence,
-        start_ns,
-        at_ns = monotonic_nanos(),
-    );
+    Duration::from_nanos(waywire_encoder::latency::monotonic_nanos())
 }
 
 #[cfg(test)]
