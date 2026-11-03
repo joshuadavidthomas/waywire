@@ -14,6 +14,7 @@ use smithay::backend::input::PointerButtonEvent;
 use smithay::backend::input::PointerMotionEvent;
 use smithay::backend::libei::EiInput;
 use smithay::backend::libei::EiInputEvent;
+use smithay::backend::libei::EiInputSeat;
 use smithay::backend::libei::EiRegion;
 use smithay::input::keyboard::KeyboardSource;
 use smithay::input::keyboard::XkbConfig;
@@ -117,7 +118,7 @@ pub(crate) fn serve_connection(
                 }
                 EiInputEvent::Disconnected => {
                     tracing::debug!("EI sender disconnected");
-                    state.eis_seats.remove(&connection_id);
+                    state.eis_seats.remove(connection_id);
                     for (_, source) in sources.devices.drain() {
                         state.disconnect_input_source(source);
                     }
@@ -211,6 +212,29 @@ pub(crate) fn serve_connection(
     Ok(())
 }
 
+/// The EI seats of connected senders, by connection.
+#[derive(Default)]
+pub(crate) struct EisSeats {
+    seats: HashMap<KeyboardSource, EiInputSeat>,
+}
+
+impl EisSeats {
+    fn insert(&mut self, connection: KeyboardSource, seat: EiInputSeat) {
+        self.seats.insert(connection, seat);
+    }
+
+    fn remove(&mut self, connection: KeyboardSource) {
+        self.seats.remove(&connection);
+    }
+
+    /// Advertise new absolute-pointer regions on every seat.
+    fn update_regions(&self, regions: &[EiRegion]) {
+        for seat in self.seats.values() {
+            seat.update_regions(regions);
+        }
+    }
+}
+
 /// One connection's devices, each its own input source with the
 /// connection's origin.
 struct Sources {
@@ -249,19 +273,19 @@ fn peer_pid(context: &eis::Context) -> Option<u32> {
     u32::try_from(credentials.pid()).ok()
 }
 
-/// EI regions are immutable per device. Smithay replaces the absolute devices,
-/// emits `DeviceRemoved` (releasing only their held input), then advertises the new
-/// regions. Relative pointers and keyboards remain live across output changes.
-#[allow(clippy::cast_possible_truncation)] // EI represents output scale as f32.
-pub(crate) fn refresh_regions(state: &State) {
-    if let Some(rect) = state.space.output_geometry(&state.output) {
-        let regions = [EiRegion {
-            rect,
-            scale: state.output.current_scale().fractional_scale() as f32,
-            mapping_id: Some(state.output.name()),
-        }];
-        for seat in state.eis_seats.values() {
-            seat.update_regions(&regions);
+impl State {
+    /// EI regions are immutable per device. Smithay replaces the absolute devices,
+    /// emits `DeviceRemoved` (releasing only their held input), then advertises the new
+    /// regions. Relative pointers and keyboards remain live across output changes.
+    #[allow(clippy::cast_possible_truncation)] // EI represents output scale as f32.
+    pub(crate) fn refresh_eis_regions(&self) {
+        if let Some(rect) = self.space.output_geometry(&self.output) {
+            let regions = [EiRegion {
+                rect,
+                scale: self.output.current_scale().fractional_scale() as f32,
+                mapping_id: Some(self.output.name()),
+            }];
+            self.eis_seats.update_regions(&regions);
         }
     }
 }

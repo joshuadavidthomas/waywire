@@ -27,7 +27,6 @@ mod wm;
 mod xwayland;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -100,7 +99,6 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::wayland::viewporter::ViewporterState;
-use smithay::wayland::virtual_pointer::VirtualPointerDevice;
 use waywire_decorations::DecorationAction;
 use waywire_decorations::WindowAction;
 use waywire_encoder::latency;
@@ -181,8 +179,8 @@ pub(crate) struct State {
     pub(crate) xdisplay: Option<u32>,
     pub(crate) xwayland_client: Option<smithay::reexports::wayland_server::Client>,
     pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
-    pub(crate) eis_seats: HashMap<KeyboardSource, smithay::backend::libei::EiInputSeat>,
-    pub(crate) virtual_pointers: HashMap<VirtualPointerDevice, KeyboardSource>,
+    pub(crate) eis_seats: eis::EisSeats,
+    pub(crate) virtual_pointers: virtual_pointer::VirtualPointers,
     pub(crate) virtual_keyboards: virtual_keyboard::VirtualKeyboards,
     text_keyboard: text_keyboard::TextKeyboard,
     capture: capture::Capture,
@@ -310,8 +308,8 @@ impl State {
             xdisplay: None,
             xwayland_client: None,
             xwayland_shell_state,
-            eis_seats: HashMap::new(),
-            virtual_pointers: HashMap::new(),
+            eis_seats: eis::EisSeats::default(),
+            virtual_pointers: virtual_pointer::VirtualPointers::default(),
             virtual_keyboards: virtual_keyboard::VirtualKeyboards::default(),
             text_keyboard: text_keyboard::TextKeyboard::default(),
             capture,

@@ -566,7 +566,7 @@ impl crate::State {
                         self.stream.quality().fps.get(),
                     );
                 }
-                crate::eis::refresh_regions(self);
+                self.refresh_eis_regions();
                 self.advance_generation()?;
                 self.emit(Event::ResizeApplied(pipe::ResizeApplied {
                     request_id: p.request_id,

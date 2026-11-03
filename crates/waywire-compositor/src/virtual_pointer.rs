@@ -9,6 +9,8 @@
 //! Control ownership is shared with every other agent source: while a browser
 //! holds the input lease, a virtual pointer's events are dropped at the seat
 //! entry points in `lib.rs`, and its held buttons are released on takeover.
+use std::collections::HashMap;
+
 use smithay::backend::input::AbsolutePositionEvent;
 use smithay::backend::input::Axis;
 use smithay::backend::input::Event;
@@ -21,6 +23,7 @@ use smithay::input::pointer::AxisFrame;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::virtual_pointer::VirtualPointerBackend;
+use smithay::wayland::virtual_pointer::VirtualPointerDevice;
 use smithay::wayland::virtual_pointer::VirtualPointerHandler;
 use smithay::wayland::virtual_pointer::VirtualPointerManagerState;
 
@@ -34,17 +37,42 @@ pub(crate) fn install(display_handle: &DisplayHandle) {
     VirtualPointerManagerState::new::<State, _>(display_handle, |_client| true);
 }
 
+/// Virtual pointers connected now, each its own input source.
+#[derive(Default)]
+pub(crate) struct VirtualPointers {
+    sources: HashMap<VirtualPointerDevice, KeyboardSource>,
+}
+
+impl VirtualPointers {
+    /// A new device gets its own source, so its held buttons are tracked and
+    /// released independently of other input sources.
+    fn add(&mut self, device: VirtualPointerDevice) -> KeyboardSource {
+        let source = KeyboardSource::new_auxiliary();
+        self.sources.insert(device, source);
+        source
+    }
+
+    fn remove(&mut self, device: &VirtualPointerDevice) -> Option<KeyboardSource> {
+        self.sources.remove(device)
+    }
+
+    /// The device's source, created for an event from a device never added.
+    fn source(&mut self, device: VirtualPointerDevice) -> KeyboardSource {
+        *self
+            .sources
+            .entry(device)
+            .or_insert_with(KeyboardSource::new_auxiliary)
+    }
+}
+
 impl VirtualPointerHandler for State {
     fn process_virtual_pointer_event(&mut self, event: InputEvent<VirtualPointerBackend>) {
         match event {
             InputEvent::DeviceAdded { device } => {
-                // One source per virtual pointer, like one per EI device, so its
-                // held buttons are tracked and released independently of other
-                // input sources.
-                let source = KeyboardSource::new_auxiliary();
+                // One source per virtual pointer, like one per EI device.
                 let client = device.wl_seat().and_then(Resource::client);
+                let source = self.virtual_pointers.add(device);
                 self.describe_client_source(source, SourceKind::VirtualPointer, client);
-                self.virtual_pointers.insert(device, source);
                 self.register_agent_source(source);
             }
             InputEvent::DeviceRemoved { device } => {
@@ -56,10 +84,7 @@ impl VirtualPointerHandler for State {
                 }
             }
             InputEvent::PointerMotion { event } => {
-                let source = *self
-                    .virtual_pointers
-                    .entry(event.device())
-                    .or_insert_with(KeyboardSource::new_auxiliary);
+                let source = self.virtual_pointers.source(event.device());
                 if let Some(pointer) = self.seat.get_pointer() {
                     let delta = event.delta();
                     self.pointer_motion_with_delta(
@@ -70,10 +95,7 @@ impl VirtualPointerHandler for State {
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                let source = *self
-                    .virtual_pointers
-                    .entry(event.device())
-                    .or_insert_with(KeyboardSource::new_auxiliary);
+                let source = self.virtual_pointers.source(event.device());
                 // The event is a fraction of the client's extents, already
                 // clamped to 0..=1. Map it onto the output's logical size.
                 let scale = self.output.current_scale().fractional_scale();
@@ -87,17 +109,11 @@ impl VirtualPointerHandler for State {
                 );
             }
             InputEvent::PointerButton { event } => {
-                let source = *self
-                    .virtual_pointers
-                    .entry(event.device())
-                    .or_insert_with(KeyboardSource::new_auxiliary);
+                let source = self.virtual_pointers.source(event.device());
                 self.pointer_button(source, event.button_code(), event.state());
             }
             InputEvent::PointerAxis { event } => {
-                let source = *self
-                    .virtual_pointers
-                    .entry(event.device())
-                    .or_insert_with(KeyboardSource::new_auxiliary);
+                let source = self.virtual_pointers.source(event.device());
                 // One frame per `frame` request, timestamped with the
                 // scroll event's own time.
                 let mut frame = AxisFrame::new(event.time()).source(event.source());
