@@ -4268,7 +4268,7 @@ mod tests {
 
         // A launch token from a pin click raises the launched window too.
         state.focus_window(Some(source_window.clone()));
-        let token = state.launch_token();
+        let token = state.activation.launch_token();
         activate(
             &mut display,
             &mut state,
@@ -4778,7 +4778,7 @@ mod tests {
             "chromium",
         );
         let received = delivery_subscribers(&mut state, source);
-        let token = state.launch_token();
+        let token = state.activation.launch_token();
 
         // Chromium's window.open popup: activated with a granted token
         // before its first buffer, when it has no foreign-toplevel handle.

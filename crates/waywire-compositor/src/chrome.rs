@@ -739,7 +739,7 @@ impl State {
         };
         // The pin click is the user's request: a single-instance app that
         // forwards this launch to its running instance may raise it.
-        command.env("XDG_ACTIVATION_TOKEN", self.launch_token());
+        command.env("XDG_ACTIVATION_TOKEN", self.activation.launch_token());
         if let Some(pid) = self.chrome.start_pin(index, command) {
             if let Some(handle) = &self.loop_handle
                 && let Err(error) = crate::wake_on_exit(handle, pid)

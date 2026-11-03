@@ -101,7 +101,6 @@ use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_pointer::VirtualPointerDevice;
-use smithay::wayland::xdg_activation::XdgActivationState;
 use waywire_decorations::DecorationAction;
 use waywire_decorations::WindowAction;
 use waywire_encoder::latency;
@@ -171,7 +170,7 @@ pub(crate) struct State {
     pub(crate) seat_state: SeatState<Self>,
     pub(crate) data_device_state: DataDeviceState,
     pub(crate) drag: Option<dnd::Drag>,
-    pub(crate) activation: XdgActivationState,
+    pub(crate) activation: activation::Activation,
     pub(crate) popups: PopupManager,
     /// The popup grab holding the pointer, kept to see when it ends.
     popup_grab: Option<PopupGrab<State>>,
@@ -243,7 +242,7 @@ impl State {
         ]);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let clipboard = clipboard::Clipboard::new(&display_handle);
-        let activation = XdgActivationState::new::<Self>(&display_handle);
+        let activation = activation::Activation::new(&display_handle);
         let xwayland_shell_state =
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&display_handle);
         install_globals(&display_handle);
@@ -437,7 +436,7 @@ impl State {
             return;
         };
         self.dirty = true;
-        self.void_activation_tokens();
+        self.activation.void_tokens();
         for source in release {
             self.release_input(source);
         }

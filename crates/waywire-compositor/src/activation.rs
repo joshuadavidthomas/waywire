@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use smithay::desktop::Window;
 use smithay::input::Seat;
+use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
@@ -28,19 +29,61 @@ const TOKEN_LIFETIME: Duration = Duration::from_secs(30);
 /// Marks a token that may raise its window.
 struct Granted;
 
-impl XdgActivationHandler for State {
-    fn activation_state(&mut self) -> &mut XdgActivationState {
-        &mut self.activation
+/// The xdg-activation global and the tokens it issued.
+pub(crate) struct Activation {
+    state: XdgActivationState,
+}
+
+impl Activation {
+    pub(crate) fn new(display_handle: &DisplayHandle) -> Self {
+        Self {
+            state: XdgActivationState::new::<State>(display_handle),
+        }
     }
 
-    // Every token is kept, so a request with an ungranted token still
-    // reaches `request_activation` and can mark its window urgent.
-    fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        self.activation
+    pub(crate) fn state(&mut self) -> &mut XdgActivationState {
+        &mut self.state
+    }
+
+    /// A client created a token. Expired tokens go; `granted` marks this one
+    /// as able to raise its window. Every token is kept, so a request with an
+    /// ungranted token still arrives and can mark its window urgent.
+    fn created(&mut self, data: &XdgActivationTokenData, granted: bool) {
+        self.state
             .retain_tokens(|_, data| data.timestamp.elapsed() < TOKEN_LIFETIME);
-        if self.granted_by_focus(&data) {
+        if granted {
             data.user_data.insert_if_missing(|| Granted);
         }
+    }
+
+    /// Use up a token and say whether it may raise its window.
+    fn redeem(&mut self, token: &XdgActivationToken, data: &XdgActivationTokenData) -> bool {
+        self.state.remove_token(token);
+        data.timestamp.elapsed() < TOKEN_LIFETIME && data.user_data.get::<Granted>().is_some()
+    }
+
+    /// A token for an application the compositor launches.
+    pub(crate) fn launch_token(&mut self) -> String {
+        let (token, data) = self.state.create_external_token(None);
+        data.user_data.insert_if_missing(|| Granted);
+        token.to_string()
+    }
+
+    /// A takeover or handback changes who drives the desktop; activations
+    /// requested by the previous driver must not move focus afterwards.
+    pub(crate) fn void_tokens(&mut self) {
+        self.state.retain_tokens(|_, _| false);
+    }
+}
+
+impl XdgActivationHandler for State {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        self.activation.state()
+    }
+
+    fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        let granted = self.granted_by_focus(&data);
+        self.activation.created(&data, granted);
         true
     }
 
@@ -50,12 +93,10 @@ impl XdgActivationHandler for State {
         data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        self.activation.remove_token(&token);
+        let granted = self.activation.redeem(&token, &data);
         let Some(window) = self.toplevel_window(&surface) else {
             return;
         };
-        let granted =
-            data.timestamp.elapsed() < TOKEN_LIFETIME && data.user_data.get::<Granted>().is_some();
         tracing::debug!(granted, "xdg-activation request");
         if granted {
             self.with_focus_cause(crate::delivery::FocusCause::Activation, |state| {
@@ -69,19 +110,6 @@ impl XdgActivationHandler for State {
 }
 
 impl State {
-    /// A token for an application the compositor launches.
-    pub(crate) fn launch_token(&mut self) -> String {
-        let (token, data) = self.activation.create_external_token(None);
-        data.user_data.insert_if_missing(|| Granted);
-        token.to_string()
-    }
-
-    /// A takeover or handback changes who drives the desktop; activations
-    /// requested by the previous driver must not move focus afterwards.
-    pub(crate) fn void_activation_tokens(&mut self) {
-        self.activation.retain_tokens(|_, _| false);
-    }
-
     /// The token carries a serial of this seat no older than the current
     /// keyboard focus, and the client that holds that focus created it.
     fn granted_by_focus(&self, data: &XdgActivationTokenData) -> bool {
