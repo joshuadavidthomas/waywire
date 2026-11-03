@@ -1,0 +1,14 @@
+[package]
+name = "waywire-decorations"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+waywire-protocol = { workspace = true }
+
+anyhow = { workspace = true }
+pangocairo = { workspace = true }
+smithay = { workspace = true }
+
+[lints]
+workspace = true

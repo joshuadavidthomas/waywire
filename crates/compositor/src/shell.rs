@@ -576,15 +576,15 @@ impl State {
             self.work_area()?
         };
         let decorated = window.toplevel().map_or_else(
-            || super::decorations::decorated(window),
+            || waywire_decorations::decorated(window),
             |top| top.with_pending_state(|state| {
                 state.decoration_mode == Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide)
                     && !state.states.contains(xdg_toplevel::State::Fullscreen)
             }),
         );
         if decorated {
-            geometry.loc.y += super::decorations::BAR;
-            geometry.size.h = (geometry.size.h - super::decorations::BAR).max(1);
+            geometry.loc.y += waywire_decorations::BAR;
+            geometry.size.h = (geometry.size.h - waywire_decorations::BAR).max(1);
         }
         Some(geometry)
     }
@@ -593,7 +593,7 @@ impl State {
         &self,
     ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
         let mut output = self.space.output_geometry(&self.output)?;
-        output.size.h = (output.size.h - super::decorations::TASKBAR).max(1);
+        output.size.h = (output.size.h - waywire_decorations::TASKBAR).max(1);
         Some(output)
     }
 

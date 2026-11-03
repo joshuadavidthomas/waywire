@@ -42,7 +42,7 @@ pub(super) struct WindowState {
     pub always_on_top: bool,
     /// An activation request without a valid token asked for attention.
     pub urgent: bool,
-    pub decoration: Option<super::decorations::Decoration>,
+    pub decoration: Option<waywire_decorations::Decoration>,
     pub decoration_mode: Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>,
     pub restore: Option<Rectangle<i32, Logical>>,
     pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,

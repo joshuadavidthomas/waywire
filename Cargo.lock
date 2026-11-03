@@ -2881,7 +2881,6 @@ dependencies = [
  "calloop",
  "clap",
  "nix",
- "pangocairo",
  "shlex 2.0.1",
  "smithay",
  "tempfile",
@@ -2893,12 +2892,23 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
+ "waywire-decorations",
  "waywire-encoder",
  "waywire-pipewire",
  "waywire-portal",
  "waywire-protocol",
  "xxhash-rust",
  "zbus",
+]
+
+[[package]]
+name = "waywire-decorations"
+version = "0.1.0-rc.1"
+dependencies = [
+ "anyhow",
+ "pangocairo",
+ "smithay",
+ "waywire-protocol",
 ]
 
 [[package]]

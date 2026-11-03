@@ -1469,7 +1469,7 @@ mod tests {
         xdg.ack_configure(app.last_configure.expect("decoration configure"));
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(crate::decorations::decorated(&window));
+        assert!(waywire_decorations::decorated(&window));
         top.with_pending_state(|pending| {
             pending.states.set(TopState::Maximized);
             pending.states.set(TopState::Fullscreen);
@@ -1477,23 +1477,23 @@ mod tests {
         top.send_configure();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert!(
-            crate::decorations::decorated(&window),
+            waywire_decorations::decorated(&window),
             "pending fullscreen must not hide chrome"
         );
         assert!(
-            !crate::decorations::window_flags(&window).1,
+            !waywire_decorations::window_flags(&window).1,
             "pending maximize must not change chrome"
         );
         assert!(
-            !crate::decorations::above_taskbar(&window),
+            !waywire_decorations::above_taskbar(&window),
             "pending fullscreen must not change stacking"
         );
         xdg.ack_configure(app.last_configure.expect("fullscreen configure"));
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(!crate::decorations::decorated(&window));
-        assert!(crate::decorations::window_flags(&window).1);
-        assert!(crate::decorations::above_taskbar(&window));
+        assert!(!waywire_decorations::decorated(&window));
+        assert!(waywire_decorations::window_flags(&window).1);
+        assert!(waywire_decorations::above_taskbar(&window));
     }
 
     fn action_fixture() -> (
@@ -2127,10 +2127,10 @@ mod tests {
         let output = state.space.output_geometry(&state.output).expect("output");
         let location = state.space.element_location(&window).expect("location");
         let content = top.with_pending_state(|pending| pending.size.expect("maximized size"));
-        assert_eq!(location.y - crate::decorations::BAR, output.loc.y);
+        assert_eq!(location.y - waywire_decorations::BAR, output.loc.y);
         assert_eq!(
             content.h,
-            output.size.h - crate::decorations::BAR - crate::decorations::TASKBAR
+            output.size.h - waywire_decorations::BAR - waywire_decorations::TASKBAR
         );
         assert_eq!(content.w, output.size.w);
     }
@@ -2287,7 +2287,7 @@ mod tests {
         use smithay::backend::renderer::pixman::PixmanRenderer;
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
 
-        use crate::decorations::SceneElement;
+        use waywire_decorations::SceneElement;
 
         let (mut display, mut state) = crate::tests::test_state();
         let (connection, mut queue, mut app) = connect_client(&mut display.handle());
@@ -2335,8 +2335,7 @@ mod tests {
     fn fullscreen_and_menu_render_above_taskbar() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-
-        use crate::decorations::SceneElement;
+        use waywire_decorations::SceneElement;
 
         let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         let mut renderer = PixmanRenderer::new().expect("renderer");
@@ -2390,8 +2389,7 @@ mod tests {
     fn normal_window_above_fullscreen_stays_above_it_in_scene() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-
-        use crate::decorations::SceneElement;
+        use waywire_decorations::SceneElement;
 
         let (mut display, mut state, connection, mut queue, mut app, fullscreen) = action_fixture();
         let top = fullscreen.toplevel().expect("toplevel").clone();

@@ -113,6 +113,9 @@ use smithay::wayland::text_input::TextInputSeat;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_pointer::VirtualPointerDevice;
 use smithay::wayland::xdg_activation::XdgActivationState;
+use waywire_decorations::DecorationAction;
+use waywire_decorations::TaskbarChip;
+use waywire_decorations::WindowAction;
 use waywire_encoder::latency;
 use waywire_encoder::striped;
 use waywire_encoder::striped::StripedEncoder;
@@ -233,34 +236,6 @@ struct TitlebarPress {
     time: Instant,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum WindowAction {
-    Focus,
-    Move,
-    Resize(xdg_toplevel::ResizeEdge),
-    Minimize,
-    Maximize,
-    Restore,
-    Close,
-    ShowMenu,
-    ToggleAlwaysOnTop,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is an independent chip state the taskbar paints"
-)]
-struct TaskbarChip {
-    window: Option<Window>,
-    pin: Option<usize>,
-    running: bool,
-    title: String,
-    minimized: bool,
-    focused: bool,
-    urgent: bool,
-}
-
 struct Pin {
     command: Vec<String>,
     pid: Option<u32>,
@@ -332,8 +307,8 @@ pub(crate) struct State {
     minimized_order: Vec<Window>,
     restore_key_source: Option<KeyboardSource>,
     decoration_press: Option<(KeyboardSource, Window)>,
-    window_menu: Option<decorations::WindowMenu>,
-    taskbar: decorations::Taskbar,
+    window_menu: Option<waywire_decorations::WindowMenu>,
+    taskbar: waywire_decorations::Taskbar,
     clock: String,
     /// A press the compositor consumed, so its release is consumed too.
     menu_button: Option<(KeyboardSource, u32, delivery::Chrome)>,
@@ -514,7 +489,7 @@ impl State {
             restore_key_source: None,
             decoration_press: None,
             window_menu: None,
-            taskbar: decorations::Taskbar::default(),
+            taskbar: waywire_decorations::Taskbar::default(),
             clock: local_clock(SystemTime::now())?,
             menu_button: None,
             menu_escape: None,
@@ -638,7 +613,7 @@ impl State {
             {
                 continue;
             }
-            if over_bar && !decorations::above_taskbar(window) {
+            if over_bar && !waywire_decorations::above_taskbar(window) {
                 break;
             }
             let location = self.space.element_location(window)? - window.geometry().loc;
@@ -660,7 +635,7 @@ impl State {
         let windows: Vec<_> = self
             .mapped_order
             .iter()
-            .filter(|window| decorations::taskbar_window(window))
+            .filter(|window| waywire_decorations::taskbar_window(window))
             .cloned()
             .collect();
         let mut matches = vec![None; self.pins.len()];
@@ -1205,8 +1180,7 @@ impl State {
             self.update_titlebar_drag(source, location);
         }
         if self.decoration_press.as_ref().is_some_and(|(_, window)| {
-            self.decoration_under(location)
-                != Some((window.clone(), decorations::DecorationAction::Close))
+            self.decoration_under(location) != Some((window.clone(), DecorationAction::Close))
         }) {
             self.decoration_press = None;
         }
@@ -1452,14 +1426,15 @@ impl State {
             let position = pointer.current_location();
             let covered = self
                 .element_under(position)
-                .is_some_and(|(window, _)| decorations::above_taskbar(window));
+                .is_some_and(|(window, _)| waywire_decorations::above_taskbar(window));
             if !covered && let Some(output) = self.space.output_geometry(&self.output) {
                 let chips = self.taskbar_chips();
                 let relative = position
-                    - (output.loc + Point::from((0, output.size.h - decorations::TASKBAR)))
+                    - (output.loc + Point::from((0, output.size.h - waywire_decorations::TASKBAR)))
                         .to_f64();
                 if let Some(chip) = chips.iter().enumerate().find_map(|(index, chip)| {
-                    let rect = decorations::chip_rectangle(output.size.w, chips.len(), index)?;
+                    let rect =
+                        waywire_decorations::chip_rectangle(output.size.w, chips.len(), index)?;
                     rect.to_f64().contains(relative).then_some(chip)
                 }) {
                     let action = if chip.minimized {
@@ -1486,7 +1461,7 @@ impl State {
         if state == ButtonState::Pressed
             && button == 0x111
             && !pointer.is_grabbed()
-            && let Some((window, decorations::DecorationAction::Move)) =
+            && let Some((window, DecorationAction::Move)) =
                 self.decoration_under(pointer.current_location())
         {
             self.window_action(&window, WindowAction::ShowMenu);
@@ -1557,7 +1532,7 @@ impl State {
             && let Some((owner, window)) = self.decoration_press.take()
             && owner == source
             && self.decoration_under(pointer.current_location())
-                == Some((window.clone(), decorations::DecorationAction::Close))
+                == Some((window.clone(), DecorationAction::Close))
         {
             self.window_action(&window, WindowAction::Close);
         }
@@ -1568,10 +1543,10 @@ impl State {
         &mut self,
         source: KeyboardSource,
         window: Window,
-        action: decorations::DecorationAction,
+        action: DecorationAction,
     ) {
         match action {
-            decorations::DecorationAction::Move => {
+            DecorationAction::Move => {
                 let now = Instant::now();
                 let double = self.last_titlebar_press.as_ref().is_some_and(|press| {
                     press.source == source
@@ -1616,19 +1591,19 @@ impl State {
                     }
                 }
             }
-            decorations::DecorationAction::Resize(edges) => {
+            DecorationAction::Resize(edges) => {
                 self.window_action(&window, WindowAction::Resize(edges));
             }
-            decorations::DecorationAction::Minimize => {
+            DecorationAction::Minimize => {
                 self.window_action(&window, WindowAction::Minimize);
             }
-            decorations::DecorationAction::Maximize => {
+            DecorationAction::Maximize => {
                 self.window_action(&window, WindowAction::Maximize);
             }
-            decorations::DecorationAction::Restore => {
+            DecorationAction::Restore => {
                 self.window_action(&window, WindowAction::Restore);
             }
-            decorations::DecorationAction::Close => self.decoration_press = Some((source, window)),
+            DecorationAction::Close => self.decoration_press = Some((source, window)),
         }
     }
 
@@ -1713,7 +1688,7 @@ impl State {
                     self.seat.get_pointer(),
                     self.space.output_geometry(&self.output),
                 ) {
-                    self.window_menu = Some(decorations::WindowMenu::new(
+                    self.window_menu = Some(waywire_decorations::WindowMenu::new(
                         window.clone(),
                         pointer.current_location(),
                         output.size,

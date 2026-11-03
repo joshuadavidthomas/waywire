@@ -16,7 +16,6 @@ use super::Signal;
 use super::WindowRecord;
 use super::monotonic_usec;
 use crate::State;
-use crate::decorations;
 use crate::focus::KeyboardFocus;
 
 /// One listed window.
@@ -93,9 +92,9 @@ pub(super) fn bounds(
 ) -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
     let geometry = Rectangle::new(location, window.geometry().size);
     let mut frame = geometry;
-    if decorations::decorated(window) {
-        frame.loc.y -= decorations::BAR;
-        frame.size.h += decorations::BAR;
+    if waywire_decorations::decorated(window) {
+        frame.loc.y -= waywire_decorations::BAR;
+        frame.size.h += waywire_decorations::BAR;
     }
     (geometry, frame)
 }
@@ -139,7 +138,7 @@ impl State {
         scale: f64,
     ) -> Option<WindowEntry> {
         let (geometry, frame) = bounds(window, self.space.element_location(window)?);
-        let (_, maximized) = decorations::window_flags(window);
+        let (_, maximized) = waywire_decorations::window_flags(window);
         let fullscreen = window.toplevel().map_or_else(
             || {
                 window
