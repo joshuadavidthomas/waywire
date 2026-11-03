@@ -28,6 +28,7 @@ struct Gateway {
     child: Child,
     address: SocketAddr,
     pipe: PathBuf,
+    arguments: PathBuf,
     _directory: tempfile::TempDir,
 }
 
@@ -36,10 +37,15 @@ impl Gateway {
         let directory = tempfile::tempdir().expect("test directory");
         let compositor = directory.path().join("compositor");
         let pipe = directory.path().join("commands");
+        let arguments = directory.path().join("arguments");
         // The shell keeps the event pipe open while `cat` records commands.
         fs::write(
             &compositor,
-            format!("#!/bin/sh\ncat > '{}'\n", pipe.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n",
+                arguments.display(),
+                pipe.display()
+            ),
         )
         .expect("stub compositor");
         fs::set_permissions(&compositor, fs::Permissions::from_mode(0o755))
@@ -64,6 +70,7 @@ impl Gateway {
             child,
             address,
             pipe,
+            arguments,
             _directory: directory,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -124,6 +131,24 @@ impl Gateway {
     }
 }
 
+impl Gateway {
+    /// The loopback RTP port the gateway gave the compositor.
+    fn rtp_port(&self) -> u16 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let arguments = fs::read_to_string(&self.arguments).unwrap_or_default();
+            let mut lines = arguments.lines();
+            if lines.any(|line| line == "--rtp-port")
+                && let Some(port) = lines.next()
+            {
+                return port.parse().expect("RTP port");
+            }
+            assert!(Instant::now() < deadline, "compositor did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 impl Drop for Gateway {
     fn drop(&mut self) {
         drop(self.child.kill());
@@ -140,26 +165,27 @@ fn send_text(stream: &mut TcpStream, text: &str) {
     stream.write_all(&frame).expect("send frame");
 }
 
+/// Read one unfragmented frame, returning its opcode and payload.
+fn read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut header = [0; 2];
+    stream.read_exact(&mut header).expect("frame header");
+    let length = match header[1] & 0x7f {
+        126 => {
+            let mut length = [0; 2];
+            stream.read_exact(&mut length).expect("frame length");
+            usize::from(u16::from_be_bytes(length))
+        }
+        127 => panic!("unexpectedly long frame"),
+        length => usize::from(length),
+    };
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload).expect("frame payload");
+    (header[0] & 0x0f, payload)
+}
+
 /// Read text frames until `expected` arrives.
 fn expect_text(stream: &mut TcpStream, expected: &str) {
-    loop {
-        let mut header = [0; 2];
-        stream.read_exact(&mut header).expect("frame header");
-        let length = match header[1] & 0x7f {
-            126 => {
-                let mut length = [0; 2];
-                stream.read_exact(&mut length).expect("frame length");
-                usize::from(u16::from_be_bytes(length))
-            }
-            127 => panic!("unexpectedly long frame"),
-            length => usize::from(length),
-        };
-        let mut payload = vec![0; length];
-        stream.read_exact(&mut payload).expect("frame payload");
-        if header[0] & 0x0f == 1 && payload == expected.as_bytes() {
-            return;
-        }
-    }
+    while read_frame(stream) != (1, expected.as_bytes().to_vec()) {}
 }
 
 const ACTIVE: &str = r#"{"type":"control-state","state":"active"}"#;
@@ -173,7 +199,7 @@ fn lease(held: bool) -> Command {
 #[test]
 fn upgrades_without_the_public_url_origin_are_forbidden() {
     let gateway = Gateway::start();
-    for path in ["/control", "/stream"] {
+    for path in ["/control", "/stream", "/audio"] {
         for origin in [
             None,
             Some("https://evil.test"),
@@ -278,4 +304,41 @@ fn disconnecting_the_input_owner_hands_input_to_a_waiting_socket() {
         expected.push(lease(false));
         gateway.assert_commands(&expected);
     }
+}
+
+/// An Opus packet the compositor sends in RTP payload type 111 reaches every
+/// `/audio` socket as one binary message holding just the packet, and never
+/// reaches the video stream.
+#[test]
+fn audio_packets_reach_audio_sockets_without_their_rtp_header() {
+    let gateway = Gateway::start();
+    let port = gateway.rtp_port();
+    let (mut first, head) = gateway.upgrade("/audio", Some("https://viewer.test"));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+    let (mut second, head) = gateway.upgrade("/audio", Some("https://viewer.test"));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+    let opus = [0xfc, 0xff, 0xfe, 0x01, 0x02, 0x03];
+    let mut packet = vec![0x80, 111, 0, 7, 0, 0, 0x1b, 0x58, 0x57, 0x57, 0x41, 0x55];
+    packet.extend_from_slice(&opus);
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("RTP sender");
+    // The socket subscribes after the upgrade; resend until a packet arrives.
+    first
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let received = loop {
+        sender
+            .send_to(&packet, ("127.0.0.1", port))
+            .expect("send RTP");
+        let mut header = [0; 1];
+        if first.peek(&mut header).is_ok_and(|count| count == 1) {
+            first
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            break read_frame(&mut first);
+        }
+        assert!(Instant::now() < deadline, "no audio message arrived");
+    };
+    assert_eq!(received, (2, opus.to_vec()));
+    assert_eq!(read_frame(&mut second), (2, opus.to_vec()));
 }

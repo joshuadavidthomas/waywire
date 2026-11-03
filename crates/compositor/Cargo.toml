@@ -10,6 +10,8 @@ anyhow = { workspace = true }
 cairo-rs = { workspace = true }
 calloop = { workspace = true }
 clap = { workspace = true }
+# Desktop audio loads the system libopus at run time, so it stays optional.
+libloading = "0.8.9"
 nix = { workspace = true }
 pangocairo = { workspace = true }
 pipewire = { workspace = true }

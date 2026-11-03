@@ -1,6 +1,7 @@
 import { ProtocolVersionMismatchError } from "../sdk/messages.ts";
 import { initialPlayoutTargetMs } from "../sdk/playout.ts";
 import { WaywireSession, type SurfaceHandle } from "../sdk/waywire.ts";
+import { DesktopAudio } from "./audio.ts";
 import {
   installViewerListeners,
   type ViewerControls,
@@ -75,6 +76,9 @@ function startViewer(): void {
     statsIntervalMs: 0,
   });
   const listeners = new AbortController();
+  const audioURL = new URL("/audio", location.origin);
+  audioURL.protocol = audioURL.protocol === "https:" ? "wss:" : "ws:";
+  const audio = new DesktopAudio(audioURL);
   let surface: SurfaceHandle | undefined;
   let viewer: ViewerControls | undefined;
   let removeProtocolVersionListener: (() => void) | undefined;
@@ -84,6 +88,7 @@ function startViewer(): void {
     if (disposed) return;
     disposed = true;
     listeners.abort();
+    audio.dispose();
     viewer?.dispose();
     removeProtocolVersionListener?.();
     removeReceiptListener?.();
@@ -196,6 +201,25 @@ function startViewer(): void {
         if (!copied) console.warn("remote clipboard write failed", error);
       }
     });
+    // The browser plays audio only after a gesture, so the first click or
+    // key starts it. Capture runs before the surface's own listeners.
+    const audioGesture = new AbortController();
+    const startAudio = (): void => {
+      void audio
+        .start()
+        .then((playing) => {
+          if (playing) audioGesture.abort();
+        })
+        .catch((error: unknown) => {
+          console.warn("desktop audio did not start", error);
+        });
+    };
+    for (const type of ["pointerdown", "keydown"]) {
+      window.addEventListener(type, startAudio, {
+        capture: true,
+        signal: AbortSignal.any([listeners.signal, audioGesture.signal]),
+      });
+    }
     window.addEventListener("pagehide", dispose, {
       once: true,
       signal: listeners.signal,

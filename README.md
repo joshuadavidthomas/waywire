@@ -84,7 +84,12 @@ on x86, so OpenH264 gets its assembly. It currently starts the X11 bridge even f
 applications. The compositor links the PipeWire client library. When the
 `pipewire` daemon binary is installed, it starts a private daemon so the
 ScreenCast portal can deliver video. Without the binary, ScreenCast reports
-stream metadata only. Pass your application and arguments directly to the gateway:
+stream metadata only. The same daemon carries desktop audio: applications play
+to its `waywire` sink, natively or through its PulseAudio protocol, and the
+viewer hears the mix as Opus from its first click or key press. Audio needs the
+daemon's PulseAudio module (in Debian's `libpipewire-0.3-modules`) for
+PulseAudio clients such as Chromium, and the system's libopus at run time;
+without them the desktop is silent. Pass your application and arguments directly to the gateway:
 
 ```sh
 ./target/release/waywire-gateway \
@@ -281,7 +286,7 @@ The browser's debug console logs decoder configuration and reset causes separate
 ## Known limits
 
 This is a prototype, not a general-purpose desktop environment. There is one
-output and no workspaces, audio, or GPU acceleration. Custom surface
+output and no workspaces, microphone input, or GPU acceleration. Custom surface
 cursors fall back to the default shape. Browser playback requires WebCodecs H.264
 High decoding; support depends on the browser and its available decoders.
 The XTest bridge covers input, not desktop capture: X11 screenshot tools do not

@@ -21,6 +21,11 @@
 //! The daemon runs without a session manager, so the compositor links each
 //! video consumer whose `target.object` (or older `node.target`) names one of
 //! its nodes, the way a session manager would for a portal client.
+//!
+//! The same daemon serves desktop audio (see `crate::audio`): it also speaks
+//! the `PulseAudio` protocol at `pulse/native` in the runtime directory, where
+//! applications given that directory as `XDG_RUNTIME_DIR` look for it, and a
+//! dummy driver clocks the audio graph in 20 ms cycles while a stream plays.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -57,16 +62,23 @@ use tokio::sync::oneshot;
 /// Socket name inside the runtime directory, the daemon's default name.
 const SOCKET: &str = "pipewire-0";
 
-/// Only what a video source and its linked consumers need: the native
-/// protocol, client nodes and adapters, links, and access control that grants
-/// ordinary clients full permissions and lets the portal frontend restrict the
-/// connections it hands out.
+/// Only what a video source, the desktop audio sink and their linked clients
+/// need: the native protocol, client nodes and adapters, links, and access
+/// control that grants ordinary clients full permissions and lets the portal
+/// frontend restrict the connections it hands out; for audio, the `PulseAudio`
+/// protocol (optional, so a daemon without it still serves video), a driver
+/// for the graph, and per-channel ports on every stream so the compositor can
+/// link them without a session manager. `{pulse}` is the `PulseAudio` socket.
 const CONFIG: &str = "context.properties = {
     core.daemon = true
     core.name = pipewire-0
     support.dbus = false
+    default.clock.rate = 48000
+    default.clock.quantum = 960
+    default.clock.min-quantum = 960
 }
 context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
     support.* = support/libspa-support
 }
 context.modules = [
@@ -75,7 +87,23 @@ context.modules = [
     { name = libpipewire-module-adapter }
     { name = libpipewire-module-link-factory }
     { name = libpipewire-module-access }
+    { name = libpipewire-module-spa-node-factory }
+    { name = libpipewire-module-protocol-pulse
+      flags = [ ifexists nofail ]
+      args = { server.address = [ \"unix:{pulse}\" ] } }
 ]
+context.objects = [
+    { factory = spa-node-factory
+      args = {
+          factory.name = support.node.driver
+          node.name = Dummy-Driver
+          node.group = pipewire.dummy
+          priority.driver = 20000
+      } }
+]
+stream.properties = {
+    adapter.auto-port-config = { mode = dsp monitor = false control = false position = preserve }
+}
 ";
 
 /// A `pipewire` daemon child serving a socket in the runtime directory.
@@ -93,7 +121,11 @@ impl Daemon {
 
     fn start_program(program: &str, runtime_path: &Path) -> Option<Self> {
         let config = runtime_path.join("pipewire.conf");
-        if let Err(error) = std::fs::write(&config, CONFIG) {
+        let pulse = runtime_path.join("pulse");
+        let contents = CONFIG.replace("{pulse}", &pulse.join("native").to_string_lossy());
+        if let Err(error) =
+            std::fs::create_dir_all(&pulse).and_then(|()| std::fs::write(&config, contents))
+        {
             tracing::warn!(%error, "could not write PipeWire configuration; ScreenCast video disabled");
             return None;
         }
@@ -102,6 +134,7 @@ impl Daemon {
             .arg("-c")
             .arg(&config)
             .env("PIPEWIRE_RUNTIME_DIR", runtime_path)
+            .env("PULSE_RUNTIME_PATH", &pulse)
             .env_remove("PIPEWIRE_REMOTE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

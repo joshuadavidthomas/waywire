@@ -1,5 +1,6 @@
 mod admission;
 mod assets;
+mod audio;
 mod control;
 mod outbound;
 mod socket;
@@ -23,6 +24,7 @@ use self::admission::SocketKind;
 use self::admission::upgrade_socket;
 use self::assets::asset;
 use self::assets::response;
+use crate::audio::AudioHub;
 use crate::daemon::AppEvents;
 use crate::session::Sessions;
 use crate::session::SocketId;
@@ -35,6 +37,7 @@ pub(crate) struct AppState {
     pub(crate) events: AppEvents,
     pub(crate) sessions: Sessions,
     pub(crate) hub: VideoHub,
+    pub(crate) audio: AudioHub,
     pub(crate) origin: Origin,
     pub(crate) connections: SocketConnections,
     pub(crate) next_socket_id: Arc<AtomicU64>,
@@ -56,6 +59,16 @@ pub(crate) fn router(state: AppState) -> Router {
                  headers: HeaderMap,
                  upgrade: WebSocketUpgrade| async move {
                     upgrade_socket(state, &headers, upgrade, SocketKind::Stream)
+                },
+            ),
+        )
+        .route(
+            "/audio",
+            get(
+                |State(state): State<AppState>,
+                 headers: HeaderMap,
+                 upgrade: WebSocketUpgrade| async move {
+                    upgrade_socket(state, &headers, upgrade, SocketKind::Audio)
                 },
             ),
         )

@@ -1,6 +1,7 @@
 //! Headless Wayland compositor streaming H.264 RTP.
 
 mod activation;
+mod audio;
 mod capture;
 mod clipboard;
 mod cursor;
@@ -2535,6 +2536,9 @@ pub fn run(mut options: Config) -> Result<()> {
     let mut pipewire_daemon = bus
         .as_ref()
         .and_then(|_| pipewire::Daemon::start(runtime.path()));
+    let audio = pipewire_daemon
+        .as_ref()
+        .and_then(|daemon| audio::Audio::start(daemon.socket(), options.rtp_port));
     let socket_path = runtime.path().join("wayland-0");
     let socket = ListeningSocket::bind_absolute(socket_path.clone())?;
     let mut event_loop = EventLoop::<State>::try_new()?;
@@ -2788,6 +2792,7 @@ pub fn run(mut options: Config) -> Result<()> {
     drop(child);
     // Streams first: their proxies talk to the daemon.
     state.screencast = None;
+    drop(audio);
     drop(pipewire_daemon);
     drop(bus);
     state.release_input(KeyboardSource::MAIN);
@@ -2893,7 +2898,11 @@ fn application_command(
         command
             .env("WAYLAND_DISPLAY", &environment.socket)
             .env("XDG_RUNTIME_DIR", &environment.runtime)
-            .env("LIBEI_SOCKET", &environment.eis);
+            .env("LIBEI_SOCKET", &environment.eis)
+            // PulseAudio clients then find the private daemon's socket in
+            // XDG_RUNTIME_DIR, not a host server.
+            .env_remove("PULSE_SERVER")
+            .env_remove("PULSE_RUNTIME_PATH");
         if let Some(display) = display {
             command.env("DISPLAY", format!(":{display}"));
         } else {

@@ -41,6 +41,7 @@ use self::events::read_events;
 use self::process::cleanup_group;
 use self::process::spawn_daemon;
 use self::process::wait_for_leader_exit;
+use crate::audio::AudioHub;
 use crate::session::Sessions;
 use crate::video::Readiness;
 use crate::video::VideoHub;
@@ -111,6 +112,7 @@ impl Daemon {
         config: &Config,
         socket: UdpSocket,
         hub: VideoHub,
+        audio: AudioHub,
     ) -> Result<StartedDaemon> {
         let readiness = Readiness::new();
         let events = AppEvents::new();
@@ -128,7 +130,7 @@ impl Daemon {
             "initial input lease could not be queued"
         );
         let (pipeline, video_worker) =
-            VideoPipeline::new(hub, commands, readiness.clone(), sessions.clone());
+            VideoPipeline::new(hub, audio, commands, readiness.clone(), sessions.clone());
         let process = spawn_daemon(config, socket.local_addr()?.port())?;
         let receivers = DaemonReceivers {
             commands: command_reader,

@@ -20,6 +20,7 @@ NAME = "waywire-acceptance"
 BROWSER_SESSION = f"ww-{os.getpid()}"
 PORT = "18925"
 SCENARIOS = (
+    "audio",
     "computer-use-linux",
     "cua-driver",
     "fedora-x11",
@@ -1099,6 +1100,102 @@ def wrapped_click_run(driver, overheads):
     return [f"{tag}: " + "; ".join(failures)] if failures else []
 
 
+# The tone a session application plays, and how near the viewer's spectral
+# peak must be to it: two bins of an 8192-point FFT at 48 kHz.
+TONE_HZ = 1000
+TONE_TOLERANCE_HZ = 12
+
+# Run before the viewer's first gesture creates its AudioContext: whatever the
+# page connects to its speakers also feeds an analyser the check reads.
+TAP_VIEWER_AUDIO = """(() => {
+  const connect = AudioNode.prototype.connect;
+  AudioNode.prototype.connect = function (destination, ...rest) {
+    if (destination instanceof AudioDestinationNode) {
+      if (!window.viewerAnalyser) {
+        window.viewerAnalyser = destination.context.createAnalyser();
+        window.viewerAnalyser.fftSize = 8192;
+      }
+      connect.call(this, window.viewerAnalyser);
+    }
+    return connect.call(this, destination, ...rest);
+  };
+  return true;
+})()"""
+
+# The loudest bin of the viewer's decoded audio, or null before it plays.
+READ_VIEWER_AUDIO = """(() => {
+  const analyser = window.viewerAnalyser;
+  if (!analyser) return null;
+  const levels = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(levels);
+  let peak = 0;
+  for (let bin = 1; bin < levels.length; bin += 1) {
+    if (levels[bin] > levels[peak]) peak = bin;
+  }
+  return {
+    hz: (peak * analyser.context.sampleRate) / analyser.fftSize,
+    db: levels[peak],
+    state: analyser.context.state,
+  };
+})()"""
+
+
+def audio_scenario():
+    """A Chromium page in the session plays a 1 kHz tone through the
+    PulseAudio API. After one click, the viewer must play audio whose
+    loudest frequency is that tone."""
+    browser("open", f"http://127.0.0.1:{PORT}/")
+    browser("set", "viewport", "1280", "720", "2")
+    browser("eval", TAP_VIEWER_AUDIO)
+    browser("mouse", "move", "100", "100")
+    browser("mouse", "down", "left")
+    browser("mouse", "up", "left")
+    page = (
+        "data:text/html,<title>Tone</title><script>"
+        "const c=new AudioContext(),o=c.createOscillator(),g=c.createGain();"
+        f"o.frequency.value={TONE_HZ};g.gain.value=0.5;"
+        "o.connect(g).connect(c.destination);o.start()</script>"
+    )
+    chromium = subprocess.Popen(
+        [
+            "sudo", "docker", "exec", NAME, "python3",
+            "/repo/tools/acceptance/session_exec.py",
+            "chromium", "--no-sandbox", "--test-type", "--ozone-platform=wayland",
+            "--user-data-dir=/tmp/chromium-audio", "--no-first-run",
+            "--no-default-browser-check", "--disable-gpu",
+            "--autoplay-policy=no-user-gesture-required", f"--app={page}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    heard = None
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            heard = json.loads(browser("--json", "eval", READ_VIEWER_AUDIO))["data"][
+                "result"
+            ]
+            if (
+                heard
+                and heard["db"] > -60
+                and abs(heard["hz"] - TONE_HZ) <= TONE_TOLERANCE_HZ
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"audio failed: the viewer's loudest frequency was {heard}, "
+                f"not {TONE_HZ} Hz above -60 dB"
+            )
+    finally:
+        subprocess.run(["sudo", "docker", "exec", NAME, "pkill", "chromium"], check=False)
+        chromium.wait(timeout=20)
+    print(
+        f"PASS: the viewer played {heard['hz']:.0f} Hz at {heard['db']:.0f} dB "
+        f"for the session's {TONE_HZ} Hz tone"
+    )
+
+
 def wrapper_t6a():
     """Replay T6a's alert and popup variants through stock cua-driver and
     computer-use-linux, bare and behind tools/receipts/mcp_wrapper.py."""
@@ -1287,6 +1384,9 @@ def main(scenario):
                 return
             if scenario == "wrapper-t6a":
                 wrapper_t6a()
+                return
+            if scenario == "audio":
+                audio_scenario()
                 return
             if scenario == "computer-use-linux":
                 driver = subprocess.Popen(

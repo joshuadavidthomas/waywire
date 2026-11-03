@@ -1,3 +1,4 @@
+mod audio;
 mod cli;
 mod config;
 mod daemon;
@@ -17,6 +18,7 @@ use tokio::net::UdpSocket;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::audio::AudioHub;
 use crate::cli::Options;
 use crate::daemon::Config;
 use crate::daemon::Daemon;
@@ -48,6 +50,7 @@ async fn main() -> Result<()> {
         .set_recv_buffer_size(4 << 20)
         .context("set loopback RTP receive buffer to 4 MiB")?;
     let hub = VideoHub::new(options.frame_rate);
+    let audio = AudioHub::default();
     let started = Daemon::start(
         &Config {
             path: options.compositor,
@@ -60,6 +63,7 @@ async fn main() -> Result<()> {
         },
         rtp,
         hub.clone(),
+        audio.clone(),
     )?;
     let daemon = started.daemon;
     let mut daemon_task = started.supervisor;
@@ -69,6 +73,7 @@ async fn main() -> Result<()> {
         events: daemon.events.clone(),
         sessions: daemon.sessions.clone(),
         hub,
+        audio,
         origin: options.origin,
         connections: connections.clone(),
         next_socket_id: Arc::new(AtomicU64::new(1)),

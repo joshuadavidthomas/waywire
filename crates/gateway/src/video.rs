@@ -59,6 +59,7 @@ use self::rtp::RtpSequence;
 #[cfg(test)]
 use self::rtp::RtpTimestamp;
 use self::rtp::decode_packet;
+use crate::audio::AudioHub;
 use crate::daemon::CommandSink;
 use crate::session::Sessions;
 
@@ -194,6 +195,8 @@ pub(crate) struct VideoPipeline {
     tx: mpsc::Sender<PipelineMessage>,
     unit_budget: Arc<Semaphore>,
     sessions: Sessions,
+    /// Desktop audio shares the RTP port; its packets go to viewers directly.
+    audio: AudioHub,
 }
 
 pub(crate) struct VideoWorker {
@@ -206,6 +209,7 @@ pub(crate) struct VideoWorker {
 impl VideoPipeline {
     pub(crate) fn new(
         hub: VideoHub,
+        audio: AudioHub,
         commands: CommandSink,
         readiness: Readiness,
         sessions: Sessions,
@@ -217,6 +221,7 @@ impl VideoPipeline {
                 tx,
                 unit_budget,
                 sessions,
+                audio,
             },
             VideoWorker {
                 rx,
@@ -304,6 +309,9 @@ impl VideoPipeline {
                 summary.record_rejection(PacketFailure::Reject(PacketReject::NonLoopbackSource {
                     address: source,
                 }));
+                continue;
+            }
+            if self.audio.offer_rtp(&buffer[..length]) {
                 continue;
             }
             let packet = match decode_packet(&buffer[..length]) {
@@ -667,8 +675,13 @@ mod tests {
                 command_events.recv().await,
                 Some(Command::InputLease(InputLease { held: true }))
             ));
-            let (pipeline, mut worker) =
-                VideoPipeline::new(video_hub(), commands, Readiness::new(), sessions.clone());
+            let (pipeline, mut worker) = VideoPipeline::new(
+                video_hub(),
+                AudioHub::default(),
+                commands,
+                Readiness::new(),
+                sessions.clone(),
+            );
             // Drain metadata without ever correlating RTP: producer pressure must
             // not depend on successful encoded delivery or correlate-time drops.
             let drain = tokio::spawn(async move { while worker.rx.recv().await.is_some() {} });
@@ -745,8 +758,13 @@ mod tests {
             waywire_protocol::pipe::Kbps::new(8_000).expect("valid bitrate"),
             fps(60),
         );
-        let (pipeline, worker) =
-            VideoPipeline::new(hub.clone(), commands, readiness.clone(), sessions);
+        let (pipeline, worker) = VideoPipeline::new(
+            hub.clone(),
+            AudioHub::default(),
+            commands,
+            readiness.clone(),
+            sessions,
+        );
         let worker_task = tokio::spawn(worker.run());
         let mut viewer = hub.subscribe();
         pipeline.metadata(metadata(1, 1)).await.expect("metadata");
@@ -771,8 +789,13 @@ mod tests {
             waywire_protocol::pipe::Kbps::new(8_000).expect("valid bitrate"),
             Fps::new(60).expect("valid fps"),
         );
-        let (pipeline, worker) =
-            VideoPipeline::new(hub.clone(), commands, readiness.clone(), sessions);
+        let (pipeline, worker) = VideoPipeline::new(
+            hub.clone(),
+            AudioHub::default(),
+            commands,
+            readiness.clone(),
+            sessions,
+        );
         let worker_task = tokio::spawn(worker.run());
 
         pipeline
@@ -886,8 +909,13 @@ mod tests {
             waywire_protocol::pipe::Kbps::new(8_000).expect("valid bitrate"),
             Fps::new(60).expect("valid fps"),
         );
-        let (pipeline, worker) =
-            VideoPipeline::new(hub.clone(), commands, readiness.clone(), sessions);
+        let (pipeline, worker) = VideoPipeline::new(
+            hub.clone(),
+            AudioHub::default(),
+            commands,
+            readiness.clone(),
+            sessions,
+        );
         let worker_task = tokio::spawn(worker.run());
 
         let gateway = tokio::net::UdpSocket::bind("127.0.0.1:0")

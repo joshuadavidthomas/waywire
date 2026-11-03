@@ -2880,6 +2880,7 @@ dependencies = [
  "cairo-rs",
  "calloop",
  "clap",
+ "libloading",
  "nix",
  "openh264",
  "pangocairo",

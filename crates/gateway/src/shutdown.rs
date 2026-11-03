@@ -201,6 +201,7 @@ mod tests {
             },
             rtp,
             VideoHub::new(fps),
+            crate::audio::AudioHub::default(),
         )
         .expect("start daemon");
         timeout(Duration::from_secs(2), async {

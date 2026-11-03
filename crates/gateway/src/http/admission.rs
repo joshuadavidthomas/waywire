@@ -15,6 +15,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 use url::Url;
 
 use super::AppState;
+use super::audio::audio_socket;
 use super::control::control_socket;
 use super::outbound::MAX_CONTROL_MESSAGE_BYTES;
 use super::stream::stream_socket;
@@ -111,6 +112,7 @@ impl SocketConnections {
 #[derive(Clone, Copy)]
 pub(super) enum SocketKind {
     Stream,
+    Audio,
     Control,
 }
 
@@ -133,6 +135,12 @@ pub(super) fn upgrade_socket(
             .max_message_size(4096)
             .max_frame_size(4096)
             .on_upgrade(move |socket| stream_socket(socket, state, socket_id, admission))
+            .into_response(),
+        SocketKind::Audio => upgrade
+            .read_buffer_size(4096)
+            .max_message_size(4096)
+            .max_frame_size(4096)
+            .on_upgrade(move |socket| audio_socket(socket, state, socket_id, admission))
             .into_response(),
         SocketKind::Control => upgrade
             .max_message_size(MAX_CONTROL_MESSAGE_BYTES)

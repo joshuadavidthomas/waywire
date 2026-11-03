@@ -763,7 +763,10 @@ Remaining:
   it is released instead of following the pointer; touch drags, since the
   seat has no touch device; and dropping files from the viewer's own machine
   onto the remote desktop.
-- Audio, which the Amp orb Desktop already streams.
+- Audio plays one way: applications reach the private PipeWire daemon's
+  `waywire` sink, natively or through its PulseAudio protocol, and the viewer
+  plays the mix as 20 ms Opus packets on its own `/audio` socket from its first
+  click or key. Still missing: microphone input and audio controls.
 - Data control is served as `ext-data-control-v1` and
   `zwlr_data_control_manager_v1` version 2, both with the primary selection.
   wl-clipboard 2.3 (Arch) uses the ext protocol; 2.1 and 2.2 (Debian 12 and 13,
