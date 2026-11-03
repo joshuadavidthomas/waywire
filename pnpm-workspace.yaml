@@ -1,5 +1,5 @@
 packages:
-  - crates/gateway/web
+  - crates/waywire-gateway/web
 
 catalog:
   "@types/node": 26.6.6

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import maximumProtocolPixels from "../../../../protocol/max-display-pixels.json";
+import maximumProtocolPixels from "../../../../waywire-protocol/max-display-pixels.json";
 import { fitObservedResize, normalizeResizeDimensions } from "./resize.ts";
 import "./test-support.ts";
 

@@ -5,7 +5,7 @@ import { StripeCompositor, h264Codec, parseStripes } from "./stripes.ts";
 import { installEncodedVideoChunk, installGlobal } from "./test-support.ts";
 
 test("stripe container parses each stripe and rejects malformed input", () => {
-  // Matches push_stripe's layout in crates/protocol/src/browser.rs.
+  // Matches push_stripe's layout in crates/waywire-protocol/src/browser.rs.
   const data = new Uint8Array([
     90, 0, 180, 0, 1, 2, 0, 0, 0, 0xaa, 0xbb, 0, 1, 64, 0, 0, 3, 0, 0, 0, 1, 2,
     3,

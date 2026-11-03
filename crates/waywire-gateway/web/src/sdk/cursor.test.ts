@@ -5,7 +5,7 @@ import { LocalCursor } from "./cursor.ts";
 import { parseControlMessage } from "./messages.ts";
 import { FakeTarget, installBrowser, installGlobal } from "./test-support.ts";
 
-// The keyword list pinned in crates/protocol/src/pipe.rs, in wire order.
+// The keyword list pinned in crates/waywire-protocol/src/pipe.rs, in wire order.
 const rustCursorShapes = [
   "default",
   "context-menu",

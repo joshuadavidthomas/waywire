@@ -38,11 +38,11 @@ wildcard_enum_match_arm = "warn"
 debug = "line-tables-only"
 
 [workspace.dependencies]
-waywire-decorations = { path = "crates/decorations" }
-waywire-encoder = { path = "crates/encoder" }
-waywire-pipewire = { path = "crates/pipewire" }
-waywire-portal = { path = "crates/portal" }
-waywire-protocol = { path = "crates/protocol" }
+waywire-decorations = { path = "crates/waywire-decorations" }
+waywire-encoder = { path = "crates/waywire-encoder" }
+waywire-pipewire = { path = "crates/waywire-pipewire" }
+waywire-portal = { path = "crates/waywire-portal" }
+waywire-protocol = { path = "crates/waywire-protocol" }
 
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }

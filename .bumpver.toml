@@ -16,6 +16,6 @@ version_pattern = "MAJOR.MINOR.PATCH[-TAG[.NUM]]"
 "package.json" = [
   '"version": "{version}"',
 ]
-"crates/gateway/web/package.json" = [
+"crates/waywire-gateway/web/package.json" = [
   '"version": "{version}"',
 ]

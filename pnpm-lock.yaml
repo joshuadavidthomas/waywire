@@ -24,7 +24,7 @@ importers:
         specifier: 3.6.2
         version: 3.6.2
 
-  crates/gateway/web:
+  crates/waywire-gateway/web:
     devDependencies:
       '@types/node':
         specifier: 'catalog:'

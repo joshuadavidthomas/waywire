@@ -1,4 +1,4 @@
-import maximumOutputPixels from "../../../../protocol/max-display-pixels.json";
+import maximumOutputPixels from "../../../../waywire-protocol/max-display-pixels.json";
 
 export interface RemoteDisplayManualPolicy {
   readonly mode: "manual";

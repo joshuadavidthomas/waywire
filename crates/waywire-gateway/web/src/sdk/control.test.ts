@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import maximumProtocolPixels from "../../../../protocol/max-display-pixels.json";
+import maximumProtocolPixels from "../../../../waywire-protocol/max-display-pixels.json";
 import { PROTOCOL_VERSION } from "./messages.ts";
 import { WaywireSession, type ResizeEvent } from "./session.ts";
 import {

@@ -784,7 +784,7 @@ upstream code to local copies of it.
 
 - **Smithay.** Pinned at `f581531` (2026-10-29), current upstream master at the
   time of the bump, 60 commits past the previous `d33a9c9` pin.
-  `crates/compositor/src/virtual_pointer.rs` now adapts upstream
+  `crates/waywire-compositor/src/virtual_pointer.rs` now adapts upstream
   `wayland::virtual_pointer` events to the seat's input entry points instead of
   porting the protocol by hand. Virtual keyboards likewise route through
   upstream's `VirtualKeyboardHandler`; the compositor reads each key's keysym

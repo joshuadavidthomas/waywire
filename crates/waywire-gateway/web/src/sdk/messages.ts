@@ -1,4 +1,4 @@
-// Mirrors PROTOCOL_VERSION in crates/protocol/src/lib.rs.
+// Mirrors PROTOCOL_VERSION in crates/waywire-protocol/src/lib.rs.
 export const PROTOCOL_VERSION = 13;
 
 export class ProtocolVersionMismatchError extends Error {
