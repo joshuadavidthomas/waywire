@@ -1,4 +1,4 @@
-//! The gateway stream: encoded frames and events out.
+//! The gateway stream: pipe commands in, encoded frames and events out.
 //!
 //! `Stream` owns the encoder and the bookkeeping that ties its frames to the
 //! gateway: the media generation and whether the gateway has cached its key
@@ -7,15 +7,28 @@
 //! output or the render schedule: callers pass the rendered image and output
 //! size in, and methods return what the compositor must do next, such as
 //! render another frame or redraw the whole output.
+//!
+//! `State::apply_command` dispatches the gateway's commands: input goes to
+//! the seat, and stream commands to `Stream`.
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use smithay::backend::input::Axis;
+use smithay::backend::input::AxisSource;
+use smithay::backend::input::ButtonState;
+use smithay::backend::input::InputTime;
+use smithay::backend::input::KeyState;
+use smithay::input::keyboard::KeyboardSource;
+use smithay::input::pointer::AxisFrame;
+use smithay::output::Scale;
 use smithay::reexports::pixman::Image;
 use smithay::utils::Physical;
+use smithay::utils::Point;
 use smithay::utils::Rectangle;
+use smithay::wayland::text_input::TextInputSeat;
 use waywire_encoder::latency;
 use waywire_encoder::striped;
 use waywire_encoder::striped::StripedEncoder;
@@ -27,6 +40,7 @@ use waywire_encoder::video::Notification;
 use waywire_encoder::video::VideoEncoder;
 use waywire_encoder::video::encoded_dimensions;
 use waywire_protocol::pipe;
+use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameDimension;
@@ -37,6 +51,8 @@ use waywire_protocol::pipe::InputSequence;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality;
 
+use crate::FrameRequest;
+use crate::delivery;
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriterError;
 use crate::image_pixels;
@@ -437,8 +453,189 @@ impl Stream {
 }
 
 /// The compositor applies the stream's requests to the render schedule and
-/// the session's lifetime.
+/// the session's lifetime, and dispatches the gateway's pipe commands.
 impl crate::State {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one direct match owns the pipe command vocabulary"
+    )]
+    pub(crate) fn apply_command(&mut self, command: Command) -> Result<()> {
+        if let Some(sequence) = command.input_sequence() {
+            self.stream.record_input(sequence);
+        }
+        let source = KeyboardSource::MAIN;
+        match command {
+            Command::PointerAbsolute(p) => self.pointer_motion(
+                source,
+                (
+                    f64::from(p.x.get()) / 65535.0 * f64::from(self.size.width())
+                        / self.output.current_scale().fractional_scale(),
+                    f64::from(p.y.get()) / 65535.0 * f64::from(self.size.height())
+                        / self.output.current_scale().fractional_scale(),
+                )
+                    .into(),
+            ),
+            Command::PointerRelative(p) => {
+                if let Some(pointer) = self.seat.get_pointer() {
+                    let scale = self.output.current_scale().fractional_scale();
+                    let delta =
+                        Point::from((f64::from(p.dx.get()) / scale, f64::from(p.dy.get()) / scale));
+                    self.pointer_motion_with_delta(
+                        source,
+                        pointer.current_location() + delta,
+                        Some(delta),
+                    );
+                }
+            }
+            Command::PointerButton(p) => self.pointer_button(
+                source,
+                p.button.evdev_code(),
+                match p.state {
+                    pipe::ButtonState::Pressed => ButtonState::Pressed,
+                    pipe::ButtonState::Released => ButtonState::Released,
+                },
+            ),
+            Command::KeyboardKey(p) => match p.state {
+                pipe::KeyState::Pressed => {
+                    self.keyboard_key(source, p.key.get(), KeyState::Pressed);
+                }
+                pipe::KeyState::Released => {
+                    self.keyboard_key(source, p.key.get(), KeyState::Released);
+                }
+                pipe::KeyState::Repeated => self.keyboard_repeat(source, p.key.get()),
+            },
+            Command::ReleaseAll(_) => self.release_input(source),
+            Command::InputLease(p) => self.set_browser_lease(p.held),
+            Command::PointerScroll(p) => {
+                let frame = AxisFrame::new(InputTime::now())
+                    .source(AxisSource::Finger)
+                    .value(Axis::Horizontal, f64::from(p.dx.get()))
+                    .value(Axis::Vertical, f64::from(p.dy.get()));
+                self.pointer_axis(source, frame);
+            }
+            Command::PointerWheel(p) => {
+                let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
+                for (axis, value) in [(Axis::Horizontal, p.dx.get()), (Axis::Vertical, p.dy.get())]
+                {
+                    if value != 0.0 {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "wheel v120 is bounded by PointerDelta"
+                        )]
+                        let v120 = value.round() as i32;
+                        frame = frame.v120(axis, v120).value(axis, f64::from(v120) / 8.0);
+                    }
+                }
+                self.pointer_axis(source, frame);
+            }
+            Command::PointerScrollStop(p) => {
+                let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Finger);
+                if p.dx.get() != 0.0 {
+                    frame = frame.stop(Axis::Horizontal);
+                }
+                if p.dy.get() != 0.0 {
+                    frame = frame.stop(Axis::Vertical);
+                }
+                self.pointer_axis(source, frame);
+            }
+            Command::Resize(p) => {
+                self.size = p.size;
+                let mode = smithay::output::Mode {
+                    size: (
+                        i32::try_from(p.size.width())?,
+                        i32::try_from(p.size.height())?,
+                    )
+                        .into(),
+                    refresh: i32::try_from(self.stream.quality().fps.get())? * 1000,
+                };
+                self.output.change_current_state(
+                    Some(mode),
+                    None,
+                    Some(Scale::Fractional(f64::from(p.scale_v120.get()) / 120.0)),
+                    None,
+                );
+                self.output.set_preferred(mode);
+                self.space.map_output(&self.output, (0, 0));
+                crate::xwayland::update_scale(self)?;
+                self.output_resized();
+                self.update_cursor_image();
+                self.capture.output_resized();
+                if let Some(screencast) = &self.screencast {
+                    screencast.resize(
+                        (p.size.width(), p.size.height()),
+                        self.stream.quality().fps.get(),
+                    );
+                }
+                crate::eis::refresh_regions(self);
+                self.advance_generation()?;
+                self.emit(Event::ResizeApplied(pipe::ResizeApplied {
+                    request_id: p.request_id,
+                    size: p.size,
+                    scale_v120: p.scale_v120,
+                    generation: self.stream.generation(),
+                }));
+            }
+            Command::Quality(q) => {
+                let current = self.stream.quality();
+                if q != current {
+                    if q.fps != current.fps
+                        && let Some(mut mode) = self.output.current_mode()
+                    {
+                        mode.refresh = i32::try_from(q.fps.get())? * 1000;
+                        self.output.set_preferred(mode);
+                        self.output
+                            .change_current_state(Some(mode), None, None, None);
+                    }
+                    self.stream.set_quality(q);
+                    self.advance_generation()?;
+                }
+            }
+            Command::ResetVideo(_) => self.advance_generation()?,
+            Command::KeyframeReadiness(p) => {
+                if self.stream.keyframe_readiness(p) {
+                    self.frame_pending = FrameRequest::Pending;
+                }
+            }
+            Command::Text(p) => {
+                if matches!(p.action, pipe::TextAction::Commit) {
+                    let serial = self.begin_input(source, delivery::FocusCause::Key);
+                    let (target, text_field) = self.keyboard_target();
+                    self.finish_input(
+                        source,
+                        serial,
+                        delivery::InputKind::Text,
+                        &target,
+                        Some(text_field),
+                    );
+                }
+                let cursor = i32::try_from(p.text.as_str().len())?;
+                let text_input = self.seat.text_input();
+                let mut active = false;
+                text_input.with_active_text_input(|text, _| {
+                    active = true;
+                    match p.action {
+                        pipe::TextAction::Commit => {
+                            text.preedit_string(None, 0, 0);
+                            text.commit_string(Some(p.text.as_str().into()));
+                        }
+                        pipe::TextAction::Preedit => {
+                            text.preedit_string(Some(p.text.as_str().into()), cursor, cursor);
+                        }
+                    }
+                });
+                text_input.done(false);
+                if !active && matches!(p.action, pipe::TextAction::Commit) {
+                    self.text_keyboard
+                        .pending
+                        .push_back(p.text.as_str().to_owned());
+                    self.flush_text_keyboard();
+                }
+            }
+            Command::Clipboard(text) => self.clipboard_set(&text),
+        }
+        Ok(())
+    }
+
     #[expect(
         clippy::needless_pass_by_value,
         reason = "events are ephemeral messages consumed at emission"
@@ -449,7 +646,7 @@ impl crate::State {
         }
     }
 
-    pub(crate) fn advance_generation(&mut self) -> Result<()> {
+    fn advance_generation(&mut self) -> Result<()> {
         self.dirty = true;
         self.stream.advance_generation()
     }
@@ -457,7 +654,7 @@ impl crate::State {
     pub(crate) fn drain_video(&mut self) {
         let drained = self.stream.drain();
         if drained.frame {
-            self.frame_pending = crate::FrameRequest::Pending;
+            self.frame_pending = FrameRequest::Pending;
         }
         if drained.redraw {
             self.dirty = true;
