@@ -491,20 +491,8 @@ impl State {
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
         self.end_window_grab(window);
         self.toplevel_list.unpublish(window);
-        if self
-            .window_menu
-            .as_ref()
-            .is_some_and(|menu| &menu.window == window)
-        {
-            self.window_menu = None;
+        if self.chrome.window_unmapped(window) {
             self.dirty = true;
-        }
-        if self
-            .decoration_press
-            .as_ref()
-            .is_some_and(|(_, target)| target == window)
-        {
-            self.decoration_press = None;
         }
         self.windows.unmapped(window);
         let focused = self

@@ -2,6 +2,7 @@
 
 mod activation;
 mod capture;
+mod chrome;
 mod clipboard;
 mod cursor;
 mod decorations;
@@ -29,16 +30,12 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::AsFd;
-use std::os::unix::process::CommandExt;
 use std::process::Child;
-use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -221,35 +218,6 @@ pub(crate) enum FrameRequest {
     Pending,
 }
 
-struct TitlebarPress {
-    source: KeyboardSource,
-    window: Window,
-    location: Point<f64, Logical>,
-    time: Instant,
-}
-
-struct Pin {
-    command: Vec<String>,
-    pid: Option<u32>,
-    child: Option<Child>,
-}
-
-impl Drop for Pin {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            drop(child.kill());
-            drop(child.wait());
-        }
-    }
-}
-
-struct LaunchEnvironment {
-    socket: std::path::PathBuf,
-    runtime: std::path::PathBuf,
-    eis: std::path::PathBuf,
-    portal: Option<Vec<(String, String)>>,
-}
-
 #[expect(
     clippy::struct_field_names,
     reason = "Smithay protocol state names match their handler methods"
@@ -292,19 +260,8 @@ pub(crate) struct State {
     pub(crate) delivery: delivery::Delivery,
     clipboard: clipboard::Clipboard,
     windows: wm::Windows,
-    pins: Vec<Pin>,
-    launch_environment: Option<LaunchEnvironment>,
     loop_handle: Option<calloop::LoopHandle<'static, State>>,
-    restore_key_source: Option<KeyboardSource>,
-    decoration_press: Option<(KeyboardSource, Window)>,
-    window_menu: Option<waywire_decorations::WindowMenu>,
-    taskbar: waywire_decorations::Taskbar,
-    clock: String,
-    /// A press the compositor consumed, so its release is consumed too.
-    menu_button: Option<(KeyboardSource, u32, delivery::Chrome)>,
-    menu_escape: Option<KeyboardSource>,
-    last_titlebar_press: Option<TitlebarPress>,
-    pending_restore_drag: Option<TitlebarPress>,
+    chrome: chrome::Chrome,
     start: Instant,
     running: bool,
     failure: Option<anyhow::Error>,
@@ -452,26 +409,8 @@ impl State {
             delivery: delivery::Delivery::default(),
             clipboard,
             windows: wm::Windows::default(),
-            pins: options
-                .pins
-                .iter()
-                .map(|command| Pin {
-                    command: command.clone(),
-                    pid: None,
-                    child: None,
-                })
-                .collect(),
-            launch_environment: None,
             loop_handle: None,
-            restore_key_source: None,
-            decoration_press: None,
-            window_menu: None,
-            taskbar: waywire_decorations::Taskbar::default(),
-            clock: local_clock(SystemTime::now())?,
-            menu_button: None,
-            menu_escape: None,
-            last_titlebar_press: None,
-            pending_restore_drag: None,
+            chrome: chrome::Chrome::new(&options.pins)?,
             start: Instant::now(),
             running: true,
             failure: None,
@@ -561,7 +500,7 @@ impl State {
     }
 
     fn under(&self, pos: Point<f64, Logical>) -> Option<(&Window, WlSurface, Point<f64, Logical>)> {
-        if self.window_menu.is_some() || self.decoration_under(pos).is_some() {
+        if self.chrome.window_menu().is_some() || self.decoration_under(pos).is_some() {
             return None;
         }
         self.element_under(pos).and_then(|(window, location)| {
@@ -598,92 +537,11 @@ impl State {
             .seat
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
-        let windows: Vec<_> = self
-            .windows
-            .mapped_order()
-            .iter()
-            .filter(|window| waywire_decorations::taskbar_window(window))
-            .cloned()
-            .collect();
-        let mut matches = vec![None; self.pins.len()];
-        let mut used = Vec::new();
-        for (index, pin) in self.pins.iter().enumerate() {
-            if let Some(pid) = pin.pid
-                && let Some(window) = windows
-                    .iter()
-                    .find(|window| !used.contains(*window) && self.window_pid(window) == Some(pid))
-            {
-                used.push(window.clone());
-                matches[index] = Some(window.clone());
-            }
-        }
-        for (index, pin) in self.pins.iter().enumerate() {
-            if matches[index].is_some() {
-                continue;
-            }
-            let name = pin
-                .command
-                .first()
-                .and_then(|command| std::path::Path::new(command).file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if let Some(window) = windows.iter().find(|window| {
-                !used.contains(*window)
-                    && toplevel_list::metadata(window)
-                        .is_some_and(|metadata| metadata.1.eq_ignore_ascii_case(name))
-            }) {
-                used.push(window.clone());
-                matches[index] = Some(window.clone());
-            }
-        }
-        let make_chip = |window: Option<Window>, pin: Option<usize>, fallback: String| {
-            let title = window
-                .as_ref()
-                .and_then(toplevel_list::metadata)
-                .map_or(fallback, |metadata| metadata.0);
-            TaskbarChip {
-                running: window.is_some()
-                    || pin.is_some_and(|index| self.pins[index].child.is_some()),
-                minimized: window
-                    .as_ref()
-                    .and_then(|window| self.windows.get(window))
-                    .is_some_and(|state| state.minimized),
-                focused: window.as_ref().is_some_and(|window| {
-                    focus.is_some() && focus == focus::KeyboardFocus::window(window)
-                }),
-                urgent: window
-                    .as_ref()
-                    .and_then(|window| self.windows.get(window))
-                    .is_some_and(|state| state.urgent),
-                window,
-                pin,
-                title,
-            }
-        };
-        let mut chips: Vec<_> = self
-            .pins
-            .iter()
-            .enumerate()
-            .map(|(index, pin)| {
-                make_chip(
-                    matches[index].clone(),
-                    Some(index),
-                    pin.command
-                        .first()
-                        .and_then(|command| std::path::Path::new(command).file_name())
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                )
-            })
-            .collect();
-        chips.extend(
-            windows
-                .into_iter()
-                .filter(|window| !used.contains(window))
-                .map(|window| make_chip(Some(window), None, String::new())),
-        );
-        chips
+        self.chrome.taskbar_chips(
+            &self.windows,
+            |window| focus.is_some() && focus == focus::KeyboardFocus::window(window),
+            |window| self.window_pid(window),
+        )
     }
 
     fn window_pid(&self, window: &Window) -> Option<u32> {
@@ -699,59 +557,25 @@ impl State {
     }
 
     fn launch_pin(&mut self, index: usize) {
-        let Some(pin) = self.pins.get(index) else {
+        let Some(mut command) = self.chrome.pin_command(index, self.xdisplay) else {
             return;
-        };
-        if pin.child.is_some() {
-            return;
-        }
-        let Some(program) = pin.command.first() else {
-            return;
-        };
-        let mut command = match application_command(
-            program,
-            &pin.command[1..],
-            self.launch_environment.as_ref(),
-            self.xdisplay,
-        ) {
-            Ok(command) => command,
-            Err(error) => {
-                tracing::warn!(%error, "prepare pinned application");
-                return;
-            }
         };
         // The pin click is the user's request: a single-instance app that
         // forwards this launch to its running instance may raise it.
         command.env("XDG_ACTIVATION_TOKEN", self.launch_token());
-        match command.spawn() {
-            Ok(child) => {
-                let pid = child.id();
-                if let Some(handle) = &self.loop_handle
-                    && let Err(error) = wake_on_exit(handle, pid)
-                {
-                    tracing::warn!(%error, "watch pinned application");
-                }
-                self.pins[index].pid = Some(pid);
-                self.pins[index].child = Some(child);
-                self.dirty = true;
+        if let Some(pid) = self.chrome.start_pin(index, command) {
+            if let Some(handle) = &self.loop_handle
+                && let Err(error) = wake_on_exit(handle, pid)
+            {
+                tracing::warn!(%error, "watch pinned application");
             }
-            Err(error) => tracing::warn!(%error, "start pinned application"),
+            self.dirty = true;
         }
     }
 
     fn reap_pins(&mut self) {
-        for pin in &mut self.pins {
-            if let Some(child) = &mut pin.child {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        pin.child = None;
-                        pin.pid = None;
-                        self.dirty = true;
-                    }
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(%error, "wait for pinned application"),
-                }
-            }
+        if self.chrome.reap_pins() {
+            self.dirty = true;
         }
     }
 
@@ -780,18 +604,8 @@ impl State {
         }
     }
 
-    fn control_text(&self) -> &'static str {
-        if self.input.browser_holds_input() {
-            "You're driving"
-        } else {
-            "Agent driving"
-        }
-    }
-
     fn update_clock(&mut self, time: SystemTime) -> Result<()> {
-        let clock = local_clock(time)?;
-        if self.clock != clock {
-            self.clock = clock;
+        if self.chrome.update_clock(time)? {
             self.dirty = true;
         }
         Ok(())
@@ -917,21 +731,19 @@ impl State {
         }
         if key == 1
             && state == KeyState::Pressed
-            && let Some(menu) = self.window_menu.take()
+            && let Some(window) = self.chrome.escape_menu(source)
         {
-            self.menu_escape = Some(source);
             self.dirty = true;
             self.refresh_pointer_focus();
             return (
                 Target::Compositor {
-                    window: Some(menu.window),
+                    window: Some(window),
                     chrome: Chrome::WindowMenu,
                 },
                 None,
             );
         }
-        if key == 1 && state == KeyState::Released && self.menu_escape == Some(source) {
-            self.menu_escape = None;
+        if key == 1 && state == KeyState::Released && self.chrome.release_escape(source) {
             return (
                 Target::Compositor {
                     window: None,
@@ -940,8 +752,7 @@ impl State {
                 None,
             );
         }
-        if key == 50 && state == KeyState::Released && self.restore_key_source == Some(source) {
-            self.restore_key_source = None;
+        if key == 50 && state == KeyState::Released && self.chrome.release_restore_key(source) {
             return (
                 Target::Compositor {
                     window: None,
@@ -957,7 +768,7 @@ impl State {
                 mods.logo && mods.shift && !mods.ctrl && !mods.alt
             })
         {
-            self.restore_key_source = Some(source);
+            self.chrome.press_restore_key(source);
             let window = self.windows.minimized_order().last().cloned();
             if let Some(window) = &window {
                 self.window_action(window, WindowAction::Restore);
@@ -1085,9 +896,7 @@ impl State {
             if self.input.pointer_motion_kind() == PointerMotionKind::Input {
                 (location, locked) = self.constrain_pointer_motion(&pointer, location);
             }
-            if let Some(menu) = self.window_menu.as_mut() {
-                self.dirty |= menu.motion(location);
-            }
+            self.dirty |= self.chrome.menu_motion(location);
             if !locked {
                 pointer.motion(
                     self,
@@ -1116,10 +925,10 @@ impl State {
         if self.input.pointer_motion_kind() == PointerMotionKind::Input {
             self.update_titlebar_drag(source, location);
         }
-        if self.decoration_press.as_ref().is_some_and(|(_, window)| {
+        if self.chrome.armed_close().is_some_and(|(_, window)| {
             self.decoration_under(location) != Some((window.clone(), DecorationAction::Close))
         }) {
-            self.decoration_press = None;
+            self.chrome.disarm_close();
         }
         if self.drag.is_some() {
             // The drag icon follows the pointer, and the drag keeps its cursor.
@@ -1138,60 +947,44 @@ impl State {
     }
 
     fn update_titlebar_drag(&mut self, source: KeyboardSource, location: Point<f64, Logical>) {
-        if self.pending_restore_drag.as_ref().is_some_and(|press| {
-            press.source == source
-                && (location - press.location)
-                    .x
-                    .hypot((location - press.location).y)
-                    > 4.0
-        }) && let Some(press) = self.pending_restore_drag.take()
+        if let Some(press) = self.chrome.start_restore_drag(source, location)
+            && let Some(maximized) = self.window_output_geometry(&press.window)
         {
-            self.last_titlebar_press = None;
-            if let Some(maximized) = self.window_output_geometry(&press.window) {
-                let restored = self
-                    .windows
-                    .get(&press.window)
-                    .and_then(|state| state.restore);
-                self.window_action(&press.window, WindowAction::Restore);
-                let restored_size = restored.map_or_else(
-                    || {
-                        press
-                            .window
-                            .x11_surface()
-                            .map_or(press.window.geometry().size, |surface| {
-                                surface.last_configure().size
-                            })
-                    },
-                    |geometry| geometry.size,
-                );
-                let position =
-                    wm::restored_drag_location(press.location, location, maximized, restored_size);
-                self.space.map_element(press.window.clone(), position, true);
-                self.enforce_topmost();
-                if let Some(surface) = press.window.x11_surface()
-                    && let Err(error) = surface.configure(Some(
-                        smithay::utils::Rectangle::new(position, restored_size)
-                            + surface.frame_extents(),
-                    ))
-                {
-                    tracing::warn!(%error, "position restored X11 window");
-                }
-                self.window_action(&press.window, WindowAction::Move);
+            let restored = self
+                .windows
+                .get(&press.window)
+                .and_then(|state| state.restore);
+            self.window_action(&press.window, WindowAction::Restore);
+            let restored_size = restored.map_or_else(
+                || {
+                    press
+                        .window
+                        .x11_surface()
+                        .map_or(press.window.geometry().size, |surface| {
+                            surface.last_configure().size
+                        })
+                },
+                |geometry| geometry.size,
+            );
+            let position =
+                wm::restored_drag_location(press.location, location, maximized, restored_size);
+            self.space.map_element(press.window.clone(), position, true);
+            self.enforce_topmost();
+            if let Some(surface) = press.window.x11_surface()
+                && let Err(error) = surface.configure(Some(
+                    smithay::utils::Rectangle::new(position, restored_size)
+                        + surface.frame_extents(),
+                ))
+            {
+                tracing::warn!(%error, "position restored X11 window");
             }
+            self.window_action(&press.window, WindowAction::Move);
         }
-        if self.last_titlebar_press.as_ref().is_some_and(|press| {
-            press.source == source
-                && self
-                    .input
-                    .buttons(source)
-                    .is_some_and(|buttons| buttons.contains(&0x110))
-                && (location - press.location)
-                    .x
-                    .hypot((location - press.location).y)
-                    > 4.0
-        }) {
-            self.last_titlebar_press = None;
-        }
+        let held = self
+            .input
+            .buttons(source)
+            .is_some_and(|buttons| buttons.contains(&0x110));
+        self.chrome.titlebar_motion(source, location, held);
     }
 
     pub(crate) fn pointer_button(
@@ -1253,14 +1046,8 @@ impl State {
     ) -> delivery::Target {
         use delivery::Chrome;
         use delivery::Target;
-        if button == 0x110
-            && state == ButtonState::Released
-            && self
-                .pending_restore_drag
-                .as_ref()
-                .is_some_and(|press| press.source == source)
-        {
-            self.pending_restore_drag = None;
+        if button == 0x110 && state == ButtonState::Released {
+            self.chrome.cancel_restore_drag(source);
         }
         if !self.input.track_button(source, button, state) {
             // Another input source can keep the aggregate button held. It must
@@ -1268,11 +1055,11 @@ impl State {
             if button == 0x110
                 && state == ButtonState::Released
                 && self
-                    .decoration_press
-                    .as_ref()
+                    .chrome
+                    .armed_close()
                     .is_some_and(|(owner, _)| *owner == source)
             {
-                self.decoration_press = None;
+                self.chrome.disarm_close();
             }
             // Another source holds the same button, so no event is sent.
             return Target::Nowhere;
@@ -1282,29 +1069,22 @@ impl State {
         };
         let serial = SERIAL_COUNTER.next_serial();
         if state == ButtonState::Released
-            && let Some((owner, held, chrome)) = self.menu_button
-            && owner == source
-            && held == button
+            && let Some(chrome) = self.chrome.consumed_release(source, button)
         {
-            self.menu_button = None;
             return Target::Compositor {
                 window: None,
                 chrome,
             };
         }
-        if let Some(menu) = self.window_menu.as_ref() {
-            if state == ButtonState::Pressed {
-                let position = pointer.current_location();
-                let selected = menu.click(position);
-                let outside = !menu.contains(position);
-                let window = menu.window.clone();
-                if outside || (button == 0x110 && selected.is_some()) {
-                    self.window_menu = None;
+        if self.chrome.window_menu().is_some() {
+            if state == ButtonState::Pressed
+                && let Some(press) = self.chrome.press_menu(pointer.current_location(), button)
+            {
+                let window = press.window;
+                if press.closed {
                     self.dirty = true;
                 }
-                if button == 0x110
-                    && let Some(action) = selected
-                {
+                if let Some(action) = press.action {
                     if matches!(action, WindowAction::Move | WindowAction::Resize(_)) {
                         pointer.button(
                             self,
@@ -1324,7 +1104,8 @@ impl State {
                     }
                     self.window_action(&window, action);
                 }
-                self.menu_button = Some((source, button, Chrome::WindowMenu));
+                self.chrome
+                    .consume_button(source, button, Chrome::WindowMenu);
                 self.refresh_pointer_focus();
                 return Target::Compositor {
                     window: Some(window),
@@ -1341,35 +1122,22 @@ impl State {
             let covered = self
                 .element_under(position)
                 .is_some_and(|(window, _)| waywire_decorations::above_taskbar(window));
-            if !covered && let Some(output) = self.space.output_geometry(&self.output) {
-                let chips = self.taskbar_chips();
-                let relative = position
-                    - (output.loc + Point::from((0, output.size.h - waywire_decorations::TASKBAR)))
-                        .to_f64();
-                if let Some(chip) = chips.iter().enumerate().find_map(|(index, chip)| {
-                    let rect =
-                        waywire_decorations::chip_rectangle(output.size.w, chips.len(), index)?;
-                    rect.to_f64().contains(relative).then_some(chip)
-                }) {
-                    let action = if chip.minimized {
-                        WindowAction::Restore
-                    } else if chip.focused {
-                        WindowAction::Minimize
-                    } else {
-                        WindowAction::Focus
-                    };
-                    let window = chip.window.clone();
-                    if let Some(window) = &window {
-                        self.window_action(window, action);
-                    } else if let Some(pin) = chip.pin {
-                        self.launch_pin(pin);
-                    }
-                    self.menu_button = Some((source, button, Chrome::Taskbar));
-                    return Target::Compositor {
-                        window,
-                        chrome: Chrome::Taskbar,
-                    };
+            if !covered
+                && let Some(output) = self.space.output_geometry(&self.output)
+                && let Some((chip, action)) =
+                    chrome::taskbar_click(self.taskbar_chips(), output, position)
+            {
+                let window = chip.window.clone();
+                if let Some(window) = &window {
+                    self.window_action(window, action);
+                } else if let Some(pin) = chip.pin {
+                    self.launch_pin(pin);
                 }
+                self.chrome.consume_button(source, button, Chrome::Taskbar);
+                return Target::Compositor {
+                    window,
+                    chrome: Chrome::Taskbar,
+                };
             }
         }
         if state == ButtonState::Pressed
@@ -1379,7 +1147,7 @@ impl State {
                 self.decoration_under(pointer.current_location())
         {
             self.window_action(&window, WindowAction::ShowMenu);
-            self.menu_button = Some((source, button, Chrome::Titlebar));
+            self.chrome.consume_button(source, button, Chrome::Titlebar);
             return Target::Compositor {
                 window: Some(window),
                 chrome: Chrome::Titlebar,
@@ -1400,7 +1168,14 @@ impl State {
                     time: InputTime::now(),
                 },
             );
-            self.press_decoration(source, window.clone(), action);
+            if let Some(action) = self.chrome.press_decoration(
+                source,
+                window.clone(),
+                action,
+                pointer.current_location(),
+            ) {
+                self.window_action(&window, action);
+            }
             pointer.frame(self);
             return Target::Compositor {
                 window: Some(window),
@@ -1418,7 +1193,7 @@ impl State {
         if state == ButtonState::Released {
             self.refresh_drag_target();
         }
-        let target = match &self.decoration_press {
+        let target = match self.chrome.armed_close() {
             Some((owner, window)) if *owner == source && state == ButtonState::Released => {
                 Target::Compositor {
                     window: Some(window.clone()),
@@ -1443,7 +1218,7 @@ impl State {
         }
         if state == ButtonState::Released
             && button == 0x110
-            && let Some((owner, window)) = self.decoration_press.take()
+            && let Some((owner, window)) = self.chrome.take_armed_close()
             && owner == source
             && self.decoration_under(pointer.current_location())
                 == Some((window.clone(), DecorationAction::Close))
@@ -1451,74 +1226,6 @@ impl State {
             self.window_action(&window, WindowAction::Close);
         }
         target
-    }
-
-    fn press_decoration(
-        &mut self,
-        source: KeyboardSource,
-        window: Window,
-        action: DecorationAction,
-    ) {
-        match action {
-            DecorationAction::Move => {
-                let now = Instant::now();
-                let double = self.last_titlebar_press.as_ref().is_some_and(|press| {
-                    press.source == source
-                        && press.window == window
-                        && now.duration_since(press.time) <= Duration::from_millis(400)
-                });
-                let maximized = window.toplevel().is_some_and(|top| {
-                    top.with_pending_state(|state| {
-                        state.states.contains(xdg_toplevel::State::Maximized)
-                    })
-                }) || window
-                    .x11_surface()
-                    .is_some_and(smithay::xwayland::X11Surface::is_maximized);
-                if double {
-                    self.last_titlebar_press = None;
-                    self.pending_restore_drag = None;
-                    self.window_action(
-                        &window,
-                        if maximized {
-                            WindowAction::Restore
-                        } else {
-                            WindowAction::Maximize
-                        },
-                    );
-                } else if let Some(pointer) = self.seat.get_pointer() {
-                    let press = TitlebarPress {
-                        source,
-                        window: window.clone(),
-                        location: pointer.current_location(),
-                        time: now,
-                    };
-                    self.last_titlebar_press = Some(TitlebarPress {
-                        source,
-                        window: window.clone(),
-                        location: press.location,
-                        time: now,
-                    });
-                    if maximized {
-                        self.pending_restore_drag = Some(press);
-                    } else {
-                        self.window_action(&window, WindowAction::Move);
-                    }
-                }
-            }
-            DecorationAction::Resize(edges) => {
-                self.window_action(&window, WindowAction::Resize(edges));
-            }
-            DecorationAction::Minimize => {
-                self.window_action(&window, WindowAction::Minimize);
-            }
-            DecorationAction::Maximize => {
-                self.window_action(&window, WindowAction::Maximize);
-            }
-            DecorationAction::Restore => {
-                self.window_action(&window, WindowAction::Restore);
-            }
-            DecorationAction::Close => self.decoration_press = Some((source, window)),
-        }
     }
 
     pub(crate) fn window_action(&mut self, window: &Window, action: WindowAction) {
@@ -1590,12 +1297,12 @@ impl State {
                     self.seat.get_pointer(),
                     self.space.output_geometry(&self.output),
                 ) {
-                    self.window_menu = Some(waywire_decorations::WindowMenu::new(
+                    self.chrome.open_menu(
                         window.clone(),
                         pointer.current_location(),
                         output.size,
                         self.windows.always_on_top(window),
-                    ));
+                    );
                     self.refresh_pointer_focus();
                     self.dirty = true;
                 }
@@ -1650,33 +1357,7 @@ impl State {
 
     pub(crate) fn release_input(&mut self, source: KeyboardSource) {
         // Disconnect/ownership loss must release buttons without activating Close.
-        if self.restore_key_source == Some(source) {
-            self.restore_key_source = None;
-        }
-        if self.menu_escape == Some(source) {
-            self.menu_escape = None;
-        }
-        if self
-            .decoration_press
-            .as_ref()
-            .is_some_and(|(owner, _)| *owner == source)
-        {
-            self.decoration_press = None;
-        }
-        if self
-            .last_titlebar_press
-            .as_ref()
-            .is_some_and(|press| press.source == source)
-        {
-            self.last_titlebar_press = None;
-        }
-        if self
-            .pending_restore_drag
-            .as_ref()
-            .is_some_and(|press| press.source == source)
-        {
-            self.pending_restore_drag = None;
-        }
+        self.chrome.release(source);
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.release_source(self, source);
             if keyboard.pressed_keys().is_empty() {
@@ -1738,11 +1419,11 @@ impl State {
             window = Some(self.windows.modal_focus(&self.space, target.clone()));
         }
         if self
-            .decoration_press
-            .as_ref()
+            .chrome
+            .armed_close()
             .is_some_and(|(_, target)| Some(target) != window.as_ref())
         {
-            self.decoration_press = None;
+            self.chrome.disarm_close();
         }
         if let Some(window) = &window {
             // X11 menus, dropdowns and tooltips draw above their app but expect
@@ -2207,25 +1888,6 @@ pub(crate) fn image_pixels<'a>(image: &'a Image<'static, 'static>) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image.stride() * image.height()) }
 }
 
-fn local_clock(time: SystemTime) -> Result<String> {
-    let seconds = time.duration_since(UNIX_EPOCH)?.as_secs().try_into()?;
-    let mut local = std::mem::MaybeUninit::<nix::libc::tm>::uninit();
-    // SAFETY: both pointers reference valid storage, and localtime_r initializes it on success.
-    let result = unsafe { nix::libc::localtime_r(&raw const seconds, local.as_mut_ptr()) };
-    if result.is_null() {
-        return Err(anyhow!("local time conversion failed"));
-    }
-    // SAFETY: localtime_r returned a non-null pointer to the initialized storage.
-    let local = unsafe { local.assume_init() };
-    Ok(format!("{:02}:{:02}", local.tm_hour, local.tm_min))
-}
-
-fn next_minute_delay(time: SystemTime) -> Duration {
-    let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let remainder = Duration::new(elapsed.as_secs() % 60, elapsed.subsec_nanos());
-    Duration::from_mins(1).saturating_sub(remainder)
-}
-
 /// Run the compositor until shutdown, reading pipe commands from stdin and writing events to stdout.
 #[expect(
     clippy::too_many_lines,
@@ -2266,14 +1928,14 @@ pub fn run(mut options: Config) -> Result<()> {
     let mut state = State::new(display.handle(), &options, sink, video)?;
     handle
         .insert_source(
-            Timer::from_duration(next_minute_delay(SystemTime::now())),
+            Timer::from_duration(chrome::next_minute_delay(SystemTime::now())),
             |_, (), state| {
                 let now = SystemTime::now();
                 if let Err(error) = state.update_clock(now) {
                     state.fail(error);
                     return TimeoutAction::Drop;
                 }
-                TimeoutAction::ToDuration(next_minute_delay(now))
+                TimeoutAction::ToDuration(chrome::next_minute_delay(now))
             },
         )
         .map_err(|error| anyhow!("register clock timer: {error}"))?;
@@ -2399,12 +2061,14 @@ pub fn run(mut options: Config) -> Result<()> {
         (Some(dirs), Some(bus)) => Some(waywire_portal::portal_environment(dirs, bus.address())),
         _ => None,
     };
-    state.launch_environment = Some(LaunchEnvironment {
-        socket: socket_path.clone(),
-        runtime: runtime.path().to_path_buf(),
-        eis: eis_path.clone(),
-        portal: session_environment,
-    });
+    state
+        .chrome
+        .set_launch_environment(chrome::LaunchEnvironment {
+            socket: socket_path.clone(),
+            runtime: runtime.path().to_path_buf(),
+            eis: eis_path.clone(),
+            portal: session_environment,
+        });
     state.loop_handle = Some(handle.clone());
     if let Some(daemon) = &pipewire_daemon {
         state.screencast = start_screencast(&handle, daemon, Rc::clone(&image));
@@ -2418,10 +2082,10 @@ pub fn run(mut options: Config) -> Result<()> {
             && let Some(display) = state.xdisplay
             && let Some(program) = options.session.first()
         {
-            let mut command = application_command(
+            let mut command = chrome::application_command(
                 program,
                 &options.session[1..],
-                state.launch_environment.as_ref(),
+                state.chrome.launch_environment(),
                 Some(display),
             )?;
             match command.spawn() {
@@ -2596,57 +2260,6 @@ pub(crate) fn pidfd(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
 }
 
-fn application_command(
-    program: impl AsRef<std::ffi::OsStr>,
-    args: &[impl AsRef<std::ffi::OsStr>],
-    environment: Option<&LaunchEnvironment>,
-    display: Option<u32>,
-) -> Result<std::process::Command> {
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .env_remove("DBUS_SESSION_BUS_ADDRESS")
-        .env_remove("WAYLAND_SOCKET")
-        .env_remove("XDG_ACTIVATION_TOKEN")
-        .env_remove("DESKTOP_STARTUP_ID");
-    if let Some(environment) = environment {
-        command
-            .env("WAYLAND_DISPLAY", &environment.socket)
-            .env("XDG_RUNTIME_DIR", &environment.runtime)
-            .env("LIBEI_SOCKET", &environment.eis)
-            // PulseAudio clients then find the private daemon's socket in
-            // XDG_RUNTIME_DIR, not a host server.
-            .env_remove("PULSE_SERVER")
-            .env_remove("PULSE_RUNTIME_PATH");
-        if let Some(display) = display {
-            command.env("DISPLAY", format!(":{display}"));
-        } else {
-            command.env_remove("DISPLAY");
-        }
-        if let Some(portal) = &environment.portal {
-            for (key, value) in portal {
-                command.env(key, value);
-            }
-        }
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
-        .stderr(Stdio::inherit());
-    // SAFETY: this hook only invokes pthread_sigmask before exec, without allocation.
-    unsafe {
-        command.pre_exec(|| {
-            nix::sys::signal::pthread_sigmask(
-                nix::sys::signal::SigmaskHow::SIG_SETMASK,
-                Some(&nix::sys::signal::SigSet::empty()),
-                None,
-            )
-            .map_err(std::io::Error::from)
-        });
-    }
-    Ok(command)
-}
-
 /// Wake the event loop once `pid` exits so the checks after dispatch see it
 /// immediately instead of at the next housekeeping deadline.
 fn wake_on_exit(handle: &calloop::LoopHandle<'static, State>, pid: u32) -> Result<()> {
@@ -2675,8 +2288,11 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::UNIX_EPOCH;
 
     use super::*;
+    use crate::chrome::local_clock;
+    use crate::chrome::next_minute_delay;
 
     pub(super) fn test_state() -> (Display<State>, State) {
         let display = Display::new().expect("test display");
@@ -2763,19 +2379,23 @@ mod tests {
         }
     }
 
+    fn control_text(state: &State) -> &'static str {
+        chrome::control_text(state.input.browser_holds_input())
+    }
+
     #[test]
     fn control_text_follows_gateway_lease() {
         let (_display, mut state) = test_state();
-        assert_eq!(state.control_text(), "Agent driving");
+        assert_eq!(control_text(&state), "Agent driving");
         state.dirty = false;
         lease(&mut state, true);
-        assert_eq!(state.control_text(), "You're driving");
+        assert_eq!(control_text(&state), "You're driving");
         assert!(state.dirty);
         state.dirty = false;
         lease(&mut state, true);
         assert!(!state.dirty);
         lease(&mut state, false);
-        assert_eq!(state.control_text(), "Agent driving");
+        assert_eq!(control_text(&state), "Agent driving");
     }
 
     #[test]
@@ -2783,7 +2403,7 @@ mod tests {
         let (_display, mut state) = test_state();
         let time = UNIX_EPOCH + Duration::from_mins(28_333_334);
         state.update_clock(time).expect("local time");
-        assert_eq!(state.clock, local_clock(time).expect("local time"));
+        assert_eq!(state.chrome.clock(), local_clock(time).expect("local time"));
         state.dirty = false;
         state
             .update_clock(time + Duration::from_secs(30))
@@ -2793,7 +2413,7 @@ mod tests {
             .update_clock(time + Duration::from_mins(1))
             .expect("local time");
         assert!(state.dirty);
-        assert_ne!(state.clock, local_clock(time).expect("local time"));
+        assert_ne!(state.chrome.clock(), local_clock(time).expect("local time"));
     }
 
     #[test]

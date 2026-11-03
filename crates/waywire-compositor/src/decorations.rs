@@ -152,7 +152,7 @@ impl State {
                 ),
             );
         }
-        if let Some(menu) = self.window_menu.as_mut() {
+        if let Some(menu) = self.chrome.window_menu_mut() {
             match menu.element(renderer, scale) {
                 Ok(element) => elements.push(element.into()),
                 Err(error) => tracing::warn!(%error, "window menu rendering failed"),
@@ -163,15 +163,16 @@ impl State {
         let hit = pointer
             .as_ref()
             .and_then(|p| self.decoration_under(p.current_location()));
-        if self.decoration_press.as_ref().is_some_and(|(_, window)| {
+        if self.chrome.armed_close().is_some_and(|(_, window)| {
             hit.as_ref() != Some(&(window.clone(), DecorationAction::Close))
         }) {
-            self.decoration_press = None;
+            self.chrome.disarm_close();
         }
         let hover = hit
             .filter(|(_, action)| *action != DecorationAction::Move)
             .filter(|_| {
-                pointer.as_ref().is_some_and(|p| !p.is_grabbed()) || self.decoration_press.is_some()
+                pointer.as_ref().is_some_and(|p| !p.is_grabbed())
+                    || self.chrome.armed_close().is_some()
             });
         let mut upper = Vec::new();
         let mut lower = Vec::new();
@@ -242,8 +243,8 @@ impl State {
                     .filter(|(target, _)| target == window)
                     .map(|(_, action)| *action),
                 pressed: self
-                    .decoration_press
-                    .as_ref()
+                    .chrome
+                    .armed_close()
                     .is_some_and(|(_, target)| target == window),
             };
             // One broken decoration must not fail the render — and the session
@@ -262,10 +263,11 @@ impl State {
         elements.extend(upper);
         if let Some(output) = self.space.output_geometry(&self.output) {
             let chips = self.taskbar_chips();
-            let control = self.control_text();
-            let clock = self.clock.clone();
+            let control = crate::chrome::control_text(self.input.browser_holds_input());
+            let clock = self.chrome.clock().to_owned();
             match self
-                .taskbar
+                .chrome
+                .taskbar_mut()
                 .element(renderer, output, scale, chips, control, clock)
             {
                 Ok(bar) => elements.push(bar.into()),

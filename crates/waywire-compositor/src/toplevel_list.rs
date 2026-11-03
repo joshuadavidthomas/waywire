@@ -1653,7 +1653,7 @@ mod tests {
         );
         let killed = top_window(&state);
         state.window_action(&killed, crate::WindowAction::ShowMenu);
-        assert!(state.window_menu.is_some());
+        assert!(state.chrome.window_menu().is_some());
         assert_eq!(
             state.seat.get_keyboard().expect("keyboard").current_focus(),
             KeyboardFocus::window(&killed)
@@ -1686,7 +1686,7 @@ mod tests {
         assert_eq!(chips[0].window, Some(kept.clone()));
         assert!(chips[0].focused, "focus passes to the remaining window");
         assert!(
-            state.window_menu.is_none(),
+            state.chrome.window_menu().is_none(),
             "the killed window's menu closes"
         );
     }
@@ -1882,18 +1882,18 @@ mod tests {
             "other",
         );
         let third = top_window(&state);
-        state.pins = vec![
-            crate::Pin {
+        *state.chrome.pins_mut() = vec![
+            crate::chrome::Pin {
                 command: vec!["/usr/bin/beta".into()],
                 pid: None,
                 child: None,
             },
-            crate::Pin {
+            crate::chrome::Pin {
                 command: vec!["different-name".into()],
                 pid: state.window_pid(&first),
                 child: None,
             },
-            crate::Pin {
+            crate::chrome::Pin {
                 command: vec!["absent".into()],
                 pid: None,
                 child: None,
@@ -1923,7 +1923,7 @@ mod tests {
     #[test]
     fn clicking_unmatched_pin_spawns_and_reaps_process() {
         let (_, mut state, _, _, _, _) = action_fixture();
-        state.pins.push(crate::Pin {
+        state.chrome.pins_mut().push(crate::chrome::Pin {
             command: vec!["sleep".into(), "5".into()],
             pid: None,
             child: None,
@@ -1931,27 +1931,28 @@ mod tests {
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
-        let pin = &mut state.pins[0];
+        let pin = &mut state.chrome.pins_mut()[0];
         let child = pin.child.as_mut().expect("spawned process");
         assert_eq!(pin.pid, Some(child.id()));
         child.kill().expect("stop child");
         child.wait().expect("wait child");
         state.reap_pins();
-        assert!(state.pins[0].pid.is_none());
+        assert!(state.chrome.pins_mut()[0].pid.is_none());
         assert!(!state.taskbar_chips()[0].running);
     }
 
     #[test]
     fn dropping_state_reaps_pinned_child() {
         let (_, mut state, _, _, _, _) = action_fixture();
-        state.pins.push(crate::Pin {
+        state.chrome.pins_mut().push(crate::chrome::Pin {
             command: vec!["sleep".into(), "30".into()],
             pid: None,
             child: None,
         });
         state.launch_pin(0);
         let pid = nix::unistd::Pid::from_raw(
-            i32::try_from(state.pins[0].pid.expect("spawned process")).expect("valid pid"),
+            i32::try_from(state.chrome.pins_mut()[0].pid.expect("spawned process"))
+                .expect("valid pid"),
         );
         drop(state);
         let result = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
@@ -1968,7 +1969,7 @@ mod tests {
     #[test]
     fn clicking_running_pin_minimizes_its_window() {
         let (_, mut state, _, _, _, window) = action_fixture();
-        state.pins.push(crate::Pin {
+        state.chrome.pins_mut().push(crate::chrome::Pin {
             command: vec!["window".into()],
             pid: None,
             child: None,
@@ -2533,7 +2534,7 @@ mod tests {
         let (_, mut state, _, _, _, window) = action_fixture();
         let before = state.space.element_location(&window);
         state.window_action(&window, crate::WindowAction::ShowMenu);
-        assert!(state.window_menu.is_some());
+        assert!(state.chrome.window_menu().is_some());
         assert_eq!(state.space.element_location(&window), before);
         assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
         state.keyboard_key(
@@ -2541,7 +2542,7 @@ mod tests {
             1,
             smithay::backend::input::KeyState::Pressed,
         );
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
         state.keyboard_key(
             KeyboardSource::MAIN,
             1,
@@ -2549,7 +2550,7 @@ mod tests {
         );
         state.window_action(&window, crate::WindowAction::ShowMenu);
         state.window_unmapped(&window);
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
     }
 
     #[test]
@@ -2559,9 +2560,9 @@ mod tests {
         state.keyboard_key(agent, 30, smithay::backend::input::KeyState::Pressed);
         state.window_action(&window, crate::WindowAction::ShowMenu);
         state.keyboard_key(agent, 1, smithay::backend::input::KeyState::Pressed);
-        assert_eq!(state.menu_escape, Some(agent));
+        assert_eq!(state.chrome.menu_escape(), Some(agent));
         state.set_browser_lease(true);
-        assert_eq!(state.menu_escape, None);
+        assert_eq!(state.chrome.menu_escape(), None);
     }
 
     #[test]
@@ -2571,7 +2572,7 @@ mod tests {
         state.window_action(&window, crate::WindowAction::ShowMenu);
         state.pointer_motion(KeyboardSource::MAIN, (400.0, 400.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
     }
 
@@ -2620,7 +2621,7 @@ mod tests {
     fn menu_minimize_hides_window() {
         let (_, mut state, _, _, _, window) = action_fixture();
         click_menu_item(&mut state, &window, 0);
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
         assert!(state.windows.get(&window).expect("window").minimized);
     }
 
@@ -2628,7 +2629,7 @@ mod tests {
     fn menu_maximize_and_restore() {
         let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         click_menu_item(&mut state, &window, 1);
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
         assert!(window.toplevel().expect("toplevel").with_pending_state(|pending| pending.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized)));
         commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         click_menu_item(&mut state, &window, 1);
@@ -2643,7 +2644,7 @@ mod tests {
         state.pointer_motion(KeyboardSource::MAIN, (110.0, 191.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         assert!(state.seat.get_pointer().expect("pointer").is_grabbed());
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
     }
 
     #[test]
@@ -2663,7 +2664,7 @@ mod tests {
                 .map(|resize| resize.0),
             Some(10)
         );
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
     }
 
     #[test]
@@ -2672,7 +2673,7 @@ mod tests {
         click_menu_item(&mut state, &window, 5);
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(app.close_requests, 1);
-        assert!(state.window_menu.is_none());
+        assert!(state.chrome.window_menu().is_none());
     }
 
     #[test]
@@ -2682,9 +2683,9 @@ mod tests {
         commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         for row in [3, 4] {
             click_menu_item(&mut state, &window, row);
-            assert!(state.window_menu.is_some());
+            assert!(state.chrome.window_menu().is_some());
             assert!(!state.seat.get_pointer().expect("pointer").is_grabbed());
-            state.window_menu = None;
+            state.chrome.close_menu();
         }
     }
 
