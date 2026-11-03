@@ -28,7 +28,7 @@ use zbus::zvariant::OwnedObjectPath;
 use zbus::zvariant::OwnedValue;
 use zbus::zvariant::Value;
 
-use super::PortalRequest;
+use crate::PortalRequest;
 
 /// Stream ID of a metadata-only stream, reported when no `PipeWire` daemon
 /// is available.

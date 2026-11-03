@@ -2882,7 +2882,6 @@ dependencies = [
  "clap",
  "nix",
  "pangocairo",
- "png",
  "shlex 2.0.1",
  "smithay",
  "tempfile",
@@ -2896,6 +2895,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "waywire-encoder",
  "waywire-pipewire",
+ "waywire-portal",
  "waywire-protocol",
  "xxhash-rust",
  "zbus",
@@ -2953,6 +2953,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "waywire-portal"
+version = "0.1.0-rc.1"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "nix",
+ "png",
+ "smithay",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zbus",
 ]
 
 [[package]]

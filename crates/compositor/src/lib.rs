@@ -15,7 +15,6 @@ mod grabs;
 mod pointer_warp;
 mod portal;
 mod screencopy;
-mod session_bus;
 mod shell;
 mod text_keyboard;
 mod toplevel_list;
@@ -2535,7 +2534,7 @@ pub fn run(mut options: Config) -> Result<()> {
     let runtime = tempfile::Builder::new().prefix("waywire-").tempdir()?;
     // Portals need a session bus, but it must be ours: an inherited bus may
     // belong to the desktop that launched us. Without a daemon, portals are off.
-    let mut bus = session_bus::SessionBus::start(runtime.path());
+    let mut bus = waywire_portal::session_bus::SessionBus::start(runtime.path());
     // ScreenCast video likewise needs our own PipeWire daemon, and only
     // matters when portals run.
     let mut pipewire_daemon = bus
@@ -2653,7 +2652,10 @@ pub fn run(mut options: Config) -> Result<()> {
             .extend(std::env::var_os("WAYWIRE_SESSION").filter(|v| !v.is_empty()));
     }
     let mut child = Session(None);
-    if let Some(pid) = bus.as_ref().and_then(session_bus::SessionBus::pid) {
+    if let Some(pid) = bus
+        .as_ref()
+        .and_then(waywire_portal::session_bus::SessionBus::pid)
+    {
         wake_on_exit(&handle, pid)?;
     }
     if let Some(pid) = pipewire_daemon
@@ -2692,7 +2694,7 @@ pub fn run(mut options: Config) -> Result<()> {
         None => None,
     };
     let session_environment = match (&portal_dirs, &bus) {
-        (Some(dirs), Some(bus)) => Some(crate::portal::portal_environment(dirs, bus.address())),
+        (Some(dirs), Some(bus)) => Some(waywire_portal::portal_environment(dirs, bus.address())),
         _ => None,
     };
     state.launch_environment = Some(LaunchEnvironment {

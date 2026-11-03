@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 waywire-encoder = { workspace = true }
 waywire-pipewire = { workspace = true }
+waywire-portal = { workspace = true }
 waywire-protocol = { workspace = true }
 
 anyhow = { workspace = true }
@@ -14,7 +15,6 @@ calloop = { workspace = true }
 clap = { workspace = true }
 nix = { workspace = true }
 pangocairo = { workspace = true }
-png = "0.18.1"
 shlex = "2.0.1"
 smithay = { workspace = true }
 tempfile = { workspace = true }

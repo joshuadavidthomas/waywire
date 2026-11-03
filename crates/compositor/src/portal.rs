@@ -1,251 +1,33 @@
-//! xdg-desktop-portal backends, served on the compositor's private session bus
-//! so packaged agent drivers work on distributions whose Xwayland lacks libei
-//! (Debian 13, Ubuntu 24.04).
-//!
-//! zbus serves the backends on the private bus as
-//! `org.freedesktop.impl.portal.desktop.waywire`, implementing `RemoteDesktop`
-//! (with `ConnectToEIS`), `ScreenCast` with `PipeWire` video, and Screenshot; method calls that
-//! need the seat or the rendered frame travel over a channel into the calloop
-//! loop and are answered when the loop gets to them.
-//!
-//! Discovery: the frontend finds backends through `*.portal` files in
-//! `xdg-desktop-portal/portals` data directories and selects them through
-//! `<desktop>-portals.conf` matched against `XDG_CURRENT_DESKTOP`. At startup
-//! this module writes both files under the runtime directory, prepends that
-//! directory to `XDG_DATA_DIRS`, and sets `XDG_DESKTOP_PORTAL_DIR` to it:
-//! frontends through 1.18 look up `.portal` files only in that single
-//! variable's directory, so it also carries symlinks to the portals already
-//! installed on the system. Those variables and the private bus address are
-//! published with `org.freedesktop.DBus.UpdateActivationEnvironment` and
-//! exported to the session program.
-
-mod remote_desktop;
-mod screencast;
-mod screenshot;
+//! The calloop side of the xdg-desktop-portal backends that `waywire_portal`
+//! serves on the private session bus: portal calls that need the seat, the
+//! EIS server or the rendered frame arrive here as `PortalRequest`s.
 
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Result;
 use calloop::LoopHandle;
 use calloop::channel::Event;
-use calloop::channel::Sender;
+use smithay::backend::input::Axis;
+use smithay::backend::input::AxisSource;
+use smithay::backend::input::KeyState;
 use smithay::input::keyboard::KeyboardSource;
+use smithay::input::keyboard::Layout;
+use smithay::input::keyboard::xkb;
+use smithay::input::pointer::AxisFrame;
 use smithay::reexports::pixman::Image;
-use tokio::sync::oneshot;
-use zbus::blocking::Connection;
-use zbus::zvariant::ObjectPath;
+use waywire_portal::PortalDirs;
+use waywire_portal::PortalInput;
+use waywire_portal::PortalRequest;
+use waywire_portal::write_portal_files;
 
 use crate::State;
-use crate::portal::remote_desktop::RemoteDesktop;
-use crate::portal::screencast::ScreenCast;
-use crate::portal::screenshot::Access;
-use crate::portal::screenshot::Screenshot;
-
-/// Bus name this backend owns, the convention for desktop-specific backends.
-pub(crate) const PORTAL_NAME: &str = "org.freedesktop.impl.portal.desktop.waywire";
-
-/// Path the backend interfaces are served on, matching other backends.
-const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
-
-/// Interfaces waywire implements, in the `.portal` file's semicolon list form.
-const PORTAL_INTERFACES: &str = "org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Access;";
-
-/// Requests the D-Bus thread routes into the calloop loop, which owns the
-/// seat, the keyboard layout, and the rendered frame.
-pub(crate) enum PortalRequest {
-    RegisterSource {
-        source: KeyboardSource,
-        /// The process that opened the session.
-        owner: Option<u32>,
-    },
-    DisconnectSource {
-        source: KeyboardSource,
-    },
-    Input(remote_desktop::PortalInput),
-    Keysym {
-        input: remote_desktop::PortalInput,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    /// Read the current output's logical dimensions.
-    OutputSize {
-        reply: oneshot::Sender<Option<(i32, i32)>>,
-    },
-    /// Start the session's screen-cast stream; the reply is its `PipeWire`
-    /// node ID, or `None` when the stream carries metadata only.
-    StartCast {
-        session: String,
-        reply: oneshot::Sender<Option<u32>>,
-    },
-    /// Destroy the session's screen-cast stream, if any.
-    CloseCast {
-        session: String,
-    },
-    /// Hand out a new EI connection for a `ConnectToEIS` call.
-    ConnectToEis {
-        owner: Option<u32>,
-        reply: oneshot::Sender<std::io::Result<(OwnedFd, std::os::unix::net::UnixStream)>>,
-    },
-    /// Copy the rendered frame into a PNG file; the reply is its path.
-    Screenshot {
-        reply: oneshot::Sender<anyhow::Result<PathBuf>>,
-    },
-}
-
-/// Directories the compositor publishes for portal discovery.
-#[derive(Clone)]
-pub(crate) struct PortalDirs {
-    /// The compositor's runtime directory, where the private `PipeWire`
-    /// daemon's socket lives.
-    pub runtime: PathBuf,
-    /// Prepended to `XDG_DATA_DIRS`.
-    pub data_dir: PathBuf,
-    /// Set as `XDG_DESKTOP_PORTAL_DIR`.
-    pub portals_dir: PathBuf,
-}
-
-/// Contents of `waywire.portal`, which describes this backend to the frontend.
-fn portal_file_contents() -> String {
-    format!(
-        "[portal]\n\
-         DBusName={PORTAL_NAME}\n\
-         Interfaces={PORTAL_INTERFACES}\n\
-         UseIn=waywire;\n"
-    )
-}
-
-/// Contents of `waywire-portals.conf`. Interfaces waywire implements route here
-/// unconditionally; everything else keeps the desktop's packaged backend, if
-/// any, or none.
-fn portals_conf_contents(default_portal: Option<&str>) -> String {
-    let default_portal = default_portal.unwrap_or("none");
-    format!(
-        "[preferred]\n\
-         default={default_portal}\n\
-         org.freedesktop.impl.portal.RemoteDesktop=waywire\n\
-         org.freedesktop.impl.portal.ScreenCast=waywire\n\
-         org.freedesktop.impl.portal.Screenshot=waywire\n\
-         org.freedesktop.impl.portal.Access=waywire\n"
-    )
-}
-
-/// Standard system data directories per the XDG base directory specification.
-fn data_dirs() -> Vec<PathBuf> {
-    data_dirs_from(std::env::var_os("XDG_DATA_DIRS").as_deref())
-}
-
-/// Data directories from an `XDG_DATA_DIRS` value; empty or absent means the
-/// default pair.
-fn data_dirs_from(dirs: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
-    let Some(dirs) = dirs else {
-        return ["/usr/local/share".into(), "/usr/share".into()].into();
-    };
-    let dirs = dirs.to_string_lossy();
-    if dirs.is_empty() {
-        return ["/usr/local/share".into(), "/usr/share".into()].into();
-    }
-    dirs.split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// Name of the packaged backend to keep for interfaces waywire does not
-/// implement, looked up in the usual portal directories.
-fn default_portal() -> Option<&'static str> {
-    for dir in data_dirs() {
-        if dir.join("xdg-desktop-portal/portals/gtk.portal").exists() {
-            return Some("gtk");
-        }
-    }
-    None
-}
-
-/// Write `waywire.portal` and `waywire-portals.conf` under the runtime
-/// directory and link the system's packaged portal files in, returning the
-/// directories to publish in the environment.
-pub(crate) fn write_portal_files(runtime_path: &Path) -> Result<PortalDirs> {
-    let data_dir = runtime_path.join("share");
-    let portals_dir = data_dir.join("xdg-desktop-portal/portals");
-    std::fs::create_dir_all(&portals_dir)?;
-    std::fs::write(portals_dir.join("waywire.portal"), portal_file_contents())?;
-    std::fs::write(
-        portals_dir.join("waywire-portals.conf"),
-        portals_conf_contents(default_portal()),
-    )?;
-    for dir in data_dirs() {
-        let Ok(entries) = std::fs::read_dir(dir.join("xdg-desktop-portal/portals")) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.ends_with(".portal") || name == "waywire.portal" {
-                continue;
-            }
-            let link = portals_dir.join(&*name);
-            if !link.exists()
-                && let Err(error) = std::os::unix::fs::symlink(entry.path(), &link)
-            {
-                tracing::debug!(%error, link = %link.display(), "link packaged portal file");
-            }
-        }
-    }
-    Ok(PortalDirs {
-        runtime: runtime_path.to_path_buf(),
-        data_dir,
-        portals_dir,
-    })
-}
-
-/// Environment a portal-using program needs on this desktop, in activation
-/// environment form.
-pub(crate) fn portal_environment(dirs: &PortalDirs, bus_address: &str) -> Vec<(String, String)> {
-    portal_environment_from(
-        dirs,
-        std::env::var_os("XDG_DATA_DIRS").as_deref(),
-        bus_address,
-    )
-}
-
-/// The environment from an `XDG_DATA_DIRS` value the compositor runs with.
-#[expect(
-    clippy::expect_used,
-    reason = "runtime directory paths never contain path-list separators"
-)]
-fn portal_environment_from(
-    dirs: &PortalDirs,
-    value: Option<&std::ffi::OsStr>,
-    bus_address: &str,
-) -> Vec<(String, String)> {
-    let mut data_dirs = data_dirs_from(value);
-    data_dirs.insert(0, dirs.data_dir.clone());
-    let joined = std::env::join_paths(data_dirs.iter())
-        .expect("data directory paths never contain separators")
-        .to_string_lossy()
-        .into_owned();
-    vec![
-        (
-            "DBUS_SESSION_BUS_ADDRESS".to_owned(),
-            bus_address.to_owned(),
-        ),
-        ("XDG_DATA_DIRS".to_owned(), joined),
-        ("XDG_CURRENT_DESKTOP".to_owned(), "waywire".to_owned()),
-        (
-            "XDG_DESKTOP_PORTAL_DIR".to_owned(),
-            dirs.portals_dir.to_string_lossy().into_owned(),
-        ),
-        // OpenPipeWireRemote connects the frontend to the default daemon,
-        // which must be the compositor's, not the host's.
-        (
-            "PIPEWIRE_RUNTIME_DIR".to_owned(),
-            dirs.runtime.to_string_lossy().into_owned(),
-        ),
-    ]
-}
+use crate::capture::image_pixels;
+use crate::delivery::SourceInfo;
+use crate::delivery::SourceKind;
 
 /// Serve the portal backends on `bus_address` for the lifetime of the
 /// compositor. Returns the published directories, or `None` when the backends
@@ -264,23 +46,19 @@ pub(crate) fn start(
     if let Err(error) = handle.insert_source(incoming, move |request, (), state| match request {
         Event::Msg(request) => match request {
             PortalRequest::RegisterSource { source, owner } => {
-                state.delivery.describe(
-                    source,
-                    crate::delivery::SourceInfo::new(crate::delivery::SourceKind::Portal, owner),
-                );
+                state
+                    .delivery
+                    .describe(source, SourceInfo::new(SourceKind::Portal, owner));
                 state.register_agent_source(source);
             }
             PortalRequest::DisconnectSource { source } => state.disconnect_input_source(source),
             PortalRequest::Input(input) => {
-                if let Err(error) = remote_desktop::apply_portal_input(state, input) {
+                if let Err(error) = apply_portal_input(state, input) {
                     tracing::warn!(%error, "portal input failed");
                 }
             }
             PortalRequest::Keysym { input, reply } => {
-                if reply
-                    .send(remote_desktop::apply_portal_input(state, input))
-                    .is_err()
-                {
+                if reply.send(apply_portal_input(state, input)).is_err() {
                     tracing::debug!("portal requester hung up");
                 }
             }
@@ -311,17 +89,20 @@ pub(crate) fn start(
                 }
             }
             PortalRequest::ConnectToEis { reply, owner } => {
-                if let Err(error) =
-                    reply.send(remote_desktop::connect_to_eis(&loop_handle, &layout, owner))
-                {
+                if let Err(error) = reply.send(connect_to_eis(&loop_handle, &layout, owner)) {
                     tracing::debug!(?error, "portal requester hung up");
                 }
             }
             PortalRequest::Screenshot { reply } => {
-                if let Err(error) = reply.send(screenshot::write_screenshot(
-                    &image.borrow(),
+                let image = image.borrow();
+                let screenshot = waywire_portal::write_screenshot(
+                    image_pixels(&image),
+                    image.width(),
+                    image.height(),
+                    image.stride(),
                     &screenshots_dir,
-                )) {
+                );
+                if let Err(error) = reply.send(screenshot) {
                     tracing::debug!(?error, "portal requester hung up");
                 }
             }
@@ -335,372 +116,421 @@ pub(crate) fn start(
         tracing::error!(?error, "portal request channel failed to install");
         return Ok(None);
     }
-    // Connect and publish before the session program starts: its first portal
-    // call may activate xdg-desktop-portal, which reads discovery variables
-    // from the activation environment.
-    let connection = match build_connection(requests, bus_address) {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::error!(%error, "portal D-Bus service failed to start");
-            return Ok(None);
-        }
-    };
-    if let Err(error) = publish_environment(&connection, &dirs, bus_address) {
-        tracing::error!(%error, "portal activation environment");
+    if !waywire_portal::serve(requests, &dirs, bus_address)? {
         return Ok(None);
     }
-    std::thread::Builder::new()
-        .name("waywire-portal".to_owned())
-        .spawn(move || {
-            // The connection serves requests on zbus's own executor; this
-            // thread just keeps it alive for the compositor's lifetime.
-            let _connection = connection;
-            loop {
-                std::thread::park();
-            }
-        })?;
     Ok(Some(dirs))
 }
 
-fn build_connection(requests: Sender<PortalRequest>, bus_address: &str) -> Result<Connection> {
-    let remote_desktop = RemoteDesktop::new(requests.clone());
-    let connection = zbus::blocking::connection::Builder::address(bus_address)?
-        .name(zbus::names::WellKnownName::try_from(PORTAL_NAME)?)?
-        .serve_at(ObjectPath::try_from(OBJECT_PATH)?, remote_desktop)?
-        .serve_at(
-            ObjectPath::try_from(OBJECT_PATH)?,
-            ScreenCast::new(requests.clone()),
-        )?
-        .serve_at(
-            ObjectPath::try_from(OBJECT_PATH)?,
-            Screenshot::new(requests),
-        )?
-        .serve_at(ObjectPath::try_from(OBJECT_PATH)?, Access)?
-        .build()?;
-    Ok(connection)
-}
-
-/// Make the frontend and portal clients inherit this desktop's discovery
-/// environment, both for services the bus activates and for programs the
-/// compositor spawns.
-fn publish_environment(
-    connection: &Connection,
-    dirs: &PortalDirs,
-    bus_address: &str,
-) -> Result<()> {
-    let environment = portal_environment(dirs, bus_address);
-    let settings: std::collections::HashMap<String, String> = environment.iter().cloned().collect();
-    zbus::blocking::Proxy::new(
-        connection,
-        "org.freedesktop.DBus",
-        ObjectPath::try_from("/org/freedesktop/DBus")?,
-        "org.freedesktop.DBus",
-    )?
-    .call::<_, _, ()>("UpdateActivationEnvironment", &(settings,))?;
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the request channel hands over each input by value"
+)]
+fn apply_portal_input(state: &mut State, input: PortalInput) -> Result<(), String> {
+    match input {
+        PortalInput::Motion { source, dx, dy } => {
+            if let Some(pointer) = state.seat.get_pointer() {
+                let delta = (dx, dy).into();
+                state.pointer_motion_with_delta(
+                    source,
+                    pointer.current_location() + delta,
+                    Some(delta),
+                );
+            }
+        }
+        PortalInput::Absolute { source, x, y } => {
+            if let Some(rect) = state.space.output_geometry(&state.output) {
+                let x = x.clamp(0.0, f64::from(rect.size.w.saturating_sub(1)));
+                let y = y.clamp(0.0, f64::from(rect.size.h.saturating_sub(1)));
+                state.pointer_motion(
+                    source,
+                    (x + f64::from(rect.loc.x), y + f64::from(rect.loc.y)).into(),
+                );
+            }
+        }
+        PortalInput::Button {
+            source,
+            button,
+            state: button_state,
+        } => state.pointer_button(source, button, button_state),
+        PortalInput::Axis { source, dx, dy } => {
+            let frame = AxisFrame::new(crate::InputTime::now())
+                .source(AxisSource::Continuous)
+                .value(Axis::Horizontal, dx)
+                .value(Axis::Vertical, dy);
+            state.pointer_axis(source, frame);
+        }
+        PortalInput::Discrete {
+            source,
+            axis,
+            steps,
+        } => {
+            let frame = AxisFrame::new(crate::InputTime::now())
+                .source(AxisSource::Wheel)
+                .v120(axis, steps.saturating_mul(120))
+                .value(axis, f64::from(steps) * 15.0);
+            state.pointer_axis(source, frame);
+        }
+        PortalInput::Keycode {
+            source,
+            key,
+            state: key_state,
+        } => state.keyboard_key(source, key, key_state),
+        PortalInput::Keysym {
+            source,
+            keysym,
+            state: key_state,
+        } => return apply_keysym(state, source, keysym, key_state),
+    }
     Ok(())
 }
 
-/// The generated `.portal` and portals.conf contents match what packaged
-/// backends ship.
+fn apply_keysym(
+    state: &mut State,
+    source: KeyboardSource,
+    keysym: u32,
+    key_state: KeyState,
+) -> Result<(), String> {
+    let keyboard = state.seat.get_keyboard().ok_or("seat has no keyboard")?;
+    let (text, original_layout) = keyboard.with_xkb_state(state, |context| {
+        let xkb = context
+            .xkb()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (xkb.keymap_as_string(), xkb.active_layout())
+    });
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        text,
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .ok_or("could not load active keymap")?;
+    let shift_index = keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
+    let altgr_index = keymap.mod_get_index("Mod5");
+    let shift_mask = 1u32.checked_shl(shift_index).unwrap_or(0);
+    let altgr_mask = 1u32.checked_shl(altgr_index).unwrap_or(0);
+    let found =
+        crate::virtual_keyboard::seat_key(&keymap, xkb::Keysym::new(keysym), original_layout.0);
+    let (key, group, mask) =
+        found.ok_or_else(|| format!("keysym {keysym:#x} is not available in the keymap"))?;
+    if state.browser_holds_input {
+        state.keyboard_key(source, key, key_state);
+        return Ok(());
+    }
+    if group != original_layout.0 {
+        keyboard.with_xkb_state(state, |mut context| context.set_layout(Layout(group)));
+    }
+    let modifiers = [(42, shift_mask), (100, altgr_mask)];
+    if key_state == KeyState::Pressed {
+        for (modifier, bit) in modifiers {
+            if mask & bit != 0 {
+                state.keyboard_key(source, modifier, key_state);
+            }
+        }
+        state.keyboard_key(source, key, key_state);
+    } else {
+        state.keyboard_key(source, key, key_state);
+        for (modifier, bit) in modifiers.into_iter().rev() {
+            if mask & bit != 0 {
+                state.keyboard_key(source, modifier, key_state);
+            }
+        }
+    }
+    if group != original_layout.0 {
+        keyboard.with_xkb_state(state, |mut context| context.set_layout(original_layout));
+    }
+    Ok(())
+}
+
+/// Runs in the calloop loop, which owns the seat and the EIS server: creates
+/// the socket pair `ConnectToEIS` hands out. One end joins the existing EIS
+/// server as a new client; the caller gets the other end and a duplicate of
+/// the server end for closing the session.
+fn connect_to_eis(
+    handle: &smithay::reexports::calloop::LoopHandle<'static, crate::State>,
+    layout: &str,
+    owner: Option<u32>,
+) -> std::io::Result<(OwnedFd, UnixStream)> {
+    use smithay::reexports::reis::eis;
+
+    let (client, server) = UnixStream::pair()?;
+    let server_handle = server.try_clone()?;
+    let context = eis::Context::new(server)?;
+    crate::eis::serve_connection(
+        handle,
+        context,
+        layout.to_owned(),
+        SourceInfo::new(SourceKind::PortalEis, owner),
+    )
+    .map_err(std::io::Error::other)?;
+    Ok((client.into(), server_handle))
+}
+
 #[cfg(test)]
 mod tests {
+    use smithay::backend::input::ButtonState;
+
     use super::*;
 
     #[test]
-    fn portal_file_declares_waywire_interfaces() {
-        assert_eq!(
-            portal_file_contents(),
-            "[portal]\n\
-             DBusName=org.freedesktop.impl.portal.desktop.waywire\n\
-             Interfaces=org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Access;\n\
-             UseIn=waywire;\n"
+    fn pointer_input_uses_output_coordinates_and_obeys_lease() {
+        let (_display, mut state) = crate::tests::test_state();
+        let source = KeyboardSource::new_auxiliary();
+        state.register_agent_source(source);
+        let pointer = state.seat.get_pointer().expect("pointer");
+        apply_portal_input(
+            &mut state,
+            PortalInput::Absolute {
+                source,
+                x: 311.0,
+                y: 97.0,
+            },
+        )
+        .expect("motion");
+        assert_eq!(pointer.current_location(), (311.0, 97.0).into());
+        apply_portal_input(
+            &mut state,
+            PortalInput::Absolute {
+                source,
+                x: 5000.0,
+                y: -20.0,
+            },
+        )
+        .expect("motion");
+        assert_eq!(pointer.current_location(), (1919.0, 0.0).into());
+        apply_portal_input(
+            &mut state,
+            PortalInput::Button {
+                source,
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        )
+        .expect("button");
+        assert!(
+            state
+                .buttons
+                .get(&source)
+                .is_some_and(|buttons| buttons.contains(&0x110))
         );
+        state.set_browser_lease(true);
+        apply_portal_input(
+            &mut state,
+            PortalInput::Button {
+                source,
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        )
+        .expect("button");
+        apply_portal_input(
+            &mut state,
+            PortalInput::Absolute {
+                source,
+                x: 311.0,
+                y: 97.0,
+            },
+        )
+        .expect("motion");
+        assert!(
+            state
+                .buttons
+                .get(&source)
+                .is_none_or(std::collections::HashSet::is_empty)
+        );
+        assert_eq!(pointer.current_location(), (1919.0, 0.0).into());
     }
 
-    #[test]
-    fn portals_conf_routes_waywire_interfaces_and_keeps_the_packaged_default() {
-        assert_eq!(
-            portals_conf_contents(Some("gtk")),
-            "[preferred]\n\
-             default=gtk\n\
-             org.freedesktop.impl.portal.RemoteDesktop=waywire\n\
-             org.freedesktop.impl.portal.ScreenCast=waywire\n\
-             org.freedesktop.impl.portal.Screenshot=waywire\n\
-             org.freedesktop.impl.portal.Access=waywire\n"
-        );
-        assert_eq!(
-            portals_conf_contents(None),
-            "[preferred]\n\
-             default=none\n\
-             org.freedesktop.impl.portal.RemoteDesktop=waywire\n\
-             org.freedesktop.impl.portal.ScreenCast=waywire\n\
-             org.freedesktop.impl.portal.Screenshot=waywire\n\
-             org.freedesktop.impl.portal.Access=waywire\n"
-        );
-    }
+    /// Sends `keys` as presses from a keyboard on a real EI connection.
+    fn ei_key_presses(stream: UnixStream, keys: &'static [u32]) -> std::io::Result<()> {
+        use smithay::reexports::reis::PendingRequestResult;
+        use smithay::reexports::reis::ei;
+        use smithay::reexports::reis::event::DeviceCapability;
+        use smithay::reexports::reis::event::EiEvent;
+        use smithay::reexports::reis::event::EiEventConverter;
+        use smithay::reexports::reis::handshake::ei_handshake_blocking;
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one private-bus test covers both shared interfaces"
-    )]
-    #[test]
-    fn screencast_reports_each_session_node_on_the_shared_backend() {
-        use std::collections::HashMap;
-
-        use zbus::zvariant::OwnedValue;
-
-        let runtime = tempfile::tempdir().expect("temporary runtime directory");
-        let Some(bus) = crate::session_bus::SessionBus::start(runtime.path()) else {
-            return;
-        };
-        // The loop answers each session's stream with a distinct node ID and
-        // records which sessions closed their stream.
-        let (requests, incoming) = calloop::channel::channel();
-        let worker = std::thread::spawn(move || {
-            let mut event_loop =
-                calloop::EventLoop::<(usize, Vec<String>)>::try_new().expect("event loop");
-            event_loop
-                .handle()
-                .insert_source(incoming, |event, (), (count, closed)| match event {
-                    Event::Msg(PortalRequest::OutputSize { reply }) => {
-                        reply.send(Some((1920, 1080))).expect("size reply");
-                    }
-                    Event::Msg(PortalRequest::StartCast { session, reply }) => {
-                        let node = if session.ends_with("/cast") { 57 } else { 58 };
-                        reply.send(Some(node)).expect("node reply");
-                        *count += 1;
-                    }
-                    Event::Msg(PortalRequest::CloseCast { session }) => closed.push(session),
-                    Event::Msg(_) | Event::Closed => {}
-                })
-                .expect("request source");
-            let mut progress = (0, Vec::new());
-            while progress.0 < 2 || progress.1.len() < 2 {
-                event_loop
-                    .dispatch(std::time::Duration::from_secs(1), &mut progress)
-                    .expect("dispatch");
+        let context = ei::Context::new(stream)?;
+        let handshake =
+            ei_handshake_blocking(&context, "key test", ei::handshake::ContextType::Sender)
+                .map_err(std::io::Error::other)?;
+        let mut converter = EiEventConverter::new(&context, handshake);
+        loop {
+            // The socket is nonblocking: zero bytes means nothing to read yet.
+            match context.read() {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error),
             }
-            progress.1
-        });
-        let _backend = build_connection(requests, bus.address()).expect("portal backend");
-        let client = zbus::blocking::connection::Builder::address(bus.address())
-            .expect("bus address")
-            .build()
-            .expect("portal client");
-        let screen = zbus::blocking::Proxy::new(
-            &client,
-            PORTAL_NAME,
-            OBJECT_PATH,
-            "org.freedesktop.impl.portal.ScreenCast",
-        )
-        .expect("ScreenCast proxy");
-        assert_eq!(
-            screen
-                .get_property::<u32>("AvailableSourceTypes")
-                .expect("source types"),
-            1
-        );
-        assert_eq!(
-            screen
-                .get_property::<u32>("AvailableCursorModes")
-                .expect("cursor modes"),
-            1
-        );
-        assert_eq!(screen.get_property::<u32>("version").expect("version"), 2);
-
-        let handle = ObjectPath::try_from("/org/freedesktop/portal/desktop/request/test")
-            .expect("request path");
-        let session = ObjectPath::try_from("/org/freedesktop/portal/desktop/session/cast")
-            .expect("session path");
-        let options: HashMap<String, OwnedValue> = HashMap::new();
-        let (status, _): (u32, HashMap<String, OwnedValue>) = screen
-            .call("CreateSession", &(&handle, &session, "", &options))
-            .expect("create ScreenCast session");
-        assert_eq!(status, 0);
-        let (status, values): (u32, HashMap<String, OwnedValue>) = screen
-            .call("SelectSources", &(&handle, &session, "", &options))
-            .expect("select sources");
-        assert_eq!(status, 0);
-        assert!(values.is_empty());
-        let (status, mut values): (u32, HashMap<String, OwnedValue>) = screen
-            .call("Start", &(&handle, &session, "", "", &options))
-            .expect("start ScreenCast");
-        assert_eq!(status, 0);
-        let streams: Vec<(u32, HashMap<String, OwnedValue>)> = values
-            .remove("streams")
-            .expect("streams result")
-            .try_into()
-            .expect("stream array type");
-        assert_eq!(streams.len(), 1);
-        // The stream ID is the PipeWire node the frontend grants access to.
-        assert_eq!(streams[0].0, 57);
-        let size: zbus::zvariant::Value<'_> = streams[0]
-            .1
-            .get("size")
-            .expect("size")
-            .try_clone()
-            .expect("clone size")
-            .into();
-        assert_eq!(
-            <(i32, i32)>::try_from(size).expect("size type"),
-            (1920, 1080)
-        );
-        zbus::blocking::Proxy::new(
-            &client,
-            PORTAL_NAME,
-            &session,
-            "org.freedesktop.impl.portal.Session",
-        )
-        .expect("ScreenCast session proxy")
-        .call::<_, _, ()>("Close", &())
-        .expect("close ScreenCast session");
-
-        let session = ObjectPath::try_from("/org/freedesktop/portal/desktop/session/remote")
-            .expect("session path");
-        let remote = zbus::blocking::Proxy::new(
-            &client,
-            PORTAL_NAME,
-            OBJECT_PATH,
-            "org.freedesktop.impl.portal.RemoteDesktop",
-        )
-        .expect("RemoteDesktop proxy");
-        let (status, _): (u32, HashMap<String, OwnedValue>) = remote
-            .call("CreateSession", &(&handle, &session, "", &options))
-            .expect("create remote session");
-        assert_eq!(status, 0);
-        let (status, mut values): (u32, HashMap<String, OwnedValue>) = remote
-            .call("Start", &(&handle, &session, "", "", &options))
-            .expect("start shared session");
-        assert_eq!(status, 0);
-        let streams: Vec<(u32, HashMap<String, OwnedValue>)> = values
-            .remove("streams")
-            .expect("shared streams result")
-            .try_into()
-            .expect("stream array type");
-        assert_eq!(streams.len(), 1);
-        assert_eq!(streams[0].0, 58);
-        let size: zbus::zvariant::Value<'_> = streams[0]
-            .1
-            .get("size")
-            .expect("size")
-            .try_clone()
-            .expect("clone size")
-            .into();
-        assert_eq!(
-            <(i32, i32)>::try_from(size).expect("size type"),
-            (1920, 1080)
-        );
-        assert_eq!(
-            u32::try_from(values.remove("devices").expect("devices result")).expect("device types"),
-            3
-        );
-        remote
-            .call::<_, _, ()>(
-                "NotifyPointerMotionAbsolute",
-                &(&session, &options, 58u32, 1.0f64, 1.0f64),
-            )
-            .expect("the session's own stream is accepted");
-        for stream in [screencast::STREAM_ID, 57] {
-            let error = remote
-                .call::<_, _, ()>(
-                    "NotifyPointerMotionAbsolute",
-                    &(&session, &options, stream, 1.0f64, 1.0f64),
-                )
-                .expect_err("another stream must be rejected");
-            assert!(
-                matches!(error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs")
-            );
+            while let Some(PendingRequestResult::Request(event)) = context.pending_event() {
+                converter
+                    .handle_event(event)
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            }
+            while let Some(event) = converter.next_event() {
+                if let EiEvent::SeatAdded(added) = &event {
+                    added
+                        .seat
+                        .bind_capabilities(DeviceCapability::Keyboard.into());
+                } else if let EiEvent::DeviceResumed(resumed) = &event
+                    && let Some(keyboard) = resumed.device.interface::<ei::Keyboard>()
+                {
+                    let device = resumed.device.device();
+                    device.start_emulating(resumed.serial, 1);
+                    for &key in keys {
+                        keyboard.key(key, ei::keyboard::KeyState::Press);
+                        device.frame(resumed.serial, 1);
+                    }
+                }
+            }
+            context.flush().map_err(std::io::Error::from)?;
         }
-        zbus::blocking::Proxy::new(
-            &client,
-            PORTAL_NAME,
-            &session,
-            "org.freedesktop.impl.portal.Session",
+    }
+
+    #[test]
+    fn ei_keys_beyond_the_evdev_range_are_dropped() {
+        let mut event_loop =
+            smithay::reexports::calloop::EventLoop::<State>::try_new().expect("event loop");
+        let (_display, mut state) = crate::tests::test_state();
+        let (client, server) =
+            connect_to_eis(&event_loop.handle(), "us", None).expect("connect to EIS");
+        // u32::MAX is the largest code an EI sender can send; 30 is KEY_A.
+        let sender = std::thread::spawn(move || {
+            ei_key_presses(UnixStream::from(client), &[u32::MAX, 0x300, 30])
+        });
+        let keyboard = state.seat.get_keyboard().expect("keyboard");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !keyboard.pressed_keys().contains(&38u32.into()) {
+            assert!(std::time::Instant::now() < deadline, "KEY_A never arrived");
+            event_loop
+                .dispatch(std::time::Duration::from_millis(10), &mut state)
+                .expect("dispatch EIS");
+        }
+        assert_eq!(keyboard.pressed_keys(), [38u32.into()].into());
+        server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut down EI connection");
+        sender.join().expect("EI sender").expect("EI connection");
+    }
+
+    #[test]
+    fn portal_eis_receipts_go_only_to_the_session_owner() {
+        let mut event_loop =
+            smithay::reexports::calloop::EventLoop::<State>::try_new().expect("event loop");
+        let (_display, mut state) = crate::tests::test_state();
+        let (outgoing, received) = std::sync::mpsc::channel();
+        state.delivery.set_outgoing(outgoing);
+        state
+            .delivery
+            .subscribe("owner".into(), Some(std::process::id()));
+        state.delivery.subscribe("stranger".into(), None);
+        let (client, server) = connect_to_eis(&event_loop.handle(), "us", Some(std::process::id()))
+            .expect("connect to EIS");
+        let sender = std::thread::spawn(move || ei_key_presses(UnixStream::from(client), &[30]));
+        let mut receipts = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while receipts.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no receipt arrived");
+            event_loop
+                .dispatch(std::time::Duration::from_millis(10), &mut state)
+                .expect("dispatch EIS");
+            for message in received.try_iter() {
+                if let crate::delivery::Message::Send(message) = message
+                    && let crate::delivery::Signal::Receipt(receipt) = message.signal
+                {
+                    receipts.push((message.to, receipt));
+                }
+            }
+        }
+        let (to, receipt) = &receipts[0];
+        assert_eq!(to, &["owner".to_owned()]);
+        assert_eq!(receipt.source, SourceKind::PortalEis);
+        assert_eq!(receipt.source_pid, Some(std::process::id()));
+        assert_eq!(receipt.delivery, "nowhere", "no window has focus");
+        server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut down EI connection");
+        sender.join().expect("EI sender").expect("EI connection");
+    }
+
+    #[test]
+    fn keyboard_input_maps_keysyms_and_obeys_lease() {
+        let (_display, mut state) = crate::tests::test_state();
+        let source = KeyboardSource::new_auxiliary();
+        let keyboard = state.seat.get_keyboard().expect("keyboard");
+        apply_portal_input(
+            &mut state,
+            PortalInput::Keycode {
+                source,
+                key: 30,
+                state: KeyState::Pressed,
+            },
         )
-        .expect("RemoteDesktop session proxy")
-        .call::<_, _, ()>("Close", &())
-        .expect("close RemoteDesktop session");
-        assert_eq!(
-            worker.join().expect("request worker"),
-            vec![
-                "/org/freedesktop/portal/desktop/session/cast".to_owned(),
-                "/org/freedesktop/portal/desktop/session/remote".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn portal_environment_prepends_the_data_dir_and_names_the_desktop() {
-        let dirs = PortalDirs {
-            runtime: PathBuf::from("/run/waywire"),
-            data_dir: PathBuf::from("/run/waywire/share"),
-            portals_dir: PathBuf::from("/run/waywire/share/xdg-desktop-portal/portals"),
-        };
-        let environment = portal_environment_from(
-            &dirs,
-            Some(std::ffi::OsStr::new("/usr/local/share:/usr/share")),
-            "unix:path=/run/waywire/bus,guid=0123456789abcdef",
-        );
-        assert_eq!(
-            environment,
-            vec![
-                (
-                    "DBUS_SESSION_BUS_ADDRESS".to_owned(),
-                    "unix:path=/run/waywire/bus,guid=0123456789abcdef".to_owned()
-                ),
-                (
-                    "XDG_DATA_DIRS".to_owned(),
-                    "/run/waywire/share:/usr/local/share:/usr/share".to_owned()
-                ),
-                ("XDG_CURRENT_DESKTOP".to_owned(), "waywire".to_owned()),
-                (
-                    "XDG_DESKTOP_PORTAL_DIR".to_owned(),
-                    "/run/waywire/share/xdg-desktop-portal/portals".to_owned()
-                ),
-                ("PIPEWIRE_RUNTIME_DIR".to_owned(), "/run/waywire".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn data_dirs_fall_back_to_the_default_pair() {
-        assert_eq!(
-            data_dirs_from(None),
-            vec![
-                PathBuf::from("/usr/local/share"),
-                PathBuf::from("/usr/share")
-            ]
-        );
-        assert_eq!(
-            data_dirs_from(Some(std::ffi::OsStr::new(""))),
-            data_dirs_from(None)
-        );
-        assert_eq!(
-            data_dirs_from(Some(std::ffi::OsStr::new("/opt/share:/usr/share"))),
-            vec![PathBuf::from("/opt/share"), PathBuf::from("/usr/share"),]
-        );
-    }
-
-    #[test]
-    fn write_portal_files_publishes_discovery_and_conf() {
-        let runtime = tempfile::tempdir().expect("temporary runtime directory");
-        let dirs = write_portal_files(runtime.path()).expect("portal files written");
-        assert_eq!(dirs.data_dir, runtime.path().join("share"));
-        assert_eq!(
-            std::fs::read_to_string(
-                dirs.data_dir
-                    .join("xdg-desktop-portal/portals/waywire.portal")
+        .expect("keycode");
+        assert!(keyboard.pressed_keys().contains(&38u32.into()));
+        apply_portal_input(
+            &mut state,
+            PortalInput::Keycode {
+                source,
+                key: 30,
+                state: KeyState::Released,
+            },
+        )
+        .expect("keycode release");
+        apply_portal_input(
+            &mut state,
+            PortalInput::Keysym {
+                source,
+                keysym: 0x41,
+                state: KeyState::Pressed,
+            },
+        )
+        .expect("keysym");
+        assert!(keyboard.pressed_keys().contains(&50u32.into()));
+        assert!(keyboard.pressed_keys().contains(&38u32.into()));
+        apply_portal_input(
+            &mut state,
+            PortalInput::Keysym {
+                source,
+                keysym: 0x41,
+                state: KeyState::Released,
+            },
+        )
+        .expect("keysym release");
+        assert!(keyboard.pressed_keys().is_empty());
+        assert!(
+            apply_portal_input(
+                &mut state,
+                PortalInput::Keysym {
+                    source,
+                    keysym: 0x1fff_ffff,
+                    state: KeyState::Pressed
+                }
             )
-            .expect("waywire.portal readable"),
-            portal_file_contents()
+            .is_err()
         );
-        let conf = std::fs::read_to_string(
-            dirs.data_dir
-                .join("xdg-desktop-portal/portals/waywire-portals.conf"),
+        state.set_browser_lease(true);
+        apply_portal_input(
+            &mut state,
+            PortalInput::Keycode {
+                source,
+                key: 30,
+                state: KeyState::Pressed,
+            },
         )
-        .expect("waywire-portals.conf readable");
-        assert!(conf.starts_with("[preferred]\ndefault="));
-        assert!(conf.contains("org.freedesktop.impl.portal.RemoteDesktop=waywire\n"));
-        assert!(conf.contains("org.freedesktop.impl.portal.ScreenCast=waywire\n"));
+        .expect("dropped keycode");
+        apply_portal_input(
+            &mut state,
+            PortalInput::Keysym {
+                source,
+                keysym: 0x41,
+                state: KeyState::Pressed,
+            },
+        )
+        .expect("dropped keysym");
+        assert!(keyboard.pressed_keys().is_empty());
     }
 }

@@ -18,7 +18,7 @@ use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
 
 /// A `dbus-daemon` child and the address it published.
-pub(crate) struct SessionBus {
+pub struct SessionBus {
     child: Option<Child>,
     address: String,
 }
@@ -27,7 +27,7 @@ impl SessionBus {
     /// Start `dbus-daemon` with its socket under `runtime_path`, returning the
     /// address it published. Portals are optional, so a daemon that cannot
     /// start only disables them.
-    pub(crate) fn start(runtime_path: &Path) -> Option<Self> {
+    pub fn start(runtime_path: &Path) -> Option<Self> {
         let socket = runtime_path.join("bus");
         let expected_address = format!("unix:path={}", socket.display());
         let mut command = Command::new("dbus-daemon");
@@ -80,17 +80,18 @@ impl SessionBus {
     }
 
     /// The daemon's PID while it is running.
-    pub(crate) fn pid(&self) -> Option<u32> {
+    pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
     }
 
     /// Address portal clients and activated services must connect to.
-    pub(crate) fn address(&self) -> &str {
+    #[must_use]
+    pub fn address(&self) -> &str {
         &self.address
     }
 
     /// Log a daemon that exited on its own; the desktop keeps running.
-    pub(crate) fn poll(&mut self) {
+    pub fn poll(&mut self) {
         let Some(child) = self.child.as_mut() else {
             return;
         };

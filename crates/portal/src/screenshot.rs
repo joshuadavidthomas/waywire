@@ -25,13 +25,12 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context;
 use anyhow::Result;
 use calloop::channel::Sender;
-use smithay::reexports::pixman::Image;
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::zvariant::OwnedValue;
 use zbus::zvariant::Value;
 
-use crate::portal::PortalRequest;
+use crate::PortalRequest;
 
 /// The frontend's permission check passes only when this interface reports
 /// version 2, matching the packaged portal interface.
@@ -137,25 +136,20 @@ impl Access {
     }
 }
 
-/// Copy the rendered frame into a PNG file under `directory` without
-/// triggering a render: the caller runs between loop iterations, so the image
-/// always holds the most recently rendered frame and the cursor is never in it.
-/// The frame is little-endian ARGB32 and opaque, because every render clears
-/// it with an opaque color, so the file holds its RGB bytes, as screencopy's
-/// XRGB buffers do.
-pub(crate) fn write_screenshot(
-    image: &Image<'static, 'static>,
+/// Write the rendered frame into a PNG file under `directory`. The caller
+/// passes the most recently rendered frame between loop iterations, so taking
+/// a screenshot never triggers a render and the cursor is never in it. The
+/// frame is `height` rows of `stride` bytes of little-endian ARGB32 and opaque,
+/// because every render clears it with an opaque color, so the file holds its
+/// RGB bytes, as screencopy's XRGB buffers do.
+pub fn write_screenshot(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
     directory: &Path,
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(directory)?;
-    let width = image.width();
-    let height = image.height();
-    let stride = image.stride();
-    // SAFETY: create_buffer owns and initializes the complete image storage;
-    // the renderer's exclusive target borrow has ended before this read.
-    let data = unsafe { image.data() };
-    // SAFETY: stride * height covers this live image's allocation.
-    let pixels = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), stride * height) };
     let mut rgb = Vec::with_capacity(width * height * 3);
     for row in pixels.chunks_exact(stride) {
         for pixel in row[..width * 4].chunks_exact(4) {
