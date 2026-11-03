@@ -468,7 +468,7 @@ impl State {
         {
             return;
         }
-        let serial = self.begin_input(source, delivery::FocusCause::Key);
+        let serial = self.delivery.begin_input(source, delivery::FocusCause::Key);
         let (target, text_field) = self.keyboard_target();
         for state in [KeyState::Released, KeyState::Pressed] {
             keyboard.input_from_source::<(), _>(
@@ -509,7 +509,7 @@ impl State {
         state: KeyState,
         reclaim: bool,
     ) {
-        let serial = self.begin_input(source, delivery::FocusCause::Key);
+        let serial = self.delivery.begin_input(source, delivery::FocusCause::Key);
         let (target, text_field) = self.dispatch_key(source, key, state, reclaim);
         let input = delivery::InputKind::Key {
             pressed: state == KeyState::Pressed,
@@ -753,7 +753,9 @@ impl State {
         button: u32,
         state: ButtonState,
     ) {
-        let serial = self.begin_input(source, delivery::FocusCause::Click);
+        let serial = self
+            .delivery
+            .begin_input(source, delivery::FocusCause::Click);
         let target = if self.accepts_input(source) {
             if source != KeyboardSource::MAIN
                 && state == ButtonState::Pressed
@@ -779,7 +781,9 @@ impl State {
     }
 
     pub(crate) fn pointer_axis(&mut self, source: KeyboardSource, frame: AxisFrame) {
-        let serial = self.begin_input(source, delivery::FocusCause::Other);
+        let serial = self
+            .delivery
+            .begin_input(source, delivery::FocusCause::Other);
         let target = if self.accepts_input(source) {
             let target = self.pointer_target();
             if let Some(pointer) = self.seat.get_pointer() {
@@ -1261,7 +1265,7 @@ pub fn run(mut options: Config) -> Result<()> {
         )?,
     ));
     if let Some(bus) = &bus {
-        match crate::delivery::start(&handle, bus.address()) {
+        match crate::delivery::start(&handle, bus.address(), State::apply_delivery_request) {
             Ok(outgoing) => state.delivery.set_outgoing(outgoing),
             Err(error) => tracing::error!(%error, "input delivery D-Bus service failed to start"),
         }

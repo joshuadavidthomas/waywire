@@ -598,7 +598,7 @@ impl crate::State {
             }
             Command::Text(p) => {
                 if matches!(p.action, pipe::TextAction::Commit) {
-                    let serial = self.begin_input(source, delivery::FocusCause::Key);
+                    let serial = self.delivery.begin_input(source, delivery::FocusCause::Key);
                     let (target, text_field) = self.keyboard_target();
                     self.finish_input(
                         source,

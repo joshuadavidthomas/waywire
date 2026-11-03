@@ -17,6 +17,9 @@
 use std::any::Any;
 use std::collections::VecDeque;
 
+use smithay::desktop::Space;
+use smithay::desktop::Window;
+use smithay::output::Output;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3;
 use smithay::reexports::wayland_server::Resource;
@@ -29,10 +32,12 @@ use smithay::wayland::text_input::TextInputSeat;
 use tokio::sync::oneshot;
 use zbus::zvariant::OwnedValue;
 
+use super::Delivery;
 use super::SourceKind;
 use super::monotonic_usec;
 use crate::FrameRequest;
 use crate::State;
+use crate::toplevel_list::ToplevelList;
 
 /// The quiet window when the caller names none.
 pub(crate) const DEFAULT_QUIET_MS: u32 = 300;
@@ -169,12 +174,30 @@ struct Caret {
 
 /// Where the focused text field's caret can blink, in output pixels.
 #[derive(Clone, Copy, Debug)]
-struct CaretArea {
+pub(crate) struct CaretArea {
     size: Size<i32, Physical>,
     window: Rectangle<i32, Physical>,
 }
 
 impl CaretArea {
+    /// The caret for a cursor rectangle `rect`, in window `window`, both
+    /// in logical pixels, at `scale`. Clients report the cursor as a
+    /// zero-width line and draw the caret around it, so the rectangle is
+    /// widened by `CARET_MARGIN` on each side.
+    pub(crate) fn new(
+        rect: Rectangle<i32, Logical>,
+        window: Rectangle<i32, Logical>,
+        scale: f64,
+    ) -> Self {
+        let size = Rectangle::<i32, Logical>::from_size(
+            rect.size + Size::from((2 * CARET_MARGIN, 2 * CARET_MARGIN)),
+        );
+        Self {
+            size: super::windows::to_pixels(size, scale).size,
+            window: super::windows::to_pixels(window, scale),
+        }
+    }
+
     /// Whether `rect` is no larger than the caret and inside its window.
     fn holds(self, rect: Rectangle<i32, Physical>) -> bool {
         rect.size.w <= self.size.w && rect.size.h <= self.size.h && self.window.contains_rect(rect)
@@ -250,117 +273,110 @@ impl Settle {
     }
 }
 
-/// Track the cursor rectangle of each text-input-v3 object. Runs on every
-/// request before Smithay handles it, which keeps the rectangle to itself.
-pub(crate) fn observe_text_input(state: &mut State, resource: &dyn Any, request: &dyn Any) {
-    let (Some(text_input), Some(request)) = (
-        resource.downcast_ref::<ZwpTextInputV3>(),
-        request.downcast_ref::<zwp_text_input_v3::Request>(),
-    ) else {
-        return;
-    };
-    let carets = &mut state.delivery.settle.carets;
-    if let zwp_text_input_v3::Request::Destroy = request {
-        carets.retain(|caret| caret.text_input != *text_input);
-        return;
-    }
-    let index = carets
-        .iter()
-        .position(|caret| caret.text_input == *text_input)
-        .unwrap_or_else(|| {
-            carets.retain(|caret| caret.text_input.is_alive());
-            carets.push(Caret {
-                text_input: text_input.clone(),
-                pending: None,
-                reset: false,
-                current: None,
-            });
-            carets.len() - 1
-        });
-    let caret = &mut carets[index];
-    match request {
-        zwp_text_input_v3::Request::Enable | zwp_text_input_v3::Request::Disable => {
-            caret.reset = true;
-            caret.pending = None;
-        }
-        zwp_text_input_v3::Request::SetCursorRectangle {
-            x,
-            y,
-            width,
-            height,
-        } => caret.pending = Some(Rectangle::new((*x, *y).into(), (*width, *height).into())),
-        zwp_text_input_v3::Request::Commit => {
-            if std::mem::take(&mut caret.reset) {
-                caret.current = None;
-            }
-            if let Some(rect) = caret.pending.take() {
-                caret.current = Some(rect);
-            }
-        }
-        zwp_text_input_v3::Request::Destroy
-        | zwp_text_input_v3::Request::SetSurroundingText { .. }
-        | zwp_text_input_v3::Request::SetTextChangeCause { .. }
-        | zwp_text_input_v3::Request::SetContentType { .. }
-        | zwp_text_input_v3::Request::SetAvailableActions { .. }
-        | zwp_text_input_v3::Request::ShowInputPanel
-        | zwp_text_input_v3::Request::HideInputPanel
-        | _ => {}
-    }
+/// A wait that ended, for [`Delivery::answer_settled`] to answer.
+pub(crate) struct Settled {
+    waiter: Waiter,
+    outcome: Outcome,
+    now: u64,
 }
 
-impl State {
-    /// The focused text field's caret, in output pixels: the size of the
-    /// cursor rectangle its active text input set, widened by
-    /// `CARET_MARGIN` on each side, since clients report it as a zero-width
-    /// line and draw the caret around it, and the bounds of the field's
-    /// window. `None` unless the field is in a window's main surface.
-    fn caret(&self) -> Option<CaretArea> {
-        let mut active = None;
-        self.seat
-            .text_input()
-            .with_active_text_input(|text_input, surface| {
-                active = Some((text_input.clone(), surface.clone()));
-            });
-        let (text_input, surface) = active?;
-        let rect = self
-            .delivery
-            .settle
-            .carets
+impl Delivery {
+    /// Track the cursor rectangle of each text-input-v3 object. Runs on
+    /// every request before Smithay handles it, which keeps the rectangle to
+    /// itself.
+    pub(crate) fn observe_text_input(&mut self, resource: &dyn Any, request: &dyn Any) {
+        let (Some(text_input), Some(request)) = (
+            resource.downcast_ref::<ZwpTextInputV3>(),
+            request.downcast_ref::<zwp_text_input_v3::Request>(),
+        ) else {
+            return;
+        };
+        let carets = &mut self.settle.carets;
+        if let zwp_text_input_v3::Request::Destroy = request {
+            carets.retain(|caret| caret.text_input != *text_input);
+            return;
+        }
+        let index = carets
             .iter()
-            .find(|caret| caret.text_input == text_input)?
-            .current?;
-        let window = self
-            .space
-            .elements()
-            .find(|window| window.wl_surface().is_some_and(|own| *own == surface))?;
-        let scale = self.output.current_scale().fractional_scale();
-        let size = Rectangle::<i32, Logical>::from_size(
-            rect.size + Size::from((2 * CARET_MARGIN, 2 * CARET_MARGIN)),
-        );
-        Some(CaretArea {
-            size: super::windows::to_pixels(size, scale).size,
-            window: super::windows::to_pixels(self.space.element_bbox(window)?, scale),
-        })
+            .position(|caret| caret.text_input == *text_input)
+            .unwrap_or_else(|| {
+                carets.retain(|caret| caret.text_input.is_alive());
+                carets.push(Caret {
+                    text_input: text_input.clone(),
+                    pending: None,
+                    reset: false,
+                    current: None,
+                });
+                carets.len() - 1
+            });
+        let caret = &mut carets[index];
+        match request {
+            zwp_text_input_v3::Request::Enable | zwp_text_input_v3::Request::Disable => {
+                caret.reset = true;
+                caret.pending = None;
+            }
+            zwp_text_input_v3::Request::SetCursorRectangle {
+                x,
+                y,
+                width,
+                height,
+            } => caret.pending = Some(Rectangle::new((*x, *y).into(), (*width, *height).into())),
+            zwp_text_input_v3::Request::Commit => {
+                if std::mem::take(&mut caret.reset) {
+                    caret.current = None;
+                }
+                if let Some(rect) = caret.pending.take() {
+                    caret.current = Some(rect);
+                }
+            }
+            zwp_text_input_v3::Request::Destroy
+            | zwp_text_input_v3::Request::SetSurroundingText { .. }
+            | zwp_text_input_v3::Request::SetTextChangeCause { .. }
+            | zwp_text_input_v3::Request::SetContentType { .. }
+            | zwp_text_input_v3::Request::SetAvailableActions { .. }
+            | zwp_text_input_v3::Request::ShowInputPanel
+            | zwp_text_input_v3::Request::HideInputPanel
+            | _ => {}
+        }
     }
 
-    /// Start a `WaitSettled` call. `pid` is the caller's process.
-    pub(crate) fn wait_settled(&mut self, pid: Option<u32>, options: SettleOptions, reply: Reply) {
-        let now = monotonic_usec();
+    /// The committed cursor rectangle of `text_input`, in its surface's
+    /// coordinates.
+    pub(crate) fn caret_rect(
+        &self,
+        text_input: &ZwpTextInputV3,
+    ) -> Option<Rectangle<i32, Logical>> {
+        self.settle
+            .carets
+            .iter()
+            .find(|caret| caret.text_input == *text_input)?
+            .current
+    }
+
+    /// Start a `WaitSettled` call at `now`. `pid` is the caller's process;
+    /// `region` finds the part of the output a window and its popups cover,
+    /// in output pixels, by its id, `None` when no window has it. Returns
+    /// whether the wait started; a refused call is answered here.
+    pub(crate) fn wait_settled(
+        &mut self,
+        pid: Option<u32>,
+        options: SettleOptions,
+        now: u64,
+        region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
+        reply: Reply,
+    ) -> bool {
         let since = match options.serial {
             None => Ok(now),
-            Some(serial) => self
-                .delivery
-                .settle
-                .issued(serial, self.delivery.last_serial(), pid),
+            Some(serial) => self.settle.issued(serial, self.last_serial(), pid),
         };
-        let region = options.window.as_ref().map(|id| self.settle_region(id));
+        let region = options.window.as_deref().map(region);
         let since = match since {
             Err(error) => Err(error),
             Ok(_) if matches!(region, Some(None)) => Err(zbus::fdo::Error::InvalidArgs(format!(
                 "no window has id {:?}",
                 options.window.as_deref().unwrap_or_default()
             ))),
-            Ok(_) if self.delivery.settle.waiters.len() >= MAX_WAITERS => Err(
+            Ok(_) if self.settle.waiters.len() >= MAX_WAITERS => Err(
                 zbus::fdo::Error::LimitsExceeded("too many settle waits in progress".into()),
             ),
             Ok(since) => Ok(since),
@@ -371,11 +387,11 @@ impl State {
                 if reply.send(Err(error)).is_err() {
                     tracing::debug!("settle requester hung up");
                 }
-                return;
+                return false;
             }
         };
         let region = region.flatten();
-        let settle = &mut self.delivery.settle;
+        let settle = &mut self.settle;
         let after = settle.latest_input(pid, since).unwrap_or(since).max(since);
         let mut waiter = Waiter {
             since,
@@ -397,24 +413,31 @@ impl State {
             }
         }
         settle.waiters.push(waiter);
-        self.poll_settled(now);
+        true
     }
 
-    /// Record a rendered frame: its damage in output pixels, the image it
-    /// was rendered to and the parts of it that were drawn, `None` when all
-    /// of it was.
+    /// Record a frame rendered at `now`: its damage in output pixels, the
+    /// packed pixels it was rendered to, `width` to a row, and the parts of
+    /// them that were drawn, `None` when all of them were. `caret` is where
+    /// the focused text field's caret can blink; `region` finds a watched
+    /// window's area, as in [`Self::wait_settled`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one frame's facts, borrowed from the renderer"
+    )]
     pub(crate) fn frame_rendered(
         &mut self,
         now: u64,
         damage: &[Rectangle<i32, Physical>],
-        image: &smithay::reexports::pixman::Image<'static, 'static>,
+        data: &[u8],
+        width: usize,
         drawn: Option<&[Rectangle<i32, Physical>]>,
+        caret: Option<CaretArea>,
+        region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
     ) {
-        self.delivery.settle.rendered = now;
-        let pixels = Pixels {
-            data: crate::image_pixels(image),
-            width: image.width(),
-        };
+        let settle = &mut self.settle;
+        settle.rendered = now;
+        let pixels = Pixels { data, width };
         // A blinking caret changes its pixels on a timer, not in answer to
         // input, so a change no larger than the caret in the field's window
         // is left out. GTK 4.8 reports where the caret is only when the
@@ -422,8 +445,6 @@ impl State {
         // size, not its place. It also damages its whole surface for each
         // caret frame, so damage in the window is first narrowed to the
         // pixels that changed, which needs the previous frame.
-        let caret = self.caret();
-        let settle = &mut self.delivery.settle;
         let last = settle
             .last
             .take()
@@ -456,15 +477,8 @@ impl State {
         if damage.is_empty() {
             return;
         }
-        let regions: Vec<_> = self
-            .delivery
-            .settle
-            .waiters
-            .iter()
-            .map(|waiter| waiter.window.as_ref().map(|id| self.settle_region(id)))
-            .collect();
-        let settle = &mut self.delivery.settle;
-        for (waiter, region) in settle.waiters.iter_mut().zip(regions) {
+        for waiter in &mut settle.waiters {
+            let region = waiter.window.as_deref().map(&region);
             // A window that closed is reported by the next poll.
             if let Some(None) = region {
                 continue;
@@ -486,26 +500,29 @@ impl State {
         settle.frames.push_back(Frame { usec: now, damage });
     }
 
-    /// Answer every wait that settled, timed out or lost its window by
-    /// `now`.
-    pub(crate) fn poll_settled(&mut self, now: u64) {
-        if self.delivery.settle.waiters.is_empty() {
-            return;
+    /// Take every wait that settled, timed out or lost its window by `now`,
+    /// in the order to answer them. `pending` says a frame is owed: commits
+    /// since the last frame are not on screen yet and may damage it.
+    /// `region` finds a watched window's area, as in [`Self::wait_settled`].
+    pub(crate) fn poll_settled(
+        &mut self,
+        now: u64,
+        pending: bool,
+        region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
+    ) -> Vec<Settled> {
+        let mut settled = Vec::new();
+        let settle = &mut self.settle;
+        if settle.waiters.is_empty() {
+            return settled;
         }
-        // Commits since the last frame are not on screen yet and may damage
-        // it, so a pending frame bounds how long the screen is known quiet.
-        let pending = self.dirty || self.frame_pending == FrameRequest::Pending;
-        let quiet_until = if pending {
-            self.delivery.settle.rendered
-        } else {
-            now
-        };
+        // A pending frame bounds how long the screen is known quiet.
+        let quiet_until = if pending { settle.rendered } else { now };
         let mut index = 0;
-        while let Some(waiter) = self.delivery.settle.waiters.get(index) {
+        while let Some(waiter) = settle.waiters.get(index) {
             let closed = waiter
                 .window
-                .as_ref()
-                .is_some_and(|id| self.settle_region(id).is_none());
+                .as_deref()
+                .is_some_and(|id| region(id).is_none());
             let outcome = if closed {
                 Outcome::Closed
             } else if quiet_until >= waiter.quiet_from() + waiter.quiet {
@@ -516,19 +533,49 @@ impl State {
                 index += 1;
                 continue;
             };
-            let waiter = self.delivery.settle.waiters.swap_remove(index);
-            self.answer_settle(waiter, outcome, now);
+            let waiter = settle.waiters.swap_remove(index);
+            settled.push(Settled {
+                waiter,
+                outcome,
+                now,
+            });
         }
+        settled
+    }
+
+    /// Answer a wait [`Self::poll_settled`] took, after every signal
+    /// already queued. Like `GetWindows`, the caller reports a pending
+    /// window change first.
+    pub(crate) fn answer_settled(&self, settled: Settled) {
+        use super::bus::insert;
+        let Settled {
+            waiter,
+            outcome,
+            now,
+        } = settled;
+        let mut answer = std::collections::HashMap::new();
+        insert(&mut answer, "result", outcome.as_str());
+        insert(&mut answer, "time_usec", now);
+        insert(&mut answer, "input_usec", waiter.since);
+        insert(&mut answer, "damage_usec", waiter.last_damage.unwrap_or(0));
+        insert(&mut answer, "frames", waiter.frames);
+        insert(&mut answer, "quiet_ms", waiter.quiet_ms);
+        insert(&mut answer, "serial", self.last_serial());
+        let answer = super::bus::owned(answer);
+        let reply = waiter.reply;
+        self.flush(Box::new(move || {
+            if reply.send(Ok(answer)).is_err() {
+                tracing::debug!("settle requester hung up");
+            }
+        }));
     }
 
     /// When the loop must wake to answer a wait, in `CLOCK_MONOTONIC`
-    /// microseconds.
-    pub(crate) fn settle_wake(&self) -> Option<u64> {
+    /// microseconds. `pending` says a frame is owed.
+    pub(crate) fn settle_wake(&self, pending: bool) -> Option<u64> {
         // A quiet window that ended with a frame pending is answered after
         // that frame, which wakes the loop itself.
-        let pending = self.dirty || self.frame_pending == FrameRequest::Pending;
-        self.delivery
-            .settle
+        self.settle
             .waiters
             .iter()
             .map(|waiter| {
@@ -540,43 +587,6 @@ impl State {
                 }
             })
             .min()
-    }
-
-    fn answer_settle(&mut self, waiter: Waiter, outcome: Outcome, now: u64) {
-        use super::bus::insert;
-        let mut answer = std::collections::HashMap::new();
-        insert(&mut answer, "result", outcome.as_str());
-        insert(&mut answer, "time_usec", now);
-        insert(&mut answer, "input_usec", waiter.since);
-        insert(&mut answer, "damage_usec", waiter.last_damage.unwrap_or(0));
-        insert(&mut answer, "frames", waiter.frames);
-        insert(&mut answer, "quiet_ms", waiter.quiet_ms);
-        // Like GetWindows: report a pending window change first, and reply
-        // after every signal already queued.
-        self.publish_window_list();
-        insert(&mut answer, "serial", self.delivery.last_serial());
-        let answer = super::bus::owned(answer);
-        let reply = waiter.reply;
-        self.delivery.flush(Box::new(move || {
-            if reply.send(Ok(answer)).is_err() {
-                tracing::debug!("settle requester hung up");
-            }
-        }));
-    }
-
-    /// The part of the output that window `id` and its popups cover, in
-    /// output pixels; `None` when no window has that id.
-    fn settle_region(&self, id: &str) -> Option<Rectangle<i32, Physical>> {
-        let window = self
-            .space
-            .elements()
-            .find(|window| self.toplevel_list.identifier(window).as_deref() == Some(id))?;
-        let location = self.space.element_location(window)?;
-        let (_, frame) = super::windows::bounds(window, location);
-        let mut popups = window.bbox_with_popups();
-        popups.loc += location - window.geometry().loc;
-        let scale = self.output.current_scale().fractional_scale();
-        Some(super::windows::to_pixels(frame.merge(popups), scale))
     }
 }
 
@@ -650,4 +660,113 @@ fn touches(damage: &[Rectangle<i32, Physical>], region: Option<Rectangle<i32, Ph
         None => !damage.is_empty(),
         Some(region) => damage.iter().any(|rect| rect.overlaps(region)),
     }
+}
+
+impl State {
+    /// Whether a frame is owed: commits since the last frame are not on
+    /// screen yet.
+    fn frame_owed(&self) -> bool {
+        self.dirty || self.frame_pending == FrameRequest::Pending
+    }
+
+    /// The focused text field's caret, in output pixels. `None` unless the
+    /// field is in a window's main surface.
+    fn caret(&self) -> Option<CaretArea> {
+        let mut active = None;
+        self.seat
+            .text_input()
+            .with_active_text_input(|text_input, surface| {
+                active = Some((text_input.clone(), surface.clone()));
+            });
+        let (text_input, surface) = active?;
+        let rect = self.delivery.caret_rect(&text_input)?;
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().is_some_and(|own| *own == surface))?;
+        let scale = self.output.current_scale().fractional_scale();
+        Some(CaretArea::new(
+            rect,
+            self.space.element_bbox(window)?,
+            scale,
+        ))
+    }
+
+    /// Start a `WaitSettled` call. `pid` is the caller's process.
+    pub(crate) fn wait_settled(&mut self, pid: Option<u32>, options: SettleOptions, reply: Reply) {
+        let now = monotonic_usec();
+        let (space, toplevel_list, output) = (&self.space, &self.toplevel_list, &self.output);
+        if self.delivery.wait_settled(
+            pid,
+            options,
+            now,
+            |id| settle_region(space, toplevel_list, output, id),
+            reply,
+        ) {
+            self.poll_settled(now);
+        }
+    }
+
+    /// Record a rendered frame: its damage in output pixels, the image it
+    /// was rendered to and the parts of it that were drawn, `None` when all
+    /// of it was.
+    pub(crate) fn frame_rendered(
+        &mut self,
+        now: u64,
+        damage: &[Rectangle<i32, Physical>],
+        image: &smithay::reexports::pixman::Image<'static, 'static>,
+        drawn: Option<&[Rectangle<i32, Physical>]>,
+    ) {
+        let caret = self.caret();
+        let (space, toplevel_list, output) = (&self.space, &self.toplevel_list, &self.output);
+        self.delivery.frame_rendered(
+            now,
+            damage,
+            crate::image_pixels(image),
+            image.width(),
+            drawn,
+            caret,
+            |id| settle_region(space, toplevel_list, output, id),
+        );
+    }
+
+    /// Answer every wait that settled, timed out or lost its window by
+    /// `now`.
+    pub(crate) fn poll_settled(&mut self, now: u64) {
+        let pending = self.frame_owed();
+        let (space, toplevel_list, output) = (&self.space, &self.toplevel_list, &self.output);
+        let settled = self.delivery.poll_settled(now, pending, |id| {
+            settle_region(space, toplevel_list, output, id)
+        });
+        for settled in settled {
+            // Like GetWindows: report a pending window change first.
+            self.publish_window_list();
+            self.delivery.answer_settled(settled);
+        }
+    }
+
+    /// When the loop must wake to answer a wait, in `CLOCK_MONOTONIC`
+    /// microseconds.
+    pub(crate) fn settle_wake(&self) -> Option<u64> {
+        self.delivery.settle_wake(self.frame_owed())
+    }
+}
+
+/// The part of the output that window `id` and its popups cover, in output
+/// pixels; `None` when no window has that id.
+fn settle_region(
+    space: &Space<Window>,
+    toplevel_list: &ToplevelList,
+    output: &Output,
+    id: &str,
+) -> Option<Rectangle<i32, Physical>> {
+    let window = space
+        .elements()
+        .find(|window| toplevel_list.identifier(window).as_deref() == Some(id))?;
+    let location = space.element_location(window)?;
+    let (_, frame) = super::windows::bounds(window, location);
+    let mut popups = window.bbox_with_popups();
+    popups.loc += location - window.geometry().loc;
+    let scale = output.current_scale().fractional_scale();
+    Some(super::windows::to_pixels(frame.merge(popups), scale))
 }

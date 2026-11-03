@@ -737,7 +737,7 @@ where
         data_init: &mut DataInit<'_, Self>,
     ) {
         crate::virtual_keyboard::exclude_keymap_nul(&mut request);
-        crate::delivery::settle::observe_text_input(state, resource, &request);
+        state.delivery.observe_text_input(resource, &request);
         data.request(state, client, resource, request, dhandle, data_init);
     }
 

@@ -11,10 +11,7 @@ use smithay::utils::Logical;
 use smithay::utils::Physical;
 use smithay::utils::Rectangle;
 
-use super::Notice;
-use super::Signal;
 use super::WindowRecord;
-use super::monotonic_usec;
 use crate::State;
 use crate::focus::KeyboardFocus;
 
@@ -179,24 +176,10 @@ impl State {
     /// `GetWindows` before it replies, so a reply never precedes the signal
     /// for a change it already shows.
     pub(crate) fn publish_window_list(&mut self) {
-        let everyone = self.delivery.everyone();
-        if everyone.is_empty() {
-            self.delivery.reported_windows = None;
+        if !self.delivery.wants_window_list() {
             return;
         }
         let list = self.window_list();
-        if self.delivery.reported_windows.as_ref() == Some(&list) {
-            return;
-        }
-        self.delivery.reported_windows = Some(list.clone());
-        let changed = WindowsChanged {
-            serial: self.delivery.next_serial(),
-            time_usec: monotonic_usec(),
-            list,
-        };
-        self.delivery.send(
-            everyone,
-            Signal::Notice(Notice::WindowsChanged(Box::new(changed))),
-        );
+        self.delivery.windows_listed(list);
     }
 }

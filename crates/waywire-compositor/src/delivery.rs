@@ -390,6 +390,24 @@ pub(crate) struct Delivery {
     settle: Settle,
 }
 
+/// Where one input went, as its receipt names it.
+#[derive(Clone, Debug)]
+pub(crate) struct Destination {
+    pub(crate) delivery: &'static str,
+    pub(crate) window: Option<WindowRecord>,
+    pub(crate) popup: bool,
+    pub(crate) chrome: Option<Chrome>,
+}
+
+/// Who receives one input's receipt.
+#[derive(Clone, Debug)]
+pub(crate) enum Recipients {
+    /// The browser viewer that sent it, over the gateway.
+    Viewer,
+    /// Bus subscribers that own its source.
+    Subscribers(Vec<String>),
+}
+
 impl Delivery {
     pub(crate) fn set_outgoing(&mut self, outgoing: mpsc::Sender<Message>) {
         self.outgoing = Some(outgoing);
@@ -416,6 +434,12 @@ impl Delivery {
     pub(crate) fn unsubscribe(&mut self, name: &str) {
         self.subscribers
             .retain(|subscriber| subscriber.name != name);
+    }
+
+    /// Whether anyone receives focus and window events, so the loop can
+    /// skip describing windows nobody asked about.
+    pub(crate) fn has_subscribers(&self) -> bool {
+        !self.subscribers.is_empty()
     }
 
     pub(crate) const fn last_serial(&self) -> u64 {
@@ -512,6 +536,261 @@ impl Delivery {
             .map(|subscriber| subscriber.name.clone())
             .collect()
     }
+
+    /// Make `cause` the reason for keyboard focus changes that no input
+    /// being dispatched explains, and return the reason it replaces.
+    pub(crate) const fn replace_cause(&mut self, cause: Option<FocusCause>) -> Option<FocusCause> {
+        std::mem::replace(&mut self.cause, cause)
+    }
+
+    /// Start dispatching one input event and return its receipt serial.
+    /// Focus changes until [`Self::finish_input`] name this input.
+    pub(crate) fn begin_input(&mut self, source: KeyboardSource, cause: FocusCause) -> u64 {
+        let lineage = self
+            .sources
+            .get(&source)
+            .map_or(&[][..], |info| &info.lineage);
+        let audience = settle::Audience::of(self.kind(source), lineage);
+        let serial = self.issue(audience, true);
+        self.dispatching = Some(Dispatching {
+            source,
+            serial,
+            cause,
+        });
+        serial
+    }
+
+    /// End the input started by [`Self::begin_input`] and say who receives
+    /// its receipt; `None` when nobody does, so it need not be described.
+    pub(crate) fn finish_input(&mut self, source: KeyboardSource) -> Option<Recipients> {
+        self.dispatching = None;
+        if source == KeyboardSource::MAIN {
+            return Some(Recipients::Viewer);
+        }
+        let owners = self.owners(source);
+        (!owners.is_empty()).then_some(Recipients::Subscribers(owners))
+    }
+
+    /// The receipt for input `serial` from `source` that went to
+    /// `destination`. Only input that reached a window names its text field.
+    pub(crate) fn receipt(
+        &self,
+        source: KeyboardSource,
+        serial: u64,
+        input: InputKind,
+        destination: Destination,
+        text_field: Option<TextField>,
+    ) -> Receipt {
+        Receipt {
+            serial,
+            time_usec: monotonic_usec(),
+            source: self.kind(source).unwrap_or(SourceKind::Viewer),
+            source_pid: self.source(source).and_then(|info| info.pid),
+            input,
+            text_field: if destination.delivery == "window" {
+                text_field
+            } else {
+                None
+            },
+            delivery: destination.delivery,
+            window: destination.window,
+            popup: destination.popup,
+            chrome: destination.chrome,
+        }
+    }
+
+    /// Send a receipt to the subscribers [`Self::finish_input`] named.
+    pub(crate) fn send_receipt(&self, owners: Vec<String>, receipt: Receipt) {
+        self.send(owners, Signal::Receipt(receipt));
+    }
+
+    /// Why focus is moving now, and the input that moves it.
+    fn focus_cause(&self) -> (FocusCause, Option<Dispatching>) {
+        // Input being dispatched explains the change best: a click on a
+        // taskbar chip that minimizes is the agent's click, not a minimize.
+        match (self.dispatching, self.cause) {
+            (Some(input), _) => (input.cause, Some(input)),
+            (None, Some(cause)) => (cause, None),
+            (None, None) => (FocusCause::Other, None),
+        }
+    }
+
+    /// Keyboard focus moved to a toplevel that has not mapped yet, so it
+    /// has no identifier; [`Self::take_deferred`] reports it once it maps.
+    pub(crate) fn defer_focus(&mut self) {
+        self.deferred = Some(self.focus_cause().0);
+    }
+
+    /// Why focus moved to a window before it mapped, if it did.
+    pub(crate) const fn take_deferred(&mut self) -> Option<FocusCause> {
+        self.deferred.take()
+    }
+
+    /// Keyboard focus moved to `window`, or one of its popups. Reported
+    /// unless it is the focus last reported.
+    pub(crate) fn focus_changed(&mut self, window: Option<WindowRecord>, popup: bool) {
+        self.deferred = None;
+        let current = (window, popup);
+        if self.reported_focus.as_ref() == Some(&current) {
+            return;
+        }
+        let previous = self
+            .reported_focus
+            .replace(current)
+            .and_then(|(window, _)| window);
+        let everyone = self.everyone();
+        if everyone.is_empty() {
+            return;
+        }
+        let (cause, input) = self.focus_cause();
+        let source = input.and_then(|input| self.kind(input.source));
+        let serial = self.next_serial();
+        let window = self
+            .reported_focus
+            .as_ref()
+            .and_then(|(window, _)| window.as_ref());
+        for name in everyone {
+            // Only the input's owners learn which of their receipts it was.
+            let owned = input.is_some_and(|input| self.owners(input.source).contains(&name));
+            let notice = Notice::FocusChanged {
+                serial,
+                time_usec: monotonic_usec(),
+                window: window.cloned(),
+                previous: previous.clone(),
+                popup,
+                cause,
+                source,
+                receipt: owned.then(|| input.map(|input| input.serial)).flatten(),
+            };
+            self.send(vec![name], Signal::Notice(notice));
+        }
+    }
+
+    /// `client` enabled text input for a field with `purpose`. Clients
+    /// that `alive` says are gone are forgotten.
+    pub(crate) fn text_input_enabled(
+        &mut self,
+        client: ClientId,
+        purpose: ContentPurpose,
+        alive: impl Fn(&ClientId) -> bool,
+    ) {
+        self.text_clients.retain(|id, _| alive(id));
+        self.text_clients.insert(client, purpose);
+    }
+
+    /// The text-field state of `client`, which holds keyboard focus;
+    /// `active` says whether it has a text input enabled now.
+    pub(crate) fn text_field(&self, client: &ClientId, active: impl FnOnce() -> bool) -> TextField {
+        let Some(purpose) = self.text_clients.get(client) else {
+            return TextField::Unknown;
+        };
+        if active() {
+            TextField::Focused(*purpose)
+        } else {
+            TextField::None
+        }
+    }
+
+    /// The focused client's text field changed to `text_field`.
+    pub(crate) fn text_field_changed(
+        &mut self,
+        window: Option<WindowRecord>,
+        text_field: TextField,
+    ) {
+        let everyone = self.everyone();
+        if everyone.is_empty() {
+            return;
+        }
+        let notice = Notice::TextFieldChanged {
+            serial: self.next_serial(),
+            time_usec: monotonic_usec(),
+            window,
+            text_field,
+        };
+        self.send(everyone, Signal::Notice(notice));
+    }
+
+    /// A window became visible for the first time.
+    pub(crate) fn window_mapped(
+        &mut self,
+        window: WindowRecord,
+        parent: Option<WindowRecord>,
+        modal: bool,
+    ) {
+        let everyone = self.everyone();
+        if everyone.is_empty() {
+            return;
+        }
+        let notice = Notice::WindowMapped {
+            serial: self.next_serial(),
+            time_usec: monotonic_usec(),
+            window,
+            parent,
+            modal,
+        };
+        self.send(everyone, Signal::Notice(notice));
+    }
+
+    /// A mapped window's title or app id changed.
+    pub(crate) fn window_changed(&mut self, window: WindowRecord) {
+        let everyone = self.everyone();
+        if everyone.is_empty() {
+            return;
+        }
+        let notice = Notice::WindowChanged {
+            serial: self.next_serial(),
+            time_usec: monotonic_usec(),
+            window,
+        };
+        self.send(everyone, Signal::Notice(notice));
+    }
+
+    /// Whether anyone receives `WindowsChanged`. With nobody, the list last
+    /// sent is forgotten, so the next subscriber gets the whole list.
+    pub(crate) fn wants_window_list(&mut self) -> bool {
+        if self.subscribers.is_empty() {
+            self.reported_windows = None;
+            return false;
+        }
+        true
+    }
+
+    /// Send `WindowsChanged` with `list` when it differs from the one last
+    /// sent.
+    pub(crate) fn windows_listed(&mut self, list: WindowList) {
+        if self.reported_windows.as_ref() == Some(&list) {
+            return;
+        }
+        self.reported_windows = Some(list.clone());
+        let changed = WindowsChanged {
+            serial: self.next_serial(),
+            time_usec: monotonic_usec(),
+            list,
+        };
+        self.send(
+            self.everyone(),
+            Signal::Notice(Notice::WindowsChanged(Box::new(changed))),
+        );
+    }
+}
+
+impl Receipt {
+    /// The receipt as the viewer that sent the input with `sequence` gets it.
+    pub(crate) fn for_viewer(&self, sequence: pipe::InputSequence) -> pipe::InputReceipt {
+        let window = self.window.clone().unwrap_or_default();
+        pipe::InputReceipt {
+            sequence,
+            delivery: match self.delivery {
+                "window" => pipe::ReceiptDelivery::Window,
+                "compositor" => pipe::ReceiptDelivery::Compositor,
+                "dropped" => pipe::ReceiptDelivery::Dropped,
+                _ => pipe::ReceiptDelivery::Nowhere,
+            },
+            window_id: pipe::ReceiptText::truncated(&window.id),
+            app_id: pipe::ReceiptText::truncated(&window.app_id),
+            title: pipe::ReceiptText::truncated(&window.title),
+        }
+    }
 }
 
 pub(crate) fn monotonic_usec() -> u64 {
@@ -519,6 +798,17 @@ pub(crate) fn monotonic_usec() -> u64 {
         u64::try_from(time.tv_sec()).unwrap_or(0) * 1_000_000
             + u64::try_from(time.tv_nsec()).unwrap_or(0) / 1000
     })
+}
+
+/// How receipts and events name an X11 window.
+pub(crate) fn x11_record(surface: &X11Surface) -> WindowRecord {
+    WindowRecord {
+        id: String::new(),
+        app_id: surface.class(),
+        title: surface.title(),
+        pid: surface.pid(),
+        x11: true,
+    }
 }
 
 impl State {
@@ -529,31 +819,13 @@ impl State {
         cause: FocusCause,
         change: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let previous = self.delivery.cause.replace(cause);
+        let previous = self.delivery.replace_cause(Some(cause));
         let result = change(self);
-        self.delivery.cause = previous;
+        self.delivery.replace_cause(previous);
         result
     }
 
-    /// Start dispatching one input event and return its receipt serial.
-    /// Focus changes until [`Self::finish_input`] name this input.
-    pub(crate) fn begin_input(&mut self, source: KeyboardSource, cause: FocusCause) -> u64 {
-        let lineage = self
-            .delivery
-            .sources
-            .get(&source)
-            .map_or(&[][..], |info| &info.lineage);
-        let audience = settle::Audience::of(self.delivery.kind(source), lineage);
-        let serial = self.delivery.issue(audience, true);
-        self.delivery.dispatching = Some(Dispatching {
-            source,
-            serial,
-            cause,
-        });
-        serial
-    }
-
-    /// Report where the input started by [`Self::begin_input`] went.
+    /// Report where the input started by [`Delivery::begin_input`] went.
     pub(crate) fn finish_input(
         &mut self,
         source: KeyboardSource,
@@ -562,46 +834,51 @@ impl State {
         target: &Target,
         text_field: Option<TextField>,
     ) {
-        self.delivery.dispatching = None;
-        let viewer = source == KeyboardSource::MAIN;
-        let owners = self.delivery.owners(source);
-        if owners.is_empty() && !viewer {
+        let Some(recipients) = self.delivery.finish_input(source) else {
             return;
-        }
-        let (delivery, window, popup, chrome) = match target {
-            Target::Client { window, popup } => {
-                ("window", Some(self.window_record(window)), *popup, None)
-            }
-            Target::X11Popup(surface) => ("window", Some(x11_record(surface)), true, None),
-            Target::Compositor { window, chrome } => (
-                "compositor",
-                window.as_ref().map(|window| self.window_record(window)),
-                false,
-                Some(*chrome),
-            ),
-            Target::Nowhere => ("nowhere", None, false, None),
-            Target::Dropped => ("dropped", None, false, None),
         };
-        let receipt = Receipt {
-            serial,
-            time_usec: monotonic_usec(),
-            source: self.delivery.kind(source).unwrap_or(SourceKind::Viewer),
-            source_pid: self.delivery.source(source).and_then(|info| info.pid),
-            input,
-            delivery,
-            window,
-            popup,
-            chrome,
-            text_field: if matches!(target, Target::Client { .. } | Target::X11Popup(_)) {
-                text_field
-            } else {
-                None
+        let destination = match target {
+            Target::Client { window, popup } => Destination {
+                delivery: "window",
+                window: Some(self.window_record(window)),
+                popup: *popup,
+                chrome: None,
+            },
+            Target::X11Popup(surface) => Destination {
+                delivery: "window",
+                window: Some(x11_record(surface)),
+                popup: true,
+                chrome: None,
+            },
+            Target::Compositor { window, chrome } => Destination {
+                delivery: "compositor",
+                window: window.as_ref().map(|window| self.window_record(window)),
+                popup: false,
+                chrome: Some(*chrome),
+            },
+            Target::Nowhere => Destination {
+                delivery: "nowhere",
+                window: None,
+                popup: false,
+                chrome: None,
+            },
+            Target::Dropped => Destination {
+                delivery: "dropped",
+                window: None,
+                popup: false,
+                chrome: None,
             },
         };
-        if viewer {
-            self.emit_viewer_receipt(&receipt);
-        } else {
-            self.delivery.send(owners, Signal::Receipt(receipt));
+        let receipt = self
+            .delivery
+            .receipt(source, serial, input, destination, text_field);
+        match recipients {
+            Recipients::Viewer => {
+                if let Some(sequence) = self.stream.latest_input_sequence() {
+                    self.emit(pipe::Event::InputReceipt(receipt.for_viewer(sequence)));
+                }
+            }
+            Recipients::Subscribers(owners) => self.delivery.send_receipt(owners, receipt),
         }
     }
 
@@ -700,16 +977,11 @@ impl State {
         let Some(client) = text_input.focus().and_then(|surface| surface.client()) else {
             return TextField::Unknown;
         };
-        let Some(purpose) = self.delivery.text_clients.get(&client.id()) else {
-            return TextField::Unknown;
-        };
-        let mut active = false;
-        text_input.with_active_text_input(|_, _| active = true);
-        if active {
-            TextField::Focused(*purpose)
-        } else {
-            TextField::None
-        }
+        self.delivery.text_field(&client.id(), || {
+            let mut active = false;
+            text_input.with_active_text_input(|_, _| active = true);
+            active
+        })
     }
 
     /// The client holding keyboard focus enabled or disabled text input.
@@ -718,14 +990,13 @@ impl State {
         if let (Some(purpose), Some(client)) =
             (purpose, surface.as_ref().and_then(Resource::client))
         {
-            let handle = self.display_handle.clone();
+            let handle = &self.display_handle;
             self.delivery
-                .text_clients
-                .retain(|id, _| handle.backend_handle().get_client_data(id.clone()).is_ok());
-            self.delivery.text_clients.insert(client.id(), purpose);
+                .text_input_enabled(client.id(), purpose, |id| {
+                    handle.backend_handle().get_client_data(id.clone()).is_ok()
+                });
         }
-        let everyone = self.delivery.everyone();
-        if everyone.is_empty() {
+        if !self.delivery.has_subscribers() {
             return;
         }
         let window = surface.and_then(|surface| match self.surface_target(&surface) {
@@ -733,13 +1004,8 @@ impl State {
             Target::X11Popup(x11) => Some(x11_record(&x11)),
             Target::Compositor { .. } | Target::Nowhere | Target::Dropped => None,
         });
-        let notice = Notice::TextFieldChanged {
-            serial: self.delivery.next_serial(),
-            time_usec: monotonic_usec(),
-            window,
-            text_field: self.text_field(),
-        };
-        self.delivery.send(everyone, Signal::Notice(notice));
+        let text_field = self.text_field();
+        self.delivery.text_field_changed(window, text_field);
     }
 
     /// Keyboard focus moved to `focus`. Called from the seat's focus hook.
@@ -755,48 +1021,15 @@ impl State {
             && window.toplevel().is_some()
             && !self.windows.get(window).is_some_and(|state| state.mapped)
         {
-            let cause = self.focus_cause();
-            self.delivery.deferred = Some(cause.0);
+            self.delivery.defer_focus();
             return;
         }
-        self.delivery.deferred = None;
         let (window, popup) = match target {
             Target::Client { window, popup } => (Some(self.window_record(&window)), popup),
             Target::X11Popup(surface) => (Some(x11_record(&surface)), true),
             Target::Compositor { .. } | Target::Nowhere | Target::Dropped => (None, false),
         };
-        let current = Some((window.clone(), popup));
-        if self.delivery.reported_focus == current {
-            return;
-        }
-        let previous = self
-            .delivery
-            .reported_focus
-            .replace((window.clone(), popup))
-            .and_then(|(window, _)| window);
-        let everyone = self.delivery.everyone();
-        if everyone.is_empty() {
-            return;
-        }
-        let (cause, input) = self.focus_cause();
-        let source = input.and_then(|input| self.delivery.kind(input.source));
-        let serial = self.delivery.next_serial();
-        for name in everyone {
-            // Only the input's owners learn which of their receipts it was.
-            let owned =
-                input.is_some_and(|input| self.delivery.owners(input.source).contains(&name));
-            let notice = Notice::FocusChanged {
-                serial,
-                time_usec: monotonic_usec(),
-                window: window.clone(),
-                previous: previous.clone(),
-                popup,
-                cause,
-                source,
-                receipt: owned.then(|| input.map(|input| input.serial)).flatten(),
-            };
-            self.delivery.send(vec![name], Signal::Notice(notice));
-        }
+        self.delivery.focus_changed(window, popup);
     }
 
     /// Describe a Wayland client's input device for receipts.
@@ -812,21 +1045,10 @@ impl State {
         self.delivery.describe(source, SourceInfo::new(kind, pid));
     }
 
-    /// Why focus is moving now, and the input that moves it.
-    fn focus_cause(&self) -> (FocusCause, Option<Dispatching>) {
-        // Input being dispatched explains the change best: a click on a
-        // taskbar chip that minimizes is the agent's click, not a minimize.
-        match (self.delivery.dispatching, self.delivery.cause) {
-            (Some(input), _) => (input.cause, Some(input)),
-            (None, Some(cause)) => (cause, None),
-            (None, None) => (FocusCause::Other, None),
-        }
-    }
-
     /// Give a newly mapped window keyboard focus and report the change,
     /// including a change made before it mapped.
     pub(crate) fn focus_mapped_window(&mut self, window: &Window, cause: FocusCause) {
-        let cause = self.delivery.deferred.take().unwrap_or(cause);
+        let cause = self.delivery.take_deferred().unwrap_or(cause);
         self.with_focus_cause(cause, |state| {
             state.focus_window(Some(window.clone()));
             let focus = state
@@ -839,36 +1061,25 @@ impl State {
 
     /// A window became visible for the first time.
     pub(crate) fn window_mapped(&mut self, window: &Window) {
-        let everyone = self.delivery.everyone();
-        if everyone.is_empty() {
+        if !self.delivery.has_subscribers() {
             return;
         }
         let parent =
             crate::wm::parent_window(&self.space, window).map(|parent| self.window_record(&parent));
-        let notice = Notice::WindowMapped {
-            serial: self.delivery.next_serial(),
-            time_usec: monotonic_usec(),
-            window: self.window_record(window),
-            parent,
-            modal: crate::wm::modal_dialog(window),
-        };
-        self.delivery.send(everyone, Signal::Notice(notice));
+        let record = self.window_record(window);
+        self.delivery
+            .window_mapped(record, parent, crate::wm::modal_dialog(window));
     }
 
     /// A mapped window's title or app id changed. Clients often set the
     /// final title after they map and take focus, so the records in earlier
     /// events are stale until this arrives.
     pub(crate) fn window_changed(&mut self, window: &Window) {
-        let everyone = self.delivery.everyone();
-        if everyone.is_empty() {
+        if !self.delivery.has_subscribers() {
             return;
         }
-        let notice = Notice::WindowChanged {
-            serial: self.delivery.next_serial(),
-            time_usec: monotonic_usec(),
-            window: self.window_record(window),
-        };
-        self.delivery.send(everyone, Signal::Notice(notice));
+        let record = self.window_record(window);
+        self.delivery.window_changed(record);
     }
 
     /// The current focus, for the bus's `GetFocus` method.
@@ -883,36 +1094,5 @@ impl State {
                 (None, false, TextField::Unknown)
             }
         }
-    }
-
-    fn emit_viewer_receipt(&mut self, receipt: &Receipt) {
-        let Some(sequence) = self.stream.latest_input_sequence() else {
-            return;
-        };
-        let window = receipt.window.clone().unwrap_or_default();
-        self.emit(waywire_protocol::pipe::Event::InputReceipt(
-            pipe::InputReceipt {
-                sequence,
-                delivery: match receipt.delivery {
-                    "window" => pipe::ReceiptDelivery::Window,
-                    "compositor" => pipe::ReceiptDelivery::Compositor,
-                    "dropped" => pipe::ReceiptDelivery::Dropped,
-                    _ => pipe::ReceiptDelivery::Nowhere,
-                },
-                window_id: pipe::ReceiptText::truncated(&window.id),
-                app_id: pipe::ReceiptText::truncated(&window.app_id),
-                title: pipe::ReceiptText::truncated(&window.title),
-            },
-        ));
-    }
-}
-
-fn x11_record(surface: &X11Surface) -> WindowRecord {
-    WindowRecord {
-        id: String::new(),
-        app_id: surface.class(),
-        title: surface.title(),
-        pid: surface.pid(),
-        x11: true,
     }
 }

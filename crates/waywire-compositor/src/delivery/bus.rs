@@ -66,15 +66,17 @@ pub(crate) enum Request {
 /// Serve `InputDelivery1` on `bus_address` for the compositor's lifetime and
 /// return the channel the loop sends signals through. The desktop runs
 /// without it if the bus refuses.
-pub(crate) fn start(
-    handle: &LoopHandle<'static, State>,
+/// Each request reaches `apply` on the loop.
+pub(crate) fn start<D: 'static>(
+    handle: &LoopHandle<'static, D>,
     bus_address: &str,
+    mut apply: impl FnMut(&mut D, Request) + 'static,
 ) -> Result<mpsc::Sender<Message>> {
     let (requests, incoming) = calloop::channel::channel::<Request>();
     handle
-        .insert_source(incoming, |event, (), state| {
+        .insert_source(incoming, move |event, (), data| {
             if let Event::Msg(request) = event {
-                state.apply_delivery_request(request);
+                apply(data, request);
             }
         })
         .map_err(|error| anyhow::anyhow!("register input delivery requests: {error}"))?;
@@ -127,7 +129,8 @@ pub(crate) fn start(
 }
 
 impl State {
-    fn apply_delivery_request(&mut self, request: Request) {
+    /// Answer one `InputDelivery1` call routed in by [`start`].
+    pub(crate) fn apply_delivery_request(&mut self, request: Request) {
         match request {
             Request::Subscribe { name, pid, reply } => {
                 tracing::debug!(%name, ?pid, "input delivery subscriber");
