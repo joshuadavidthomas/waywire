@@ -10,14 +10,25 @@ use std::collections::hash_map::Entry;
 
 use smithay::desktop::Space;
 use smithay::desktop::Window;
+use smithay::input::Seat;
+use smithay::input::keyboard::KeyboardSource;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::utils::Logical;
 use smithay::utils::Point;
 use smithay::utils::Rectangle;
+use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
 use smithay::utils::Size;
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
+use waywire_decorations::WindowAction;
+
+use crate::State;
+use crate::delivery;
+use crate::focus;
 
 #[derive(Default)]
 #[expect(
@@ -361,5 +372,275 @@ pub(crate) fn close_window(window: &Window) {
         && let Err(error) = x11.close()
     {
         tracing::warn!(%error, "close X11 window");
+    }
+}
+
+/// The compositor applies window management's decisions to the space, the
+/// seat, the XWM and the toplevel list.
+impl State {
+    pub(crate) fn window_pid(&self, window: &Window) -> Option<u32> {
+        if let Some(surface) = window.x11_surface() {
+            return surface.pid();
+        }
+        let surface = window.toplevel()?.wl_surface();
+        let credentials = surface
+            .client()?
+            .get_credentials(&self.display_handle)
+            .ok()?;
+        u32::try_from(credentials.pid).ok()
+    }
+
+    pub(crate) fn update_titlebar_drag(
+        &mut self,
+        source: KeyboardSource,
+        location: Point<f64, Logical>,
+    ) {
+        if let Some(press) = self.chrome.start_restore_drag(source, location)
+            && let Some(maximized) = self.window_output_geometry(&press.window)
+        {
+            let restored = self
+                .windows
+                .get(&press.window)
+                .and_then(|state| state.restore);
+            self.window_action(&press.window, WindowAction::Restore);
+            let restored_size = restored.map_or_else(
+                || {
+                    press
+                        .window
+                        .x11_surface()
+                        .map_or(press.window.geometry().size, |surface| {
+                            surface.last_configure().size
+                        })
+                },
+                |geometry| geometry.size,
+            );
+            let position =
+                restored_drag_location(press.location, location, maximized, restored_size);
+            self.space.map_element(press.window.clone(), position, true);
+            self.enforce_topmost();
+            if let Some(surface) = press.window.x11_surface()
+                && let Err(error) = surface.configure(Some(
+                    smithay::utils::Rectangle::new(position, restored_size)
+                        + surface.frame_extents(),
+                ))
+            {
+                tracing::warn!(%error, "position restored X11 window");
+            }
+            self.window_action(&press.window, WindowAction::Move);
+        }
+        let held = self
+            .input
+            .buttons(source)
+            .is_some_and(|buttons| buttons.contains(&0x110));
+        self.chrome.titlebar_motion(source, location, held);
+    }
+
+    pub(crate) fn window_action(&mut self, window: &Window, action: WindowAction) {
+        match action {
+            WindowAction::Focus => self.focus_window(Some(window.clone())),
+            WindowAction::Move => {
+                self.start_decoration_action(window.clone(), SERIAL_COUNTER.next_serial(), None);
+            }
+            WindowAction::Resize(edges) => {
+                if edges != xdg_toplevel::ResizeEdge::None {
+                    self.start_decoration_action(
+                        window.clone(),
+                        SERIAL_COUNTER.next_serial(),
+                        Some(edges),
+                    );
+                }
+            }
+            WindowAction::Maximize => {
+                self.set_window_expanded(window, xdg_toplevel::State::Maximized, true);
+            }
+            WindowAction::Minimize => {
+                if self.windows.minimize(window) {
+                    if let Some(surface) = window.x11_surface()
+                        && let Err(error) = surface.set_hidden(true)
+                    {
+                        tracing::warn!(%error, "set X11 hidden state");
+                    }
+                    if window.x11_surface().is_some() {
+                        self.x11_stacking = None;
+                    }
+                    let focused = self
+                        .seat
+                        .get_keyboard()
+                        .and_then(|keyboard| keyboard.current_focus());
+                    if focused == focus::KeyboardFocus::window(window) {
+                        let next = self.windows.topmost_focusable(&self.space, Some(window));
+                        self.with_focus_cause(delivery::FocusCause::Minimized, |state| {
+                            state.focus_window(next);
+                        });
+                    }
+                    self.refresh_toplevel_states();
+                    self.refresh_pointer_focus();
+                    self.dirty = true;
+                }
+            }
+            WindowAction::Restore => {
+                if self.windows.unminimize(window) {
+                    if let Some(surface) = window.x11_surface()
+                        && let Err(error) = surface.set_hidden(false)
+                    {
+                        tracing::warn!(%error, "clear X11 hidden state");
+                    }
+                    if window.x11_surface().is_some() {
+                        self.x11_stacking = None;
+                    }
+                    self.focus_window(Some(window.clone()));
+                } else {
+                    self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
+                }
+            }
+            WindowAction::Close => close_window(window),
+            WindowAction::ToggleAlwaysOnTop => {
+                self.windows.toggle_always_on_top(window);
+                self.enforce_topmost();
+                self.dirty = true;
+            }
+            WindowAction::ShowMenu => {
+                if let (Some(pointer), Some(output)) = (
+                    self.seat.get_pointer(),
+                    self.space.output_geometry(&self.output),
+                ) {
+                    self.chrome.open_menu(
+                        window.clone(),
+                        pointer.current_location(),
+                        output.size,
+                        self.windows.always_on_top(window),
+                    );
+                    self.refresh_pointer_focus();
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Activate a window from a foreign-toplevel request when the request's
+    /// seat belongs to this compositor.
+    pub(crate) fn activate_foreign_toplevel(&mut self, window: &Window, seat: &WlSeat) {
+        if Seat::<Self>::from_resource(seat).as_ref() != Some(&self.seat) {
+            return;
+        }
+        self.activate_window(window);
+    }
+
+    /// Restore a minimized window, or raise and focus it. Foreign-toplevel
+    /// and xdg-activation requests both use this path.
+    pub(crate) fn activate_window(&mut self, window: &Window) {
+        if self.windows.is_minimized(window) {
+            self.window_action(window, WindowAction::Restore);
+        } else {
+            self.window_action(window, WindowAction::Focus);
+        }
+    }
+
+    /// Apply a maximize or fullscreen request to the window's native surface.
+    /// Both paths already exist for client requests; this only selects the
+    /// Wayland or X11 one.
+    pub(crate) fn set_window_expanded(
+        &mut self,
+        window: &Window,
+        mode: xdg_toplevel::State,
+        enabled: bool,
+    ) {
+        if let Some(top) = window.toplevel() {
+            self.set_expanded(top, mode, enabled);
+        } else if let Some(surface) = window.x11_surface() {
+            self.x11_zoom(surface, mode == xdg_toplevel::State::Fullscreen, enabled);
+        }
+    }
+
+    /// Recompute every foreign-toplevel's state from the seat's current focus.
+    pub(crate) fn refresh_toplevel_states(&mut self) {
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        self.toplevel_list
+            .refresh_states(focused.as_ref(), self.windows.minimized_order());
+    }
+
+    /// Raise always-on-top windows and their dialogs above the rest.
+    pub(crate) fn enforce_topmost(&mut self) {
+        for window in self.windows.topmost(&self.space) {
+            self.space.raise_element(&window, false);
+        }
+    }
+
+    pub(crate) fn center_dialog(&mut self, window: &Window) {
+        let Some(location) =
+            dialog_location(&self.space, window, self.window_output_geometry(window))
+        else {
+            return;
+        };
+        self.space.map_element(window.clone(), location, false);
+        if let Some(surface) = window.x11_surface() {
+            let mut geometry = surface.last_configure();
+            geometry.loc = location - window.geometry().loc;
+            if let Err(error) = surface.configure(geometry) {
+                tracing::warn!(%error, "center X11 dialog");
+            }
+        }
+    }
+
+    pub(crate) fn focus_window(&mut self, window: Option<Window>) {
+        if window
+            .as_ref()
+            .is_some_and(|window| self.windows.is_minimized(window))
+        {
+            return;
+        }
+        let mut window = window;
+        if let Some(target) = &window {
+            for member in &self.windows.family(&self.space, target) {
+                self.space.raise_element(member, true);
+                if let (Some(xwm), Some(surface)) = (&mut self.xwm, member.x11_surface())
+                    && let Err(error) = xwm.raise_window(surface)
+                {
+                    tracing::warn!(%error, "raise X11 window");
+                }
+            }
+            self.enforce_topmost();
+            window = Some(self.windows.modal_focus(&self.space, target.clone()));
+        }
+        if self
+            .chrome
+            .armed_close()
+            .is_some_and(|(_, target)| Some(target) != window.as_ref())
+        {
+            self.chrome.disarm_close();
+        }
+        if let Some(window) = &window {
+            // X11 menus, dropdowns and tooltips draw above their app but expect
+            // keyboard focus to stay with it; taking focus closes them.
+            if is_override_redirect(window) {
+                self.refresh_pointer_focus();
+                self.dirty = true;
+                return;
+            }
+        }
+        if let Some(window) = &window {
+            self.windows.clear_urgent(window);
+        }
+        self.refresh_pointer_focus();
+        for current in self.space.elements() {
+            current.set_activated(window.as_ref() == Some(current));
+            if let Some(top) = current.toplevel()
+                && top.is_initial_configure_sent()
+            {
+                top.send_pending_configure();
+            }
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                window.as_ref().and_then(focus::KeyboardFocus::window),
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+        self.refresh_toplevel_states();
+        self.dirty = true;
     }
 }

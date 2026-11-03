@@ -26,7 +26,9 @@ use waywire_decorations::DecorationAction;
 use waywire_decorations::TaskbarChip;
 use waywire_decorations::WindowAction;
 
+use crate::State;
 use crate::delivery;
+use crate::focus;
 use crate::toplevel_list;
 use crate::wm::Windows;
 
@@ -713,4 +715,51 @@ pub(crate) fn application_command(
         });
     }
     Ok(command)
+}
+
+/// The compositor applies chrome's decisions: it gathers seat focus and
+/// client processes for the taskbar, issues activation tokens, watches
+/// launched pins, and marks redraws.
+impl State {
+    pub(crate) fn taskbar_chips(&self) -> Vec<TaskbarChip> {
+        let focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus());
+        self.chrome.taskbar_chips(
+            &self.windows,
+            |window| focus.is_some() && focus == focus::KeyboardFocus::window(window),
+            |window| self.window_pid(window),
+        )
+    }
+
+    pub(crate) fn launch_pin(&mut self, index: usize) {
+        let Some(mut command) = self.chrome.pin_command(index, self.xdisplay) else {
+            return;
+        };
+        // The pin click is the user's request: a single-instance app that
+        // forwards this launch to its running instance may raise it.
+        command.env("XDG_ACTIVATION_TOKEN", self.launch_token());
+        if let Some(pid) = self.chrome.start_pin(index, command) {
+            if let Some(handle) = &self.loop_handle
+                && let Err(error) = crate::wake_on_exit(handle, pid)
+            {
+                tracing::warn!(%error, "watch pinned application");
+            }
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn reap_pins(&mut self) {
+        if self.chrome.reap_pins() {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn update_clock(&mut self, time: SystemTime) -> Result<()> {
+        if self.chrome.update_clock(time)? {
+            self.dirty = true;
+        }
+        Ok(())
+    }
 }
