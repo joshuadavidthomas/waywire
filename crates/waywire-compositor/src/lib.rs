@@ -12,6 +12,7 @@ mod event_writer;
 mod focus;
 mod foreign_toplevel;
 mod grabs;
+mod input;
 mod pointer_warp;
 mod portal;
 mod screencopy;
@@ -24,7 +25,6 @@ mod xwayland;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -329,15 +329,7 @@ pub(crate) struct State {
     acknowledged: Option<Generation>,
     sequence: u64,
     latest_input_sequence: Option<InputSequence>,
-    buttons: HashMap<KeyboardSource, HashSet<u32>>,
-    /// Every connected agent source: EIS devices, virtual pointers and
-    /// virtual keyboards. `KeyboardSource::MAIN` is the browser and never
-    /// belongs here.
-    agent_sources: HashSet<KeyboardSource>,
-    /// Sources already logged as dropped during the current browser lease.
-    dropped_agent_sources: HashSet<KeyboardSource>,
-    agent_input: pipe::AgentInput,
-    browser_holds_input: bool,
+    input: input::Input,
     pub(crate) dirty: bool,
     pub(crate) frame_pending: FrameRequest,
     /// The content hash of the last submitted frame when that frame was a forced full
@@ -515,11 +507,7 @@ impl State {
             acknowledged: None,
             sequence: 0,
             latest_input_sequence: None,
-            buttons: HashMap::new(),
-            agent_sources: HashSet::new(),
-            dropped_agent_sources: HashSet::new(),
-            agent_input: pipe::AgentInput::default(),
-            browser_holds_input: false,
+            input: input::Input::default(),
             dirty: true,
             frame_pending: FrameRequest::Pending,
             forced_frame_hash: None,
@@ -793,28 +781,13 @@ impl State {
     /// while a browser holds the lease their events are dropped, with one
     /// debug line per source per lease rather than one per event.
     fn accepts_input(&mut self, source: KeyboardSource) -> bool {
-        if source == KeyboardSource::MAIN {
-            return true;
-        }
         self.register_agent_source(source);
-        if !self.browser_holds_input {
-            return true;
-        }
-        if self.dropped_agent_sources.insert(source) {
-            tracing::debug!(
-                ?source,
-                "dropped agent input while a browser holds input control"
-            );
-        }
-        false
+        self.input.accepts(source)
     }
 
     pub(crate) fn register_agent_source(&mut self, source: KeyboardSource) {
-        if source == KeyboardSource::MAIN {
-            return;
-        }
-        if self.agent_sources.insert(source) {
-            self.publish_agent_input();
+        if let Some(state) = self.input.register(source) {
+            self.emit(Event::AgentInput(state));
         }
     }
 
@@ -823,26 +796,13 @@ impl State {
     pub(crate) fn disconnect_input_source(&mut self, source: KeyboardSource) {
         self.release_input(source);
         self.delivery.forget(source);
-        self.dropped_agent_sources.remove(&source);
-        if self.agent_sources.remove(&source) {
-            self.publish_agent_input();
-        }
-    }
-
-    fn publish_agent_input(&mut self) {
-        let connected = !self.agent_sources.is_empty();
-        let state = pipe::AgentInput {
-            connected,
-            dropped: self.browser_holds_input && (connected || self.agent_input.dropped),
-        };
-        if state != self.agent_input {
-            self.agent_input = state;
+        if let Some(state) = self.input.disconnect(source) {
             self.emit(Event::AgentInput(state));
         }
     }
 
     fn control_text(&self) -> &'static str {
-        if self.browser_holds_input {
+        if self.input.browser_holds_input() {
             "You're driving"
         } else {
             "Agent driving"
@@ -868,26 +828,22 @@ impl State {
     /// key's release late, and a client repeating on its own timer would type
     /// that key until the release arrived.
     pub(crate) fn set_browser_lease(&mut self, held: bool) {
-        if self.browser_holds_input == held {
+        let Some(release) = self.input.set_browser_lease(held) else {
             return;
-        }
-        self.browser_holds_input = held;
+        };
         self.dirty = true;
         self.void_activation_tokens();
-        if held {
-            let sources: Vec<_> = self.agent_sources.iter().copied().collect();
-            for source in sources {
-                self.release_input(source);
-            }
+        for source in release {
+            self.release_input(source);
         }
-        self.release_input(KeyboardSource::MAIN);
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard
                 .change_repeat_info(if held { 0 } else { KEY_REPEAT_RATE }, KEY_REPEAT_DELAY_MS);
         }
-        self.dropped_agent_sources.clear();
         self.toplevel_list.lease_changed();
-        self.publish_agent_input();
+        if let Some(state) = self.input.publish() {
+            self.emit(Event::AgentInput(state));
+        }
     }
 
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
@@ -914,7 +870,8 @@ impl State {
             // SAFETY: the reference does not outlive the lock.
             unsafe { xkb.keymap() }.key_repeats(code)
         });
-        if !self.browser_holds_input || !repeats || !keyboard.pressed_keys().contains(&code) {
+        if !self.input.browser_holds_input() || !repeats || !keyboard.pressed_keys().contains(&code)
+        {
             return;
         }
         let serial = self.begin_input(source, delivery::FocusCause::Key);
@@ -1257,8 +1214,8 @@ impl State {
         if self.last_titlebar_press.as_ref().is_some_and(|press| {
             press.source == source
                 && self
-                    .buttons
-                    .get(&source)
+                    .input
+                    .buttons(source)
                     .is_some_and(|buttons| buttons.contains(&0x110))
                 && (location - press.location)
                     .x
@@ -1337,18 +1294,7 @@ impl State {
         {
             self.pending_restore_drag = None;
         }
-        let before = self.buttons.values().any(|keys| keys.contains(&button));
-        let keys = self.buttons.entry(source).or_default();
-        match state {
-            ButtonState::Pressed => {
-                keys.insert(button);
-            }
-            ButtonState::Released => {
-                keys.remove(&button);
-            }
-        }
-        let after = self.buttons.values().any(|keys| keys.contains(&button));
-        if before == after {
+        if !self.input.track_button(source, button, state) {
             // Another input source can keep the aggregate button held. It must
             // not inherit an armed Close after its original owner releases it.
             if button == 0x110
@@ -1800,7 +1746,7 @@ impl State {
                 self.flush_text_keyboard();
             }
         }
-        let buttons = self.buttons.get(&source).cloned().unwrap_or_default();
+        let buttons = self.input.buttons(source).cloned().unwrap_or_default();
         if !buttons.is_empty() {
             // Losing a source is not a drop: its drag ends without one.
             self.cancel_drag();
@@ -1808,7 +1754,7 @@ impl State {
         for button in buttons {
             self.pointer_button_inner(source, button, ButtonState::Released);
         }
-        self.buttons.remove(&source);
+        self.input.forget_buttons(source);
     }
 
     /// The topmost mapped window that can take keyboard focus, skipping `except`.
@@ -2953,6 +2899,8 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     pub(super) fn test_state() -> (Display<State>, State) {
@@ -3123,13 +3071,13 @@ mod tests {
         assert!(pressed(&state, 30), "the agent's key must reach the seat");
         assert!(
             state
-                .buttons
-                .get(&agent)
+                .input
+                .buttons(agent)
                 .is_some_and(|buttons| buttons.contains(&0x110)),
             "the agent's button must reach the seat"
         );
         assert_eq!(
-            state.agent_input,
+            state.input.agent_input(),
             pipe::AgentInput {
                 connected: true,
                 dropped: false,
@@ -3145,12 +3093,12 @@ mod tests {
         state.pointer_button(source, 0x110, ButtonState::Pressed);
         assert!(
             state
-                .buttons
-                .get(&source)
+                .input
+                .buttons(source)
                 .is_some_and(|buttons| buttons.contains(&0x110))
         );
         state.disconnect_input_source(source);
-        assert!(state.buttons.get(&source).is_none_or(HashSet::is_empty));
+        assert!(state.input.buttons(source).is_none_or(HashSet::is_empty));
     }
 
     #[test]
@@ -3206,7 +3154,7 @@ mod tests {
             "a key held across the takeover must be released"
         );
         assert!(
-            state.buttons.get(&agent).is_none_or(HashSet::is_empty),
+            state.input.buttons(agent).is_none_or(HashSet::is_empty),
             "a button held across the takeover must be released"
         );
 
@@ -3216,13 +3164,13 @@ mod tests {
         state.pointer_button(agent, 0x111, ButtonState::Pressed);
         state.pointer_motion(agent, (12.0, 34.0).into());
         assert!(!pressed(&state, 31));
-        assert!(state.buttons.get(&agent).is_none_or(HashSet::is_empty));
+        assert!(state.input.buttons(agent).is_none_or(HashSet::is_empty));
         assert!(
             state.event_sink.take_events().is_empty(),
             "dropped agent motion must not move the cursor or emit an event"
         );
         assert_eq!(
-            state.agent_input,
+            state.input.agent_input(),
             pipe::AgentInput {
                 connected: true,
                 dropped: true,
@@ -3243,7 +3191,7 @@ mod tests {
         state.pointer_button(agent, 0x111, ButtonState::Pressed);
         state.keyboard_key(KeyboardSource::MAIN, 32, KeyState::Pressed);
         assert!(!pressed(&state, 31));
-        assert!(state.buttons.get(&agent).is_none_or(HashSet::is_empty));
+        assert!(state.input.buttons(agent).is_none_or(HashSet::is_empty));
         assert!(pressed(&state, 32));
 
         lease(&mut state, false);
@@ -3258,13 +3206,13 @@ mod tests {
         assert!(pressed(&state, 31), "agent keys resume after handback");
         assert!(
             state
-                .buttons
-                .get(&agent)
+                .input
+                .buttons(agent)
                 .is_some_and(|buttons| buttons.contains(&0x111)),
             "agent buttons resume after handback"
         );
         assert_eq!(
-            state.agent_input,
+            state.input.agent_input(),
             pipe::AgentInput {
                 connected: true,
                 dropped: false,

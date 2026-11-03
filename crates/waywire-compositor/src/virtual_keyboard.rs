@@ -218,7 +218,7 @@ impl State {
             return;
         };
         let removed = self.virtual_keyboards.devices.remove(index);
-        if removed.modifiers != [0; 3] && !self.browser_holds_input {
+        if removed.modifiers != [0; 3] && !self.input.browser_holds_input() {
             self.set_seat_modifiers([0; 3]);
         }
     }
@@ -241,7 +241,7 @@ impl State {
     /// Give the seat the modifiers the client holds, under the seat's names,
     /// when they changed since this device last set them.
     fn follow_client_modifiers(&mut self, device: &VirtualKeyboardDevice) {
-        if self.browser_holds_input {
+        if self.input.browser_holds_input() {
             return;
         }
         let Some(entry) = self.virtual_keyboard(device) else {
@@ -382,7 +382,7 @@ impl State {
         }
         let [depressed, latched, locked] = translated;
         let wanted = [depressed | level, latched, locked];
-        let change = !self.browser_holds_input && (wanted != seat_mods || group != layout);
+        let change = !self.input.browser_holds_input() && (wanted != seat_mods || group != layout);
         if change && let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.with_xkb_state(self, |mut context| {
                 context.set_modifier_mask(wanted[0], wanted[1], wanted[2], group);

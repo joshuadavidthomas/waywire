@@ -215,7 +215,7 @@ fn apply_keysym(
         crate::virtual_keyboard::seat_key(&keymap, xkb::Keysym::new(keysym), original_layout.0);
     let (key, group, mask) =
         found.ok_or_else(|| format!("keysym {keysym:#x} is not available in the keymap"))?;
-    if state.browser_holds_input {
+    if state.input.browser_holds_input() {
         state.keyboard_key(source, key, key_state);
         return Ok(());
     }
@@ -311,8 +311,8 @@ mod tests {
         .expect("button");
         assert!(
             state
-                .buttons
-                .get(&source)
+                .input
+                .buttons(source)
                 .is_some_and(|buttons| buttons.contains(&0x110))
         );
         state.set_browser_lease(true);
@@ -336,8 +336,8 @@ mod tests {
         .expect("motion");
         assert!(
             state
-                .buttons
-                .get(&source)
+                .input
+                .buttons(source)
                 .is_none_or(std::collections::HashSet::is_empty)
         );
         assert_eq!(pointer.current_location(), (1919.0, 0.0).into());

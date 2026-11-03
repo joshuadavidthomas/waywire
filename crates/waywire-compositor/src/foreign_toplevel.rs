@@ -110,7 +110,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
         if !matches!(request, Request::Destroy | Request::SetRectangle { .. })
             && !state
                 .toplevel_list
-                .accepts_request(state.browser_holds_input)
+                .accepts_request(state.input.browser_holds_input())
         {
             return;
         }
