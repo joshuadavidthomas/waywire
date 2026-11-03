@@ -13,7 +13,19 @@ use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::KeyboardSource;
 use waywire_protocol::pipe;
 
-#[derive(Default)]
+/// Why the pointer is moving.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointerMotionKind {
+    /// Input from the browser or an agent.
+    Input,
+    /// A focus refresh replaying the position under a window grab, which the
+    /// grab ignores.
+    RefreshGrabFocus,
+    /// A client's pointer warp hint. Like a focus refresh, it skips pointer
+    /// constraints and titlebar drags.
+    WarpHint,
+}
+
 pub(crate) struct Input {
     buttons: HashMap<KeyboardSource, HashSet<u32>>,
     /// Every connected agent source: EIS devices, virtual pointers and
@@ -25,6 +37,27 @@ pub(crate) struct Input {
     /// The agent input state last published.
     published: pipe::AgentInput,
     browser_lease: bool,
+    pointer_motion_kind: PointerMotionKind,
+    /// The source the cursor position was last reported for.
+    cursor_source: pipe::CursorSource,
+    /// Set during a focus refresh, which moves the pointer on behalf of
+    /// whoever moved it last.
+    focus_refresh_source: Option<pipe::CursorSource>,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self {
+            buttons: HashMap::new(),
+            agent_sources: HashSet::new(),
+            dropped_agent_sources: HashSet::new(),
+            published: pipe::AgentInput::default(),
+            browser_lease: false,
+            pointer_motion_kind: PointerMotionKind::Input,
+            cursor_source: pipe::CursorSource::Browser,
+            focus_refresh_source: None,
+        }
+    }
 }
 
 impl Input {
@@ -141,5 +174,36 @@ impl Input {
     /// Forget a source's buttons once each one has been released.
     pub(crate) fn forget_buttons(&mut self, source: KeyboardSource) {
         self.buttons.remove(&source);
+    }
+
+    pub(crate) fn pointer_motion_kind(&self) -> PointerMotionKind {
+        self.pointer_motion_kind
+    }
+
+    pub(crate) fn set_pointer_motion_kind(&mut self, kind: PointerMotionKind) {
+        self.pointer_motion_kind = kind;
+    }
+
+    /// Attribute pointer motion until [`Self::end_focus_refresh`] to the
+    /// source that last moved the cursor.
+    pub(crate) fn begin_focus_refresh(&mut self) {
+        self.focus_refresh_source = Some(self.cursor_source);
+    }
+
+    pub(crate) fn end_focus_refresh(&mut self) {
+        self.focus_refresh_source = None;
+    }
+
+    /// Record that `source` moved the pointer, and return the cursor source
+    /// to report for that motion.
+    pub(crate) fn move_cursor(&mut self, source: KeyboardSource) -> pipe::CursorSource {
+        self.cursor_source =
+            self.focus_refresh_source
+                .unwrap_or(if source == KeyboardSource::MAIN {
+                    pipe::CursorSource::Browser
+                } else {
+                    pipe::CursorSource::Agent
+                });
+        self.cursor_source
     }
 }

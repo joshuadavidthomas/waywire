@@ -143,6 +143,7 @@ use waywire_protocol::pipe::{
 
 use crate::event_writer::EventSink;
 use crate::event_writer::EventWriter;
+use crate::input::PointerMotionKind;
 
 /// Startup settings for the compositor and its initial video stream.
 #[derive(Debug)]
@@ -220,13 +221,6 @@ impl Video {
 pub(crate) enum FrameRequest {
     Idle,
     Pending,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PointerMotionKind {
-    Input,
-    RefreshGrabFocus,
-    WarpHint,
 }
 
 struct TitlebarPress {
@@ -315,9 +309,6 @@ pub(crate) struct State {
     menu_escape: Option<KeyboardSource>,
     last_titlebar_press: Option<TitlebarPress>,
     pending_restore_drag: Option<TitlebarPress>,
-    pointer_motion_kind: PointerMotionKind,
-    cursor_source: pipe::CursorSource,
-    focus_refresh_source: Option<pipe::CursorSource>,
     start: Instant,
     running: bool,
     failure: Option<anyhow::Error>,
@@ -487,9 +478,6 @@ impl State {
             menu_escape: None,
             last_titlebar_press: None,
             pending_restore_drag: None,
-            pointer_motion_kind: PointerMotionKind::Input,
-            cursor_source: pipe::CursorSource::Browser,
-            focus_refresh_source: None,
             start: Instant::now(),
             running: true,
             failure: None,
@@ -1050,12 +1038,13 @@ impl State {
                 return;
             }
             if window_grab {
-                self.pointer_motion_kind = PointerMotionKind::RefreshGrabFocus;
+                self.input
+                    .set_pointer_motion_kind(PointerMotionKind::RefreshGrabFocus);
             }
-            self.focus_refresh_source = Some(self.cursor_source);
+            self.input.begin_focus_refresh();
             self.pointer_motion(KeyboardSource::MAIN, pointer.current_location());
-            self.focus_refresh_source = None;
-            self.pointer_motion_kind = PointerMotionKind::Input;
+            self.input.end_focus_refresh();
+            self.input.set_pointer_motion_kind(PointerMotionKind::Input);
         }
     }
 
@@ -1102,7 +1091,7 @@ impl State {
         ));
         if let Some(pointer) = self.seat.get_pointer() {
             let mut locked = false;
-            if self.pointer_motion_kind == PointerMotionKind::Input {
+            if self.input.pointer_motion_kind() == PointerMotionKind::Input {
                 (location, locked) = self.constrain_pointer_motion(&pointer, location);
             }
             if let Some(menu) = self.window_menu.as_mut() {
@@ -1133,7 +1122,7 @@ impl State {
             self.activate_focused_constraint(&pointer);
             pointer.frame(self);
         }
-        if self.pointer_motion_kind == PointerMotionKind::Input {
+        if self.input.pointer_motion_kind() == PointerMotionKind::Input {
             self.update_titlebar_drag(source, location);
         }
         if self.decoration_press.as_ref().is_some_and(|(_, window)| {
@@ -1149,17 +1138,11 @@ impl State {
         } else if self.surface_under(location).is_none() {
             self.emit(Event::CursorShape(pipe::CursorShape::Default));
         }
-        self.cursor_source =
-            self.focus_refresh_source
-                .unwrap_or(if source == KeyboardSource::MAIN {
-                    pipe::CursorSource::Browser
-                } else {
-                    pipe::CursorSource::Agent
-                });
+        let cursor_source = self.input.move_cursor(source);
         self.emit(Event::CursorPosition(pipe::CursorPosition {
             x: normalized_coordinate(location.x * scale, self.size.width()),
             y: normalized_coordinate(location.y * scale, self.size.height()),
-            source: self.cursor_source,
+            source: cursor_source,
         }));
     }
 

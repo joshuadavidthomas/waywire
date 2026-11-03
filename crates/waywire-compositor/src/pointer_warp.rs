@@ -30,8 +30,8 @@ use smithay::wayland::pointer_constraints::with_pointer_constraint;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::seat::WaylandFocus;
 
-use super::PointerMotionKind;
 use super::State;
+use crate::input::PointerMotionKind;
 
 /// Advertise the pointer-constraints and relative-pointer globals Xwayland's
 /// warp emulator requires.
@@ -228,8 +228,9 @@ impl PointerConstraintsHandler for State {
         // The surface sits inside the outer window geometry, whose origin the
         // space element location tracks (see `decorations::DecorationLayout`).
         let origin = (element - window.geometry().loc).to_f64();
-        self.pointer_motion_kind = PointerMotionKind::WarpHint;
+        self.input
+            .set_pointer_motion_kind(PointerMotionKind::WarpHint);
         self.pointer_motion(KeyboardSource::MAIN, origin + location);
-        self.pointer_motion_kind = PointerMotionKind::Input;
+        self.input.set_pointer_motion_kind(PointerMotionKind::Input);
     }
 }

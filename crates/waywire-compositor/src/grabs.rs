@@ -315,7 +315,7 @@ impl PointerGrab<State> for WindowGrab {
         _: Option<(super::focus::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
-        if state.pointer_motion_kind == super::PointerMotionKind::RefreshGrabFocus {
+        if state.input.pointer_motion_kind() == crate::input::PointerMotionKind::RefreshGrabFocus {
             return;
         }
         handle.motion(state, None, event);
