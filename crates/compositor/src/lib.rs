@@ -1,7 +1,6 @@
 //! Headless Wayland compositor streaming H.264 RTP.
 
 mod activation;
-mod audio;
 mod capture;
 mod clipboard;
 mod cursor;
@@ -13,7 +12,6 @@ mod event_writer;
 mod focus;
 mod foreign_toplevel;
 mod grabs;
-mod pipewire;
 mod pointer_warp;
 mod portal;
 mod screencopy;
@@ -323,7 +321,7 @@ pub(crate) struct State {
     screencopy: screencopy::Screencopy,
     /// `ScreenCast` portal video, present while the private `PipeWire`
     /// daemon is reachable.
-    screencast: Option<pipewire::Streams>,
+    screencast: Option<waywire_pipewire::Streams>,
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     pub(crate) delivery: delivery::Delivery,
     clipboard: clipboard::Clipboard,
@@ -2390,7 +2388,7 @@ impl State {
                     left: self.video.as_ref().map_or(0, Video::refresh_frames),
                 };
                 if let Some(screencast) = &self.screencast {
-                    screencast.frame(image);
+                    screencast.frame(&cast_frame(image));
                 }
             }
         }
@@ -2542,10 +2540,10 @@ pub fn run(mut options: Config) -> Result<()> {
     // matters when portals run.
     let mut pipewire_daemon = bus
         .as_ref()
-        .and_then(|_| pipewire::Daemon::start(runtime.path()));
-    let audio = pipewire_daemon
-        .as_ref()
-        .and_then(|daemon| audio::Audio::start(daemon.socket(), options.rtp_port));
+        .and_then(|_| waywire_pipewire::Daemon::start(runtime.path()));
+    let audio = pipewire_daemon.as_ref().and_then(|daemon| {
+        waywire_pipewire::audio::Audio::start(daemon.socket(), options.rtp_port)
+    });
     let socket_path = runtime.path().join("wayland-0");
     let socket = ListeningSocket::bind_absolute(socket_path.clone())?;
     let mut event_loop = EventLoop::<State>::try_new()?;
@@ -2658,7 +2656,10 @@ pub fn run(mut options: Config) -> Result<()> {
     if let Some(pid) = bus.as_ref().and_then(session_bus::SessionBus::pid) {
         wake_on_exit(&handle, pid)?;
     }
-    if let Some(pid) = pipewire_daemon.as_ref().and_then(pipewire::Daemon::pid) {
+    if let Some(pid) = pipewire_daemon
+        .as_ref()
+        .and_then(waywire_pipewire::Daemon::pid)
+    {
         wake_on_exit(&handle, pid)?;
     }
     let mut renderer = PixmanRenderer::new()?;
@@ -2816,10 +2817,10 @@ pub fn run(mut options: Config) -> Result<()> {
 /// only, when the connection fails.
 fn start_screencast(
     handle: &calloop::LoopHandle<'static, State>,
-    daemon: &pipewire::Daemon,
+    daemon: &waywire_pipewire::Daemon,
     image: Rc<RefCell<Image<'static, 'static>>>,
-) -> Option<pipewire::Streams> {
-    let streams = match pipewire::Streams::connect(daemon.socket()) {
+) -> Option<waywire_pipewire::Streams> {
+    let streams = match waywire_pipewire::Streams::connect(daemon.socket()) {
         Ok(streams) => streams,
         Err(error) => {
             tracing::warn!(%error, "PipeWire connection failed; ScreenCast video disabled");
@@ -2838,7 +2839,7 @@ fn start_screencast(
         move |_, _, state| {
             if let Some(streams) = &state.screencast {
                 streams.dispatch();
-                streams.offer_pending(&image.borrow());
+                streams.offer_pending(&cast_frame(&image.borrow()));
             }
             Ok(PostAction::Continue)
         },
@@ -2847,6 +2848,15 @@ fn start_screencast(
         return None;
     }
     Some(streams)
+}
+
+fn cast_frame<'a>(image: &'a Image<'static, 'static>) -> waywire_pipewire::Frame<'a> {
+    waywire_pipewire::Frame {
+        pixels: image_pixels(image),
+        width: image.width(),
+        height: image.height(),
+        stride: image.stride(),
+    }
 }
 
 fn frame_deadline(previous: Instant, finished: Instant, interval: Duration) -> Instant {

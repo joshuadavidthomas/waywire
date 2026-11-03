@@ -34,6 +34,7 @@ wildcard_enum_match_arm = "warn"
 
 [workspace.dependencies]
 waywire-encoder = { path = "crates/encoder" }
+waywire-pipewire = { path = "crates/pipewire" }
 waywire-protocol = { path = "crates/protocol" }
 
 anyhow = "1.0.104"

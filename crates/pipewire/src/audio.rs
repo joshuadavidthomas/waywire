@@ -46,7 +46,7 @@ const BITRATE: i32 = 64_000;
 const MAX_PACKET: usize = 1500;
 
 /// The audio thread; dropping it stops the sink.
-pub(crate) struct Audio {
+pub struct Audio {
     quit: pw::channel::Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -54,7 +54,7 @@ pub(crate) struct Audio {
 impl Audio {
     /// Serve the desktop sink on the daemon at `socket` and send its Opus
     /// packets to the loopback `rtp_port`.
-    pub(crate) fn start(socket: &Path, rtp_port: u16) -> Option<Self> {
+    pub fn start(socket: &Path, rtp_port: u16) -> Option<Self> {
         let socket = socket.to_path_buf();
         let (quit, receiver) = pw::channel::channel();
         let thread = std::thread::Builder::new()
@@ -448,7 +448,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::pipewire::Daemon;
+    use crate::Daemon;
 
     const TONE_HZ: f32 = 1000.0;
 

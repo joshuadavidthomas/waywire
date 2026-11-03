@@ -22,10 +22,12 @@
 //! video consumer whose `target.object` (or older `node.target`) names one of
 //! its nodes, the way a session manager would for a portal client.
 //!
-//! The same daemon serves desktop audio (see `crate::audio`): it also speaks
+//! The same daemon serves desktop audio (see `audio`): it also speaks
 //! the `PulseAudio` protocol at `pulse/native` in the runtime directory, where
 //! applications given that directory as `XDG_RUNTIME_DIR` look for it, and a
 //! dummy driver clocks the audio graph in 20 ms cycles while a stream plays.
+
+pub mod audio;
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -49,7 +51,6 @@ use nix::sys::signal::pthread_sigmask;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
-use smithay::reexports::pixman::Image;
 use spa::pod::ChoiceValue;
 use spa::pod::Pod;
 use spa::pod::Property;
@@ -107,7 +108,7 @@ stream.properties = {
 ";
 
 /// A `pipewire` daemon child serving a socket in the runtime directory.
-pub(crate) struct Daemon {
+pub struct Daemon {
     child: Option<Child>,
     socket: PathBuf,
 }
@@ -115,7 +116,8 @@ pub(crate) struct Daemon {
 impl Daemon {
     /// Start `pipewire` with its socket under `runtime_path`. `ScreenCast`
     /// video is optional, so a daemon that cannot start only disables it.
-    pub(crate) fn start(runtime_path: &Path) -> Option<Self> {
+    #[must_use]
+    pub fn start(runtime_path: &Path) -> Option<Self> {
         Self::start_program("pipewire", runtime_path)
     }
 
@@ -179,17 +181,18 @@ impl Daemon {
     }
 
     /// Absolute socket path, usable as `PIPEWIRE_REMOTE`.
-    pub(crate) fn socket(&self) -> &Path {
+    #[must_use]
+    pub fn socket(&self) -> &Path {
         &self.socket
     }
 
     /// The daemon's PID while it is running.
-    pub(crate) fn pid(&self) -> Option<u32> {
+    pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
     }
 
     /// Log a daemon that exited on its own; the desktop keeps running.
-    pub(crate) fn poll(&mut self) {
+    pub fn poll(&mut self) {
         let Some(child) = self.child.as_mut() else {
             return;
         };
@@ -267,11 +270,11 @@ impl Cast {
     /// Copy `image` into a free buffer and push it, if the consumer accepted
     /// the image's size and holds a buffer free. Otherwise the frame stays
     /// pending.
-    fn offer(&self, image: &Image<'static, 'static>) {
+    fn offer(&self, image: &Frame<'_>) {
         if !self.state.pending.get() || self.stream.state() != pw::stream::StreamState::Streaming {
             return;
         }
-        let (Ok(width), Ok(height)) = (u32::try_from(image.width()), u32::try_from(image.height()))
+        let (Ok(width), Ok(height)) = (u32::try_from(image.width), u32::try_from(image.height))
         else {
             return;
         };
@@ -281,7 +284,7 @@ impl Cast {
         let Some(mut buffer) = self.stream.dequeue_buffer() else {
             return;
         };
-        let pixels = crate::capture::image_pixels(image);
+        let pixels = image.pixels;
         let Some(data) = buffer.datas_mut().first_mut() else {
             return;
         };
@@ -293,7 +296,7 @@ impl Cast {
             return;
         };
         target.copy_from_slice(pixels);
-        let (Ok(size), Ok(stride)) = (u32::try_from(pixels.len()), i32::try_from(image.stride()))
+        let (Ok(size), Ok(stride)) = (u32::try_from(pixels.len()), i32::try_from(image.stride))
         else {
             return;
         };
@@ -326,9 +329,17 @@ fn node_id(stream: &pw::stream::Stream) -> Option<u32> {
     Some(stream.node_id()).filter(|id| *id != spa::sys::SPA_ID_INVALID)
 }
 
+/// A rendered image in `BGRx` or `BGRA`: `height` rows of `stride` bytes.
+pub struct Frame<'a> {
+    pub pixels: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+}
+
 /// The compositor's `PipeWire` connection and its screen-cast streams, one
 /// per started portal session.
-pub(crate) struct Streams {
+pub struct Streams {
     casts: HashMap<String, Cast>,
     graph: Rc<RefCell<Graph>>,
     _registry_listener: pw::registry::Listener,
@@ -341,7 +352,7 @@ pub(crate) struct Streams {
 
 impl Streams {
     /// Connect to the daemon at `socket`.
-    pub(crate) fn connect(socket: &Path) -> Result<Self> {
+    pub fn connect(socket: &Path) -> Result<Self> {
         pw::init();
         let main_loop = pw::main_loop::MainLoopRc::new(None)?;
         let context = pw::context::ContextRc::new(&main_loop, None)?;
@@ -387,19 +398,19 @@ impl Streams {
 
     /// Descriptor that becomes readable when `PipeWire` has work for
     /// [`Self::dispatch`].
-    pub(crate) fn fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+    pub fn fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
         self.main_loop.loop_().fd().try_clone_to_owned()
     }
 
     /// Handle pending `PipeWire` events without blocking.
-    pub(crate) fn dispatch(&self) {
+    pub fn dispatch(&self) {
         self.main_loop.loop_().iterate(pw::loop_::Timeout::None);
     }
 
     /// Create the stream for portal `session`; `reply` receives its node ID
     /// once the daemon assigned one, or `None` on failure. A repeated start
     /// replaces the session's stream.
-    pub(crate) fn start(
+    pub fn start(
         &mut self,
         session: String,
         size: (u32, u32),
@@ -507,13 +518,13 @@ impl Streams {
     }
 
     /// Destroy the stream for portal `session`, ending its consumers.
-    pub(crate) fn close(&mut self, session: &str) {
+    pub fn close(&mut self, session: &str) {
         self.casts.remove(session);
     }
 
     /// Advertise the new output size; frames pause until the consumer
     /// renegotiates.
-    pub(crate) fn resize(&self, size: (u32, u32), fps: u32) {
+    pub fn resize(&self, size: (u32, u32), fps: u32) {
         let format = match format_param(size, fps) {
             Ok(format) => format,
             Err(error) => {
@@ -533,7 +544,7 @@ impl Streams {
     }
 
     /// Offer a newly rendered frame to every stream.
-    pub(crate) fn frame(&self, image: &Image<'static, 'static>) {
+    pub fn frame(&self, image: &Frame<'_>) {
         for cast in self.casts.values() {
             cast.state.pending.set(true);
             cast.offer(image);
@@ -542,7 +553,7 @@ impl Streams {
 
     /// Retry frames that found no free buffer, or that a consumer needs
     /// after starting or renegotiating.
-    pub(crate) fn offer_pending(&self, image: &Image<'static, 'static>) {
+    pub fn offer_pending(&self, image: &Frame<'_>) {
         for cast in self.casts.values() {
             cast.offer(image);
         }
@@ -718,7 +729,6 @@ fn buffers_param(width: u32, height: u32) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use smithay::reexports::pixman;
 
     use super::*;
 
@@ -729,29 +739,22 @@ mod tests {
         frame: Option<((u32, u32), Vec<u8>)>,
     }
 
-    fn solid(width: usize, height: usize, argb: u32) -> Image<'static, 'static> {
-        let mut image =
-            Image::new(pixman::FormatCode::A8R8G8B8, width, height, true).expect("test image");
-        image
-            .fill_boxes(
-                pixman::Operation::Src,
-                argb,
-                &[pixman::Box32 {
-                    x1: 0,
-                    y1: 0,
-                    x2: i32::try_from(width).expect("width"),
-                    y2: i32::try_from(height).expect("height"),
-                }],
-            )
-            .expect("fill test image");
-        image
+    /// A `width` x `height` frame of one `ARGB8888` color, packed as BGRA bytes
+    /// the way the compositor's renderer stores it on little-endian hosts.
+    fn solid(width: usize, height: usize, argb: u32) -> Frame<'static> {
+        Frame {
+            pixels: argb.to_le_bytes().repeat(width * height).leak(),
+            width,
+            height,
+            stride: width * 4,
+        }
     }
 
     /// Iterate both loops until `done` holds or five seconds pass.
     fn pump(
         streams: &Streams,
         consumer: &pw::main_loop::MainLoopRc,
-        image: &Image<'static, 'static>,
+        image: &Frame<'_>,
         mut done: impl FnMut() -> bool,
     ) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);

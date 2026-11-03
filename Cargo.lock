@@ -2880,10 +2880,8 @@ dependencies = [
  "cairo-rs",
  "calloop",
  "clap",
- "libloading",
  "nix",
  "pangocairo",
- "pipewire",
  "png",
  "shlex 2.0.1",
  "smithay",
@@ -2897,6 +2895,7 @@ dependencies = [
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "waywire-encoder",
+ "waywire-pipewire",
  "waywire-protocol",
  "xxhash-rust",
  "zbus",
@@ -2941,6 +2940,19 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "waywire-protocol",
+]
+
+[[package]]
+name = "waywire-pipewire"
+version = "0.1.0-rc.1"
+dependencies = [
+ "anyhow",
+ "libloading",
+ "nix",
+ "pipewire",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
