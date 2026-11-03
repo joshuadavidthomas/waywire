@@ -876,6 +876,28 @@ the review are in place. Remaining gaps:
   `<video>` without waiting for an animation frame. In a slow-link run the
   `<video>` then presented 30 frames a second throughout, against 7.5 to 9.4
   before.
+- Busy viewer page (one study on one orb, not a benchmark check). A 30 fps
+  scrolling page streamed with OpenH264, viewed on the canvas path with the
+  viewer page's main thread blocked periodically. 3 rounds, 20 s of frames and
+  24 key presses per pattern per round:
+
+  | main thread busy  | fps  | longest gap | overdue drops/s | probe p50/p95 |
+  | ----------------- | ---- | ----------- | --------------- | ------------- |
+  | idle              | 29.9 | 54 ms       | 0.0             | 140/174 ms    |
+  | 16 ms per 100 ms  | 29.8 | 61 ms       | 0.1             | 201/238 ms    |
+  | 50 ms per 200 ms  | 25.2 | 104 ms      | 4.6             | 196/255 ms    |
+  | 100 ms per 500 ms | 25.9 | 135 ms      | 4.0             | 211/274 ms    |
+
+  Against a worker that decoded the same stream, the main thread received
+  decoded frames up to one busy span late. Of the 51 to 83 ms of extra mean
+  latency, 38 to 54 ms was video waiting on the main thread, partly through a
+  playout target that main-thread lateness raised (75 ms instead of 50 at
+  16/100). Only 1 to 11 ms was key events waiting behind the page, and 5 to
+  19 ms was the busy loop taking CPU from the desktop. Moving decoding and
+  presentation into a worker would remove the video share. Before the viewer
+  stopped waiting for an animation frame on the `<video>` track path, headless
+  Chromium ran that path's animation frames at about 8 Hz even on an idle
+  page, so the study could not compare it.
 
 ## Decisions
 
