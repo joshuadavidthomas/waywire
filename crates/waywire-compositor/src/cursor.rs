@@ -13,6 +13,7 @@ use waywire_protocol::pipe::CursorVisibility;
 use waywire_protocol::pipe::Event;
 
 use crate::State;
+use crate::dnd;
 
 fn image(surface: &WlSurface, output_width: u16) -> Option<CursorImage> {
     with_states(surface, |states| {
@@ -164,7 +165,7 @@ impl State {
 
     /// Frame callbacks for the pointer's surfaces: the cursor and any drag icon.
     pub(crate) fn send_cursor_frame(&self) {
-        let icon = self.drag.as_ref().and_then(|drag| drag.icon.as_ref());
+        let icon = self.drag.as_ref().and_then(dnd::Drag::icon);
         for surface in self.cursor.surface().into_iter().chain(icon) {
             smithay::desktop::utils::send_frames_surface_tree(
                 surface,

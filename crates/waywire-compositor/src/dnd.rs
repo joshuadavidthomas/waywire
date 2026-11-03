@@ -40,12 +40,41 @@ use crate::focus::PointerFocus;
 /// A drag started by a Wayland client. X11 sources draw their own icon
 /// windows and set their own cursor.
 pub(crate) struct Drag {
-    pub(crate) icon: Option<WlSurface>,
+    icon: Option<WlSurface>,
     /// The icon's offset from the pointer, moved by the icon's attach offsets.
-    pub(crate) offset: Point<i32, Logical>,
+    offset: Point<i32, Logical>,
 }
 
 impl Drag {
+    fn new(icon: Option<WlSurface>) -> Self {
+        Self {
+            icon,
+            offset: (0, 0).into(),
+        }
+    }
+
+    pub(crate) fn icon(&self) -> Option<&WlSurface> {
+        self.icon.as_ref()
+    }
+
+    /// Where the icon goes for a pointer at `pointer`.
+    pub(crate) fn icon_location(&self, pointer: Point<f64, Logical>) -> Point<f64, Logical> {
+        pointer + self.offset.to_f64()
+    }
+
+    /// A surface was destroyed. Drops the icon when it was the icon or is
+    /// gone, and says whether it did.
+    fn surface_destroyed(&mut self, surface: Option<&WlSurface>) -> bool {
+        let gone = self
+            .icon
+            .as_ref()
+            .is_some_and(|icon| Some(icon) == surface || !smithay::utils::IsAlive::alive(icon));
+        if gone {
+            self.icon = None;
+        }
+        gone
+    }
+
     /// A surface committed. Icons move by their attach offsets, as cursor
     /// hotspots do.
     pub(crate) fn committed(&mut self, surface: &WlSurface) {
@@ -188,10 +217,7 @@ impl WaylandDndGrabHandler for State {
             source.cancel();
             return;
         };
-        self.drag = Some(Drag {
-            icon,
-            offset: (0, 0).into(),
-        });
+        self.drag = Some(Drag::new(icon));
         pointer.set_grab(
             self,
             DnDGrab::new_pointer(&self.display_handle, start, source, seat.clone()),
@@ -258,12 +284,8 @@ impl State {
     /// surface is gone, and drop the icon if it was the icon.
     pub(crate) fn drag_surface_destroyed(&mut self, surface: Option<&WlSurface>) {
         if let Some(drag) = &mut self.drag
-            && drag
-                .icon
-                .as_ref()
-                .is_some_and(|icon| Some(icon) == surface || !smithay::utils::IsAlive::alive(icon))
+            && drag.surface_destroyed(surface)
         {
-            drag.icon = None;
             self.frame_pending = FrameRequest::Pending;
         }
         if !self.dnd_grab_active() {
