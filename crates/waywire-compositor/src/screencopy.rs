@@ -63,6 +63,49 @@ impl Screencopy {
             pending: Vec::new(),
         }
     }
+
+    fn queue(&mut self, copy: PendingCopy) {
+        self.pending.push(copy);
+    }
+
+    fn forget(&mut self, frame: &ZwlrScreencopyFrameV1) {
+        self.pending.retain(|pending| pending.frame != *frame);
+    }
+
+    /// Complete queued copies by copying the rendered image into the
+    /// clients' `wl_shm` buffers. Call once per rendered frame, after
+    /// rendering.
+    pub(crate) fn serve_pending(&mut self, image: &Image<'static, 'static>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pixels = image_pixels(image);
+        let presented = monotonic();
+        let (tv_sec_hi, tv_sec_lo, tv_nsec) = timestamp_parts(presented);
+        for mut pending in std::mem::take(&mut self.pending) {
+            let (width, height) = region_extents(pending.region);
+            let copied = region_args(pending.region).is_some_and(|region| {
+                with_buffer_contents_mut(&pending.buffer, |pool, pool_len, shm| {
+                    copy_pixels(pool, pool_len, shm, pixels, image.stride(), region)
+                })
+                .is_ok_and(|result| result.is_ok())
+            });
+            if copied {
+                if pending.with_damage {
+                    // No damage tracking: report the whole captured region as the
+                    // damage since the previous copy from this manager.
+                    pending.frame.damage(0, 0, width, height);
+                }
+                // BGRA row bytes match the render buffer's orientation, so the
+                // contents are not y-inverted.
+                pending.frame.flags(Flags::empty());
+                pending.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
+            } else {
+                pending.frame.failed();
+            }
+            pending.submitted = true;
+        }
+    }
 }
 
 /// Global data for the screencopy manager; waywire has one output and no access
@@ -300,7 +343,7 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
         }
 
         copied.store(true, Ordering::SeqCst);
-        state.screencopy.pending.push(PendingCopy {
+        state.screencopy.queue(PendingCopy {
             frame: frame.clone(),
             buffer,
             region: *region,
@@ -311,10 +354,7 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
     }
 
     fn destroyed(&self, state: &mut State, _client: ClientId, frame: &ZwlrScreencopyFrameV1) {
-        state
-            .screencopy
-            .pending
-            .retain(|pending| pending.frame != *frame);
+        state.screencopy.forget(frame);
     }
 }
 
@@ -338,40 +378,6 @@ fn region_args(region: Rectangle<i32, Physical>) -> Option<(usize, usize, usize,
 fn timestamp_parts(timestamp: Duration) -> (u32, u32, u32) {
     let secs = timestamp.as_secs();
     ((secs >> 32) as u32, secs as u32, timestamp.subsec_nanos())
-}
-
-/// Complete queued copies by copying the rendered image into the clients'
-/// `wl_shm` buffers. Call once per rendered frame, after rendering.
-pub(crate) fn serve_pending(state: &mut State, image: &Image<'static, 'static>) {
-    if state.screencopy.pending.is_empty() {
-        return;
-    }
-    let pixels = image_pixels(image);
-    let presented = monotonic();
-    let (tv_sec_hi, tv_sec_lo, tv_nsec) = timestamp_parts(presented);
-    for mut pending in std::mem::take(&mut state.screencopy.pending) {
-        let (width, height) = region_extents(pending.region);
-        let copied = region_args(pending.region).is_some_and(|region| {
-            with_buffer_contents_mut(&pending.buffer, |pool, pool_len, shm| {
-                copy_pixels(pool, pool_len, shm, pixels, image.stride(), region)
-            })
-            .is_ok_and(|result| result.is_ok())
-        });
-        if copied {
-            if pending.with_damage {
-                // No damage tracking: report the whole captured region as the
-                // damage since the previous copy from this manager.
-                pending.frame.damage(0, 0, width, height);
-            }
-            // BGRA row bytes match the render buffer's orientation, so the
-            // contents are not y-inverted.
-            pending.frame.flags(Flags::empty());
-            pending.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
-        } else {
-            pending.frame.failed();
-        }
-        pending.submitted = true;
-    }
 }
 
 #[cfg(test)]
@@ -591,7 +597,7 @@ mod tests {
             round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
             frame.copy(&buffer);
             round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
-            serve_pending(&mut state, &image);
+            state.screencopy.serve_pending(&image);
             round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
             assert!(app.ready, "capture {capture} completes");
 

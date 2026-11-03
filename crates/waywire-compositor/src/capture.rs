@@ -51,6 +51,14 @@ impl Capture {
         }
     }
 
+    pub(crate) fn output_capture_source(&mut self) -> &mut OutputCaptureSourceState {
+        &mut self.output_capture_source
+    }
+
+    pub(crate) fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+        &mut self.image_copy_capture_state
+    }
+
     /// Re-send buffer constraints after the output was resized, so long-lived
     /// sessions learn the new buffer size before allocating their next frame.
     pub(crate) fn output_resized(&mut self) {
@@ -63,6 +71,51 @@ impl Capture {
                 .is_some_and(|current| current.size != constraints.size)
             {
                 session.update_constraints(constraints);
+            }
+        }
+    }
+
+    /// Keep a session; dropping an owned one would send `stopped`.
+    fn add_session(&mut self, session: Session) {
+        self.sessions.push(session);
+    }
+
+    fn remove_session(&mut self, session: &SessionRef) {
+        self.sessions.retain(|owned| owned != session);
+    }
+
+    /// Queue a frame for the next already-rendered frame.
+    fn queue(&mut self, frame: Frame) {
+        self.pending.push(frame);
+    }
+
+    fn abort(&mut self, frame: &FrameRef) {
+        self.pending.retain(|pending| pending != frame);
+    }
+
+    /// Complete queued frames by copying the rendered image into the
+    /// clients' `wl_shm` buffers. Call once per rendered frame, after
+    /// rendering.
+    pub(crate) fn serve_pending(&mut self, image: &Image<'static, 'static>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pixels = image_pixels(image);
+        let presented = monotonic();
+        let region = (0, 0, image.width(), image.height());
+        for frame in std::mem::take(&mut self.pending) {
+            let buffer = frame.buffer();
+            let copied = with_buffer_contents_mut(&buffer, |pool, pool_len, shm| {
+                copy_pixels(pool, pool_len, shm, pixels, image.stride(), region)
+            });
+            match copied {
+                Ok(Ok(())) => {
+                    // Without damage regions the client assumes a full redraw.
+                    frame.success(Transform::Normal, None, presented);
+                }
+                Ok(Err(())) => frame.fail(CaptureFailureReason::BufferConstraints),
+                // A bad pool was already reported to the client by Smithay.
+                Err(_) => frame.fail(CaptureFailureReason::Unknown),
             }
         }
     }
@@ -100,7 +153,7 @@ fn shm_dimensions(shm: &BufferData) -> Option<(usize, usize, usize, usize)> {
 
 impl OutputCaptureSourceHandler for State {
     fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
-        &mut self.capture.output_capture_source
+        self.capture.output_capture_source()
     }
 
     fn output_source_created(&mut self, source: ImageCaptureSource, output: &Output) {
@@ -112,7 +165,7 @@ impl ImageCaptureSourceHandler for State {}
 
 impl ImageCopyCaptureHandler for State {
     fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
-        &mut self.capture.image_copy_capture_state
+        self.capture.image_copy_capture_state()
     }
 
     fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
@@ -121,48 +174,21 @@ impl ImageCopyCaptureHandler for State {
     }
 
     fn new_session(&mut self, session: Session) {
-        // Owned sessions keep capture alive; dropping one would send `stopped`.
-        self.capture.sessions.push(session);
+        self.capture.add_session(session);
     }
 
     fn frame(&mut self, _session: &SessionRef, frame: Frame) {
         // Complete from the next already-rendered frame instead of rendering.
-        self.capture.pending.push(frame);
+        self.capture.queue(frame);
         self.frame_pending = crate::FrameRequest::Pending;
     }
 
     fn frame_aborted(&mut self, frame: FrameRef) {
-        self.capture.pending.retain(|pending| *pending != frame);
+        self.capture.abort(&frame);
     }
 
     fn session_destroyed(&mut self, session: SessionRef) {
-        self.capture.sessions.retain(|owned| *owned != session);
-    }
-}
-
-/// Complete queued capture frames by copying the rendered image into the
-/// clients' `wl_shm` buffers. Call once per rendered frame, after rendering.
-pub(crate) fn serve_pending(state: &mut State, image: &Image<'static, 'static>) {
-    if state.capture.pending.is_empty() {
-        return;
-    }
-    let pixels = image_pixels(image);
-    let presented = monotonic();
-    let region = (0, 0, image.width(), image.height());
-    for frame in std::mem::take(&mut state.capture.pending) {
-        let buffer = frame.buffer();
-        let copied = with_buffer_contents_mut(&buffer, |pool, pool_len, shm| {
-            copy_pixels(pool, pool_len, shm, pixels, image.stride(), region)
-        });
-        match copied {
-            Ok(Ok(())) => {
-                // Without damage regions the client assumes a full redraw.
-                frame.success(Transform::Normal, None, presented);
-            }
-            Ok(Err(())) => frame.fail(CaptureFailureReason::BufferConstraints),
-            // A bad pool was already reported to the client by Smithay.
-            Err(_) => frame.fail(CaptureFailureReason::Unknown),
-        }
+        self.capture.remove_session(&session);
     }
 }
 

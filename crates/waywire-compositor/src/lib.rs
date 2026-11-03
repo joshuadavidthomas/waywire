@@ -1085,8 +1085,8 @@ impl State {
         {
             screencast.frame(&cast_frame(image));
         }
-        capture::serve_pending(self, image);
-        screencopy::serve_pending(self, image);
+        self.capture.serve_pending(image);
+        self.screencopy.serve_pending(image);
         self.dirty = false;
         self.frame_pending = FrameRequest::Idle;
         self.send_cursor_frame();
