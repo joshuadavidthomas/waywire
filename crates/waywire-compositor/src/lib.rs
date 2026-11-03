@@ -1331,7 +1331,7 @@ pub fn run(mut options: Config) -> Result<()> {
         if state.dirty || state.frame_pending == FrameRequest::Pending {
             deadline = deadline.min(next_frame);
         }
-        if state.clipboard_active() {
+        if state.clipboard.active() {
             deadline = deadline.min(now + Duration::from_millis(20));
         }
         if let Some(at) = state.stream.refresh_due() {
