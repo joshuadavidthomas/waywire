@@ -167,11 +167,10 @@ impl State {
                 .is_some_and(|state| state.minimized),
             maximized,
             fullscreen,
-            parent: self
-                .parent_window(window)
+            parent: crate::wm::parent_window(&self.space, window)
                 .and_then(|parent| self.toplevel_list.identifier(&parent))
                 .unwrap_or_default(),
-            modal: Self::modal_dialog(window),
+            modal: crate::wm::modal_dialog(window),
         })
     }
 

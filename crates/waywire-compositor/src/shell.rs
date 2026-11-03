@@ -193,8 +193,8 @@ impl CompositorHandler for State {
                     // whenever the client re-commits.
                     self.toplevel_list.publish(&window);
                 }
-                if mapped && !previous && !self.mapped_order.contains(&window) {
-                    self.mapped_order.push(window.clone());
+                if mapped && !previous {
+                    self.windows.add_mapped(&window);
                 }
                 if mapped && !previous {
                     self.center_dialog(&window);
@@ -206,7 +206,7 @@ impl CompositorHandler for State {
                 }
                 if mapped && !previous {
                     self.window_mapped(&window);
-                    let cause = if self.parent_window(&window).is_some() {
+                    let cause = if crate::wm::parent_window(&self.space, &window).is_some() {
                         crate::delivery::FocusCause::NewDialog
                     } else {
                         crate::delivery::FocusCause::NewWindow
@@ -491,8 +491,6 @@ impl State {
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
         self.end_window_grab(window);
         self.toplevel_list.unpublish(window);
-        self.mapped_order.retain(|item| item != window);
-        self.minimized_order.retain(|item| item != window);
         if self
             .window_menu
             .as_ref()
@@ -508,18 +506,13 @@ impl State {
         {
             self.decoration_press = None;
         }
-        if let Some(state) = self.windows.get_mut(window) {
-            state.mapped = false;
-            state.minimized = false;
-            state.resize = None;
-            state.decoration = None;
-        }
+        self.windows.unmapped(window);
         let focused = self
             .seat
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
         if focused.is_some() && focused == super::focus::KeyboardFocus::window(window) {
-            let next = self.topmost_focusable(Some(window));
+            let next = self.windows.topmost_focusable(&self.space, Some(window));
             self.with_focus_cause(crate::delivery::FocusCause::WindowClosed, |state| {
                 state.focus_window(next);
             });

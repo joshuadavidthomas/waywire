@@ -449,7 +449,7 @@ impl XwmHandler for State {
         };
         geometry.loc = location - window.geometry().loc;
         self.space.map_element(window.clone(), location, true);
-        self.mapped_order.push(window.clone());
+        self.windows.add_mapped(&window);
         self.enforce_topmost();
         self.toplevel_list.publish(&window);
         self.x11_geometry(&surface, geometry);

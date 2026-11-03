@@ -2021,7 +2021,10 @@ mod tests {
         state.window_action(&second, crate::WindowAction::Minimize);
         assert!(state.windows.get(&second).expect("window").minimized);
         assert!(state.space.element_location(&second).is_some());
-        assert_eq!(state.topmost_focusable(None), Some(first.clone()));
+        assert_eq!(
+            state.windows.topmost_focusable(&state.space, None),
+            Some(first.clone())
+        );
         assert_eq!(
             state.seat.get_keyboard().expect("keyboard").current_focus(),
             KeyboardFocus::window(&first)

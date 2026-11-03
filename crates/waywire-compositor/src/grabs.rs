@@ -31,24 +31,6 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 
 use super::State;
 
-#[derive(Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "mapping, minimizing, stacking and urgency change independently"
-)]
-pub(super) struct WindowState {
-    pub mapped: bool,
-    pub minimized: bool,
-    pub always_on_top: bool,
-    /// An activation request without a valid token asked for attention.
-    pub urgent: bool,
-    pub decoration: Option<waywire_decorations::Decoration>,
-    pub decoration_mode: Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>,
-    pub restore: Option<Rectangle<i32, Logical>>,
-    pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
-    pub grab_serial: Option<Serial>,
-}
-
 pub(super) struct WindowGrab {
     start: GrabStartData<State>,
     window: Window,

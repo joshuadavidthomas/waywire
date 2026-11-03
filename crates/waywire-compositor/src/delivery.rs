@@ -843,15 +843,14 @@ impl State {
         if everyone.is_empty() {
             return;
         }
-        let parent = self
-            .parent_window(window)
-            .map(|parent| self.window_record(&parent));
+        let parent =
+            crate::wm::parent_window(&self.space, window).map(|parent| self.window_record(&parent));
         let notice = Notice::WindowMapped {
             serial: self.delivery.next_serial(),
             time_usec: monotonic_usec(),
             window: self.window_record(window),
             parent,
-            modal: Self::modal_dialog(window),
+            modal: crate::wm::modal_dialog(window),
         };
         self.delivery.send(everyone, Signal::Notice(notice));
     }

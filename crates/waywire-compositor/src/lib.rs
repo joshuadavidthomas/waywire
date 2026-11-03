@@ -21,6 +21,7 @@ mod text_keyboard;
 mod toplevel_list;
 mod virtual_keyboard;
 mod virtual_pointer;
+mod wm;
 mod xwayland;
 
 use std::cell::RefCell;
@@ -98,14 +99,11 @@ use smithay::utils::Rectangle;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::compositor::with_states;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
-use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::text_input::TextInputManagerState;
@@ -293,12 +291,10 @@ pub(crate) struct State {
     pub(crate) toplevel_list: toplevel_list::ToplevelList,
     pub(crate) delivery: delivery::Delivery,
     clipboard: clipboard::Clipboard,
-    windows: HashMap<Window, grabs::WindowState>,
+    windows: wm::Windows,
     pins: Vec<Pin>,
     launch_environment: Option<LaunchEnvironment>,
     loop_handle: Option<calloop::LoopHandle<'static, State>>,
-    mapped_order: Vec<Window>,
-    minimized_order: Vec<Window>,
     restore_key_source: Option<KeyboardSource>,
     decoration_press: Option<(KeyboardSource, Window)>,
     window_menu: Option<waywire_decorations::WindowMenu>,
@@ -455,7 +451,7 @@ impl State {
             toplevel_list,
             delivery: delivery::Delivery::default(),
             clipboard,
-            windows: HashMap::new(),
+            windows: wm::Windows::default(),
             pins: options
                 .pins
                 .iter()
@@ -467,8 +463,6 @@ impl State {
                 .collect(),
             launch_environment: None,
             loop_handle: None,
-            mapped_order: Vec::new(),
-            minimized_order: Vec::new(),
             restore_key_source: None,
             decoration_press: None,
             window_menu: None,
@@ -582,11 +576,7 @@ impl State {
             .work_area()
             .is_some_and(|area| pos.y >= f64::from(area.loc.y + area.size.h));
         for window in self.space.elements().rev() {
-            if self
-                .windows
-                .get(window)
-                .is_some_and(|state| state.minimized)
-            {
+            if self.windows.is_minimized(window) {
                 continue;
             }
             if over_bar && !waywire_decorations::above_taskbar(window) {
@@ -609,7 +599,8 @@ impl State {
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
         let windows: Vec<_> = self
-            .mapped_order
+            .windows
+            .mapped_order()
             .iter()
             .filter(|window| waywire_decorations::taskbar_window(window))
             .cloned()
@@ -967,7 +958,7 @@ impl State {
             })
         {
             self.restore_key_source = Some(source);
-            let window = self.minimized_order.last().cloned();
+            let window = self.windows.minimized_order().last().cloned();
             if let Some(window) = &window {
                 self.window_action(window, WindowAction::Restore);
             }
@@ -1173,14 +1164,8 @@ impl State {
                     },
                     |geometry| geometry.size,
                 );
-                let fraction = ((press.location.x - f64::from(maximized.loc.x))
-                    / f64::from(maximized.size.w.max(1)))
-                .clamp(0.0, 1.0);
-                let position = Point::<f64, Logical>::from((
-                    location.x - fraction * f64::from(restored_size.w),
-                    location.y + f64::from(maximized.loc.y) - press.location.y,
-                ))
-                .to_i32_round();
+                let position =
+                    wm::restored_drag_location(press.location, location, maximized, restored_size);
                 self.space.map_element(press.window.clone(), position, true);
                 self.enforce_topmost();
                 if let Some(surface) = press.window.x11_surface()
@@ -1555,10 +1540,7 @@ impl State {
                 self.set_window_expanded(window, xdg_toplevel::State::Maximized, true);
             }
             WindowAction::Minimize => {
-                let state = self.windows.entry(window.clone()).or_default();
-                if !state.minimized {
-                    state.minimized = true;
-                    self.minimized_order.push(window.clone());
+                if self.windows.minimize(window) {
                     if let Some(surface) = window.x11_surface()
                         && let Err(error) = surface.set_hidden(true)
                     {
@@ -1572,7 +1554,7 @@ impl State {
                         .get_keyboard()
                         .and_then(|keyboard| keyboard.current_focus());
                     if focused == focus::KeyboardFocus::window(window) {
-                        let next = self.topmost_focusable(Some(window));
+                        let next = self.windows.topmost_focusable(&self.space, Some(window));
                         self.with_focus_cause(delivery::FocusCause::Minimized, |state| {
                             state.focus_window(next);
                         });
@@ -1583,15 +1565,7 @@ impl State {
                 }
             }
             WindowAction::Restore => {
-                if self
-                    .windows
-                    .get(window)
-                    .is_some_and(|state| state.minimized)
-                {
-                    if let Some(state) = self.windows.get_mut(window) {
-                        state.minimized = false;
-                    }
-                    self.minimized_order.retain(|item| item != window);
+                if self.windows.unminimize(window) {
                     if let Some(surface) = window.x11_surface()
                         && let Err(error) = surface.set_hidden(false)
                     {
@@ -1605,10 +1579,9 @@ impl State {
                     self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
                 }
             }
-            WindowAction::Close => Self::close_window(window),
+            WindowAction::Close => wm::close_window(window),
             WindowAction::ToggleAlwaysOnTop => {
-                let state = self.windows.entry(window.clone()).or_default();
-                state.always_on_top = !state.always_on_top;
+                self.windows.toggle_always_on_top(window);
                 self.enforce_topmost();
                 self.dirty = true;
             }
@@ -1621,27 +1594,12 @@ impl State {
                         window.clone(),
                         pointer.current_location(),
                         output.size,
-                        self.windows
-                            .get(window)
-                            .is_some_and(|state| state.always_on_top),
+                        self.windows.always_on_top(window),
                     ));
                     self.refresh_pointer_focus();
                     self.dirty = true;
                 }
             }
-        }
-    }
-
-    /// Ask a window to close. The titlebar's Close button and the
-    /// wlr-foreign-toplevel-management close request both use this path.
-    pub(crate) fn close_window(window: &Window) {
-        if let Some(top) = window.toplevel() {
-            top.send_close();
-        }
-        if let Some(x11) = window.x11_surface()
-            && let Err(error) = x11.close()
-        {
-            tracing::warn!(%error, "close X11 window");
         }
     }
 
@@ -1657,11 +1615,7 @@ impl State {
     /// Restore a minimized window, or raise and focus it. Foreign-toplevel
     /// and xdg-activation requests both use this path.
     pub(crate) fn activate_window(&mut self, window: &Window) {
-        if self
-            .windows
-            .get(window)
-            .is_some_and(|state| state.minimized)
-        {
+        if self.windows.is_minimized(window) {
             self.window_action(window, WindowAction::Restore);
         } else {
             self.window_action(window, WindowAction::Focus);
@@ -1691,7 +1645,7 @@ impl State {
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
         self.toplevel_list
-            .refresh_states(focused.as_ref(), &self.minimized_order);
+            .refresh_states(focused.as_ref(), self.windows.minimized_order());
     }
 
     pub(crate) fn release_input(&mut self, source: KeyboardSource) {
@@ -1740,148 +1694,23 @@ impl State {
         self.input.forget_buttons(source);
     }
 
-    /// The topmost mapped window that can take keyboard focus, skipping `except`.
-    pub(crate) fn topmost_focusable(&self, except: Option<&Window>) -> Option<Window> {
-        self.space
-            .elements()
-            .rev()
-            .find(|window| {
-                Some(*window) != except
-                    && !is_override_redirect(window)
-                    && self
-                        .windows
-                        .get(*window)
-                        .is_some_and(|state| state.mapped && !state.minimized)
-            })
-            .cloned()
-    }
-
-    fn parent_window(&self, window: &Window) -> Option<Window> {
-        if let Some(parent) = window
-            .toplevel()
-            .and_then(smithay::wayland::shell::xdg::ToplevelSurface::parent)
-        {
-            return self
-                .space
-                .elements()
-                .find(|candidate| {
-                    candidate
-                        .toplevel()
-                        .is_some_and(|top| top.wl_surface() == &parent)
-                })
-                .cloned();
-        }
-        let parent = window.x11_surface()?.is_transient_for()?;
-        self.space
-            .elements()
-            .find(|candidate| {
-                candidate
-                    .x11_surface()
-                    .is_some_and(|surface| surface.window_id() == parent)
-            })
-            .cloned()
-    }
-
-    fn modal_dialog(window: &Window) -> bool {
-        if let Some(top) = window.toplevel() {
-            return with_states(top.wl_surface(), |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .and_then(|data| data.lock().ok())
-                    .is_some_and(|data| data.dialog_hint == ToplevelDialogHint::Modal)
-            });
-        }
-        window
-            .x11_surface()
-            .is_some_and(smithay::xwayland::X11Surface::is_modal)
-    }
-
-    fn dialog_children(&self, parent: &Window) -> Vec<Window> {
-        self.space
-            .elements()
-            .filter(|candidate| {
-                self.windows
-                    .get(*candidate)
-                    .is_some_and(|state| state.mapped && !state.minimized)
-                    && self.parent_window(candidate).as_ref() == Some(parent)
-            })
-            .cloned()
-            .collect()
-    }
-
+    /// Raise always-on-top windows and their dialogs above the rest.
     pub(crate) fn enforce_topmost(&mut self) {
-        let mut topmost: Vec<_> = self
-            .space
-            .elements()
-            .filter(|window| {
-                let mut current = Some((*window).clone());
-                let mut visited = Vec::new();
-                while let Some(target) = current {
-                    if visited.contains(&target) {
-                        break;
-                    }
-                    if self
-                        .windows
-                        .get(&target)
-                        .is_some_and(|state| state.always_on_top)
-                    {
-                        return true;
-                    }
-                    current = self.parent_window(&target);
-                    visited.push(target);
-                }
-                false
-            })
-            .cloned()
-            .collect();
-        topmost.sort_by_key(|window| {
-            let mut depth = 0;
-            let mut current = self.parent_window(window);
-            let mut visited = vec![window.clone()];
-            while let Some(parent) = current {
-                if visited.contains(&parent) {
-                    break;
-                }
-                depth += 1;
-                current = self.parent_window(&parent);
-                visited.push(parent);
-            }
-            depth
-        });
-        for window in topmost {
+        for window in self.windows.topmost(&self.space) {
             self.space.raise_element(&window, false);
         }
     }
 
     pub(crate) fn center_dialog(&mut self, window: &Window) {
-        let Some(parent) = self.parent_window(window) else {
+        let Some(location) =
+            wm::dialog_location(&self.space, window, self.window_output_geometry(window))
+        else {
             return;
         };
-        let Some(parent_location) = self.space.element_location(&parent) else {
-            return;
-        };
-        let parent_geometry = parent.geometry();
-        let child_geometry = window.geometry();
-        let mut location = parent_location
-            + Point::from((
-                (parent_geometry.size.w - child_geometry.size.w) / 2,
-                (parent_geometry.size.h - child_geometry.size.h) / 2,
-            ));
-        if let Some(area) = self.window_output_geometry(window) {
-            location.x = location.x.clamp(
-                area.loc.x,
-                area.loc.x + (area.size.w - child_geometry.size.w).max(0),
-            );
-            location.y = location.y.clamp(
-                area.loc.y,
-                area.loc.y + (area.size.h - child_geometry.size.h).max(0),
-            );
-        }
         self.space.map_element(window.clone(), location, false);
         if let Some(surface) = window.x11_surface() {
             let mut geometry = surface.last_configure();
-            geometry.loc = location - child_geometry.loc;
+            geometry.loc = location - window.geometry().loc;
             if let Err(error) = surface.configure(geometry) {
                 tracing::warn!(%error, "center X11 dialog");
             }
@@ -1889,26 +1718,15 @@ impl State {
     }
 
     pub(crate) fn focus_window(&mut self, window: Option<Window>) {
-        if window.as_ref().is_some_and(|window| {
-            self.windows
-                .get(window)
-                .is_some_and(|state| state.minimized)
-        }) {
+        if window
+            .as_ref()
+            .is_some_and(|window| self.windows.is_minimized(window))
+        {
             return;
         }
         let mut window = window;
         if let Some(target) = &window {
-            let mut family = vec![target.clone()];
-            let mut index = 0;
-            while index < family.len() {
-                for child in self.dialog_children(&family[index]) {
-                    if !family.contains(&child) {
-                        family.push(child);
-                    }
-                }
-                index += 1;
-            }
-            for member in &family {
+            for member in &self.windows.family(&self.space, target) {
                 self.space.raise_element(member, true);
                 if let (Some(xwm), Some(surface)) = (&mut self.xwm, member.x11_surface())
                     && let Err(error) = xwm.raise_window(surface)
@@ -1917,22 +1735,7 @@ impl State {
                 }
             }
             self.enforce_topmost();
-            let mut visited = Vec::new();
-            while let Some(target) = &window {
-                if visited.contains(target) {
-                    break;
-                }
-                visited.push(target.clone());
-                let next = self
-                    .dialog_children(target)
-                    .into_iter()
-                    .rev()
-                    .find(Self::modal_dialog);
-                if next.is_none() {
-                    break;
-                }
-                window = next;
-            }
+            window = Some(self.windows.modal_focus(&self.space, target.clone()));
         }
         if self
             .decoration_press
@@ -1944,17 +1747,14 @@ impl State {
         if let Some(window) = &window {
             // X11 menus, dropdowns and tooltips draw above their app but expect
             // keyboard focus to stay with it; taking focus closes them.
-            if is_override_redirect(window) {
+            if wm::is_override_redirect(window) {
                 self.refresh_pointer_focus();
                 self.dirty = true;
                 return;
             }
         }
-        if let Some(state) = window
-            .as_ref()
-            .and_then(|window| self.windows.get_mut(window))
-        {
-            state.urgent = false;
+        if let Some(window) = &window {
+            self.windows.clear_urgent(window);
         }
         self.refresh_pointer_focus();
         for current in self.space.elements() {
@@ -2221,9 +2021,7 @@ impl State {
             *tracker = OutputDamageTracker::from_output(&self.output);
         }
         self.space.refresh();
-        self.windows
-            .retain(|window, _| smithay::utils::IsAlive::alive(window));
-        self.minimized_order.retain(smithay::utils::IsAlive::alive);
+        self.windows.retain_alive();
         self.toplevel_list.cleanup();
         self.popups.cleanup();
         if self
@@ -2232,7 +2030,7 @@ impl State {
             .and_then(|keyboard| keyboard.current_focus())
             .is_some_and(|focus| !smithay::utils::IsAlive::alive(&focus))
         {
-            let next = self.topmost_focusable(None);
+            let next = self.windows.topmost_focusable(&self.space, None);
             self.with_focus_cause(delivery::FocusCause::WindowClosed, |state| {
                 state.focus_window(next);
             });
@@ -2784,12 +2582,6 @@ fn normalized_coordinate(pixel: f64, extent: u32) -> pipe::PointerCoordinate {
             .clamp(0.0, 65535.0) as u32,
     )
     .expect("clamped cursor coordinate")
-}
-
-fn is_override_redirect(window: &Window) -> bool {
-    window
-        .x11_surface()
-        .is_some_and(smithay::xwayland::X11Surface::is_override_redirect)
 }
 
 /// Open a pidfd, which becomes readable when the process exits.
