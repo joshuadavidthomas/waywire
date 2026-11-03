@@ -507,15 +507,12 @@ impl SelectionHandler for State {
     ) {
         // Smithay invokes this before it installs the seat's selection.
         let types = source.map(|source| source.mime_types());
-        if let Some(xwm) = &mut self.xwm
-            && let Err(error) = xwm.new_selection(
-                target,
-                types.clone().map(|types| with_text(types, &X11_TEXT)),
-            )
-        {
+        if let Err(error) = self.xwayland.new_selection(
+            target,
+            types.clone().map(|types| with_text(types, &X11_TEXT)),
+        ) {
             tracing::warn!(%error, ?target, "forward selection ownership to X11");
         }
-        self.x11_stacking = None;
         let wayland = types.is_some();
         self.clipboard
             .owned(target, types.unwrap_or_default(), wayland);
@@ -570,13 +567,12 @@ impl State {
             strings(&WAYLAND_TEXT),
             SelectionData::Text(text),
         );
-        if let Some(xwm) = &mut self.xwm
-            && let Err(error) =
-                xwm.new_selection(SelectionTarget::Clipboard, Some(strings(&X11_TEXT)))
+        if let Err(error) = self
+            .xwayland
+            .new_selection(SelectionTarget::Clipboard, Some(strings(&X11_TEXT)))
         {
             tracing::warn!(%error, "forward clipboard ownership to X11");
         }
-        self.x11_stacking = None;
     }
 
     /// An X11 client took `target`.
@@ -619,12 +615,9 @@ impl State {
         match target {
             SelectionTarget::Clipboard => {}
             SelectionTarget::Primary if wayland => {
-                if let Some(xwm) = &mut self.xwm
-                    && let Err(error) = xwm.new_selection(target, None)
-                {
+                if let Err(error) = self.xwayland.new_selection(target, None) {
                     tracing::warn!(%error, "clear X11 primary selection");
                 }
-                self.x11_stacking = None;
             }
             SelectionTarget::Primary => clear_primary_selection(&self.display_handle, &self.seat),
         }
@@ -685,8 +678,8 @@ impl State {
                 }
                 SelectionTarget::Primary => request_primary_client_selection(&self.seat, mime, fd)?,
             }
-        } else if let Some(xwm) = &mut self.xwm {
-            xwm.send_selection(target, mime, fd)?;
+        } else {
+            self.xwayland.send_selection(target, mime, fd)?;
         }
         Ok(())
     }
@@ -763,18 +756,18 @@ impl State {
             self.clipboard_own(text);
         } else {
             clear_data_device_selection(&self.display_handle, &self.seat);
-            if let Some(xwm) = &mut self.xwm
-                && let Err(error) = xwm.new_selection(SelectionTarget::Clipboard, None)
+            if let Err(error) = self
+                .xwayland
+                .new_selection(SelectionTarget::Clipboard, None)
             {
                 tracing::warn!(%error, "clear X11 clipboard");
             }
-            self.x11_stacking = None;
             if let Ok(text) = ClipboardText::new(String::new()) {
                 self.emit(Event::Clipboard(text));
             }
         }
         // Ticks run outside dispatch; flush the XWM's ownership change now.
-        crate::xwayland::sync_stacking(self);
+        self.sync_x11_stacking();
     }
 }
 #[cfg(test)]

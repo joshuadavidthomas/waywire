@@ -172,12 +172,7 @@ pub(crate) struct State {
     pub(crate) popups: PopupManager,
     /// The popup grab holding the pointer, kept to see when it ends.
     popup_grab: Option<PopupGrab<State>>,
-    pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
-    /// Last X11 stacking order sent to the XWM; `None` forces the next sync,
-    /// which also flushes requests such as `new_selection` that do not flush.
-    pub(crate) x11_stacking: Option<Vec<u32>>,
-    pub(crate) xdisplay: Option<u32>,
-    pub(crate) xwayland_client: Option<smithay::reexports::wayland_server::Client>,
+    pub(crate) xwayland: xwayland::XWayland,
     pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub(crate) eis_seats: eis::EisSeats,
     pub(crate) virtual_pointers: virtual_pointer::VirtualPointers,
@@ -303,10 +298,7 @@ impl State {
             activation,
             popups: PopupManager::default(),
             popup_grab: None,
-            xwm: None,
-            x11_stacking: None,
-            xdisplay: None,
-            xwayland_client: None,
+            xwayland: xwayland::XWayland::default(),
             xwayland_shell_state,
             eis_seats: eis::EisSeats::default(),
             virtual_pointers: virtual_pointer::VirtualPointers::default(),
@@ -1306,7 +1298,7 @@ pub fn run(mut options: Config) -> Result<()> {
     tracing::info!(socket = %socket_path.display(), "Wayland compositor ready");
     while state.running {
         if child.0.is_none()
-            && let Some(display) = state.xdisplay
+            && let Some(display) = state.xwayland.display()
             && let Some(program) = options.session.first()
         {
             let mut command = chrome::application_command(
@@ -1347,7 +1339,7 @@ pub fn run(mut options: Config) -> Result<()> {
         }
         state.reap_pins();
         state.space.refresh();
-        crate::xwayland::sync_stacking(&mut state);
+        state.sync_x11_stacking();
         state.publish_window_list();
         if (state.dirty || state.frame_pending == FrameRequest::Pending)
             && Instant::now() >= next_frame

@@ -734,7 +734,7 @@ impl State {
     }
 
     pub(crate) fn launch_pin(&mut self, index: usize) {
-        let Some(mut command) = self.chrome.pin_command(index, self.xdisplay) else {
+        let Some(mut command) = self.chrome.pin_command(index, self.xwayland.display()) else {
             return;
         };
         // The pin click is the user's request: a single-instance app that

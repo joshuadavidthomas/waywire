@@ -461,7 +461,7 @@ impl State {
                         tracing::warn!(%error, "set X11 hidden state");
                     }
                     if window.x11_surface().is_some() {
-                        self.x11_stacking = None;
+                        self.xwayland.restack();
                     }
                     let focused = self
                         .seat
@@ -486,7 +486,7 @@ impl State {
                         tracing::warn!(%error, "clear X11 hidden state");
                     }
                     if window.x11_surface().is_some() {
-                        self.x11_stacking = None;
+                        self.xwayland.restack();
                     }
                     self.focus_window(Some(window.clone()));
                 } else {
@@ -596,10 +596,8 @@ impl State {
         if let Some(target) = &window {
             for member in &self.windows.family(&self.space, target) {
                 self.space.raise_element(member, true);
-                if let (Some(xwm), Some(surface)) = (&mut self.xwm, member.x11_surface())
-                    && let Err(error) = xwm.raise_window(surface)
-                {
-                    tracing::warn!(%error, "raise X11 window");
+                if let Some(surface) = member.x11_surface() {
+                    self.xwayland.raise(surface);
                 }
             }
             self.enforce_topmost();

@@ -330,11 +330,7 @@ impl PointerGrab<State> for WindowGrab {
                 });
                 top.send_pending_configure();
             } else if let Some(surface) = self.window.x11_surface() {
-                let scale = state
-                    .xwayland_client
-                    .as_ref()
-                    .and_then(|client| client.get_data::<smithay::xwayland::XWaylandClientData>())
-                    .map_or(1.0, |data| data.compositor_state.client_scale());
+                let scale = state.xwayland.client_scale();
                 let requested = resize_size(
                     self.initial.size,
                     delta,

@@ -14,6 +14,7 @@ use nix::sys::signal::SigSet;
 use nix::sys::signal::SigmaskHow;
 use nix::sys::signal::pthread_sigmask;
 use smithay::backend::renderer::utils::with_renderer_surface_state;
+use smithay::desktop::Space;
 use smithay::desktop::Window;
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::calloop::LoopHandle;
@@ -23,9 +24,11 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::TimeoutAction;
 use smithay::reexports::calloop::timer::Timer;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::x11rb;
 use smithay::reexports::x11rb::connection::Connection;
+use smithay::reexports::x11rb::errors::ReplyOrIdError;
 use smithay::reexports::x11rb::protocol::xproto::AtomEnum;
 use smithay::reexports::x11rb::protocol::xproto::ChangeWindowAttributesAux;
 use smithay::reexports::x11rb::protocol::xproto::ConnectionExt;
@@ -39,40 +42,180 @@ use smithay::wayland::xwayland_shell::XWaylandShellHandler;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Surface;
 use smithay::xwayland::X11Wm;
-use smithay::xwayland::XWayland;
+use smithay::xwayland::XWaylandClientData;
 use smithay::xwayland::XWaylandEvent;
 use smithay::xwayland::XwmHandler;
 use smithay::xwayland::xwm::Reorder;
 use smithay::xwayland::xwm::ResizeEdge;
 use smithay::xwayland::xwm::WmWindowProperty;
 use smithay::xwayland::xwm::XwmId;
+use waywire_decorations::WindowAction;
 
 use crate::State;
 
-// Keep X11 hit testing in the scene's stacking order. This also flushes XWM
-// requests issued by Wayland callbacks (notably new_selection, which does not
-// flush its SetSelectionOwner request in the pinned Smithay revision).
-pub(crate) fn sync_stacking(state: &mut State) {
-    let Some(xwm) = &mut state.xwm else {
-        return;
-    };
-    // Smithay grabs and ungrabs the X server on every call, which woke
-    // Xwayland on every loop iteration. Map, unmap and raise_window keep its
-    // stacking list in step with the space, so only a reorder or an unflushed
-    // request needs a sync.
-    let order: Vec<u32> = state
-        .space
-        .elements()
-        .filter_map(Window::x11_surface)
-        .map(X11Surface::window_id)
-        .collect();
-    if state.x11_stacking.as_ref() == Some(&order) {
-        return;
+/// The Xwayland server's Wayland client, the X11 window manager running on
+/// it, and the stacking order last sent to it.
+#[derive(Default)]
+pub(crate) struct XWayland {
+    /// Xwayland's own Wayland client, from spawn on.
+    client: Option<Client>,
+    /// The window manager, once Xwayland is ready.
+    wm: Option<X11Wm>,
+    /// The X11 display number, once Xwayland is ready.
+    display: Option<u32>,
+    /// Last X11 stacking order sent to the XWM; `None` forces the next sync,
+    /// which also flushes requests such as `new_selection` that do not flush.
+    stacking: Option<Vec<u32>>,
+}
+
+impl XWayland {
+    fn spawned(&mut self, client: Client) {
+        self.client = Some(client);
     }
-    match xwm.update_stacking_order_upwards(state.space.elements().filter_map(Window::x11_surface))
-    {
-        Ok(()) => state.x11_stacking = Some(order),
-        Err(error) => tracing::warn!(%error, "X11 stacking synchronization failed"),
+
+    fn ready(&mut self, wm: X11Wm, display: u32) {
+        self.wm = Some(wm);
+        self.display = Some(display);
+    }
+
+    fn disconnected(&mut self) {
+        self.wm = None;
+        self.display = None;
+    }
+
+    /// The X11 display number, once Xwayland is ready.
+    pub(crate) const fn display(&self) -> Option<u32> {
+        self.display
+    }
+
+    /// The factor Xwayland's clients scale X11 coordinates by; 1 before
+    /// Xwayland starts.
+    pub(crate) fn client_scale(&self) -> f64 {
+        self.client
+            .as_ref()
+            .and_then(|client| client.get_data::<XWaylandClientData>())
+            .map_or(1.0, |data| data.compositor_state.client_scale())
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "XWM events are dispatched only after registration"
+    )]
+    fn wm(&mut self) -> &mut X11Wm {
+        self.wm
+            .as_mut()
+            .expect("XWM callback before WM registration")
+    }
+
+    /// Make the next [`Self::sync_stacking`] talk to the XWM, which also
+    /// flushes its pending requests.
+    pub(crate) fn restack(&mut self) {
+        self.stacking = None;
+    }
+
+    pub(crate) fn raise(&mut self, surface: &X11Surface) {
+        if let Some(wm) = &mut self.wm
+            && let Err(error) = wm.raise_window(surface)
+        {
+            tracing::warn!(%error, "raise X11 window");
+        }
+    }
+
+    /// Give X11 clients `target` with `mime_types`, or clear it for them
+    /// with `None`. The next stacking sync flushes the request.
+    pub(crate) fn new_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_types: Option<Vec<String>>,
+    ) -> Result<(), ReplyOrIdError> {
+        self.stacking = None;
+        match &mut self.wm {
+            Some(wm) => wm.new_selection(target, mime_types),
+            None => Ok(()),
+        }
+    }
+
+    /// Ask the X11 owner of `target` to write it into `fd` as `mime_type`.
+    pub(crate) fn send_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) -> Result<()> {
+        if let Some(wm) = &mut self.wm {
+            wm.send_selection(target, mime_type, fd)?;
+        }
+        Ok(())
+    }
+
+    // Keep X11 hit testing in the scene's stacking order. This also flushes XWM
+    // requests issued by Wayland callbacks (notably new_selection, which does not
+    // flush its SetSelectionOwner request in the pinned Smithay revision).
+    pub(crate) fn sync_stacking(&mut self, space: &Space<Window>) {
+        let Some(wm) = &mut self.wm else {
+            return;
+        };
+        // Smithay grabs and ungrabs the X server on every call, which woke
+        // Xwayland on every loop iteration. Map, unmap and raise_window keep its
+        // stacking list in step with the space, so only a reorder or an unflushed
+        // request needs a sync.
+        let order: Vec<u32> = space
+            .elements()
+            .filter_map(Window::x11_surface)
+            .map(X11Surface::window_id)
+            .collect();
+        if self.stacking.as_ref() == Some(&order) {
+            return;
+        }
+        match wm.update_stacking_order_upwards(space.elements().filter_map(Window::x11_surface)) {
+            Ok(()) => self.stacking = Some(order),
+            Err(error) => tracing::warn!(%error, "X11 stacking synchronization failed"),
+        }
+    }
+
+    /// Tell Xwayland and its toolkits the output's `scale`. Returns whether
+    /// the client scale changed, so X11 windows need configuring again.
+    fn set_scale(&mut self, scale: f64) -> Result<bool> {
+        let (Some(client), Some(display), Some(wm)) = (&self.client, self.display, &mut self.wm)
+        else {
+            return Ok(false);
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "output scale and DPI are bounded"
+        )]
+        let settings = [
+            ("Xft/DPI".into(), (scale * 96.0 * 1024.0).round() as i32),
+            ("Gdk/WindowScalingFactor".into(), scale.floor() as i32),
+            (
+                "Gdk/UnscaledDPI".into(),
+                (96.0 * 1024.0 * (1.0 + scale.fract() / scale.floor())).round() as i32,
+            ),
+        ];
+        wm.set_xsettings(
+            settings
+                .into_iter()
+                .map(|(name, value)| (name, value.into())),
+        )?;
+        update_resources(display, scale)?;
+        let data = client
+            .get_data::<XWaylandClientData>()
+            .ok_or_else(|| anyhow!("missing Xwayland client data"))?;
+        if data.compositor_state.client_scale().to_bits() == scale.to_bits() {
+            return Ok(false);
+        }
+        data.compositor_state.set_client_scale(scale);
+        Ok(true)
+    }
+}
+
+/// What a `_NET_WM_STATE` request to remove (0), add (1) or toggle (2)
+/// HIDDEN asks of a window that is `minimized` or not.
+fn hidden_request(action: u32, minimized: bool) -> Option<WindowAction> {
+    match (action, minimized) {
+        (0 | 2, true) => Some(WindowAction::Restore),
+        (1 | 2, false) => Some(WindowAction::Minimize),
+        _ => None,
     }
 }
 
@@ -92,7 +235,7 @@ pub(crate) fn start(
         Some(&mut previous_mask),
     )
     .map_err(|error| anyhow!("could not unblock signals before Xwayland spawn: {error}"))?;
-    let spawned = XWayland::spawn(
+    let spawned = smithay::xwayland::XWayland::spawn(
         &state.display_handle,
         None,
         [("LIBEI_SOCKET", eis_path.as_os_str())],
@@ -106,7 +249,7 @@ pub(crate) fn start(
         tracing::warn!(%error, "could not restore signals after Xwayland spawn");
     }
     let (xwayland, client) = spawned?;
-    state.xwayland_client = Some(client.clone());
+    state.xwayland.spawned(client.clone());
     let ready_handle = handle.clone();
     let ready_client = client.clone();
     let token = handle.insert_source(xwayland, move |event, (), state| match event {
@@ -121,12 +264,11 @@ pub(crate) fn start(
                 ready_client.clone(),
             ) {
                 Ok(wm) => {
-                    state.xwm = Some(wm);
-                    state.xdisplay = Some(display_number);
+                    state.xwayland.ready(wm, display_number);
                     if let Err(error) = watch_hidden_requests(&ready_handle, display_number) {
                         state.fail(error.context("watch X11 hidden requests"));
                     }
-                    if let Err(error) = update_scale(state) {
+                    if let Err(error) = state.update_xwayland_scale() {
                         state.fail(error.context("configure Xwayland scale"));
                     }
                     tracing::info!(display_number, "Xwayland ready");
@@ -148,7 +290,7 @@ pub(crate) fn start(
                     monitor_handle.remove(token);
                     state.fail(anyhow!("Xwayland disconnected"));
                     TimeoutAction::Drop
-                } else if state.xdisplay.is_some() {
+                } else if state.xwayland.display().is_some() {
                     TimeoutAction::Drop
                 } else if Instant::now() >= deadline {
                     monitor_handle.remove(token);
@@ -213,22 +355,8 @@ fn watch_hidden_requests(handle: &LoopHandle<'static, State>, display: u32) -> R
                                 .windows
                                 .get(&window)
                                 .is_some_and(|state| state.minimized);
-                            match data[0] {
-                                0 if minimized => {
-                                    state.window_action(&window, crate::WindowAction::Restore);
-                                }
-                                1 if !minimized => {
-                                    state.window_action(&window, crate::WindowAction::Minimize);
-                                }
-                                2 => state.window_action(
-                                    &window,
-                                    if minimized {
-                                        crate::WindowAction::Restore
-                                    } else {
-                                        crate::WindowAction::Minimize
-                                    },
-                                ),
-                                _ => {}
+                            if let Some(action) = hidden_request(data[0], minimized) {
+                                state.window_action(&window, action);
                             }
                         }
                     }
@@ -272,60 +400,33 @@ fn update_resources(display: u32, scale: f64) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn update_scale(state: &mut State) -> Result<()> {
-    let (Some(client), Some(display), Some(xwm)) =
-        (&state.xwayland_client, state.xdisplay, &mut state.xwm)
-    else {
-        return Ok(());
-    };
-    // Match cosmic-comp's fractional descaling: retain 1.5 rather than rounding
-    // Xwayland to 2, so X11 coordinates and toolkit DPI use the output scale.
-    let scale = state.output.current_scale().fractional_scale().max(1.0);
-    let geometries = state
-        .space
-        .elements()
-        .filter_map(Window::x11_surface)
-        .map(|surface| (surface.clone(), surface.last_configure()))
-        .collect::<Vec<_>>();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "output scale and DPI are bounded"
-    )]
-    let settings = [
-        ("Xft/DPI".into(), (scale * 96.0 * 1024.0).round() as i32),
-        ("Gdk/WindowScalingFactor".into(), scale.floor() as i32),
-        (
-            "Gdk/UnscaledDPI".into(),
-            (96.0 * 1024.0 * (1.0 + scale.fract() / scale.floor())).round() as i32,
-        ),
-    ];
-    xwm.set_xsettings(
-        settings
-            .into_iter()
-            .map(|(name, value)| (name, value.into())),
-    )?;
-    update_resources(display, scale)?;
-    let data = client
-        .get_data::<smithay::xwayland::XWaylandClientData>()
-        .ok_or_else(|| anyhow!("missing Xwayland client data"))?;
-    if data.compositor_state.client_scale().to_bits() == scale.to_bits() {
-        return Ok(());
-    }
-    data.compositor_state.set_client_scale(scale);
-    state.output.change_current_state(None, None, None, None);
-    for (surface, geometry) in geometries {
-        if !surface.is_override_redirect() {
-            surface.configure(geometry)?;
-        }
-    }
-    state.x11_stacking = None;
-    Ok(())
-}
-
 #[derive(Default)]
 struct RestoreGeometry(RefCell<Option<Rectangle<i32, Logical>>>);
 
 impl State {
+    // Keep X11 hit testing in the scene's stacking order; see
+    // [`XWayland::sync_stacking`].
+    pub(crate) fn sync_x11_stacking(&mut self) {
+        self.xwayland.sync_stacking(&self.space);
+    }
+
+    pub(crate) fn update_xwayland_scale(&mut self) -> Result<()> {
+        // Match cosmic-comp's fractional descaling: retain 1.5 rather than rounding
+        // Xwayland to 2, so X11 coordinates and toolkit DPI use the output scale.
+        let scale = self.output.current_scale().fractional_scale().max(1.0);
+        if !self.xwayland.set_scale(scale)? {
+            return Ok(());
+        }
+        self.output.change_current_state(None, None, None, None);
+        for surface in self.space.elements().filter_map(Window::x11_surface) {
+            if !surface.is_override_redirect() {
+                surface.configure(surface.last_configure())?;
+            }
+        }
+        self.xwayland.restack();
+        Ok(())
+    }
+
     fn x11_window(&self, surface: &X11Surface) -> Option<Window> {
         self.space
             .elements()
@@ -416,14 +517,8 @@ impl XWaylandShellHandler for State {
 }
 
 impl XwmHandler for State {
-    #[expect(
-        clippy::expect_used,
-        reason = "XWM events are dispatched only after registration"
-    )]
     fn xwm_state(&mut self, _: XwmId) -> &mut X11Wm {
-        self.xwm
-            .as_mut()
-            .expect("XWM callback before WM registration")
+        self.xwayland.wm()
     }
     fn new_window(&mut self, _: XwmId, _: X11Surface) {}
     fn new_override_redirect_window(&mut self, _: XwmId, _: X11Surface) {}
@@ -591,7 +686,7 @@ impl XwmHandler for State {
 
     fn minimize_request(&mut self, _: XwmId, surface: X11Surface) {
         if let Some(window) = self.x11_window(&surface) {
-            self.window_action(&window, crate::WindowAction::Minimize);
+            self.window_action(&window, WindowAction::Minimize);
         }
     }
 
@@ -602,7 +697,7 @@ impl XwmHandler for State {
                 .get(&window)
                 .is_some_and(|state| state.minimized)
         {
-            self.window_action(&window, crate::WindowAction::Restore);
+            self.window_action(&window, WindowAction::Restore);
         }
     }
 
@@ -689,8 +784,7 @@ impl XwmHandler for State {
     }
 
     fn disconnected(&mut self, _: XwmId) {
-        self.xwm = None;
-        self.xdisplay = None;
+        self.xwayland.disconnected();
         self.fail(anyhow!("Xwayland WM disconnected"));
     }
 }

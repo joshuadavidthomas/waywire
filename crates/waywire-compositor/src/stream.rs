@@ -556,7 +556,7 @@ impl crate::State {
                 );
                 self.output.set_preferred(mode);
                 self.space.map_output(&self.output, (0, 0));
-                crate::xwayland::update_scale(self)?;
+                self.update_xwayland_scale()?;
                 self.output_resized();
                 self.update_cursor_image();
                 self.capture.output_resized();
