@@ -61,7 +61,7 @@ pub(super) fn response(status: StatusCode, mime: &'static str, body: Vec<u8>) ->
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'self'; connect-src 'self' ws: wss:; script-src 'self'; \
-             style-src 'self'; img-src 'self' data:",
+             worker-src 'self'; style-src 'self'; img-src 'self' data:",
         ),
     );
     response

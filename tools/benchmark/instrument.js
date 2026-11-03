@@ -28,6 +28,84 @@ const frameTime = (timestamp) => {
   return entry;
 };
 let pendingInput = null;
+// waywire's video worker, where it decodes and shows frames off the page. Its
+// own instrument (instrument-worker.js) takes the baseline and detects the
+// change; the page keeps the keydown and control-socket times.
+let videoWorker = null;
+// Shift a worker time onto this page's performance clock.
+const pageTime = (origin, time) =>
+  time === undefined ? undefined : time + origin - performance.timeOrigin;
+const NativeWorker = window.Worker;
+if (NativeWorker) {
+  window.Worker = class extends NativeWorker {
+    constructor(url, options) {
+      super(url, options);
+      if (options?.name !== "waywire-video") return;
+      videoWorker = this;
+      // Hold the viewer's messages until the worker's instrument is in place;
+      // it may run after the worker's own top level.
+      this.held = [];
+      this.lastRun = undefined;
+      this.addEventListener("message", (event) => {
+        const report = event.data?.benchmark;
+        if (!report) return;
+        event.stopImmediatePropagation();
+        if (report.hello) {
+          const held = this.held;
+          this.held = null;
+          for (const args of held) super.postMessage(...args);
+          return;
+        }
+        const { origin } = report;
+        if (report.socket)
+          window.benchmarkSockets[report.socket] =
+            (window.benchmarkSockets[report.socket] ?? 0) + report.bytes;
+        if (report.draws) window.benchmarkDraws += report.draws;
+        if (report.decode) {
+          window.benchmarkFrames++;
+          window.benchmarkDecodes.push(report.decode);
+          window.benchmarkFirstFrame ??= report.decode[0];
+          window.benchmarkNonblank ||= report.nonblank;
+        }
+        const trace = report.trace;
+        if (trace && pendingInput?.viaWorker) {
+          const shifted = Object.fromEntries(
+            Object.entries(trace).map(([key, value]) => [
+              key,
+              key === "captureMicros" || key === "sequence"
+                ? value
+                : pageTime(origin, value),
+            ]),
+          );
+          window.benchmarkLatencies.push(shifted.detected - pendingInput.time);
+          window.benchmarkTraces.push({
+            keydown: pendingInput.time,
+            armed: pendingInput.armed,
+            sent: pendingInput.sent,
+            input: pendingInput.input,
+            ...shifted,
+          });
+          pendingInput = null;
+        }
+      });
+    }
+
+    postMessage(message, transfer) {
+      if (this.held === undefined) return super.postMessage(message, transfer);
+      this.lastRun = message?.run ?? this.lastRun;
+      if (this.held) this.held.push([message, transfer]);
+      else super.postMessage(message, transfer);
+    }
+
+    arm() {
+      super.postMessage({
+        type: "benchmark-arm",
+        benchmarkArm: true,
+        run: this.lastRun,
+      });
+    }
+  };
+}
 // The last frame handed to a MediaStreamTrackGenerator, where the viewer shows
 // frames through a <video> instead of drawing the canvas.
 let lastShown = null;
@@ -37,6 +115,18 @@ document.addEventListener(
     if (!window.benchmarkArmed) return;
     const canvas = document.querySelector("#display");
     const time = performance.now();
+    if (videoWorker) {
+      videoWorker.arm();
+      pendingInput = {
+        time,
+        viaWorker: true,
+        sent: null,
+        input: null,
+        armed: performance.now() - time,
+      };
+      window.benchmarkArmed = false;
+      return;
+    }
     const viaTrack = lastShown !== null;
     pendingInput = {
       time,

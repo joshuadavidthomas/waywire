@@ -1151,6 +1151,24 @@ def check_regressions(results):
     return failures
 
 
+def instrument_video_worker():
+    """Instrument waywire's video worker as --init-script does the page."""
+    process = subprocess.Popen(
+        [
+            "node",
+            str(ROOT / "tools/benchmark/worker_instrument.mjs"),
+            browser("get", "cdp-url").strip(),
+            str(ROOT / "tools/benchmark/instrument-worker.js"),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    if process.stdout.readline().strip() != "ready":
+        process.kill()
+        raise RuntimeError("could not instrument the video worker")
+    return process
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1159,6 +1177,7 @@ def main():
         help="fail on regressions beyond the documented tolerances",
     )
     args = parser.parse_args()
+    worker_instrument = None
     with tempfile.TemporaryDirectory(prefix="benchmark-agent-") as tmp:
         fixture = Path(tmp)
         subprocess.run(
@@ -1203,6 +1222,7 @@ def main():
                 "open",
                 "about:blank",
             )
+            worker_instrument = instrument_video_worker()
             # A throwaway launch of each desktop first, so neither measured
             # launch pays for the viewer's cold start.
             for name in ("waywire", "waymote"):
@@ -1223,6 +1243,9 @@ def main():
                     return 1
                 print("Regression check passed", flush=True)
         finally:
+            if worker_instrument is not None:
+                worker_instrument.kill()
+                worker_instrument.wait()
             subprocess.run(
                 ["agent-browser", "--session", SESSION, "close"],
                 check=False,

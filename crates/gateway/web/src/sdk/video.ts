@@ -7,7 +7,7 @@ import {
 } from "./messages.ts";
 import type { WaywireStats } from "./session.ts";
 import { StripeCompositor } from "./stripes.ts";
-import { TrackSink } from "./track-sink.ts";
+import type { FrameSink } from "./track-sink.ts";
 import { decodeRecord, readFrameMetadata } from "./wire.ts";
 export const maximumVideoDecodeQueueSize = 24;
 const busyDecodeQueueSize = 5;
@@ -69,6 +69,32 @@ export interface VideoOwner {
   publishStats(stats: WaywireStats): void;
   /** A striped stream has no periodic key frames, so a viewer that lost one asks. */
   requestKeyFrame(): void;
+  /** Where to show frames instead of the canvas, asked once per attached canvas. */
+  createTrackSink(): FrameSink | null;
+  /** The canvas itself is fullscreen, which hides a `<video>` beside it. */
+  displayFullscreen(): boolean;
+}
+
+/** A canvas the playout draws on: the page's, or one moved to a worker. */
+export type VideoCanvas = HTMLCanvasElement | OffscreenCanvas;
+export type VideoCanvasContext =
+  | CanvasRenderingContext2D
+  | OffscreenCanvasRenderingContext2D;
+
+/** What the session drives, whether the video runs on this thread or a worker. */
+export interface VideoPipeline {
+  readonly hasSocket: boolean;
+  readonly renderedFrameCount: number;
+  readonly stats: Readonly<Partial<WaywireStats>>;
+  connect(): Promise<void>;
+  disconnect(): void;
+  invalidateConnectionAttempt(): void;
+  closeForHiddenPage(): void;
+  setLatencyTarget(milliseconds: number): void;
+  resetFeedbackInterval(): void;
+  /** Hands the interval's feedback to `deliver`, now or once a worker answers. */
+  requestFeedback(deliver: (feedback: VideoFeedback | null) => void): void;
+  detach(): void;
 }
 
 export type VideoPacket = Readonly<{
@@ -85,6 +111,28 @@ export type VideoPacket = Readonly<{
   height: number;
   fps: number;
 }>;
+
+/** A playout latency target, checked where a caller sets it. */
+export function latencyMilliseconds(value: number): number {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+    throw new RangeError("Latency must be a non-negative number");
+  }
+  return milliseconds;
+}
+
+/** The session's video options, checked when the session is created. */
+export function videoOptions(
+  latency: number | undefined,
+  statsIntervalMs: number | undefined,
+): Readonly<{ latency: number; statsIntervalMs: number }> {
+  const target = latencyMilliseconds(latency ?? 60);
+  const interval = Number(statsIntervalMs ?? 0);
+  if (!Number.isFinite(interval) || interval < 0) {
+    throw new RangeError("Stats interval must be a non-negative number");
+  }
+  return { latency: target, statsIntervalMs: interval };
+}
 
 export function parseVideoPacket(buffer: ArrayBuffer): VideoPacket | null {
   try {
@@ -128,9 +176,9 @@ type PendingVideoFrame = Readonly<{
   metadata: FrameMetadata;
 }>;
 
-export class VideoRuntime {
-  private display: HTMLCanvasElement | null = null;
-  private context: CanvasRenderingContext2D | null = null;
+export class VideoRuntime implements VideoPipeline {
+  private display: VideoCanvas | null = null;
+  private context: VideoCanvasContext | null = null;
   private decoder: VideoDecoder | null = null;
   private stripes: StripeCompositor | null = null;
   private socket: WebSocket | null = null;
@@ -179,27 +227,16 @@ export class VideoRuntime {
   private lastDrawStats: WaywireStats | null = null;
   private presentedInput = 0;
   // Undefined until the first frame decides whether this browser has a track sink.
-  private trackSink: TrackSink | null | undefined;
+  private trackSink: FrameSink | null | undefined;
 
   constructor(
     private readonly owner: VideoOwner,
     latency: number | undefined,
     statsIntervalMs: number | undefined,
   ) {
-    this.targetLatencyMilliseconds = Number(latency ?? 60);
-    this.statsIntervalMilliseconds = Number(statsIntervalMs ?? 0);
-    if (
-      !Number.isFinite(this.targetLatencyMilliseconds) ||
-      this.targetLatencyMilliseconds < 0
-    ) {
-      throw new RangeError("Latency must be a non-negative number");
-    }
-    if (
-      !Number.isFinite(this.statsIntervalMilliseconds) ||
-      this.statsIntervalMilliseconds < 0
-    ) {
-      throw new RangeError("Stats interval must be a non-negative number");
-    }
+    const options = videoOptions(latency, statsIntervalMs);
+    this.targetLatencyMilliseconds = options.latency;
+    this.statsIntervalMilliseconds = options.statsIntervalMs;
   }
 
   get hasSocket(): boolean {
@@ -242,7 +279,7 @@ export class VideoRuntime {
     };
   }
 
-  attach(display: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
+  attach(display: VideoCanvas, context: VideoCanvasContext): void {
     this.closeTrackSink();
     this.display = display;
     this.context = context;
@@ -435,11 +472,7 @@ export class VideoRuntime {
   }
 
   setLatencyTarget(milliseconds: number): void {
-    milliseconds = Number(milliseconds);
-    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
-      throw new RangeError("Latency must be a non-negative number");
-    }
-    this.targetLatencyMilliseconds = milliseconds;
+    this.targetLatencyMilliseconds = latencyMilliseconds(milliseconds);
     if (this.presentationTimer !== null) clearTimeout(this.presentationTimer);
     this.presentationTimer = null;
     this.schedulePresentation();
@@ -455,6 +488,10 @@ export class VideoRuntime {
     this.queueObservedAt = now;
     this.queueObservedSize = this.decoder?.decodeQueueSize ?? 0;
     this.queuePeak = this.queueObservedSize;
+  }
+
+  requestFeedback(deliver: (feedback: VideoFeedback | null) => void): void {
+    deliver(this.takeFeedback());
   }
 
   takeFeedback(now = performance.now()): VideoFeedback | null {
@@ -844,10 +881,11 @@ export class VideoRuntime {
       display.width = frame.displayWidth;
       display.height = frame.displayHeight;
     }
-    if (this.trackSink === undefined) this.trackSink = TrackSink.over(display);
+    if (this.trackSink === undefined)
+      this.trackSink = this.owner.createTrackSink();
     this.trackSink?.show(frame);
     // A fullscreen canvas hides the <video> beside it, so it draws as well.
-    if (!this.trackSink?.showing || document.fullscreenElement === display)
+    if (!this.trackSink?.showing || this.owner.displayFullscreen())
       context.drawImage(frame, 0, 0, display.width, display.height);
     const drawCompletedAtMs = performance.now();
     // Presented means rendered to the canvas, not physical display scanout.

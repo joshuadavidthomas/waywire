@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ClockSynchronizer } from "./control.ts";
+import { ClockSynchronizer } from "./clock.ts";
 
 function sample(
   clock: ClockSynchronizer,

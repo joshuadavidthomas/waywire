@@ -12,10 +12,11 @@ type TrackGeneratorConstructor = new (init: {
  * `drawImage` on the main thread. Elsewhere the viewer draws into the canvas.
  */
 export class TrackSink {
+  private writer: WritableStreamDefaultWriter<VideoFrame> | null = null;
+
   private constructor(
     private readonly element: HTMLVideoElement,
     private readonly track: TrackGenerator,
-    private readonly writer: WritableStreamDefaultWriter<VideoFrame>,
     private readonly observer: ResizeObserver,
   ) {}
 
@@ -52,7 +53,7 @@ export class TrackSink {
     observer.observe(canvas);
     canvas.after(element);
     element.play().catch(() => undefined);
-    return new TrackSink(element, track, track.writable.getWriter(), observer);
+    return new TrackSink(element, track, observer);
   }
 
   /**
@@ -64,15 +65,33 @@ export class TrackSink {
     return this.element.readyState >= 2; // HAVE_CURRENT_DATA
   }
 
+  /** Calls `listener` once the `<video>` has a frame to show. */
+  onShowing(listener: () => void): void {
+    this.element.addEventListener("loadeddata", listener);
+  }
+
+  /**
+   * The track's input, for a video worker to write frames to. Chromium
+   * delivers frames written to a transferred generator stream without the
+   * page's main thread, so a busy page does not hold them back.
+   */
+  get writable(): WritableStream<VideoFrame> {
+    return this.track.writable;
+  }
+
   /** Show the frame; the caller keeps its own reference. */
   show(frame: VideoFrame): void {
+    this.writer ??= this.track.writable.getWriter();
     this.writer.write(frame.clone()).catch(() => undefined);
   }
 
   close(): void {
     this.observer.disconnect();
-    this.writer.close().catch(() => undefined);
+    this.writer?.close().catch(() => undefined);
     this.track.stop();
     this.element.remove();
   }
 }
+
+/** Where the playout shows frames instead of drawing them on the canvas. */
+export type FrameSink = Pick<TrackSink, "showing" | "show" | "close">;

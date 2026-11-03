@@ -899,6 +899,39 @@ the review are in place. Remaining gaps:
   Chromium ran that path's animation frames at about 8 Hz even on an idle
   page, so the study could not compare it.
 
+  The viewer now decodes and shows video in a dedicated worker. The same
+  study, rebuilt with keys sent over CDP at random phases of the busy loop,
+  then ran both builds on one orb, 3 rounds each. Cells are fps, longest gap,
+  overdue drops/s and probe p50/p95 ms:
+
+  | main thread busy  | `<video>`, before       | `<video>`, worker      | canvas, before          | canvas, worker          |
+  | ----------------- | ----------------------- | ---------------------- | ----------------------- | ----------------------- |
+  | idle              | 29.9, 39, 0.0, 162/190  | 29.8, 39, 0.0, 142/175 | 29.8, 53, 0.0, 163/188  | 29.9, 51, 0.0, 138/180  |
+  | 16 ms per 100 ms  | 29.8, 56, 0.0, 167/194  | 29.8, 42, 0.0, 132/171 | 29.9, 61, 0.0, 212/236  | 29.9, 64, 0.0, 138/175  |
+  | 50 ms per 200 ms  | 29.0, 73, 0.7, 203/224  | 29.8, 40, 0.0, 128/169 | 25.1, 107, 4.7, 214/266 | 29.8, 97, 0.0, 203/227  |
+  | 100 ms per 500 ms | 26.5, 122, 3.1, 222/268 | 29.8, 43, 0.0, 131/170 | 25.2, 149, 4.6, 215/286 | 27.1, 188, 2.7, 196/270 |
+
+  On the `<video>` path, which Chromium takes, a busy page no longer costs
+  frames or latency: the page hands the track's writable stream to the
+  worker, which writes frames to it without the page's main thread. The
+  canvas path still stalls on long busy spans. In headless Chromium 156,
+  `drawImage`, `copyTo` and `createImageBitmap` of a `VideoFrame` in a worker
+  wait for the page's busy main thread (78 to 97 ms of each 100 ms span),
+  while the worker's timers and socket keep running and drawing another
+  canvas does not wait. That is measured only in headless Chromium 156.
+  Firefox and Safari, the browsers that take the canvas path, are untested.
+  Safari 18 has `VideoTrackGenerator` only in workers and cannot transfer a
+  writable stream, so it takes the canvas path too. Selkies found that
+  Firefox delivers a worker's WebSocket messages through the page's main
+  thread, so a busy page delays them there; the worker does not avoid that.
+
+  Idle latency is lower in the worker columns, but that was not the
+  worker. Idle runs of both builds interleaved afterwards measured 119 to 131
+  ms p50 on each (one main `<video>` run 163), and input sent to frame
+  received took 67 to 72 ms in all of them against about 105 ms during the
+  first main run: the desktop side drifted over the hour. Compare rows within
+  a column.
+
 ## Decisions
 
 - **Scope.** Headless and remote only; no local hardware backend for now.

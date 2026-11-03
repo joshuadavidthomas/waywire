@@ -1,3 +1,4 @@
+import { ClockSynchronizer } from "./clock.ts";
 import { LocalCursor } from "./cursor.ts";
 import { InputRuntime, SurfaceListeners } from "./input.ts";
 import { parseControlMessage, parseJson } from "./messages.ts";
@@ -7,7 +8,9 @@ import {
   normalizeResizeDimensions,
   type RemoteDisplayPolicy,
 } from "./resize.ts";
-import { VideoRuntime } from "./video.ts";
+import { RemoteVideo, videoWorkerAvailable } from "./remote-video.ts";
+import { TrackSink } from "./track-sink.ts";
+import { VideoRuntime, type VideoOwner } from "./video.ts";
 import { resize as resizeRecord } from "./wire.ts";
 import type {
   SurfaceHandle,
@@ -26,23 +29,20 @@ export type WebSocketFactory = (
   url: URL,
 ) => WebSocket | Promise<WebSocket>;
 
-const clockMaximumAgeMilliseconds = 5000;
-const maximumClockSampleRttMilliseconds = 60_000;
-
 export class SessionTransport {
   constructor(
     private readonly endpoint: string | URL | undefined,
     private readonly factory: WebSocketFactory | undefined,
   ) {}
 
-  private websocketURL(path: TransportPath): URL {
+  url(path: TransportPath): URL {
     const url = new URL(path, this.endpoint ?? location.origin);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     return url;
   }
 
   async create(path: TransportPath): Promise<WebSocket> {
-    const url = this.websocketURL(path);
+    const url = this.url(path);
     const socket = this.factory
       ? await this.factory(path, url)
       : new WebSocket(url);
@@ -56,67 +56,6 @@ export class SessionTransport {
       );
     }
     return socket;
-  }
-}
-
-export class ClockSynchronizer {
-  offsetMicros: number | null = null;
-  bestRttMilliseconds = Number.POSITIVE_INFINITY;
-  private sampleCount = 0;
-  private lastSampleAt = 0;
-
-  synchronized(now = performance.now()): boolean {
-    return (
-      this.offsetMicros !== null &&
-      this.sampleCount >= 2 &&
-      now - this.lastSampleAt <= clockMaximumAgeMilliseconds
-    );
-  }
-
-  update(sent: number, received: number, serverNanos: string | number): void {
-    const serverMicros = Number(serverNanos) / 1000;
-    const sampleRtt = received - sent;
-    if (
-      !Number.isFinite(serverMicros) ||
-      serverMicros < 0 ||
-      !Number.isFinite(sampleRtt) ||
-      sampleRtt < 0 ||
-      sampleRtt > maximumClockSampleRttMilliseconds
-    ) {
-      return;
-    }
-    const candidateOffset = (sent + received) * 500 - serverMicros;
-    if (
-      this.offsetMicros === null ||
-      // Once confidence has expired, an obsolete best RTT must not prevent
-      // reacquisition on a slower path. Two fresh samples are still required.
-      received - this.lastSampleAt > clockMaximumAgeMilliseconds
-    ) {
-      this.offsetMicros = candidateOffset;
-      this.bestRttMilliseconds = sampleRtt;
-      this.sampleCount = 1;
-      this.lastSampleAt = received;
-    } else if (
-      sampleRtt <=
-      this.bestRttMilliseconds + Math.max(2, this.bestRttMilliseconds * 0.25)
-    ) {
-      const correction = candidateOffset - this.offsetMicros;
-      this.offsetMicros +=
-        Math.abs(correction) > 100_000 ? correction : correction * 0.1;
-      this.bestRttMilliseconds = Math.min(this.bestRttMilliseconds, sampleRtt);
-      this.sampleCount += 1;
-      this.lastSampleAt = received;
-    }
-  }
-
-  expectedPresentationTime(
-    captureMicros: number,
-    targetLatencyMilliseconds: number,
-  ): number | null {
-    if (!this.synchronized() || !Number.isFinite(captureMicros)) return null;
-    return this.offsetMicros === null
-      ? null
-      : (captureMicros + this.offsetMicros) / 1000 + targetLatencyMilliseconds;
   }
 }
 
@@ -181,7 +120,7 @@ export class ControlRuntime {
   private readonly owner: RuntimeOwner;
   private readonly options: WaywireSessionOptions;
   private readonly transport: SessionTransport;
-  private readonly video: VideoRuntime;
+  private readonly video: VideoRuntime | RemoteVideo;
 
   constructor(owner: RuntimeOwner, options: WaywireSessionOptions) {
     this.owner = owner;
@@ -201,7 +140,6 @@ export class ControlRuntime {
   private inputElement: HTMLElement | null = null;
   private localCursor: LocalCursor | null = null;
   private imeProxy: HTMLInputElement | HTMLTextAreaElement | null = null;
-  private context: CanvasRenderingContext2D | null = null;
   private readonly surfaceListeners = new SurfaceListeners();
   private resizeObserver: ResizeObserver | null = null;
   private feedbackTimer: Timer | null = null;
@@ -244,53 +182,62 @@ export class ControlRuntime {
   private readonly pings = new Map<number, number>();
   private readonly resizeRequests = new Map<number, ResizeRequest>();
   private resizeState: WaywireStats["resizeState"] = "idle";
-  private createVideo(): VideoRuntime {
-    return new VideoRuntime(
-      {
-        createSocket: () => this.transport.create("/stream"),
-        connectionGeneration: () => this.connectionGeneration,
-        shouldRun: () => this.sessionConnected && !document.hidden,
-        disposed: () => this.sessionDisposed,
-        setStatus: (text, connected) => this.setStatus(text, connected),
-        updateState: (changes) => this.owner.updateState("video", changes),
-        emitError: (error) => this.emit("error", error),
-        halt: (error) => this.owner.halt(error),
-        expectedPresentationTime: (captureMicros, latencyMilliseconds) =>
-          this.clock.expectedPresentationTime(
-            captureMicros,
-            latencyMilliseconds,
-          ),
-        statsContext: () => ({
-          bitrateKbps: this.qualityBitrate,
-          scalePercent: this.qualityScale,
-          rttMs: this.rtt,
-          clockConfident: this.clock.synchronized(),
-          clockUncertaintyMs: Number.isFinite(this.clock.bestRttMilliseconds)
-            ? this.clock.bestRttMilliseconds / 2
-            : null,
-          pendingInputCount: Math.max(
-            0,
-            this.inputSequence - this.latestAppliedInput,
-          ),
-          resizeState: this.resizeState,
-        }),
-        setLatestAppliedInput: (sequence) => {
-          this.latestAppliedInput = sequence;
-        },
-        presentResizeGeneration: (generation, width, height) =>
-          this.presentResizeGeneration(generation, width, height),
-        publishStats: (stats) => this.emit("stats", stats),
-        requestKeyFrame: () => {
-          if (this.controlSocket?.readyState === WebSocket.OPEN) {
-            this.controlSocket.send(
-              JSON.stringify({ type: "request-key-frame" }),
-            );
-          }
-        },
+  private createVideo(): VideoRuntime | RemoteVideo {
+    const owner: VideoOwner = {
+      createSocket: () => this.transport.create("/stream"),
+      connectionGeneration: () => this.connectionGeneration,
+      shouldRun: () => this.sessionConnected && !document.hidden,
+      disposed: () => this.sessionDisposed,
+      setStatus: (text, connected) => this.setStatus(text, connected),
+      updateState: (changes) => this.owner.updateState("video", changes),
+      emitError: (error) => this.emit("error", error),
+      halt: (error) => this.owner.halt(error),
+      expectedPresentationTime: (captureMicros, latencyMilliseconds) =>
+        this.clock.expectedPresentationTime(captureMicros, latencyMilliseconds),
+      statsContext: () => ({
+        bitrateKbps: this.qualityBitrate,
+        scalePercent: this.qualityScale,
+        rttMs: this.rtt,
+        clockConfident: this.clock.synchronized(),
+        clockUncertaintyMs: Number.isFinite(this.clock.bestRttMilliseconds)
+          ? this.clock.bestRttMilliseconds / 2
+          : null,
+        pendingInputCount: Math.max(
+          0,
+          this.inputSequence - this.latestAppliedInput,
+        ),
+        resizeState: this.resizeState,
+      }),
+      setLatestAppliedInput: (sequence) => {
+        this.latestAppliedInput = sequence;
       },
-      this.options.latency,
-      this.options.statsIntervalMs,
-    );
+      presentResizeGeneration: (generation, width, height) =>
+        this.presentResizeGeneration(generation, width, height),
+      publishStats: (stats) => this.emit("stats", stats),
+      requestKeyFrame: () => {
+        if (this.controlSocket?.readyState === WebSocket.OPEN) {
+          this.controlSocket.send(
+            JSON.stringify({ type: "request-key-frame" }),
+          );
+        }
+      },
+      createTrackSink: () => this.display && TrackSink.over(this.display),
+      displayFullscreen: () =>
+        this.display !== null && document.fullscreenElement === this.display,
+    };
+    return videoWorkerAvailable(this.options.createWebSocket !== undefined)
+      ? new RemoteVideo(
+          owner,
+          this.clock,
+          this.transport.url("/stream"),
+          this.options.latency,
+          this.options.statsIntervalMs,
+        )
+      : new VideoRuntime(
+          owner,
+          this.options.latency,
+          this.options.statsIntervalMs,
+        );
   }
 
   private readonly inputRuntime = new InputRuntime({
@@ -1102,7 +1049,6 @@ export class ControlRuntime {
 
   private sendFeedback(): void {
     const now = performance.now();
-    const feedback = this.video.takeFeedback(now);
     const socket = this.controlSocket;
     if (socket && socket.readyState === WebSocket.OPEN) {
       const id = ++this.pingID;
@@ -1111,11 +1057,13 @@ export class ControlRuntime {
         if (sent < now - 10_000) this.pings.delete(pendingID);
       }
       socket.send(JSON.stringify({ type: "ping", id }));
-      if (feedback)
+    }
+    this.video.requestFeedback((feedback) => {
+      if (feedback && socket && socket.readyState === WebSocket.OPEN)
         socket.send(
           JSON.stringify({ type: "feedback", ...feedback, rtt: this.rtt }),
         );
-    }
+    });
   }
 
   private refreshResizeObservation(): void {
@@ -1197,16 +1145,25 @@ export class ControlRuntime {
       document.body.append(createdImeProxy);
     }
 
-    this.context = attachedCanvas.getContext("2d", { alpha: false });
-    if (!this.context) {
+    try {
+      if (this.video instanceof RemoteVideo) {
+        this.video.attach(attachedCanvas);
+      } else {
+        const context = attachedCanvas.getContext("2d", { alpha: false });
+        if (!context) {
+          throw new Error(
+            "The attached canvas does not provide a 2D this.context",
+          );
+        }
+        this.video.attach(attachedCanvas, context);
+      }
+    } catch (error) {
       createdImeProxy?.remove();
       this.display = null;
       this.inputElement = null;
       this.imeProxy = null;
-      throw new Error("The attached canvas does not provide a 2D this.context");
+      throw error;
     }
-
-    this.video.attach(attachedCanvas, this.context);
     this.localCursor = new LocalCursor(attachedInput, attachedCanvas);
     this.clipboardAutoSync = Boolean(surfaceOptions.clipboardAutoSync);
     this.owner.setControlOnFocus(Boolean(surfaceOptions.controlOnFocus));
@@ -1240,7 +1197,6 @@ export class ControlRuntime {
       this.display = null;
       this.inputElement = null;
       this.imeProxy = null;
-      this.context = null;
       this.video.detach();
       if (this.surfaceDisposer === disposeSurface) this.surfaceDisposer = null;
     };
@@ -1271,7 +1227,7 @@ export class ControlRuntime {
       throw new Error("The session has been disposed");
     }
     if (this.sessionConnected) return;
-    if (!this.display || !this.context) {
+    if (!this.display) {
       throw new Error("Attach a canvas before connecting the session");
     }
     if (!("VideoDecoder" in window)) {

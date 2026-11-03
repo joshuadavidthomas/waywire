@@ -216,6 +216,7 @@ class RegressionCheckTest(unittest.TestCase):
             patch.object(sys, "argv", ["benchmark.py", "--check"]),
             patch("benchmark.subprocess.run"),
             patch("benchmark.browser"),
+            patch("benchmark.instrument_video_worker"),
             patch(
                 "benchmark.run_desktop",
                 side_effect=lambda name, _, warmup=False: self.results[name],

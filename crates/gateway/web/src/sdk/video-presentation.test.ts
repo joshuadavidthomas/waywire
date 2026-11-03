@@ -12,6 +12,7 @@ import {
   socket,
   videoPacket,
 } from "./test-support.ts";
+import { TrackSink } from "./track-sink.ts";
 import { VideoRuntime } from "./video.ts";
 
 async function presentation(context: TestContext, latency: number) {
@@ -30,6 +31,7 @@ async function presentation(context: TestContext, latency: number) {
   const stream = new FakeWebSocket();
   const draws: Array<{ timestamp: number; at: number }> = [];
   const published: WaywireStats[] = [];
+  const canvas = new FakeTarget();
   const video = new VideoRuntime(
     {
       createSocket: async () => socket(stream),
@@ -59,11 +61,15 @@ async function presentation(context: TestContext, latency: number) {
       presentResizeGeneration() {},
       publishStats: (stats) => published.push(stats),
       requestKeyFrame() {},
+      createTrackSink: () =>
+        TrackSink.over(canvas as unknown as HTMLCanvasElement),
+      displayFullscreen: () =>
+        (document as unknown as { fullscreenElement?: unknown })
+          .fullscreenElement === canvas,
     },
     latency,
     0,
   );
-  const canvas = new FakeTarget();
   video.attach(
     canvas as unknown as HTMLCanvasElement,
     {

@@ -11,6 +11,7 @@ export interface WaywireSessionOptions {
   readonly endpoint?: string | URL;
   /** Presentation delay; decoded-frame storage grows with delay and source FPS. */
   readonly latency?: number;
+  /** Makes the session's sockets. A session with one runs its video on the page. */
   readonly createWebSocket?: (
     path: TransportPath,
     url: URL,
@@ -132,6 +133,15 @@ export interface WaywireEventMap {
 }
 
 export interface SurfaceOptions {
+  /**
+   * The canvas the remote screen is shown on. Where the browser can move a
+   * canvas to a worker (`transferControlToOffscreen`) and the session uses
+   * the default WebSockets, the session decodes and draws video in a
+   * dedicated worker and keeps this canvas for good: it must not have a
+   * rendering context yet, the page cannot draw on it, and attaching it
+   * again after the surface is disposed throws. Attach a new canvas instead.
+   * Elsewhere the session draws on the page as before.
+   */
   readonly canvas: HTMLCanvasElement;
   readonly inputElement?: HTMLElement;
   readonly textInputElement?: HTMLInputElement | HTMLTextAreaElement;
