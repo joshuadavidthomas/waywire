@@ -758,14 +758,19 @@ export class VideoRuntime {
       presentation === null || answersInput
         ? 0
         : presentation - performance.now();
-    if (delay > presentationLeadMilliseconds) {
+    // A frame written to the <video> shows at once, so it waits until it is
+    // due; within the lead it would not be due yet and would come straight back.
+    const writesTrack = !answersInput && this.trackSink?.showing === true;
+    if (delay > presentationLeadMilliseconds || (writesTrack && delay > 0)) {
       this.presentationTimer = setTimeout(
         () => {
           this.presentationTimer = null;
           this.schedulePresentation();
         },
         Math.min(
-          delay - presentationWakeMarginMilliseconds,
+          delay > presentationLeadMilliseconds
+            ? delay - presentationWakeMarginMilliseconds
+            : delay,
           maximumPresentationTimerMilliseconds,
         ),
       );
