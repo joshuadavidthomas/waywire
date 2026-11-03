@@ -772,8 +772,12 @@ export class VideoRuntime {
       return;
     }
     // After idle, the first animation frame can take a vsync or more to
-    // arrive. The canvas commits with the next frame either way.
-    if (answersInput) {
+    // arrive. The canvas commits with the next frame either way. Chromium
+    // matches its frame rate to a page whose only damage is video, so a track
+    // frame that waited for an animation frame would lower that rate, which
+    // shows fewer frames and lowers it again: 30, 15, then 7.5 Hz. The <video>
+    // composites track frames by itself.
+    if (answersInput || this.trackSink?.showing) {
       this.renderFrame();
       return;
     }

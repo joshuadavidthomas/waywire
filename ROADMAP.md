@@ -861,6 +861,21 @@ the review are in place. Remaining gaps:
   chunks are queued during the GOP replay on connect, and an idle desktop never
   sends another keyframe, so the viewer stays blank. The fix is upstream in
   Waymote; a run that hits it is rerun.
+- `just benchmark --check` failed twice with "slow link openh264 fps: 7.5 <
+  15". The frames were lost in the viewer, not in OpenH264: per-frame traces
+  showed the compositor rendering, OpenH264 coding (no empty or skipped
+  stripes), the gateway sending and the viewer decoding 30 frames a second
+  throughout the sag. The viewer showed a due frame only on the next
+  animation frame, and animation frames came 33, then 67, then 133 ms apart,
+  so three of every four decoded frames were dropped as overdue. The likely
+  cause is Chromium's frame interval decider, which runs a page whose only
+  damage is video at the video's rate: each missed animation frame lowered
+  that rate, which lowered the next one. The rate recovered after each
+  generation change, which pauses the video briefly; that is probably why a
+  bitrate step restored it. The viewer now shows due frames through the
+  `<video>` without waiting for an animation frame. In a slow-link run the
+  `<video>` then presented 30 frames a second throughout, against 7.5 to 9.4
+  before.
 
 ## Decisions
 

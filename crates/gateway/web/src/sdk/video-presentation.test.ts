@@ -354,6 +354,13 @@ test("where MediaStreamTrackGenerator exists, frames show through a <video> over
       "none",
       "input stays on the canvas",
     );
+    await h.feed(315_000, { inputSequence: 1 });
+    h.advance(315);
+    assert.deepEqual(
+      written,
+      [0, 310_000, 315_000],
+      "a due frame shows without waiting for an animation frame, which Chromium slows to the video's rate",
+    );
     Object.assign(document, { fullscreenElement: h.canvas });
     h.advance(10);
     await h.feed(320_000, { inputSequence: 2 });
@@ -362,7 +369,7 @@ test("where MediaStreamTrackGenerator exists, frames show through a <video> over
       [0, 320_000],
       "a fullscreen canvas is drawn too",
     );
-    assert.deepEqual(written, [0, 310_000, 320_000]);
+    assert.deepEqual(written, [0, 310_000, 315_000, 320_000]);
     h.video.detach();
     assert.equal(stage.children.length, 1);
     assert.ok(stopped);
