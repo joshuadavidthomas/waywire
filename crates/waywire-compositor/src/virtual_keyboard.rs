@@ -164,6 +164,51 @@ pub(crate) struct VirtualKeyboards {
     devices: Vec<VirtualKeyboard>,
 }
 
+impl VirtualKeyboards {
+    fn get_mut(&mut self, device: &VirtualKeyboardDevice) -> Option<&mut VirtualKeyboard> {
+        self.devices
+            .iter_mut()
+            .find(|known| known.device == *device)
+    }
+
+    /// Track a new device. Its keys are dropped when it uploaded a keymap
+    /// that does not compile.
+    fn add(&mut self, device: VirtualKeyboardDevice) {
+        let client = client_state(&device);
+        if device.keymap().is_some() && client.is_none() {
+            tracing::warn!("virtual keyboard keymap does not compile; its keys are dropped");
+        }
+        self.devices.push(VirtualKeyboard {
+            device,
+            client,
+            held: HashMap::new(),
+            modifiers: [0; 3],
+        });
+    }
+
+    /// A new keymap from a connected client. Keys it holds stay held on the
+    /// seat keys they pressed.
+    fn rekey(&mut self, device: &VirtualKeyboardDevice) {
+        let client = client_state(device);
+        if let Some(keyboard) = self.get_mut(device) {
+            keyboard.client = client;
+        }
+    }
+
+    /// Stop tracking the device. Returns whether it had set seat modifiers,
+    /// which no key release will clear.
+    fn remove(&mut self, device: &VirtualKeyboardDevice) -> bool {
+        let Some(index) = self
+            .devices
+            .iter()
+            .position(|known| known.device == *device)
+        else {
+            return false;
+        };
+        self.devices.remove(index).modifiers != [0; 3]
+    }
+}
+
 struct VirtualKeyboard {
     device: VirtualKeyboardDevice,
     /// The client's keymap, in the state its keys and `modifiers` requests
@@ -177,48 +222,14 @@ struct VirtualKeyboard {
 
 impl State {
     fn virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) -> Option<&mut VirtualKeyboard> {
-        self.virtual_keyboards
-            .devices
-            .iter_mut()
-            .find(|known| known.device == *device)
-    }
-
-    fn add_virtual_keyboard(&mut self, device: VirtualKeyboardDevice) {
-        let client = client_state(&device);
-        if device.keymap().is_some() && client.is_none() {
-            tracing::warn!("virtual keyboard keymap does not compile; its keys are dropped");
-        }
-        self.virtual_keyboards.devices.push(VirtualKeyboard {
-            device,
-            client,
-            held: HashMap::new(),
-            modifiers: [0; 3],
-        });
-    }
-
-    /// A new keymap from a connected client. Keys it holds stay held on the
-    /// seat keys they pressed.
-    fn rekey_virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) {
-        let client = client_state(device);
-        if let Some(keyboard) = self.virtual_keyboard(device) {
-            keyboard.client = client;
-        }
+        self.virtual_keyboards.get_mut(device)
     }
 
     /// The device is gone: release what it holds and clear the modifiers it
     /// set, which no key release will clear.
     fn remove_virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) {
         self.disconnect_input_source(device.source());
-        let Some(index) = self
-            .virtual_keyboards
-            .devices
-            .iter()
-            .position(|known| known.device == *device)
-        else {
-            return;
-        };
-        let removed = self.virtual_keyboards.devices.remove(index);
-        if removed.modifiers != [0; 3] && !self.input.browser_holds_input() {
+        if self.virtual_keyboards.remove(device) && !self.input.browser_holds_input() {
             self.set_seat_modifiers([0; 3]);
         }
     }
@@ -407,10 +418,10 @@ impl VirtualKeyboardHandler for State {
                     device.client(),
                 );
                 self.register_agent_source(device.source());
-                self.add_virtual_keyboard(device);
+                self.virtual_keyboards.add(device);
             }
             InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
-                self.rekey_virtual_keyboard(&device);
+                self.virtual_keyboards.rekey(&device);
             }
             InputEvent::DeviceRemoved { device } => {
                 self.remove_virtual_keyboard(&device);

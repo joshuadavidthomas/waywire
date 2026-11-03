@@ -625,9 +625,7 @@ impl crate::State {
                 });
                 text_input.done(false);
                 if !active && matches!(p.action, pipe::TextAction::Commit) {
-                    self.text_keyboard
-                        .pending
-                        .push_back(p.text.as_str().to_owned());
+                    self.text_keyboard.queue(p.text.as_str().to_owned());
                     self.flush_text_keyboard();
                 }
             }

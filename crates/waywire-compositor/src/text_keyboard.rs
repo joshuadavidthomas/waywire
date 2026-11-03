@@ -17,7 +17,7 @@ const CHARACTER_KEYS: [u32; 2] = [89 + 8, 124 + 8];
 
 #[derive(Default)]
 pub(crate) struct TextKeyboard {
-    pub(crate) pending: VecDeque<String>,
+    pending: VecDeque<String>,
     base: Option<String>,
     installed: Option<KeymapFileId>,
     slots: Vec<Slot>,
@@ -33,6 +33,76 @@ struct Slot {
 }
 
 impl TextKeyboard {
+    /// Queue composed text to type once no key is held.
+    pub(crate) fn queue(&mut self, text: String) {
+        self.pending.push_back(text);
+    }
+
+    /// Take the next queued text.
+    fn next_pending(&mut self) -> Option<String> {
+        self.pending.pop_front()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The keymap with the slots' characters became the seat's keymap.
+    fn installed(&mut self, id: KeymapFileId) {
+        self.installed = Some(id);
+    }
+
+    fn base(&mut self, base: String, slots: Vec<Slot>) {
+        tracing::info!(
+            x11 = slots.iter().filter(|slot| slot.code <= 255).count(),
+            wayland = slots.iter().filter(|slot| slot.code > 255).count(),
+            "text keyboard spare keycodes"
+        );
+        self.base = Some(base);
+        self.slots = slots;
+    }
+
+    /// Stop editing the keymap after it failed to build or install.
+    fn abandon(&mut self) {
+        self.base = None;
+    }
+
+    /// Start over from the seat's keymap when something else replaced the
+    /// one this installed. Returns whether the spare keycodes must be read
+    /// from the seat's keymap again.
+    fn prepare(&mut self, active: KeymapFileId) -> bool {
+        if self.installed.is_some_and(|id| active != id) {
+            self.base = None;
+            self.installed = None;
+            self.slots.clear();
+        }
+        self.base.is_none()
+    }
+
+    /// Empty the spare keycode `code` when it holds a character of the keymap
+    /// `active`. Returns whether the keymap must be installed again.
+    fn reclaim(&mut self, active: KeymapFileId, code: u32) -> bool {
+        if self.installed != Some(active) {
+            return false;
+        }
+        let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.code == code && slot.character.is_some())
+        else {
+            return false;
+        };
+        slot.character = None;
+        true
+    }
+
+    /// Whether a spare keycode is one of the real character keys.
+    fn has_character_key(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| CHARACTER_KEYS.contains(&slot.code))
+    }
+
     /// Spare keycodes, among those `usable` allows, that type `text`, and
     /// whether the keymap has to change for them.
     fn assign(&mut self, text: &str, usable: impl Fn(u32) -> bool) -> (Vec<u32>, bool) {
@@ -147,13 +217,7 @@ impl State {
             Some((guard.keymap_as_string(), slots))
         });
         if let Some((base, slots)) = result {
-            tracing::info!(
-                x11 = slots.iter().filter(|slot| slot.code <= 255).count(),
-                wayland = slots.iter().filter(|slot| slot.code > 255).count(),
-                "text keyboard spare keycodes"
-            );
-            self.text_keyboard.base = Some(base);
-            self.text_keyboard.slots = slots;
+            self.text_keyboard.base(base, slots);
         }
     }
 
@@ -164,16 +228,16 @@ impl State {
         };
         let Some(keymap) = self.text_keyboard.keymap() else {
             tracing::warn!("unexpected XKB keymap format");
-            self.text_keyboard.base = None;
+            self.text_keyboard.abandon();
             return false;
         };
         let modifiers = keyboard.modifier_state();
         if let Err(error) = keyboard.set_keymap_from_string(self, keymap) {
             tracing::warn!(%error, "text keyboard keymap failed");
-            self.text_keyboard.base = None;
+            self.text_keyboard.abandon();
             return false;
         }
-        self.text_keyboard.installed = Some(keyboard.keymap_file().id());
+        self.text_keyboard.installed(keyboard.keymap_file().id());
         keyboard.set_modifier_state(modifiers);
         keyboard.advertise_modifier_state(self);
         true
@@ -186,19 +250,12 @@ impl State {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
-        if self.text_keyboard.installed != Some(keyboard.keymap_file().id()) {
-            return;
-        }
-        let Some(slot) = self
+        if self
             .text_keyboard
-            .slots
-            .iter_mut()
-            .find(|slot| slot.code == code && slot.character.is_some())
-        else {
-            return;
-        };
-        slot.character = None;
-        self.install_text_keymap();
+            .reclaim(keyboard.keymap_file().id(), code)
+        {
+            self.install_text_keymap();
+        }
     }
 
     /// A seat keycode whose first level types `character`, holding it in a
@@ -217,13 +274,7 @@ impl State {
             Some(crate::focus::KeyboardFocus::Wayland(_))
         );
         let real_key = |code| CHARACTER_KEYS.contains(&code);
-        let usable: &dyn Fn(u32) -> bool = if wayland
-            && self
-                .text_keyboard
-                .slots
-                .iter()
-                .any(|slot| real_key(slot.code))
-        {
+        let usable: &dyn Fn(u32) -> bool = if wayland && self.text_keyboard.has_character_key() {
             &real_key
         } else {
             &|code| (code > 255) == wayland
@@ -238,12 +289,7 @@ impl State {
     /// Start over from the seat's keymap when something else replaced the
     /// one this installed.
     fn prepare_text_keyboard(&mut self, active: KeymapFileId) {
-        if self.text_keyboard.installed.is_some_and(|id| active != id) {
-            self.text_keyboard.base = None;
-            self.text_keyboard.installed = None;
-            self.text_keyboard.slots.clear();
-        }
-        if self.text_keyboard.base.is_none() {
+        if self.text_keyboard.prepare(active) {
             self.init_text_keyboard();
         }
     }
@@ -252,7 +298,7 @@ impl State {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
-        if !keyboard.pressed_keys().is_empty() || self.text_keyboard.pending.is_empty() {
+        if !keyboard.pressed_keys().is_empty() || !self.text_keyboard.has_pending() {
             return;
         }
         self.prepare_text_keyboard(keyboard.keymap_file().id());
@@ -260,7 +306,7 @@ impl State {
             keyboard.current_focus(),
             Some(crate::focus::KeyboardFocus::Wayland(_))
         );
-        while let Some(text) = self.text_keyboard.pending.pop_front() {
+        while let Some(text) = self.text_keyboard.next_pending() {
             let (codes, changed) = self
                 .text_keyboard
                 .assign(&text, |code| (code > 255) == wayland);
