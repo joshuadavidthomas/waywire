@@ -131,9 +131,8 @@ impl CompositorHandler for State {
         }
         self.surfaces.retain(|item| item != surface);
         self.drag_surface_destroyed(Some(surface));
-        if self.cursor_surface.as_ref() == Some(surface) {
-            self.cursor_surface = None;
-            self.cursor_image = None;
+        if self.cursor.is(surface) {
+            self.cursor.clear();
             self.emit(Event::CursorVisibility(CursorVisibility::Hidden));
         }
     }
@@ -141,26 +140,15 @@ impl CompositorHandler for State {
         tracing::debug!(
             target: "waywire_latency",
             stage = "commit",
-            cursor = self.cursor_surface.as_ref() == Some(surface),
+            cursor = self.cursor.is(surface),
             at_ns = waywire_encoder::latency::monotonic_nanos(),
         );
         on_commit_buffer_handler::<Self>(surface);
-        if self.cursor_surface.as_ref() == Some(surface) {
+        if self.cursor.is(surface) {
             self.update_cursor_image();
         }
-        if let Some(drag) = &mut self.drag
-            && drag.icon.as_ref() == Some(surface)
-        {
-            // Icons move by their attach offsets, as cursor hotspots do.
-            drag.offset += smithay::wayland::compositor::with_states(surface, |states| {
-                states
-                    .cached_state
-                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
-                    .current()
-                    .buffer_delta
-                    .take()
-                    .unwrap_or_default()
-            });
+        if let Some(drag) = &mut self.drag {
+            drag.committed(surface);
         }
         self.frame_pending = crate::FrameRequest::Pending;
         if !is_sync_subsurface(surface) {
@@ -285,13 +273,11 @@ impl SeatHandler for State {
     fn cursor_image(&mut self, _: &Seat<Self>, image: CursorImageStatus) {
         match image {
             CursorImageStatus::Hidden => {
-                self.cursor_surface = None;
-                self.cursor_image = None;
+                self.cursor.clear();
                 self.emit(Event::CursorVisibility(CursorVisibility::Hidden));
             }
             CursorImageStatus::Named(icon) => {
-                self.cursor_surface = None;
-                self.cursor_image = None;
+                self.cursor.clear();
                 let shape = CursorShape::ALL
                     .into_iter()
                     .find(|s| s.css_name() == icon.name())
@@ -300,7 +286,7 @@ impl SeatHandler for State {
                 self.emit(Event::CursorVisibility(CursorVisibility::Visible));
             }
             CursorImageStatus::Surface(surface) => {
-                self.cursor_surface = Some(surface);
+                self.cursor.set_surface(surface);
                 self.update_cursor_image();
             }
         }

@@ -101,11 +101,55 @@ fn image(surface: &WlSurface, output_width: u16) -> Option<CursorImage> {
     })
 }
 
+/// The client's cursor surface and the image last sent for it.
+#[derive(Default)]
+pub(crate) struct Cursor {
+    surface: Option<WlSurface>,
+    image: Option<CursorImage>,
+}
+
+impl Cursor {
+    pub(crate) fn surface(&self) -> Option<&WlSurface> {
+        self.surface.as_ref()
+    }
+
+    pub(crate) fn is(&self, surface: &WlSurface) -> bool {
+        self.surface.as_ref() == Some(surface)
+    }
+
+    pub(crate) fn set_surface(&mut self, surface: WlSurface) {
+        self.surface = Some(surface);
+    }
+
+    /// Forget the surface and the image sent for it.
+    pub(crate) fn clear(&mut self) {
+        self.surface = None;
+        self.image = None;
+    }
+
+    /// Read the surface's image again, scaled for an output `output_width`
+    /// pixels wide. Returns the events for the viewer: none without a
+    /// surface, a new image only when it changed.
+    pub(crate) fn refresh(&mut self, output_width: u16) -> Vec<Event> {
+        let Some(surface) = &self.surface else {
+            return Vec::new();
+        };
+        let Some(image) = image(surface, output_width) else {
+            self.image = None;
+            return vec![Event::CursorVisibility(CursorVisibility::Hidden)];
+        };
+        let mut events = Vec::new();
+        if self.image.as_ref() != Some(&image) {
+            self.image = Some(image.clone());
+            events.push(Event::CursorImage(image));
+        }
+        events.push(Event::CursorVisibility(CursorVisibility::Visible));
+        events
+    }
+}
+
 impl State {
     pub(crate) fn update_cursor_image(&mut self) {
-        let Some(surface) = &self.cursor_surface else {
-            return;
-        };
         let Some(output_width) = self
             .space
             .output_geometry(&self.output)
@@ -113,22 +157,15 @@ impl State {
         else {
             return;
         };
-        let Some(image) = image(surface, output_width) else {
-            self.cursor_image = None;
-            self.emit(Event::CursorVisibility(CursorVisibility::Hidden));
-            return;
-        };
-        if self.cursor_image.as_ref() != Some(&image) {
-            self.cursor_image = Some(image.clone());
-            self.emit(Event::CursorImage(image));
+        for event in self.cursor.refresh(output_width) {
+            self.emit(event);
         }
-        self.emit(Event::CursorVisibility(CursorVisibility::Visible));
     }
 
     /// Frame callbacks for the pointer's surfaces: the cursor and any drag icon.
     pub(crate) fn send_cursor_frame(&self) {
         let icon = self.drag.as_ref().and_then(|drag| drag.icon.as_ref());
-        for surface in self.cursor_surface.iter().chain(icon) {
+        for surface in self.cursor.surface().into_iter().chain(icon) {
             smithay::desktop::utils::send_frames_surface_tree(
                 surface,
                 &self.output,

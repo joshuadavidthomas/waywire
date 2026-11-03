@@ -45,6 +45,25 @@ pub(crate) struct Drag {
     pub(crate) offset: Point<i32, Logical>,
 }
 
+impl Drag {
+    /// A surface committed. Icons move by their attach offsets, as cursor
+    /// hotspots do.
+    pub(crate) fn committed(&mut self, surface: &WlSurface) {
+        if self.icon.as_ref() != Some(surface) {
+            return;
+        }
+        self.offset += smithay::wayland::compositor::with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                .current()
+                .buffer_delta
+                .take()
+                .unwrap_or_default()
+        });
+    }
+}
+
 pub(crate) enum Offer<S: Source> {
     Wayland(WlOfferData<S>),
     X11(XwmOfferData<S>),
