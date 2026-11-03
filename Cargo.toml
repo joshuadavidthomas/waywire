@@ -32,6 +32,11 @@ unwrap_in_result = "warn"
 unwrap_used = "warn"
 wildcard_enum_match_arm = "warn"
 
+[profile.dev]
+# Line tables keep file and line numbers in panics and backtraces but drop the
+# variable and type info only a debugger reads, which costs build time and disk.
+debug = "line-tables-only"
+
 [workspace.dependencies]
 waywire-decorations = { path = "crates/decorations" }
 waywire-encoder = { path = "crates/encoder" }
