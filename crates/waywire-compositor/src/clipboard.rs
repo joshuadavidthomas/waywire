@@ -730,7 +730,7 @@ mod tests {
         state.x11_selection_cleared(SelectionTarget::Clipboard);
         state.clipboard_tick();
         state.clipboard_tick();
-        assert_eq!(state.event_sink.take_events(), vec![clipboard("naïve")]);
+        assert_eq!(state.stream.take_events(), vec![clipboard("naïve")]);
         assert!(matches!(
             current_data_device_selection_userdata(&state.seat).as_deref(),
             Some(SelectionData::Text(text)) if &**text == "naïve"
@@ -743,7 +743,7 @@ mod tests {
         state.clipboard_tick();
         state.x11_selection_cleared(SelectionTarget::Clipboard);
         state.clipboard_tick();
-        assert_eq!(state.event_sink.take_events(), vec![clipboard("")]);
+        assert_eq!(state.stream.take_events(), vec![clipboard("")]);
         assert!(current_data_device_selection_userdata(&state.seat).is_none());
     }
 
@@ -792,7 +792,7 @@ mod tests {
                 .expect("owner thread")
                 .expect_err("the owner's write must fail once the read is dropped");
             assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-            assert!(state.event_sink.take_events().is_empty());
+            assert!(state.stream.take_events().is_empty());
         });
         let logs = String::from_utf8(logs.0.lock().expect("log buffer").clone()).expect("logs");
         assert!(
@@ -812,12 +812,12 @@ mod tests {
             state.clipboard_tick();
             state.clipboard_tick();
             assert_eq!(
-                state.event_sink.take_events(),
+                state.stream.take_events(),
                 vec![Event::Clipboard(text.clone())]
             );
             state.clipboard_tick();
             assert!(
-                state.event_sink.take_events().is_empty(),
+                state.stream.take_events().is_empty(),
                 "idle is not a new selection"
             );
         }
@@ -825,7 +825,7 @@ mod tests {
             state.clipboard_offer(Vec::new());
             state.clipboard_tick();
             assert_eq!(
-                state.event_sink.take_events(),
+                state.stream.take_events(),
                 vec![Event::Clipboard(
                     ClipboardText::new(String::new()).expect("empty clipboard")
                 )]
@@ -1177,7 +1177,7 @@ mod tests {
         let mut wlr = Client::connect(&mut display, &mut state, false);
         let keyboard = state.seat.get_keyboard().expect("seat keyboard");
         assert!(keyboard.current_focus().is_none());
-        state.event_sink.take_events();
+        state.stream.take_events();
 
         ext.copy(false, "ext α");
         ext.copy(true, "ext primary β");
@@ -1186,12 +1186,12 @@ mod tests {
         let pasted = paste(&mut display, &mut state, &mut wlr, &mut [&mut ext], true);
         assert_eq!(pasted.as_deref(), Some("ext primary β"));
         // The viewer syncs the clipboard, never the primary selection.
-        assert_eq!(state.event_sink.take_events(), vec![clipboard("ext α")]);
+        assert_eq!(state.stream.take_events(), vec![clipboard("ext α")]);
 
         wlr.copy(false, "wlr γ");
         let pasted = paste(&mut display, &mut state, &mut ext, &mut [&mut wlr], false);
         assert_eq!(pasted.as_deref(), Some("wlr γ"));
-        assert_eq!(state.event_sink.take_events(), vec![clipboard("wlr γ")]);
+        assert_eq!(state.stream.take_events(), vec![clipboard("wlr γ")]);
         assert!(keyboard.current_focus().is_none());
 
         // Owners exit: the clipboard keeps its text, the primary selection ends.
@@ -1207,7 +1207,7 @@ mod tests {
             paste(&mut display, &mut state, &mut reader, &mut [], true),
             None
         );
-        assert!(state.event_sink.take_events().is_empty());
+        assert!(state.stream.take_events().is_empty());
     }
 
     #[test]
@@ -1215,13 +1215,13 @@ mod tests {
         let (_display, mut state) = crate::tests::test_state();
         offer_read(&mut state, "old native text");
         state.clipboard_tick(); // Buffered, but not yet published at EOF.
-        assert!(state.event_sink.take_events().is_empty());
+        assert!(state.stream.take_events().is_empty());
         let text = ClipboardText::new("new browser text".into()).expect("valid clipboard text");
         state.clipboard_set(&text);
         state.clipboard_tick();
         assert!(state.clipboard.read.is_none());
         assert_eq!(
-            state.event_sink.take_events(),
+            state.stream.take_events(),
             vec![Event::Clipboard(text.clone())]
         );
 
@@ -1230,13 +1230,13 @@ mod tests {
         state.clipboard_tick();
         state.clipboard_tick();
         assert_eq!(
-            state.event_sink.take_events(),
+            state.stream.take_events(),
             vec![Event::Clipboard(text.clone())]
         );
 
         state.clipboard_offer(Vec::new()); // A queued clear must not replace a newer write.
         state.clipboard_set(&text);
         state.clipboard_tick();
-        assert_eq!(state.event_sink.take_events(), vec![Event::Clipboard(text)]);
+        assert_eq!(state.stream.take_events(), vec![Event::Clipboard(text)]);
     }
 }

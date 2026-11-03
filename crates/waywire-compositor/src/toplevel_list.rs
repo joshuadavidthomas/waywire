@@ -2861,7 +2861,7 @@ mod tests {
         state.pointer_motion(KeyboardSource::MAIN, (100.0, 72.0).into());
         assert!(
             state
-                .event_sink
+                .stream
                 .take_events()
                 .iter()
                 .any(|event| matches!(event, Event::CursorShape(CursorShape::NwResize)))
@@ -2869,7 +2869,7 @@ mod tests {
         state.pointer_motion(KeyboardSource::MAIN, (500.0, 500.0).into());
         assert!(
             state
-                .event_sink
+                .stream
                 .take_events()
                 .iter()
                 .any(|event| matches!(event, Event::CursorShape(CursorShape::Default)))
@@ -3839,7 +3839,7 @@ mod tests {
         );
         cursor.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        let events = state.event_sink.take_events();
+        let events = state.stream.take_events();
         let image = events
             .iter()
             .find_map(|event| {
@@ -3862,7 +3862,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert!(
             !state
-                .event_sink
+                .stream
                 .take_events()
                 .iter()
                 .any(|event| matches!(event, waywire_protocol::pipe::Event::CursorImage(_)))
@@ -3876,7 +3876,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(app.refresh_rates.last(), Some(&60_000));
-        let mut quality = state.quality;
+        let mut quality = state.stream.quality();
         quality.fps = waywire_protocol::pipe::Fps::new(30).expect("valid fps");
         state
             .apply_command(waywire_protocol::pipe::Command::Quality(quality))
@@ -4961,7 +4961,7 @@ mod tests {
             "org.gnome.TextEditor",
         );
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        state.event_sink.take_events();
+        state.stream.take_events();
         state
             .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey {
                 key: pipe::KeyCode::new(30).expect("key"),
@@ -4970,7 +4970,7 @@ mod tests {
             }))
             .expect("key");
         let receipts: Vec<_> = state
-            .event_sink
+            .stream
             .take_events()
             .into_iter()
             .filter_map(|event| {
@@ -5008,7 +5008,7 @@ mod tests {
             "no client repeat while a browser holds input"
         );
 
-        state.event_sink.take_events();
+        state.stream.take_events();
         let mut sequence = 0;
         let mut key = |state: &mut crate::State, key, key_state| {
             sequence += 1;
@@ -5035,7 +5035,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(typed_text(&app), "AAAb");
         let receipts: Vec<_> = state
-            .event_sink
+            .stream
             .take_events()
             .into_iter()
             .filter_map(|event| {

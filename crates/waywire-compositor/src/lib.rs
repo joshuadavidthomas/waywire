@@ -18,6 +18,7 @@ mod pointer_warp;
 mod portal;
 mod screencopy;
 mod shell;
+mod stream;
 mod text_keyboard;
 mod toplevel_list;
 mod virtual_keyboard;
@@ -87,9 +88,7 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::ListeningSocket;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Logical;
-use smithay::utils::Physical;
 use smithay::utils::Point;
-use smithay::utils::Rectangle;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
@@ -108,26 +107,15 @@ use smithay::wayland::xdg_activation::XdgActivationState;
 use waywire_decorations::DecorationAction;
 use waywire_decorations::WindowAction;
 use waywire_encoder::latency;
-use waywire_encoder::striped;
 use waywire_encoder::striped::StripedEncoder;
-use waywire_encoder::striped::StripedFrame;
-use waywire_encoder::video;
-use waywire_encoder::video::CapturedFrame;
-use waywire_encoder::video::EncoderConfig;
-use waywire_encoder::video::Notification;
 use waywire_encoder::video::VideoEncoder;
-use waywire_encoder::video::encoded_dimensions;
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Event;
 use waywire_protocol::pipe::Fps;
-use waywire_protocol::pipe::FrameDimension;
-use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::FrameSize;
 use waywire_protocol::pipe::Generation;
-use waywire_protocol::pipe::InputSequence;
 use waywire_protocol::pipe::Kbps;
-use waywire_protocol::pipe::Quality;
 use waywire_protocol::pipe::{
     self,
 };
@@ -160,52 +148,6 @@ pub enum EncoderChoice {
     Ffmpeg,
     /// `OpenH264` in process, in horizontal stripes, delivered as encoded-frame events.
     OpenH264,
-}
-
-/// The running encoder.
-pub(crate) enum Video {
-    Ffmpeg(VideoEncoder),
-    Striped(StripedEncoder),
-}
-
-impl Video {
-    fn set_generation(&self, generation: Generation) -> Result<(), video::VideoError> {
-        match self {
-            Self::Ffmpeg(video) => video.set_generation(generation),
-            Self::Striped(video) => video.set_generation(generation),
-        }
-    }
-
-    fn try_notification(&self) -> Option<Notification> {
-        match self {
-            Self::Ffmpeg(video) => video.try_notification(),
-            Self::Striped(_) => None,
-        }
-    }
-
-    fn take_notification_source(&mut self) -> Option<calloop::ping::PingSource> {
-        match self {
-            Self::Ffmpeg(video) => video.take_notification_source(),
-            Self::Striped(video) => video.take_notification_source(),
-        }
-    }
-
-    fn stop(self) {
-        match self {
-            Self::Ffmpeg(video) => video.stop(),
-            Self::Striped(video) => video.stop(),
-        }
-    }
-
-    /// Frames a still screen is refreshed over: x264 refines a repeated frame a little
-    /// each pass, and the striped encoder spreads its stripes' refreshes.
-    const fn refresh_frames(&self) -> u8 {
-        match self {
-            Self::Ffmpeg(_) => REFRESH_FRAMES,
-            #[expect(clippy::cast_possible_truncation, reason = "a small constant")]
-            Self::Striped(_) => striped::REFRESH_FRAMES as u8,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -261,39 +203,19 @@ pub(crate) struct State {
     start: Instant,
     running: bool,
     failure: Option<anyhow::Error>,
-    event_sink: EventSink,
-    video: Option<Video>,
-    quality: Quality,
+    stream: stream::Stream,
+    /// The output's size in pixels, which the stream encodes.
     size: FrameSize,
-    generation: Generation,
-    acknowledged: Option<Generation>,
-    sequence: u64,
-    latest_input_sequence: Option<InputSequence>,
     input: input::Input,
+    /// Redraw the whole output on the next frame.
     pub(crate) dirty: bool,
     pub(crate) frame_pending: FrameRequest,
-    /// The content hash of the last submitted frame when that frame was a forced full
-    /// redraw, which reports the whole output damaged whether or not a pixel changed.
-    forced_frame_hash: Option<u64>,
-    refresh: Refresh,
 }
 
 /// The seat's key repeat, in keys per second after a delay in milliseconds,
 /// while no browser holds input. Clients repeat held keys on their own timer.
 const KEY_REPEAT_RATE: i32 = 25;
 const KEY_REPEAT_DELAY_MS: i32 = 200;
-/// Once nothing has changed for `REFRESH_DELAY`, the last frame is encoded
-/// `REFRESH_FRAMES` more times. x264's constant rate factor codes a still frame's
-/// remaining residual finer on each pass: a scrolled page gains about 2.5 dB after
-/// six. The delay keeps the refresh out of typing and pointer cadences.
-const REFRESH_DELAY: Duration = Duration::from_millis(500);
-const REFRESH_FRAMES: u8 = 6;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refresh {
-    Idle,
-    Due { at: Instant, left: u8 },
-}
 
 /// Advertise the globals whose server state `State` never needs to reach.
 fn install_globals(display_handle: &DisplayHandle) {
@@ -310,12 +232,11 @@ fn install_globals(display_handle: &DisplayHandle) {
 }
 
 impl State {
-    #[expect(clippy::too_many_lines, reason = "one initializer per State field")]
     fn new(
         display_handle: DisplayHandle,
         options: &Config,
         event_sink: EventSink,
-        video: Video,
+        video: stream::Video,
     ) -> Result<Self> {
         let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -410,25 +331,11 @@ impl State {
             start: Instant::now(),
             running: true,
             failure: None,
-            event_sink,
-            video: Some(video),
-            quality: Quality {
-                fps: options.frame_rate,
-                bitrate_kbps: options.bitrate,
-                scale_percent: pipe::ScalePercent::new(100)?,
-                crf: pipe::Crf::new(27)?,
-                chroma: pipe::Chroma::Yuv420,
-            },
+            stream: stream::Stream::new(video, event_sink, options.frame_rate, options.bitrate)?,
             size: options.resolution,
-            generation: Generation::new(1)?,
-            acknowledged: None,
-            sequence: 0,
-            latest_input_sequence: None,
             input: input::Input::default(),
             dirty: true,
             frame_pending: FrameRequest::Pending,
-            forced_frame_hash: None,
-            refresh: Refresh::Idle,
         })
     }
 
@@ -437,39 +344,6 @@ impl State {
             self.failure = Some(error);
         }
         self.running = false;
-    }
-
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "events are ephemeral messages consumed at emission"
-    )]
-    fn emit(&mut self, event: Event) {
-        if let Err(error) = self.event_sink.send(&event) {
-            self.fail(error.into());
-        }
-    }
-
-    /// The gateway lost its key frame: the in-process encoder codes the next frame as one.
-    /// The `FFmpeg` encoder's periodic key frames need no request.
-    fn request_key(&self) {
-        if let Some(Video::Striped(video)) = &self.video {
-            video.request_key();
-        }
-    }
-
-    fn advance_generation(&mut self) -> Result<()> {
-        self.generation = Generation::new(
-            self.generation
-                .get()
-                .checked_add(1)
-                .context("media generation exhausted")?,
-        )?;
-        self.acknowledged = None;
-        self.dirty = true;
-        if let Some(video) = &self.video {
-            video.set_generation(self.generation)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn surface_under(
@@ -1155,13 +1029,7 @@ impl State {
     )]
     fn apply_command(&mut self, command: Command) -> Result<()> {
         if let Some(sequence) = command.input_sequence() {
-            self.latest_input_sequence = Some(sequence);
-            tracing::debug!(
-                target: "waywire_latency",
-                stage = "compositor_input",
-                input = sequence.get(),
-                at_ns = latency::monotonic_nanos(),
-            );
+            self.stream.record_input(sequence);
         }
         let source = KeyboardSource::MAIN;
         match command {
@@ -1246,7 +1114,7 @@ impl State {
                         i32::try_from(p.size.height())?,
                     )
                         .into(),
-                    refresh: i32::try_from(self.quality.fps.get())? * 1000,
+                    refresh: i32::try_from(self.stream.quality().fps.get())? * 1000,
                 };
                 self.output.change_current_state(
                     Some(mode),
@@ -1261,7 +1129,10 @@ impl State {
                 self.update_cursor_image();
                 self.capture.output_resized();
                 if let Some(screencast) = &self.screencast {
-                    screencast.resize((p.size.width(), p.size.height()), self.quality.fps.get());
+                    screencast.resize(
+                        (p.size.width(), p.size.height()),
+                        self.stream.quality().fps.get(),
+                    );
                 }
                 crate::eis::refresh_regions(self);
                 self.advance_generation()?;
@@ -1269,12 +1140,13 @@ impl State {
                     request_id: p.request_id,
                     size: p.size,
                     scale_v120: p.scale_v120,
-                    generation: self.generation,
+                    generation: self.stream.generation(),
                 }));
             }
             Command::Quality(q) => {
-                if q != self.quality {
-                    if q.fps != self.quality.fps
+                let current = self.stream.quality();
+                if q != current {
+                    if q.fps != current.fps
                         && let Some(mut mode) = self.output.current_mode()
                     {
                         mode.refresh = i32::try_from(q.fps.get())? * 1000;
@@ -1282,21 +1154,14 @@ impl State {
                         self.output
                             .change_current_state(Some(mode), None, None, None);
                     }
-                    self.quality = q;
+                    self.stream.set_quality(q);
                     self.advance_generation()?;
                 }
             }
             Command::ResetVideo(_) => self.advance_generation()?,
             Command::KeyframeReadiness(p) => {
-                if p.generation == self.generation {
-                    self.acknowledged = match p.state {
-                        pipe::KeyframeState::Cached => Some(p.generation),
-                        pipe::KeyframeState::Missing => {
-                            self.frame_pending = FrameRequest::Pending;
-                            self.request_key();
-                            None
-                        }
-                    };
+                if self.stream.keyframe_readiness(p) {
+                    self.frame_pending = FrameRequest::Pending;
                 }
             }
             Command::Text(p) => {
@@ -1339,42 +1204,6 @@ impl State {
         Ok(())
     }
 
-    fn drain_video(&mut self) {
-        while let Some(frame) = match &self.video {
-            Some(Video::Striped(video)) => video.try_frame(),
-            _ => None,
-        } {
-            match frame {
-                // A full stdout queue drops this frame rather than the session. The
-                // stripes it carried are now out of step, so code a key frame next.
-                Ok(frame) => {
-                    let sequence = frame.metadata.sequence;
-                    match self.event_sink.send(&Event::EncodedFrame(frame)) {
-                        Ok(()) => latency::trace_frame("emitted", sequence, 0),
-                        Err(event_writer::EventWriterError::QueueFull) => {
-                            self.request_key();
-                            self.frame_pending = FrameRequest::Pending;
-                        }
-                        Err(error) => self.fail(error.into()),
-                    }
-                }
-                Err(error) => self.fail(anyhow!(error)),
-            }
-        }
-        while let Some(notification) = self.video.as_ref().and_then(Video::try_notification) {
-            match notification {
-                Notification::Submitted(metadata) => self.emit(Event::Frame(metadata)),
-                Notification::RestartRequired { generation } if generation == self.generation => {
-                    if let Err(error) = self.advance_generation() {
-                        self.fail(error);
-                    }
-                }
-                Notification::RestartRequired { .. } => {}
-                Notification::Fatal(error) => self.fail(anyhow!(error)),
-            }
-        }
-    }
-
     fn render(
         &mut self,
         renderer: &mut PixmanRenderer,
@@ -1409,7 +1238,7 @@ impl State {
             });
         }
         let elements = self.scene_elements(renderer);
-        let forced = self.dirty || self.acknowledged != Some(self.generation);
+        let forced = self.dirty || !self.stream.acknowledged();
         let clear = [0.08, 0.09, 0.12, 1.0];
         let (damage, changed) = {
             let mut target = renderer.bind(image)?;
@@ -1434,37 +1263,15 @@ impl State {
         };
         let drawn = (!forced).then(|| damage.as_deref().unwrap_or_default());
         self.frame_rendered(delivery::monotonic_usec(), &changed, image, drawn);
-        if damage.is_some() || forced {
-            let full = [Rectangle::<i32, Physical>::from_size(
-                (
-                    i32::try_from(self.size.width())?,
-                    i32::try_from(self.size.height())?,
-                )
-                    .into(),
-            )];
-            let damage = if forced {
-                &full[..]
-            } else {
-                damage.as_deref().unwrap_or(&full)
-            };
-            // A forced redraw reports the whole output damaged. Hash only those, so
-            // a redraw that changed no pixel is not encoded again.
-            let hash = forced.then(|| xxhash_rust::xxh3::xxh3_64(image_pixels(image)));
-            let unchanged = hash.is_some()
-                && hash == self.forced_frame_hash
-                && self.acknowledged == Some(self.generation);
-            self.forced_frame_hash = hash;
-            if !unchanged {
-                latency::trace_frame("render", self.sequence, render_started_ns);
-                self.submit_video(image, damage, false)?;
-                self.refresh = Refresh::Due {
-                    at: Instant::now() + REFRESH_DELAY,
-                    left: self.video.as_ref().map_or(0, Video::refresh_frames),
-                };
-                if let Some(screencast) = &self.screencast {
-                    screencast.frame(&cast_frame(image));
-                }
-            }
+        if self.stream.rendered(
+            image,
+            self.size,
+            damage.as_deref(),
+            forced,
+            render_started_ns,
+        )? && let Some(screencast) = &self.screencast
+        {
+            screencast.frame(&cast_frame(image));
         }
         capture::serve_pending(self, image);
         screencopy::serve_pending(self, image);
@@ -1478,90 +1285,6 @@ impl State {
                 Some(Duration::ZERO),
                 |_, _| Some(self.output.clone()),
             );
-        }
-        Ok(())
-    }
-
-    /// Encode the unchanged output again once the screen has held still.
-    fn refresh_video(&mut self, image: &Image<'static, 'static>) -> Result<()> {
-        let Refresh::Due { at, left } = self.refresh else {
-            return Ok(());
-        };
-        let now = Instant::now();
-        if now < at {
-            return Ok(());
-        }
-        self.submit_video(image, &[], true)?;
-        self.refresh = match left.checked_sub(1) {
-            Some(left @ 1..) => Refresh::Due {
-                at: now + Duration::from_secs_f64(1.0 / f64::from(self.quality.fps.get())),
-                left,
-            },
-            _ => Refresh::Idle,
-        };
-        Ok(())
-    }
-
-    fn submit_video(
-        &mut self,
-        image: &Image<'static, 'static>,
-        damage: &[Rectangle<i32, Physical>],
-        refresh: bool,
-    ) -> Result<()> {
-        let (width, height) = encoded_dimensions(
-            self.size.width(),
-            self.size.height(),
-            self.quality.scale_percent,
-            self.quality.fps,
-        );
-        let config = EncoderConfig {
-            raw_width: FrameDimension::new(self.size.width().try_into()?)?,
-            raw_height: FrameDimension::new(self.size.height().try_into()?)?,
-            encoded_width: FrameDimension::new(width)?,
-            encoded_height: FrameDimension::new(height)?,
-            fps: self.quality.fps,
-            bitrate_kbps: self.quality.bitrate_kbps,
-            crf: self.quality.crf,
-            chroma: self.quality.chroma,
-        };
-        let metadata = FrameMetadata {
-            generation: self.generation,
-            width: config.encoded_width,
-            height: config.encoded_height,
-            capture_nanos: latency::monotonic_nanos(),
-            sequence: self.sequence,
-            input_sequence: self.latest_input_sequence,
-            fps: self.quality.fps,
-            chroma: self.quality.chroma,
-        };
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .context("frame sequence exhausted")?;
-        // ARGB8888 on little-endian hosts is packed BGRA; four-byte pixels have no row padding.
-        match &self.video {
-            Some(Video::Ffmpeg(video)) => {
-                video.submit(CapturedFrame::new(image_pixels(image), metadata, config))?;
-            }
-            Some(Video::Striped(video)) => {
-                let damage: Vec<_> = damage
-                    .iter()
-                    .map(|rectangle| {
-                        rectangle.loc.y..rectangle.loc.y.saturating_add(rectangle.size.h)
-                    })
-                    .collect();
-                video.submit(&StripedFrame {
-                    pixels: image_pixels(image),
-                    width: image.width(),
-                    height: image.height(),
-                    damage: &damage,
-                    metadata,
-                    crf: self.quality.crf,
-                    bitrate: self.quality.bitrate_kbps,
-                    refresh,
-                })?;
-            }
-            None => {}
         }
         Ok(())
     }
@@ -1606,12 +1329,12 @@ pub fn run(mut options: Config) -> Result<()> {
     let display = Display::<State>::new()?;
     let (event_writer, sink) = EventWriter::start()?;
     let mut video = match options.encoder {
-        EncoderChoice::Ffmpeg => Video::Ffmpeg(VideoEncoder::start(
+        EncoderChoice::Ffmpeg => stream::Video::Ffmpeg(VideoEncoder::start(
             options.ffmpeg.clone(),
             options.rtp_port,
         )?),
         EncoderChoice::OpenH264 => {
-            Video::Striped(StripedEncoder::start(options.stripes, Generation::new(1)?)?)
+            stream::Video::Striped(StripedEncoder::start(options.stripes, Generation::new(1)?)?)
         }
     };
     let notifications = video
@@ -1799,7 +1522,7 @@ pub fn run(mut options: Config) -> Result<()> {
         if state.clipboard_active() {
             deadline = deadline.min(now + Duration::from_millis(20));
         }
-        if let Refresh::Due { at, .. } = state.refresh {
+        if let Some(at) = state.stream.refresh_due() {
             deadline = deadline.min(at);
         }
         if let Some(at) = state.settle_wake() {
@@ -1824,16 +1547,16 @@ pub fn run(mut options: Config) -> Result<()> {
             next_frame = frame_deadline(
                 next_frame.max(started),
                 Instant::now(),
-                Duration::from_secs_f64(1.0 / f64::from(state.quality.fps.get())),
+                Duration::from_secs_f64(1.0 / f64::from(state.stream.quality().fps.get())),
             );
         }
         state.poll_settled(delivery::monotonic_usec());
-        if let Err(error) = state.refresh_video(&image.borrow()) {
+        if let Err(error) = state.stream.refresh(&image.borrow(), state.size) {
             state.fail(error);
         }
         if Instant::now() >= next_housekeeping {
             next_housekeeping = Instant::now() + Duration::from_secs(2);
-            if state.acknowledged != Some(state.generation) {
+            if !state.stream.acknowledged() {
                 state.frame_pending = FrameRequest::Pending;
             }
         }
@@ -1864,7 +1587,7 @@ pub fn run(mut options: Config) -> Result<()> {
     drop(pipewire_daemon);
     drop(bus);
     state.release_input(KeyboardSource::MAIN);
-    if let Some(video) = state.video.take() {
+    if let Some(video) = state.stream.take_video() {
         video.stop();
     }
     event_writer.stop();
@@ -1982,6 +1705,8 @@ mod tests {
     use std::collections::HashSet;
     use std::time::UNIX_EPOCH;
 
+    use waywire_protocol::pipe::InputSequence;
+
     use super::*;
     use crate::chrome::local_clock;
     use crate::chrome::next_minute_delay;
@@ -2000,10 +1725,10 @@ mod tests {
             pins: Vec::new(),
             session: Vec::new(),
         };
-        let video = Video::Ffmpeg(VideoEncoder::idle_for_test().expect("idle encoder"));
+        let video = stream::Video::Ffmpeg(VideoEncoder::idle_for_test().expect("idle encoder"));
         let mut state = State::new(display.handle(), &options, EventSink::for_test(), video)
             .expect("test compositor");
-        state.video.take().expect("new encoder").stop();
+        state.stream.take_video().expect("new encoder").stop();
         (display, state)
     }
 
@@ -2127,10 +1852,10 @@ mod tests {
             (eis, pipe::CursorSource::Agent),
             (virtual_pointer, pipe::CursorSource::Agent),
         ] {
-            state.event_sink.take_events();
+            state.stream.take_events();
             state.pointer_motion(source, (100.0, 100.0).into());
             let positions: Vec<_> = state
-                .event_sink
+                .stream
                 .take_events()
                 .into_iter()
                 .filter_map(|event| {
@@ -2144,7 +1869,7 @@ mod tests {
             assert_eq!(positions, vec![expected]);
         }
         state.pointer_button(virtual_pointer, 0x110, ButtonState::Pressed);
-        assert!(state.event_sink.take_events().iter().any(|event| matches!(event, Event::CursorClick(position) if position.source == pipe::CursorSource::Agent)));
+        assert!(state.stream.take_events().iter().any(|event| matches!(event, Event::CursorClick(position) if position.source == pipe::CursorSource::Agent)));
     }
 
     #[test]
@@ -2197,7 +1922,7 @@ mod tests {
         state.disconnect_input_source(source);
         assert!(
             state
-                .event_sink
+                .stream
                 .take_events()
                 .contains(&Event::AgentInput(pipe::AgentInput {
                     connected: false,
@@ -2208,7 +1933,7 @@ mod tests {
         lease(&mut state, false);
         assert!(
             state
-                .event_sink
+                .stream
                 .take_events()
                 .contains(&Event::AgentInput(pipe::AgentInput {
                     connected: false,
@@ -2216,7 +1941,7 @@ mod tests {
                 }))
         );
         lease(&mut state, true);
-        assert!(state.event_sink.take_events().is_empty());
+        assert!(state.stream.take_events().is_empty());
     }
 
     #[test]
@@ -2246,14 +1971,14 @@ mod tests {
         );
 
         // Later agent events are dropped rather than queued or forwarded.
-        state.event_sink.take_events();
+        state.stream.take_events();
         state.keyboard_key(agent, 31, KeyState::Pressed);
         state.pointer_button(agent, 0x111, ButtonState::Pressed);
         state.pointer_motion(agent, (12.0, 34.0).into());
         assert!(!pressed(&state, 31));
         assert!(state.input.buttons(agent).is_none_or(HashSet::is_empty));
         assert!(
-            state.event_sink.take_events().is_empty(),
+            state.stream.take_events().is_empty(),
             "dropped agent motion must not move the cursor or emit an event"
         );
         assert_eq!(
@@ -2330,7 +2055,7 @@ mod tests {
     /// The normalized positions reported to the viewer since the last call.
     fn reported_positions(state: &State) -> Vec<(u32, u32)> {
         state
-            .event_sink
+            .stream
             .take_events()
             .into_iter()
             .filter_map(|event| {
@@ -2367,7 +2092,7 @@ mod tests {
             (480, (160.0, 90.0)),
         ] {
             resize(&mut state, 1920, 1080, scale_v120);
-            state.event_sink.take_events();
+            state.stream.take_events();
             browser_absolute(&mut state, 21845, 21845);
             assert_location(&state, expected);
             assert_eq!(
@@ -2385,7 +2110,7 @@ mod tests {
             resize(&mut state, 1920, 1080, scale_v120);
             browser_absolute(&mut state, 0, 0);
             assert_location(&state, (0.0, 0.0));
-            state.event_sink.take_events();
+            state.stream.take_events();
             // The far edge is pixel 1919 and row 1079, not one past them:
             // 1919 / 1920 * 65535 rounds to 65501 and 1079 / 1080 * 65535 to
             // 65474 at every scale.

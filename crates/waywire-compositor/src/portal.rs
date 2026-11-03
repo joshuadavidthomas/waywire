@@ -73,7 +73,7 @@ pub(crate) fn start(
             }
             PortalRequest::StartCast { session, reply } => {
                 let size = (state.size.width(), state.size.height());
-                let fps = state.quality.fps.get();
+                let fps = state.stream.quality().fps.get();
                 match state.screencast.as_mut() {
                     Some(streams) => streams.start(session, size, fps, reply),
                     None => {

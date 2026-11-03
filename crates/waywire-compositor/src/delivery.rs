@@ -886,7 +886,7 @@ impl State {
     }
 
     fn emit_viewer_receipt(&mut self, receipt: &Receipt) {
-        let Some(sequence) = self.latest_input_sequence else {
+        let Some(sequence) = self.stream.latest_input_sequence() else {
             return;
         };
         let window = receipt.window.clone().unwrap_or_default();
