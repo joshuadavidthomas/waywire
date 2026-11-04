@@ -253,6 +253,12 @@ fn install_globals(display_handle: &DisplayHandle) {
     virtual_keyboard::init(display_handle);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    Seat,
+    TextSlot,
+}
+
 impl State {
     fn new(
         display_handle: DisplayHandle,
@@ -480,7 +486,7 @@ impl State {
     }
 
     pub(crate) fn keyboard_key(&mut self, source: KeyboardSource, key: u32, state: KeyState) {
-        self.keyboard_key_inner(source, key, state, true);
+        self.keyboard_key_inner(source, key, state, KeyKind::Seat);
     }
 
     /// Replay one of the browser's repeats of a key it holds. While a browser
@@ -540,7 +546,7 @@ impl State {
         key: u32,
         state: KeyState,
     ) {
-        self.keyboard_key_inner(source, key, state, false);
+        self.keyboard_key_inner(source, key, state, KeyKind::TextSlot);
     }
 
     fn keyboard_key_inner(
@@ -548,10 +554,10 @@ impl State {
         source: KeyboardSource,
         key: u32,
         state: KeyState,
-        reclaim: bool,
+        kind: KeyKind,
     ) {
         let serial = self.delivery.begin_input(source, delivery::FocusCause::Key);
-        let (target, text_field) = self.dispatch_key(source, key, state, reclaim);
+        let (target, text_field) = self.dispatch_key(source, key, state, kind);
         let input = delivery::InputKind::Key { state };
         self.finish_input(source, serial, input, &target, text_field);
     }
@@ -562,7 +568,7 @@ impl State {
         source: KeyboardSource,
         key: u32,
         state: KeyState,
-        reclaim: bool,
+        kind: KeyKind,
     ) -> (delivery::Target, Option<delivery::TextField>) {
         use delivery::Chrome;
         use delivery::Target;
@@ -621,7 +627,7 @@ impl State {
                 None,
             );
         }
-        if reclaim && state == KeyState::Pressed {
+        if kind == KeyKind::Seat && state == KeyState::Pressed {
             self.reclaim_text_keycode(key + 8);
         }
         let (target, text_field) = if self.delivery.wanted(source) {
