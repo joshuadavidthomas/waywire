@@ -148,8 +148,8 @@ impl StripedEncoder {
     }
 
     pub fn submit(&self, frame: &StripedFrame<'_>) -> Result<(), VideoError> {
-        let width = usize::from(frame.metadata.width.get());
-        let height = usize::from(frame.metadata.height.get());
+        let width = usize::from(frame.metadata.width().get());
+        let height = usize::from(frame.metadata.height().get());
         if width > encoder::MAX_WIDTH
             || width > frame.width
             || height > frame.height
@@ -168,7 +168,7 @@ impl StripedEncoder {
         if staging.state == WorkerState::Stopping {
             return Err(VideoError::Stopped);
         }
-        if frame.metadata.generation != staging.generation {
+        if frame.metadata.generation() != staging.generation {
             return Err(VideoError::InvalidFrame);
         }
         let resized = staging.width != width || staging.height != height;
@@ -229,7 +229,7 @@ impl StripedEncoder {
                 *band = BandChange::Changed;
             }
         }
-        crate::latency::trace_frame("converted", frame.metadata.sequence, submitted_ns);
+        crate::latency::trace_frame("converted", frame.metadata.sequence(), submitted_ns);
         staging.pending = Some(Pending {
             metadata: frame.metadata.clone(),
             crf: frame.crf,
@@ -262,7 +262,7 @@ impl StripedEncoder {
         if staging
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.metadata.generation != generation)
+            .is_some_and(|pending| pending.metadata.generation() != generation)
         {
             staging.pending = None;
         }
@@ -344,7 +344,7 @@ fn run(
             };
             let key = std::mem::replace(&mut staging.key, KeyRequest::None);
             #[expect(clippy::cast_precision_loss, reason = "a frame rate of at most 120")]
-            let fps = pending.metadata.fps.get() as f32;
+            let fps = pending.metadata.fps().get() as f32;
             let bitrate = pending.bitrate.get().saturating_mul(1000);
             let (width, height) = (staging.width, staging.height);
             let current =
@@ -352,8 +352,9 @@ fn run(
             if current.size() != (width, height) {
                 *current = Stripes::new(width, height, requested, fps, bitrate);
             }
-            if generation != Some(pending.metadata.generation) || current.bitrate_bps() != bitrate {
-                generation = Some(pending.metadata.generation);
+            if generation != Some(pending.metadata.generation()) || current.bitrate_bps() != bitrate
+            {
+                generation = Some(pending.metadata.generation());
                 current.reset(fps, bitrate);
             }
             current.copy_changed(&mut staging);
@@ -393,17 +394,13 @@ fn run(
                     );
                 }
                 let mut metadata = pending.metadata;
-                metadata.chroma = Chroma::Yuv420;
-                Ok(EncodedFrame {
-                    kind,
-                    metadata,
-                    data,
-                })
+                metadata.set_chroma(Chroma::Yuv420);
+                Ok(EncodedFrame::new(kind, metadata, data))
             }
             Err(error) => Err(error),
         };
         if let Ok(frame) = &notification {
-            crate::latency::trace_frame("encoder_output", frame.metadata.sequence, taken_ns);
+            crate::latency::trace_frame("encoder_output", frame.metadata().sequence(), taken_ns);
         }
         let fatal = notification.is_err();
         if sender.send(notification).is_err() {
@@ -494,16 +491,16 @@ mod tests {
                 width,
                 height,
                 damage: &[],
-                metadata: FrameMetadata {
+                metadata: FrameMetadata::new(
                     generation,
-                    width: FrameDimension::new(320).expect("width"),
-                    height: FrameDimension::new(180).expect("height"),
-                    capture_nanos: 1,
-                    sequence: 1,
-                    input_sequence: None,
-                    fps: Fps::new(30).expect("fps"),
-                    chroma: Chroma::Yuv420,
-                },
+                    FrameDimension::new(320).expect("width"),
+                    FrameDimension::new(180).expect("height"),
+                    1,
+                    1,
+                    None,
+                    Fps::new(30).expect("fps"),
+                    Chroma::Yuv420,
+                ),
                 crf: Crf::new(27).expect("crf"),
                 bitrate: Kbps::new(12_000).expect("bitrate"),
                 cause: FrameCause::Damage,
@@ -517,12 +514,12 @@ mod tests {
             assert!(Instant::now() < deadline, "no encoded frame");
             thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(frame.kind, FrameKind::Key);
+        assert_eq!(frame.kind(), FrameKind::Key);
         // One stripe: its row, its height, its key flag, its length, then its access unit.
-        assert_eq!(&frame.data[..5], &[0, 0, 180, 0, 1]);
+        assert_eq!(&frame.data()[..5], &[0, 0, 180, 0, 1]);
         let mut decoder = Decoder::new().expect("decoder");
         let picture = decoder
-            .decode(&frame.data[9..])
+            .decode(&frame.data()[9..])
             .expect("decode")
             .expect("picture");
         assert_eq!(picture.dimensions(), (320, 180));

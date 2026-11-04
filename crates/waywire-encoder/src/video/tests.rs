@@ -44,20 +44,20 @@ fn wire_metadata(
     input_sequence: Option<u32>,
     fps: Fps,
 ) -> FrameMetadata {
-    FrameMetadata {
-        generation: waywire_protocol::pipe::Generation::new(generation)
+    FrameMetadata::new(
+        waywire_protocol::pipe::Generation::new(generation)
             .expect("test generation should be valid"),
         width,
         height,
-        capture_nanos: sequence,
         sequence,
-        input_sequence: input_sequence.map(|value| {
+        sequence,
+        input_sequence.map(|value| {
             waywire_protocol::pipe::InputSequence::new(value)
                 .expect("test input sequence should be valid")
         }),
         fps,
-        chroma: Chroma::Yuv444,
-    }
+        Chroma::Yuv444,
+    )
 }
 
 fn frame(sequence: u64, generation: u32) -> RawFrame {
@@ -247,7 +247,7 @@ fn shared_pending_sequence(shared: &Shared) -> Option<u64> {
         .lock()
         .expect("frame pool mutex should not be poisoned");
     pool.slots.iter().find_map(|slot| match slot {
-        FrameSlot::Pending(frame) => Some(frame.metadata.sequence),
+        FrameSlot::Pending(frame) => Some(frame.metadata.sequence()),
         FrameSlot::Free(_) | FrameSlot::Encoding => None,
     })
 }
@@ -552,7 +552,7 @@ fn spawn_failure_retries_queued_frame_without_another_submit() {
 
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata { sequence: 1, .. })
+        Notification::Submitted(metadata) if metadata.sequence() == 1
     ));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     encoder.stop();
@@ -587,7 +587,7 @@ fn newer_pending_frame_replaces_queued_spawn_retry() {
     );
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata { sequence: 2, .. })
+        Notification::Submitted(metadata) if metadata.sequence() == 2
     ));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     encoder.stop();
@@ -931,7 +931,7 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
         }
     }
 
-    assert_eq!(first_encoding.metadata.sequence, 1);
+    assert_eq!(first_encoding.metadata.sequence(), 1);
     assert!(first_encoding.pixels.iter().all(|pixel| *pixel == 1));
     assert_ne!(first_encoding.pixels.as_ptr(), pending_pointer);
     {
@@ -954,7 +954,7 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
     let (latest_slot, latest) =
         take_pending_frame(&shared).expect("submitted test frame should occupy a pending slot");
     assert_eq!(latest_slot, pending_slot);
-    assert_eq!(latest.metadata.sequence, 103);
+    assert_eq!(latest.metadata.sequence(), 103);
     assert!(latest.pixels.iter().all(|pixel| *pixel == 103));
     release_slot(&shared, latest_slot, latest);
 }
@@ -1003,7 +1003,7 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
             .expect("frame pool mutex should not be poisoned");
         match &pool.slots[pending_slot] {
             FrameSlot::Pending(pending) => {
-                assert_eq!(pending.metadata.sequence, 1);
+                assert_eq!(pending.metadata.sequence(), 1);
                 assert_eq!(pending.pixels.as_ptr(), pending_pointer);
             }
             FrameSlot::Free(_) | FrameSlot::Encoding => {
@@ -1280,7 +1280,7 @@ fn notification_wakeup_drains_a_burst_and_rearms_without_loss() {
         .insert_source(notification_source, move |(), (), sequences| {
             while let Ok(notification) = receiver.try_recv() {
                 match notification {
-                    Notification::Submitted(metadata) => sequences.push(metadata.sequence),
+                    Notification::Submitted(metadata) => sequences.push(metadata.sequence()),
                     Notification::RestartRequired { .. } | Notification::Fatal(_) => {
                         panic!("unexpected notification")
                     }
@@ -1576,11 +1576,11 @@ fn encoder_reports_the_chroma_it_can_encode() {
         };
         let mut input = frame(1, 1);
         input.config.chroma = requested;
-        input.metadata.chroma = requested;
+        input.metadata.set_chroma(requested);
         submit_frame(&encoder, &input).expect("frame accepted");
         let (slot, queued) = take_pending_frame(&shared).expect("frame queued");
         assert_eq!(queued.config.chroma, expected);
-        assert_eq!(queued.metadata.chroma, expected);
+        assert_eq!(queued.metadata.chroma(), expected);
         release_slot(&shared, slot, queued);
     }
 }
@@ -1754,15 +1754,11 @@ fn ffmpeg_actual_sps_matches_each_protocol_profile() {
             .expect("FFmpeg-backed test encoder should start");
         let mut test_frame = real_frame(1, 1);
         test_frame.config.chroma = chroma;
-        test_frame.metadata.chroma = chroma;
+        test_frame.metadata.set_chroma(chroma);
         submit_frame(&encoder, &test_frame).expect("test frame should be accepted by the encoder");
         assert!(matches!(
-            wait_for_notification(&encoder),
-            Notification::Submitted(FrameMetadata {
-                generation,
-                sequence: 1,
-                ..
-            }) if generation.get() == 1
+                wait_for_notification(&encoder),
+                Notification::Submitted(metadata) if metadata.sequence() == 1 && metadata.generation().get() == 1
         ));
 
         let access_unit = receive_first_rtp_access_unit(&socket);
@@ -1870,11 +1866,7 @@ fn ffmpeg_emits_a_complete_rtp_frame_without_stdin_eof() {
         .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata {
-            generation,
-            sequence: 1,
-            ..
-        }) if generation.get() == 1
+        Notification::Submitted(metadata) if metadata.sequence() == 1 && metadata.generation().get() == 1
     ));
 
     assert_eq!(receive_frame_ssrc(&socket), 1);
@@ -1907,15 +1899,10 @@ fn ffmpeg_sparse_frames_resume_after_idle_at_thirty_and_sixty_fps() {
             let frame = real_frame_at_fps(sequence, 1, fps);
             submit_frame(&encoder, &frame).expect("test frame should be accepted by the encoder");
             assert!(matches!(
-                wait_for_notification(&encoder),
-                Notification::Submitted(FrameMetadata {
-                    generation,
-                    sequence: submitted,
-                    fps: submitted_fps,
-                    ..
-                }) if generation.get() == 1
-                    && submitted == sequence
-                    && submitted_fps.get() == fps
+                        wait_for_notification(&encoder),
+                        Notification::Submitted(metadata) if metadata.generation().get() == 1
+                            && metadata.sequence() == sequence
+                            && metadata.fps().get() == fps
             ));
             assert_eq!(receive_frame_ssrc(&socket), 1);
             assert!(encoder.child_pid().is_some());
@@ -1943,11 +1930,7 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
         .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata {
-            generation,
-            sequence: 1,
-            ..
-        }) if generation.get() == 1
+        Notification::Submitted(metadata) if metadata.sequence() == 1 && metadata.generation().get() == 1
     ));
     let old_ssrc = receive_frame_ssrc(&socket);
     let pid = encoder.child_pid().expect("ffmpeg child was not recorded");
@@ -1970,11 +1953,7 @@ fn ffmpeg_idle_exit_waits_for_a_new_generation_before_new_ssrc() {
         .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata {
-            generation,
-            sequence: 2,
-            ..
-        }) if generation.get() == 2
+        Notification::Submitted(metadata) if metadata.sequence() == 2 && metadata.generation().get() == 2
     ));
     let new_ssrc = receive_frame_ssrc(&socket);
     assert_eq!(old_ssrc, 1);
@@ -2012,11 +1991,11 @@ fn ffmpeg_rgb_yuv_transitions_replace_the_color_matrix() {
         }
         let mut frame = real_frame(u64::from(next), next);
         frame.config.chroma = chroma;
-        frame.metadata.chroma = chroma;
+        frame.metadata.set_chroma(chroma);
         frame.config.encoded_width = dimension(160);
         frame.config.encoded_height = dimension(90);
-        frame.metadata.width = dimension(160);
-        frame.metadata.height = dimension(90);
+        frame.metadata.set_width(dimension(160));
+        frame.metadata.set_height(dimension(90));
         submit_frame(&encoder, &frame).expect("frame accepted");
         assert!(matches!(
             wait_for_notification(&encoder),
@@ -2052,11 +2031,7 @@ fn ffmpeg_chroma_reconfiguration_waits_for_a_new_generation_and_changes_sps() {
         .expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata {
-            generation,
-            sequence: 1,
-            ..
-        }) if generation.get() == 1
+        Notification::Submitted(metadata) if metadata.sequence() == 1 && metadata.generation().get() == 1
     ));
     let old_access_unit = receive_first_rtp_access_unit(&socket);
     let old_sps = old_access_unit
@@ -2067,7 +2042,7 @@ fn ffmpeg_chroma_reconfiguration_waits_for_a_new_generation_and_changes_sps() {
 
     let mut changed = real_frame(2, 1);
     changed.config.chroma = Chroma::Yuv420;
-    changed.metadata.chroma = Chroma::Yuv420;
+    changed.metadata.set_chroma(Chroma::Yuv420);
     submit_frame(&encoder, &changed).expect("test frame should be accepted by the encoder");
     assert_eq!(
         wait_for_notification(&encoder),
@@ -2079,18 +2054,14 @@ fn ffmpeg_chroma_reconfiguration_waits_for_a_new_generation_and_changes_sps() {
 
     let mut replacement = real_frame(3, 2);
     replacement.config.chroma = Chroma::Yuv420;
-    replacement.metadata.chroma = Chroma::Yuv420;
+    replacement.metadata.set_chroma(Chroma::Yuv420);
     encoder
         .set_generation(generation(2))
         .expect("valid next media generation should be accepted");
     submit_frame(&encoder, &replacement).expect("test frame should be accepted by the encoder");
     assert!(matches!(
         wait_for_notification(&encoder),
-        Notification::Submitted(FrameMetadata {
-            generation,
-            sequence: 3,
-            ..
-        }) if generation.get() == 2
+        Notification::Submitted(metadata) if metadata.sequence() == 3 && metadata.generation().get() == 2
     ));
     let new_access_unit = receive_first_rtp_access_unit(&socket);
     let new_sps = new_access_unit

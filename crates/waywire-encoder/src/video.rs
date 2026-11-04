@@ -169,11 +169,11 @@ impl<'a> CapturedFrame<'a> {
 
     fn validate(&self) -> Result<(), VideoError> {
         if self.pixels.len() != self.config.validate()?
-            || self.metadata.generation.get() > MAX_MEDIA_GENERATION
-            || self.metadata.width != self.config.encoded_width
-            || self.metadata.height != self.config.encoded_height
-            || self.metadata.fps != self.config.fps
-            || self.metadata.chroma != self.config.chroma
+            || self.metadata.generation().get() > MAX_MEDIA_GENERATION
+            || self.metadata.width() != self.config.encoded_width
+            || self.metadata.height() != self.config.encoded_height
+            || self.metadata.fps() != self.config.fps
+            || self.metadata.chroma() != self.config.chroma
         {
             return Err(VideoError::InvalidFrame);
         }
@@ -388,10 +388,10 @@ impl VideoEncoder {
         frame.validate()?;
         if self.encoder == Encoder::OpenH264 {
             frame.config.chroma = Chroma::Yuv420;
-            frame.metadata.chroma = Chroma::Yuv420;
+            frame.metadata.set_chroma(Chroma::Yuv420);
         } else if self.encoder == Encoder::X264WithoutRgb && frame.config.chroma == Chroma::Rgb {
             frame.config.chroma = Chroma::Yuv444;
-            frame.metadata.chroma = Chroma::Yuv444;
+            frame.metadata.set_chroma(Chroma::Yuv444);
         }
         let mut pool = self
             .shared
@@ -401,7 +401,7 @@ impl VideoEncoder {
         if pool.state == WorkerState::Stopping {
             return Err(VideoError::Stopped);
         }
-        if frame.metadata.generation != pool.generation {
+        if frame.metadata.generation() != pool.generation {
             return Err(VideoError::InvalidFrame);
         }
         let result = if let Some(slot) = pool.pending()
@@ -446,7 +446,7 @@ impl VideoEncoder {
         if let Some(slot) = pool.pending() {
             let discard = matches!(
                 &pool.slots[slot],
-                FrameSlot::Pending(frame) if frame.metadata.generation != generation
+                FrameSlot::Pending(frame) if frame.metadata.generation() != generation
             );
             if discard {
                 let salvaged =
@@ -775,7 +775,7 @@ impl Worker<'_> {
                     active.config,
                     active.generation,
                     frame.config,
-                    frame.metadata.generation,
+                    frame.metadata.generation(),
                 )
             });
         match transition {
@@ -785,7 +785,7 @@ impl Worker<'_> {
                 TransitionOutcome::Proceed(slot, frame)
             }
             EncoderTransition::RequestNewGeneration => {
-                let generation = frame.metadata.generation;
+                let generation = frame.metadata.generation();
                 stop_process(self.shared, self.process.take());
                 release_slot(self.shared, slot, frame);
                 if current_generation(self.shared) == generation
@@ -810,7 +810,7 @@ impl Worker<'_> {
         frame: RawFrame,
         error: &FrameWriteError,
     ) -> ControlFlow<()> {
-        let frame_generation = frame.metadata.generation;
+        let frame_generation = frame.metadata.generation();
         match error {
             FrameWriteError::GenerationChanged { observed, frame } => error!(
                 %error,
@@ -893,7 +893,7 @@ impl Worker<'_> {
             };
             let taken_ns = crate::latency::monotonic_nanos();
 
-            if frame.metadata.generation != current_generation(self.shared) {
+            if frame.metadata.generation() != current_generation(self.shared) {
                 release_slot(self.shared, slot, frame);
                 continue;
             }
@@ -921,7 +921,7 @@ impl Worker<'_> {
                     self.ffmpeg,
                     self.rtp_port,
                     frame.config,
-                    frame.metadata.generation,
+                    frame.metadata.generation(),
                 )
                 .and_then(|started| watch_process(self.shared, self.notification_wake, started))
                 {
@@ -943,7 +943,7 @@ impl Worker<'_> {
                 release_slot(self.shared, slot, frame);
                 continue;
             };
-            let frame_generation = frame.metadata.generation;
+            let frame_generation = frame.metadata.generation();
             let write_result = write_frame(
                 self.shared,
                 &mut active.input,
@@ -957,7 +957,7 @@ impl Worker<'_> {
                 }
             }
 
-            crate::latency::trace_frame("encoder_input", frame.metadata.sequence, taken_ns);
+            crate::latency::trace_frame("encoder_input", frame.metadata.sequence(), taken_ns);
             // Correlation metadata follows only a complete raw-frame pipe write.
             if send_notification(
                 self.shared,
@@ -1129,7 +1129,7 @@ fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
     // Any pending frame arrived after this worker took its frame. Keep it,
     // regardless of sequence wraparound; arrival owns the latest-frame policy.
     if pool.state == WorkerState::Stopping
-        || pool.generation != frame.metadata.generation
+        || pool.generation != frame.metadata.generation()
         || pool.pending().is_some()
     {
         pool.slots[slot] = FrameSlot::Free(frame.pixels);
