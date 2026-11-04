@@ -8,7 +8,13 @@ pub const HEADER_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
-pub struct InvalidValue(pub(crate) &'static str);
+pub struct InvalidValue(&'static str);
+
+impl InvalidValue {
+    pub(crate) const fn new(reason: &'static str) -> Self {
+        Self(reason)
+    }
+}
 
 pub(crate) trait Wire: Sized {
     fn write(&self, out: &mut Writer);
@@ -26,7 +32,7 @@ impl<'a> Reader<'a> {
         let (head, tail) = self
             .0
             .split_first_chunk::<N>()
-            .ok_or(InvalidValue("payload is too short"))?;
+            .ok_or(InvalidValue::new("payload is too short"))?;
         self.0 = tail;
         Ok(*head)
     }
@@ -37,7 +43,7 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn slice(&mut self, length: usize) -> Result<&'a [u8], InvalidValue> {
         if self.0.len() < length {
-            return Err(InvalidValue("payload is too short"));
+            return Err(InvalidValue::new("payload is too short"));
         }
         let (head, tail) = self.0.split_at(length);
         self.0 = tail;
@@ -52,7 +58,7 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn rest_utf8(&mut self) -> Result<&'a str, InvalidValue> {
         let Ok(text) = std::str::from_utf8(self.rest()) else {
-            return Err(InvalidValue("text is not UTF-8"));
+            return Err(InvalidValue::new("text is not UTF-8"));
         };
         Ok(text)
     }
@@ -61,7 +67,7 @@ impl<'a> Reader<'a> {
         if self.0.is_empty() {
             Ok(())
         } else {
-            Err(InvalidValue("payload has trailing bytes"))
+            Err(InvalidValue::new("payload has trailing bytes"))
         }
     }
 }

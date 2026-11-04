@@ -45,7 +45,9 @@ macro_rules! nonzero_newtype {
 
         impl $name {
             pub fn new(value: $inner) -> Result<Self, InvalidValue> {
-                <$nonzero>::new(value).map(Self).ok_or(InvalidValue($label))
+                <$nonzero>::new(value)
+                    .map(Self)
+                    .ok_or(InvalidValue::new($label))
             }
 
             #[must_use]
@@ -92,7 +94,7 @@ macro_rules! ranged_newtype {
                 if minimum <= value && value <= maximum {
                     Ok(Self(value))
                 } else {
-                    Err(InvalidValue($label))
+                    Err(InvalidValue::new($label))
                 }
             }
 
@@ -316,7 +318,7 @@ impl Wire for Chroma {
             0_u8 => Ok(Self::Yuv444),
             1 => Ok(Self::Yuv420),
             2 => Ok(Self::Rgb),
-            _ => Err(InvalidValue("unknown chroma sampling")),
+            _ => Err(InvalidValue::new("unknown chroma sampling")),
         }
     }
 }
@@ -368,7 +370,9 @@ impl FrameSize {
         {
             Ok(Self { width, height })
         } else {
-            Err(InvalidValue("frame size is outside the supported range"))
+            Err(InvalidValue::new(
+                "frame size is outside the supported range",
+            ))
         }
     }
 
@@ -402,7 +406,7 @@ impl ClipboardText {
         if text.len() <= MAX_CLIPBOARD_BYTES {
             Ok(Self(text))
         } else {
-            Err(InvalidValue("clipboard text must be at most 1 MiB"))
+            Err(InvalidValue::new("clipboard text must be at most 1 MiB"))
         }
     }
 
@@ -428,9 +432,9 @@ pub struct InputText(String);
 impl InputText {
     pub fn new(text: String) -> Result<Self, InvalidValue> {
         if text.len() > MAX_TEXT_BYTES {
-            Err(InvalidValue("input text must be at most 4000 bytes"))
+            Err(InvalidValue::new("input text must be at most 4000 bytes"))
         } else if text.contains('\0') {
-            Err(InvalidValue("input text must not contain NUL"))
+            Err(InvalidValue::new("input text must not contain NUL"))
         } else {
             Ok(Self(text))
         }
@@ -460,7 +464,7 @@ impl PointerDelta {
         if value.is_finite() && (-4096.0..=4096.0).contains(&value) {
             Ok(Self(value))
         } else {
-            Err(InvalidValue(
+            Err(InvalidValue::new(
                 "pointer delta must be finite and between -4096 and 4096",
             ))
         }
@@ -517,7 +521,7 @@ impl Wire for Button {
             0x112 => Ok(Self::Middle),
             0x113 => Ok(Self::Side),
             0x114 => Ok(Self::Extra),
-            _ => Err(InvalidValue("unknown pointer button")),
+            _ => Err(InvalidValue::new("unknown pointer button")),
         }
     }
 }
@@ -760,7 +764,7 @@ impl Wire for CursorShape {
             34 => Ok(Self::ZoomOut),
             35 => Ok(Self::DndAsk),
             36 => Ok(Self::AllResize),
-            _ => Err(InvalidValue("unknown cursor shape")),
+            _ => Err(InvalidValue::new("unknown cursor shape")),
         }
     }
 }
@@ -769,9 +773,28 @@ impl Wire for CursorShape {
 /// Independent of output scale and encoded video dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CursorPosition {
-    pub x: PointerCoordinate,
-    pub y: PointerCoordinate,
-    pub source: CursorSource,
+    x: PointerCoordinate,
+    y: PointerCoordinate,
+    source: CursorSource,
+}
+
+impl CursorPosition {
+    #[must_use]
+    pub fn new(x: PointerCoordinate, y: PointerCoordinate, source: CursorSource) -> Self {
+        Self { x, y, source }
+    }
+    #[must_use]
+    pub fn x(&self) -> PointerCoordinate {
+        self.x
+    }
+    #[must_use]
+    pub fn y(&self) -> PointerCoordinate {
+        self.y
+    }
+    #[must_use]
+    pub fn source(&self) -> CursorSource {
+        self.source
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -793,7 +816,7 @@ impl Wire for CursorSource {
         match input.get::<u8>()? {
             0 => Ok(Self::Browser),
             1 => Ok(Self::Agent),
-            _ => Err(InvalidValue("unknown cursor source")),
+            _ => Err(InvalidValue::new("unknown cursor source")),
         }
     }
 }
@@ -833,7 +856,7 @@ impl Wire for ButtonState {
         match input.get()? {
             0_u8 => Ok(Self::Released),
             1 => Ok(Self::Pressed),
-            _ => Err(InvalidValue("state must be zero or one")),
+            _ => Err(InvalidValue::new("state must be zero or one")),
         }
     }
 }
@@ -852,7 +875,7 @@ impl Wire for KeyState {
             0_u8 => Ok(Self::Released),
             1 => Ok(Self::Pressed),
             2 => Ok(Self::Repeated),
-            _ => Err(InvalidValue("state must be zero, one, or two")),
+            _ => Err(InvalidValue::new("state must be zero, one, or two")),
         }
     }
 }
@@ -869,7 +892,7 @@ impl Wire for KeyframeState {
         match input.get()? {
             0_u8 => Ok(Self::Missing),
             1 => Ok(Self::Cached),
-            _ => Err(InvalidValue("state must be zero or one")),
+            _ => Err(InvalidValue::new("state must be zero or one")),
         }
     }
 }
@@ -886,7 +909,7 @@ impl Wire for CursorVisibility {
         match input.get()? {
             0_u8 => Ok(Self::Hidden),
             1 => Ok(Self::Visible),
-            _ => Err(InvalidValue("visibility must be zero or one")),
+            _ => Err(InvalidValue::new("visibility must be zero or one")),
         }
     }
 }
@@ -903,16 +926,35 @@ impl Wire for TextAction {
         match input.get()? {
             0_u8 => Ok(Self::Commit),
             1 => Ok(Self::Preedit),
-            _ => Err(InvalidValue("action must be zero or one")),
+            _ => Err(InvalidValue::new("action must be zero or one")),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PointerAbsolute {
-    pub x: PointerCoordinate,
-    pub y: PointerCoordinate,
-    pub sequence: InputSequence,
+    x: PointerCoordinate,
+    y: PointerCoordinate,
+    sequence: InputSequence,
+}
+
+impl PointerAbsolute {
+    #[must_use]
+    pub fn new(x: PointerCoordinate, y: PointerCoordinate, sequence: InputSequence) -> Self {
+        Self { x, y, sequence }
+    }
+    #[must_use]
+    pub fn x(&self) -> PointerCoordinate {
+        self.x
+    }
+    #[must_use]
+    pub fn y(&self) -> PointerCoordinate {
+        self.y
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
 }
 
 impl Wire for PointerAbsolute {
@@ -933,9 +975,32 @@ impl Wire for PointerAbsolute {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PointerButton {
-    pub button: Button,
-    pub state: ButtonState,
-    pub sequence: InputSequence,
+    button: Button,
+    state: ButtonState,
+    sequence: InputSequence,
+}
+
+impl PointerButton {
+    #[must_use]
+    pub fn new(button: Button, state: ButtonState, sequence: InputSequence) -> Self {
+        Self {
+            button,
+            state,
+            sequence,
+        }
+    }
+    #[must_use]
+    pub fn button(&self) -> Button {
+        self.button
+    }
+    #[must_use]
+    pub fn state(&self) -> ButtonState {
+        self.state
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
 }
 
 impl Wire for PointerButton {
@@ -956,9 +1021,28 @@ impl Wire for PointerButton {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerScroll {
-    pub dx: PointerDelta,
-    pub dy: PointerDelta,
-    pub sequence: InputSequence,
+    dx: PointerDelta,
+    dy: PointerDelta,
+    sequence: InputSequence,
+}
+
+impl PointerScroll {
+    #[must_use]
+    pub fn new(dx: PointerDelta, dy: PointerDelta, sequence: InputSequence) -> Self {
+        Self { dx, dy, sequence }
+    }
+    #[must_use]
+    pub fn dx(&self) -> PointerDelta {
+        self.dx
+    }
+    #[must_use]
+    pub fn dy(&self) -> PointerDelta {
+        self.dy
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
 }
 
 impl Wire for PointerScroll {
@@ -979,9 +1063,32 @@ impl Wire for PointerScroll {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyboardKey {
-    pub key: KeyCode,
-    pub state: KeyState,
-    pub sequence: InputSequence,
+    key: KeyCode,
+    state: KeyState,
+    sequence: InputSequence,
+}
+
+impl KeyboardKey {
+    #[must_use]
+    pub fn new(key: KeyCode, state: KeyState, sequence: InputSequence) -> Self {
+        Self {
+            key,
+            state,
+            sequence,
+        }
+    }
+    #[must_use]
+    pub fn key(&self) -> KeyCode {
+        self.key
+    }
+    #[must_use]
+    pub fn state(&self) -> KeyState {
+        self.state
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
 }
 
 impl Wire for KeyboardKey {
@@ -1014,20 +1121,21 @@ impl Wire for ReleaseAll {
 /// Whether a browser currently holds the seat's input lease. While it does,
 /// the compositor releases and then drops every agent source's input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputLease {
-    pub held: bool,
+pub enum InputControl {
+    Agents,
+    Browser,
 }
 
-impl Wire for InputLease {
+impl Wire for InputControl {
     fn write(&self, out: &mut Writer) {
-        out.put(&u8::from(self.held));
+        out.put(&u8::from(matches!(self, Self::Browser)));
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
         match input.get()? {
-            0_u8 => Ok(Self { held: false }),
-            1 => Ok(Self { held: true }),
-            _ => Err(InvalidValue("lease state must be zero or one")),
+            0_u8 => Ok(Self::Agents),
+            1 => Ok(Self::Browser),
+            _ => Err(InvalidValue::new("lease state must be zero or one")),
         }
     }
 }
@@ -1074,16 +1182,39 @@ impl Wire for ResetVideoRefusal {
             4 => Ok(Self::CompositorCancelled),
             5 => Ok(Self::CompositorTimedOut),
             6 => Ok(Self::OutputUnavailable),
-            _ => Err(InvalidValue("unknown video reset refusal reason")),
+            _ => Err(InvalidValue::new("unknown video reset refusal reason")),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resize {
-    pub size: FrameSize,
-    pub scale_v120: ScaleV120,
-    pub request_id: RequestId,
+    size: FrameSize,
+    scale_v120: ScaleV120,
+    request_id: RequestId,
+}
+
+impl Resize {
+    #[must_use]
+    pub fn new(size: FrameSize, scale_v120: ScaleV120, request_id: RequestId) -> Self {
+        Self {
+            size,
+            scale_v120,
+            request_id,
+        }
+    }
+    #[must_use]
+    pub fn size(&self) -> FrameSize {
+        self.size
+    }
+    #[must_use]
+    pub fn scale_v120(&self) -> ScaleV120 {
+        self.scale_v120
+    }
+    #[must_use]
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
 }
 
 impl Wire for Resize {
@@ -1104,9 +1235,28 @@ impl Wire for Resize {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerRelative {
-    pub dx: PointerDelta,
-    pub dy: PointerDelta,
-    pub sequence: InputSequence,
+    dx: PointerDelta,
+    dy: PointerDelta,
+    sequence: InputSequence,
+}
+
+impl PointerRelative {
+    #[must_use]
+    pub fn new(dx: PointerDelta, dy: PointerDelta, sequence: InputSequence) -> Self {
+        Self { dx, dy, sequence }
+    }
+    #[must_use]
+    pub fn dx(&self) -> PointerDelta {
+        self.dx
+    }
+    #[must_use]
+    pub fn dy(&self) -> PointerDelta {
+        self.dy
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
 }
 
 impl Wire for PointerRelative {
@@ -1127,11 +1277,50 @@ impl Wire for PointerRelative {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quality {
-    pub bitrate_kbps: Kbps,
-    pub fps: Fps,
-    pub scale_percent: ScalePercent,
-    pub crf: Crf,
-    pub chroma: Chroma,
+    bitrate_kbps: Kbps,
+    fps: Fps,
+    scale_percent: ScalePercent,
+    crf: Crf,
+    chroma: Chroma,
+}
+
+impl Quality {
+    #[must_use]
+    pub fn new(
+        bitrate_kbps: Kbps,
+        fps: Fps,
+        scale_percent: ScalePercent,
+        crf: Crf,
+        chroma: Chroma,
+    ) -> Self {
+        Self {
+            bitrate_kbps,
+            fps,
+            scale_percent,
+            crf,
+            chroma,
+        }
+    }
+    #[must_use]
+    pub fn bitrate_kbps(&self) -> Kbps {
+        self.bitrate_kbps
+    }
+    #[must_use]
+    pub fn fps(&self) -> Fps {
+        self.fps
+    }
+    #[must_use]
+    pub fn scale_percent(&self) -> ScalePercent {
+        self.scale_percent
+    }
+    #[must_use]
+    pub fn crf(&self) -> Crf {
+        self.crf
+    }
+    #[must_use]
+    pub fn chroma(&self) -> Chroma {
+        self.chroma
+    }
 }
 
 impl Wire for Quality {
@@ -1156,31 +1345,69 @@ impl Wire for Quality {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Text {
-    pub action: TextAction,
-    pub sequence: InputSequence,
-    pub text: InputText,
+    action: TextAction,
+    sequence: InputSequence,
+    content: InputText,
+}
+
+impl Text {
+    #[must_use]
+    pub fn new(action: TextAction, sequence: InputSequence, text: InputText) -> Self {
+        Self {
+            action,
+            sequence,
+            content: text,
+        }
+    }
+    #[must_use]
+    pub fn action(&self) -> TextAction {
+        self.action
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
+    #[must_use]
+    pub fn text(&self) -> &InputText {
+        &self.content
+    }
 }
 
 impl Wire for Text {
     fn write(&self, out: &mut Writer) {
         out.put(&self.action);
         out.put(&self.sequence);
-        out.put(&self.text);
+        out.put(&self.content);
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
         Ok(Self {
             action: input.get()?,
             sequence: input.get()?,
-            text: input.get()?,
+            content: input.get()?,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyframeReadiness {
-    pub generation: Generation,
-    pub state: KeyframeState,
+    generation: Generation,
+    state: KeyframeState,
+}
+
+impl KeyframeReadiness {
+    #[must_use]
+    pub fn new(generation: Generation, state: KeyframeState) -> Self {
+        Self { generation, state }
+    }
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+    #[must_use]
+    pub fn state(&self) -> KeyframeState {
+        self.state
+    }
 }
 
 impl Wire for KeyframeReadiness {
@@ -1312,7 +1539,7 @@ pub enum Command {
     Text(Text),
     KeyframeReadiness(KeyframeReadiness),
     ResetVideo(ResetVideo),
-    InputLease(InputLease),
+    InputLease(InputControl),
 }
 
 impl Command {
@@ -1410,14 +1637,96 @@ impl Record for Command {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameMetadata {
-    pub generation: Generation,
-    pub width: FrameDimension,
-    pub height: FrameDimension,
-    pub capture_nanos: u64,
-    pub sequence: u64,
-    pub input_sequence: Option<InputSequence>,
-    pub fps: Fps,
-    pub chroma: Chroma,
+    generation: Generation,
+    width: FrameDimension,
+    height: FrameDimension,
+    capture_nanos: u64,
+    sequence: u64,
+    input_sequence: Option<InputSequence>,
+    fps: Fps,
+    chroma: Chroma,
+}
+
+impl FrameMetadata {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor names every field of the wire record"
+    )]
+    #[must_use]
+    pub fn new(
+        generation: Generation,
+        width: FrameDimension,
+        height: FrameDimension,
+        capture_nanos: u64,
+        sequence: u64,
+        input_sequence: Option<InputSequence>,
+        fps: Fps,
+        chroma: Chroma,
+    ) -> Self {
+        Self {
+            generation,
+            width,
+            height,
+            capture_nanos,
+            sequence,
+            input_sequence,
+            fps,
+            chroma,
+        }
+    }
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+    #[must_use]
+    pub fn width(&self) -> FrameDimension {
+        self.width
+    }
+    #[must_use]
+    pub fn height(&self) -> FrameDimension {
+        self.height
+    }
+    #[must_use]
+    pub fn capture_nanos(&self) -> u64 {
+        self.capture_nanos
+    }
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    #[must_use]
+    pub fn input_sequence(&self) -> Option<InputSequence> {
+        self.input_sequence
+    }
+    #[must_use]
+    pub fn fps(&self) -> Fps {
+        self.fps
+    }
+    #[must_use]
+    pub fn chroma(&self) -> Chroma {
+        self.chroma
+    }
+
+    pub fn set_chroma(&mut self, value: Chroma) {
+        self.chroma = value;
+    }
+
+    pub fn set_capture_nanos(&mut self, value: u64) {
+        self.capture_nanos = value;
+    }
+    pub fn set_generation(&mut self, value: Generation) {
+        self.generation = value;
+    }
+    pub fn set_sequence(&mut self, value: u64) {
+        self.sequence = value;
+    }
+
+    pub fn set_height(&mut self, value: FrameDimension) {
+        self.height = value;
+    }
+    pub fn set_width(&mut self, value: FrameDimension) {
+        self.width = value;
+    }
 }
 
 impl Wire for FrameMetadata {
@@ -1449,12 +1758,45 @@ impl Wire for FrameMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ResizeApplied {
     #[serde(rename = "request")]
-    pub request_id: RequestId,
+    request_id: RequestId,
     #[serde(flatten)]
-    pub size: FrameSize,
+    size: FrameSize,
     #[serde(rename = "scale")]
-    pub scale_v120: ScaleV120,
-    pub generation: Generation,
+    scale_v120: ScaleV120,
+    generation: Generation,
+}
+
+impl ResizeApplied {
+    #[must_use]
+    pub fn new(
+        request_id: RequestId,
+        size: FrameSize,
+        scale_v120: ScaleV120,
+        generation: Generation,
+    ) -> Self {
+        Self {
+            request_id,
+            size,
+            scale_v120,
+            generation,
+        }
+    }
+    #[must_use]
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+    #[must_use]
+    pub fn size(&self) -> FrameSize {
+        self.size
+    }
+    #[must_use]
+    pub fn scale_v120(&self) -> ScaleV120 {
+        self.scale_v120
+    }
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
 }
 
 impl Wire for ResizeApplied {
@@ -1476,29 +1818,54 @@ impl Wire for ResizeApplied {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AgentInput {
-    pub connected: bool,
-    pub dropped: bool,
+pub enum AgentInputState {
+    #[default]
+    None,
+    Driving,
+    Paused,
+    /// The last agent disconnected while browser control still pauses agent input.
+    PausedDisconnected,
 }
 
-impl Wire for AgentInput {
+impl AgentInputState {
+    #[must_use]
+    pub const fn connected(self) -> bool {
+        matches!(self, Self::Driving | Self::Paused)
+    }
+
+    #[must_use]
+    pub const fn dropped(self) -> bool {
+        matches!(self, Self::Paused | Self::PausedDisconnected)
+    }
+}
+
+impl Wire for AgentInputState {
     fn write(&self, out: &mut Writer) {
-        out.put(&u8::from(self.connected));
-        out.put(&u8::from(self.dropped));
+        out.put(&u8::from(self.connected()));
+        out.put(&u8::from(self.dropped()));
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
         let connected = match input.get()? {
             0_u8 => false,
             1 => true,
-            _ => return Err(InvalidValue("agent connection state must be zero or one")),
+            _ => {
+                return Err(InvalidValue::new(
+                    "agent connection state must be zero or one",
+                ));
+            }
         };
         let dropped = match input.get()? {
             0_u8 => false,
             1 => true,
-            _ => return Err(InvalidValue("agent drop state must be zero or one")),
+            _ => return Err(InvalidValue::new("agent drop state must be zero or one")),
         };
-        Ok(Self { connected, dropped })
+        Ok(match (connected, dropped) {
+            (false, false) => Self::None,
+            (true, false) => Self::Driving,
+            (true, true) => Self::Paused,
+            (false, true) => Self::PausedDisconnected,
+        })
     }
 }
 
@@ -1532,7 +1899,7 @@ impl Wire for ReceiptDelivery {
             2 => Ok(Self::Compositor),
             3 => Ok(Self::Nowhere),
             4 => Ok(Self::Dropped),
-            _ => Err(InvalidValue("receipt delivery is unknown")),
+            _ => Err(InvalidValue::new("receipt delivery is unknown")),
         }
     }
 }
@@ -1548,7 +1915,7 @@ impl ReceiptText {
         if text.len() <= MAX_RECEIPT_TEXT_BYTES {
             Ok(Self(text))
         } else {
-            Err(InvalidValue("receipt text must be at most 512 bytes"))
+            Err(InvalidValue::new("receipt text must be at most 512 bytes"))
         }
     }
 
@@ -1578,7 +1945,7 @@ impl Wire for ReceiptText {
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
         let length: u16 = input.get()?;
         let Ok(text) = std::str::from_utf8(input.slice(usize::from(length))?) else {
-            return Err(InvalidValue("receipt text is not UTF-8"));
+            return Err(InvalidValue::new("receipt text is not UTF-8"));
         };
         Self::new(text.to_owned())
     }
@@ -1588,12 +1955,70 @@ impl Wire for ReceiptText {
 /// it reached, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputReceipt {
-    pub sequence: InputSequence,
-    pub delivery: ReceiptDelivery,
+    sequence: InputSequence,
+    delivery: ReceiptDelivery,
     /// The window's ext-foreign-toplevel-list identifier, or empty.
-    pub window_id: ReceiptText,
-    pub app_id: ReceiptText,
-    pub title: ReceiptText,
+    window_id: ReceiptText,
+    app_id: ReceiptText,
+    title: ReceiptText,
+}
+
+impl InputReceipt {
+    #[must_use]
+    pub fn new(
+        sequence: InputSequence,
+        delivery: ReceiptDelivery,
+        window_id: ReceiptText,
+        app_id: ReceiptText,
+        title: ReceiptText,
+    ) -> Self {
+        Self {
+            sequence,
+            delivery,
+            window_id,
+            app_id,
+            title,
+        }
+    }
+    #[must_use]
+    pub fn sequence(&self) -> InputSequence {
+        self.sequence
+    }
+    #[must_use]
+    pub fn delivery(&self) -> ReceiptDelivery {
+        self.delivery
+    }
+    #[must_use]
+    pub fn window_id(&self) -> &ReceiptText {
+        &self.window_id
+    }
+    #[must_use]
+    pub fn app_id(&self) -> &ReceiptText {
+        &self.app_id
+    }
+    #[must_use]
+    pub fn title(&self) -> &ReceiptText {
+        &self.title
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        InputSequence,
+        ReceiptDelivery,
+        ReceiptText,
+        ReceiptText,
+        ReceiptText,
+    ) {
+        (
+            self.sequence,
+            self.delivery,
+            self.window_id,
+            self.app_id,
+            self.title,
+        )
+    }
 }
 
 impl Wire for InputReceipt {
@@ -1618,12 +2043,57 @@ impl Wire for InputReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorImage {
-    pub width: u8,
-    pub height: u8,
-    pub hotspot_x: u8,
-    pub hotspot_y: u8,
-    pub output_width: u16,
-    pub png: Vec<u8>,
+    width: u8,
+    height: u8,
+    hotspot_x: u8,
+    hotspot_y: u8,
+    output_width: u16,
+    png: Vec<u8>,
+}
+
+impl CursorImage {
+    #[must_use]
+    pub fn new(
+        width: u8,
+        height: u8,
+        hotspot_x: u8,
+        hotspot_y: u8,
+        output_width: u16,
+        png: Vec<u8>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            output_width,
+            png,
+        }
+    }
+    #[must_use]
+    pub fn width(&self) -> u8 {
+        self.width
+    }
+    #[must_use]
+    pub fn height(&self) -> u8 {
+        self.height
+    }
+    #[must_use]
+    pub fn hotspot_x(&self) -> u8 {
+        self.hotspot_x
+    }
+    #[must_use]
+    pub fn hotspot_y(&self) -> u8 {
+        self.hotspot_y
+    }
+    #[must_use]
+    pub fn output_width(&self) -> u16 {
+        self.output_width
+    }
+    #[must_use]
+    pub fn png(&self) -> &Vec<u8> {
+        &self.png
+    }
 }
 
 impl Wire for CursorImage {
@@ -1652,7 +2122,7 @@ impl Wire for CursorImage {
             || output_width == 0
             || !png.starts_with(b"\x89PNG\r\n\x1a\n")
         {
-            return Err(InvalidValue("invalid cursor image"));
+            return Err(InvalidValue::new("invalid cursor image"));
         }
         Ok(Self {
             width,
@@ -1670,9 +2140,37 @@ impl Wire for CursorImage {
 /// stripe of the frame is a key frame, so a viewer can start from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedFrame {
-    pub kind: FrameKind,
-    pub metadata: FrameMetadata,
-    pub data: Vec<u8>,
+    kind: FrameKind,
+    metadata: FrameMetadata,
+    data: Vec<u8>,
+}
+
+impl EncodedFrame {
+    #[must_use]
+    pub fn new(kind: FrameKind, metadata: FrameMetadata, data: Vec<u8>) -> Self {
+        Self {
+            kind,
+            metadata,
+            data,
+        }
+    }
+    #[must_use]
+    pub fn kind(&self) -> FrameKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn metadata(&self) -> &FrameMetadata {
+        &self.metadata
+    }
+    #[must_use]
+    pub fn data(&self) -> &Vec<u8> {
+        &self.data
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (FrameKind, FrameMetadata, Vec<u8>) {
+        (self.kind, self.metadata, self.data)
+    }
 }
 
 impl Wire for EncodedFrame {
@@ -1686,7 +2184,11 @@ impl Wire for EncodedFrame {
         let kind = match input.get()? {
             0_u8 => FrameKind::Delta,
             1 => FrameKind::Key,
-            _ => return Err(InvalidValue("encoded frame key flag must be zero or one")),
+            _ => {
+                return Err(InvalidValue::new(
+                    "encoded frame key flag must be zero or one",
+                ));
+            }
         };
         Ok(Self {
             kind,
@@ -1708,7 +2210,7 @@ pub enum Event {
     CursorPosition(CursorPosition),
     CursorClick(CursorPosition),
     ResetVideoRefused(ResetVideoRefusal),
-    AgentInput(AgentInput),
+    AgentInput(AgentInputState),
     InputReceipt(InputReceipt),
 }
 
@@ -1974,7 +2476,7 @@ mod tests {
                 Command::Text(Text {
                     action: TextAction::Preedit,
                     sequence,
-                    text: value(InputText::new("hey".into())),
+                    content: value(InputText::new("hey".into())),
                 }),
                 vec![13, 10, 0, 0, 8, 0, 0, 0, 1, 7, 0, 0, 0, 104, 101, 121],
             ),
@@ -1993,12 +2495,12 @@ mod tests {
             ),
             (
                 "browser input lease",
-                Command::InputLease(InputLease { held: true }),
+                Command::InputLease(InputControl::Browser),
                 vec![13, 13, 0, 0, 1, 0, 0, 0, 1],
             ),
             (
                 "browser input handback",
-                Command::InputLease(InputLease { held: false }),
+                Command::InputLease(InputControl::Agents),
                 vec![13, 13, 0, 0, 1, 0, 0, 0, 0],
             ),
         ]
@@ -2113,10 +2615,7 @@ mod tests {
         vec![
             (
                 "agent input",
-                Event::AgentInput(AgentInput {
-                    connected: true,
-                    dropped: true,
-                }),
+                Event::AgentInput(AgentInputState::Paused),
                 vec![13, 8, 0, 0, 2, 0, 0, 0, 1, 1],
             ),
             (
@@ -2177,11 +2676,16 @@ mod tests {
 
     #[test]
     fn agent_input_round_trips_every_flag_combination() {
-        for connected in [false, true] {
-            for dropped in [false, true] {
-                let event = Event::AgentInput(AgentInput { connected, dropped });
-                assert_eq!(Event::decode(&event.encode()), Ok(event));
-            }
+        for (state, flags) in [
+            (AgentInputState::None, [0, 0]),
+            (AgentInputState::Driving, [1, 0]),
+            (AgentInputState::Paused, [1, 1]),
+            (AgentInputState::PausedDisconnected, [0, 1]),
+        ] {
+            let event = Event::AgentInput(state);
+            let bytes = event.encode();
+            assert_eq!(&bytes[HEADER_BYTES..], &flags);
+            assert_eq!(Event::decode(&bytes), Ok(event));
         }
     }
 
@@ -2264,14 +2768,14 @@ mod tests {
 
     #[test]
     fn cursor_image_record_round_trips_and_rejects_invalid_hotspot() {
-        let event = Event::CursorImage(CursorImage {
-            width: 16,
-            height: 24,
-            hotspot_x: 2,
-            hotspot_y: 3,
-            output_width: 1600,
-            png: b"\x89PNG\r\n\x1a\nexample".to_vec(),
-        });
+        let event = Event::CursorImage(CursorImage::new(
+            16,
+            24,
+            2,
+            3,
+            1600,
+            b"\x89PNG\r\n\x1a\nexample".to_vec(),
+        ));
         let bytes = event.encode();
         assert_eq!(Event::decode(&bytes), Ok(event));
         let mut invalid = bytes;

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
+use serde::ser::SerializeStruct;
 use thiserror::Error;
 
 use crate::PROTOCOL_VERSION;
@@ -56,11 +57,7 @@ pub enum ClientEvent {
     ControlState {
         state: ControlState,
     },
-    #[serde(rename_all = "camelCase")]
-    AgentInput {
-        connected: bool,
-        dropped: bool,
-    },
+    AgentInput(pipe::AgentInputState),
     /// Where one of this viewer's input events went.
     #[serde(rename_all = "camelCase")]
     InputReceipt {
@@ -98,25 +95,158 @@ pub enum ControlState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CursorState {
     #[serde(rename = "visible")]
-    pub visibility: CursorVisibility,
-    pub shape: CursorShape,
+    visibility: CursorVisibility,
+    shape: CursorShape,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<CursorImage>,
-    /// `None` until the compositor has reported a position.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub position: Option<CursorPosition>,
-    pub click: bool,
+    image: Option<CursorImage>,
+    #[serde(flatten)]
+    event: CursorEvent,
+}
+
+impl CursorState {
+    #[must_use]
+    pub fn new(
+        visibility: CursorVisibility,
+        shape: CursorShape,
+        image: Option<CursorImage>,
+        event: CursorEvent,
+    ) -> Self {
+        Self {
+            visibility,
+            shape,
+            image,
+            event,
+        }
+    }
+    #[must_use]
+    pub fn visibility(&self) -> CursorVisibility {
+        self.visibility
+    }
+    #[must_use]
+    pub fn shape(&self) -> CursorShape {
+        self.shape
+    }
+    #[must_use]
+    pub fn image(&self) -> &Option<CursorImage> {
+        &self.image
+    }
+
+    pub fn set_shape(&mut self, shape: CursorShape) {
+        self.shape = shape;
+        self.image = None;
+    }
+
+    pub fn set_image(&mut self, image: CursorImage) {
+        self.image = Some(image);
+    }
+
+    pub fn set_visibility(&mut self, visibility: CursorVisibility) {
+        self.visibility = visibility;
+    }
+
+    pub fn set_position(&mut self, position: CursorPosition) {
+        self.event = CursorEvent::State(Some(position));
+    }
+
+    #[must_use]
+    pub fn clicked(mut self, position: CursorPosition) -> Self {
+        self.event = CursorEvent::Click(position);
+        self
+    }
+}
+
+/// A click always has a position; ordinary state may precede the first position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorEvent {
+    State(Option<CursorPosition>),
+    Click(CursorPosition),
+}
+
+impl Serialize for CursorEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let position = match self {
+            Self::State(position) => *position,
+            Self::Click(position) => Some(*position),
+        };
+        let mut state =
+            serializer.serialize_struct("CursorEvent", 1 + usize::from(position.is_some()))?;
+        if let Some(position) = position {
+            state.serialize_field("position", &position)?;
+        }
+        state.serialize_field("click", &matches!(self, Self::Click(_)))?;
+        state.end()
+    }
+}
+
+impl Serialize for pipe::AgentInputState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("AgentInput", 2)?;
+        state.serialize_field("connected", &self.connected())?;
+        state.serialize_field("dropped", &self.dropped())?;
+        state.end()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorImage {
-    pub url: String,
-    pub width: u8,
-    pub height: u8,
-    pub hotspot_x: u8,
-    pub hotspot_y: u8,
-    pub output_width: u16,
+    url: String,
+    width: u8,
+    height: u8,
+    hotspot_x: u8,
+    hotspot_y: u8,
+    output_width: u16,
+}
+
+impl CursorImage {
+    #[must_use]
+    pub fn new(
+        url: String,
+        width: u8,
+        height: u8,
+        hotspot_x: u8,
+        hotspot_y: u8,
+        output_width: u16,
+    ) -> Self {
+        Self {
+            url,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            output_width,
+        }
+    }
+    #[must_use]
+    pub fn url(&self) -> &String {
+        &self.url
+    }
+    #[must_use]
+    pub fn width(&self) -> u8 {
+        self.width
+    }
+    #[must_use]
+    pub fn height(&self) -> u8 {
+        self.height
+    }
+    #[must_use]
+    pub fn hotspot_x(&self) -> u8 {
+        self.hotspot_x
+    }
+    #[must_use]
+    pub fn hotspot_y(&self) -> u8 {
+        self.hotspot_y
+    }
+    #[must_use]
+    pub fn output_width(&self) -> u16 {
+        self.output_width
+    }
 }
 
 impl Serialize for CursorVisibility {
@@ -134,17 +264,49 @@ impl Default for CursorState {
             visibility: CursorVisibility::Visible,
             shape: CursorShape::Default,
             image: None,
-            position: None,
-            click: false,
+            event: CursorEvent::State(None),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct QualityLevels {
-    pub bitrate: Kbps,
-    pub fps: Fps,
-    pub scale: ScalePercent,
+    bitrate: Kbps,
+    fps: Fps,
+    scale: ScalePercent,
+}
+
+impl QualityLevels {
+    #[must_use]
+    pub fn new(bitrate: Kbps, fps: Fps, scale: ScalePercent) -> Self {
+        Self {
+            bitrate,
+            fps,
+            scale,
+        }
+    }
+    #[must_use]
+    pub fn bitrate(&self) -> Kbps {
+        self.bitrate
+    }
+    #[must_use]
+    pub fn fps(&self) -> Fps {
+        self.fps
+    }
+    #[must_use]
+    pub fn scale(&self) -> ScalePercent {
+        self.scale
+    }
+
+    pub fn set_bitrate(&mut self, value: Kbps) {
+        self.bitrate = value;
+    }
+    pub fn set_fps(&mut self, value: Fps) {
+        self.fps = value;
+    }
+    pub fn set_scale(&mut self, value: ScalePercent) {
+        self.scale = value;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -234,16 +396,77 @@ enum JsonInput {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FeedbackValues {
-    pub received: u32,
-    pub presented: u32,
-    pub queue_peak: u32,
-    pub queue_busy_ms: f64,
-    pub sample_ms: f64,
+    received: u32,
+    presented: u32,
+    queue_peak: u32,
+    queue_busy_ms: f64,
+    sample_ms: f64,
     /// Capacity/reset loss, not decoded frames superseded by a newer canvas draw.
-    pub dropped: u32,
-    pub rtt: f64,
+    dropped: u32,
+    rtt: f64,
     /// Stream payload bytes the viewer received during the sample.
-    pub bytes: u32,
+    bytes: u32,
+}
+
+impl FeedbackValues {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor names every field of the wire record"
+    )]
+    #[must_use]
+    pub fn new(
+        received: u32,
+        presented: u32,
+        queue_peak: u32,
+        queue_busy_ms: f64,
+        sample_ms: f64,
+        dropped: u32,
+        rtt: f64,
+        bytes: u32,
+    ) -> Self {
+        Self {
+            received,
+            presented,
+            queue_peak,
+            queue_busy_ms,
+            sample_ms,
+            dropped,
+            rtt,
+            bytes,
+        }
+    }
+    #[must_use]
+    pub fn received(&self) -> u32 {
+        self.received
+    }
+    #[must_use]
+    pub fn presented(&self) -> u32 {
+        self.presented
+    }
+    #[must_use]
+    pub fn queue_peak(&self) -> u32 {
+        self.queue_peak
+    }
+    #[must_use]
+    pub fn queue_busy_ms(&self) -> f64 {
+        self.queue_busy_ms
+    }
+    #[must_use]
+    pub fn sample_ms(&self) -> f64 {
+        self.sample_ms
+    }
+    #[must_use]
+    pub fn dropped(&self) -> u32 {
+        self.dropped
+    }
+    #[must_use]
+    pub fn rtt(&self) -> f64 {
+        self.rtt
+    }
+    #[must_use]
+    pub fn bytes(&self) -> u32 {
+        self.bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -367,7 +590,7 @@ impl Wire for FrameKind {
         match input.get()? {
             0_u8 => Ok(Self::Delta),
             1 => Ok(Self::Key),
-            _ => Err(InvalidValue("frame kind must be zero or one")),
+            _ => Err(InvalidValue::new("frame kind must be zero or one")),
         }
     }
 }
@@ -390,7 +613,7 @@ impl Wire for Continuity {
         match input.get()? {
             0_u8 => Ok(Self::Continuous),
             1 => Ok(Self::AfterGap),
-            _ => Err(InvalidValue("continuity must be zero or one")),
+            _ => Err(InvalidValue::new("continuity must be zero or one")),
         }
     }
 }
@@ -456,11 +679,58 @@ pub enum Layout {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSample {
-    pub data: Arc<[u8]>,
-    pub layout: Layout,
-    pub kind: FrameKind,
-    pub continuity: Continuity,
-    pub metadata: FrameMetadata,
+    data: Arc<[u8]>,
+    layout: Layout,
+    kind: FrameKind,
+    continuity: Continuity,
+    metadata: FrameMetadata,
+}
+
+impl VideoSample {
+    #[must_use]
+    pub fn new(
+        data: Arc<[u8]>,
+        layout: Layout,
+        kind: FrameKind,
+        continuity: Continuity,
+        metadata: FrameMetadata,
+    ) -> Self {
+        Self {
+            data,
+            layout,
+            kind,
+            continuity,
+            metadata,
+        }
+    }
+    #[must_use]
+    pub fn data(&self) -> &Arc<[u8]> {
+        &self.data
+    }
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+    #[must_use]
+    pub fn kind(&self) -> FrameKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn continuity(&self) -> Continuity {
+        self.continuity
+    }
+    #[must_use]
+    pub fn metadata(&self) -> &FrameMetadata {
+        &self.metadata
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut FrameMetadata {
+        &mut self.metadata
+    }
+
+    pub fn set_continuity(&mut self, value: Continuity) {
+        self.continuity = value;
+    }
 }
 
 impl Record for VideoSample {
@@ -538,16 +808,23 @@ mod tests {
             visibility: CursorVisibility::Visible,
             shape: CursorShape::Pointer,
             image: None,
-            position: Some(CursorPosition {
-                x: value(pipe::PointerCoordinate::new(10)),
-                y: value(pipe::PointerCoordinate::new(20)),
-                source: pipe::CursorSource::Browser,
-            }),
-            click: false,
+            event: CursorEvent::State(Some(CursorPosition::new(
+                value(pipe::PointerCoordinate::new(10)),
+                value(pipe::PointerCoordinate::new(20)),
+                pipe::CursorSource::Browser,
+            ))),
         };
         assert_eq!(
-            json(&ClientEvent::Cursor(cursor)),
+            json(&ClientEvent::Cursor(cursor.clone())),
             r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":10,"y":20,"source":"browser"},"click":false}"#
+        );
+        assert_eq!(
+            json(&ClientEvent::Cursor(cursor.clicked(CursorPosition::new(
+                value(pipe::PointerCoordinate::new(30)),
+                value(pipe::PointerCoordinate::new(40)),
+                pipe::CursorSource::Agent,
+            )))),
+            r#"{"type":"cursor","visible":true,"shape":"pointer","position":{"x":30,"y":40,"source":"agent"},"click":true}"#
         );
     }
 
@@ -596,12 +873,12 @@ mod tests {
 
     #[test]
     fn resize_applied_json_is_exact() {
-        let event = ClientEvent::ResizeApplied(pipe::ResizeApplied {
-            request_id: value(pipe::RequestId::new(9)),
-            size: value(pipe::FrameSize::new(1280, 720)),
-            scale_v120: value(pipe::ScaleV120::new(180)),
-            generation: value(pipe::Generation::new(4)),
-        });
+        let event = ClientEvent::ResizeApplied(pipe::ResizeApplied::new(
+            value(pipe::RequestId::new(9)),
+            value(pipe::FrameSize::new(1280, 720)),
+            value(pipe::ScaleV120::new(180)),
+            value(pipe::Generation::new(4)),
+        ));
         assert_eq!(
             json(&event),
             r#"{"type":"resize-applied","request":9,"width":1280,"height":720,"scale":180,"generation":4}"#
@@ -643,13 +920,26 @@ mod tests {
 
     #[test]
     fn agent_input_json_is_exact() {
-        assert_eq!(
-            json(&ClientEvent::AgentInput {
-                connected: true,
-                dropped: false,
-            }),
-            r#"{"type":"agent-input","connected":true,"dropped":false}"#
-        );
+        for (state, expected) in [
+            (
+                pipe::AgentInputState::None,
+                r#"{"type":"agent-input","connected":false,"dropped":false}"#,
+            ),
+            (
+                pipe::AgentInputState::Driving,
+                r#"{"type":"agent-input","connected":true,"dropped":false}"#,
+            ),
+            (
+                pipe::AgentInputState::Paused,
+                r#"{"type":"agent-input","connected":true,"dropped":true}"#,
+            ),
+            (
+                pipe::AgentInputState::PausedDisconnected,
+                r#"{"type":"agent-input","connected":false,"dropped":true}"#,
+            ),
+        ] {
+            assert_eq!(json(&ClientEvent::AgentInput(state)), expected);
+        }
     }
 
     #[test]
@@ -764,13 +1054,13 @@ mod tests {
                 };
                 assert_eq!(
                     (
-                        resize.size.width(),
-                        resize.size.height(),
-                        resize.scale_v120.get()
+                        resize.size().width(),
+                        resize.size().height(),
+                        resize.scale_v120().get()
                     ),
                     (width, height, scale)
                 );
-                assert_eq!(resize.request_id.get(), 7);
+                assert_eq!(resize.request_id().get(), 7);
             }
             for scale in [119, 481] {
                 assert!(parse_browser_record(&record(width, height, scale)).is_err());
@@ -782,22 +1072,22 @@ mod tests {
     fn browser_records_reject_private_kinds() {
         let commands = [
             Command::Clipboard(value(ClipboardText::new(String::new()))),
-            Command::Quality(pipe::Quality {
-                bitrate_kbps: value(Kbps::new(8_000)),
-                fps: value(Fps::new(60)),
-                scale_percent: value(ScalePercent::new(100)),
-                crf: value(pipe::Crf::new(23)),
-                chroma: pipe::Chroma::Yuv444,
-            }),
-            Command::Text(pipe::Text {
-                action: TextAction::Commit,
-                sequence: value(InputSequence::new(1)),
-                text: value(InputText::new(String::new())),
-            }),
-            Command::KeyframeReadiness(pipe::KeyframeReadiness {
-                generation: value(pipe::Generation::new(1)),
-                state: pipe::KeyframeState::Cached,
-            }),
+            Command::Quality(pipe::Quality::new(
+                value(Kbps::new(8_000)),
+                value(Fps::new(60)),
+                value(ScalePercent::new(100)),
+                value(pipe::Crf::new(23)),
+                pipe::Chroma::Yuv444,
+            )),
+            Command::Text(pipe::Text::new(
+                TextAction::Commit,
+                value(InputSequence::new(1)),
+                value(InputText::new(String::new())),
+            )),
+            Command::KeyframeReadiness(pipe::KeyframeReadiness::new(
+                value(pipe::Generation::new(1)),
+                pipe::KeyframeState::Cached,
+            )),
         ];
         for command in commands {
             let record = command.encode();
@@ -891,8 +1181,8 @@ mod tests {
             .expect("text message should parse"),
             ClientMessage::Text {
                 action: TextAction::Commit,
-                text: value(InputText::new("hello".into())),
                 sequence: value(InputSequence::new(7)),
+                text: value(InputText::new("hello".into())),
             }
         );
     }
@@ -925,16 +1215,16 @@ mod tests {
             layout: Layout::Whole,
             kind: FrameKind::Key,
             continuity: Continuity::AfterGap,
-            metadata: FrameMetadata {
-                generation: value(pipe::Generation::new(4)),
-                width: value(pipe::FrameDimension::new(1280)),
-                height: value(pipe::FrameDimension::new(720)),
-                capture_nanos: 99_000,
-                sequence: 17,
-                input_sequence: Some(value(InputSequence::new(8))),
-                fps: value(Fps::new(60)),
-                chroma: pipe::Chroma::Yuv420,
-            },
+            metadata: FrameMetadata::new(
+                value(pipe::Generation::new(4)),
+                value(pipe::FrameDimension::new(1280)),
+                value(pipe::FrameDimension::new(720)),
+                99_000,
+                17,
+                Some(value(InputSequence::new(8))),
+                value(Fps::new(60)),
+                pipe::Chroma::Yuv420,
+            ),
         };
         let bytes = vec![
             13, 1, 0, 0, 37, 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 5, 208, 2, 184, 130, 1, 0, 0, 0, 0, 0,
