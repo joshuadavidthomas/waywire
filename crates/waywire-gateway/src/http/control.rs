@@ -116,13 +116,10 @@ enum WriterStatus {
 async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: SocketId) -> SocketEnd {
     let (snapshot, mut events) = state.events.subscribe();
     let mut ownership_changes = state.sessions.subscribe_ownership();
-    let cancellation = state.connections.cancellation.child_token();
+    let cancellation = state.connections.cancellation().child_token();
     let (sink, mut incoming) = socket.split();
     let (sender, receiver) = mpsc::channel(OUTBOUND_MESSAGE_LIMIT);
-    let outbound = Outbound {
-        tx: sender,
-        bytes: Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)),
-    };
+    let outbound = Outbound::new(sender, Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)));
     let mut writer = tokio::spawn(control_writer(sink, receiver, cancellation.clone()));
     let mut writer_status = WriterStatus::Running;
     let mut ownership = InputOwnership::NotHeld;
@@ -147,7 +144,7 @@ async fn run_control_socket(socket: WebSocket, state: &AppState, socket_id: Sock
         loop {
             tokio::select! {
                 biased;
-                () = state.connections.cancellation.cancelled() => break 'connected SocketEnd::Shutdown,
+                () = state.connections.cancellation().cancelled() => break 'connected SocketEnd::Shutdown,
                 writer_result = &mut writer => {
                     writer_status = WriterStatus::Finished;
                     break 'connected match writer_result {
@@ -450,7 +447,7 @@ async fn finish_control_socket(
         return reason;
     };
     match &mut reason {
-        SocketEnd::Failed(failure) => failure.cleanup = Some(cleanup_error),
+        SocketEnd::Failed(failure) => failure.record_cleanup(cleanup_error),
         SocketEnd::Shutdown | SocketEnd::ClientClosed(_) | SocketEnd::Disconnected => warn!(
             socket_id = socket_id.get(),
             reason = %format_args!("{cleanup_error:#}"),
@@ -689,10 +686,7 @@ mod tests {
     fn outbound() -> (Outbound, mpsc::Receiver<OutboundItem>) {
         let (tx, rx) = mpsc::channel(16);
         (
-            Outbound {
-                tx,
-                bytes: Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT)),
-            },
+            Outbound::new(tx, Arc::new(Semaphore::new(OUTBOUND_BYTE_LIMIT))),
             rx,
         )
     }
@@ -719,7 +713,7 @@ mod tests {
             .recv()
             .await
             .expect("client event should be enqueued");
-        match item.message {
+        match item.into_message() {
             Message::Text(text) => text.to_string(),
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {
                 panic!("client event should be text")

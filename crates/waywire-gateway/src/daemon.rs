@@ -87,28 +87,66 @@ pub(crate) enum XkbLayoutError {
 }
 
 pub(crate) struct Daemon {
-    pub(crate) sessions: Sessions,
-    pub(crate) readiness: Readiness,
-    pub(crate) events: AppEvents,
+    sessions: Sessions,
+    readiness: Readiness,
+    events: AppEvents,
     shutdown: mpsc::Sender<()>,
 }
 
 pub(crate) struct StartedDaemon {
-    pub(crate) daemon: Daemon,
-    pub(crate) supervisor: tokio::task::JoinHandle<Result<()>>,
+    daemon: Daemon,
+    supervisor: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl StartedDaemon {
+    pub(crate) fn into_parts(self) -> (Daemon, tokio::task::JoinHandle<Result<()>>) {
+        (self.daemon, self.supervisor)
+    }
 }
 
 pub(crate) struct Config {
-    pub(crate) path: PathBuf,
-    pub(crate) frame_rate: Fps,
-    pub(crate) bitrate: Kbps,
-    pub(crate) xkb_layout: XkbLayout,
-    pub(crate) resolution: FrameSize,
-    pub(crate) pins: Vec<String>,
-    pub(crate) session: Vec<OsString>,
+    path: PathBuf,
+    frame_rate: Fps,
+    bitrate: Kbps,
+    xkb_layout: XkbLayout,
+    resolution: FrameSize,
+    pins: Vec<String>,
+    session: Vec<OsString>,
+}
+
+impl Config {
+    pub(crate) fn new(
+        path: PathBuf,
+        frame_rate: Fps,
+        bitrate: Kbps,
+        xkb_layout: XkbLayout,
+        resolution: FrameSize,
+        pins: Vec<String>,
+        session: Vec<OsString>,
+    ) -> Self {
+        Self {
+            path,
+            frame_rate,
+            bitrate,
+            xkb_layout,
+            resolution,
+            pins,
+            session,
+        }
+    }
 }
 
 impl Daemon {
+    pub(crate) fn sessions(&self) -> Sessions {
+        self.sessions.clone()
+    }
+    pub(crate) fn readiness(&self) -> Readiness {
+        self.readiness.clone()
+    }
+    pub(crate) fn events(&self) -> AppEvents {
+        self.events.clone()
+    }
+
     pub(crate) fn start(
         config: &Config,
         socket: UdpSocket,

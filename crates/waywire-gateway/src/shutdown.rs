@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
 use axum::serve::ListenerExt;
 use socket2::SockRef;
 use tokio::net::TcpListener;
@@ -47,7 +46,7 @@ pub(super) async fn finish_shutdown(
     daemon.shutdown().await;
     let sockets_result = timeout_at(deadline, connections.wait())
         .await
-        .map_err(|_elapsed| anyhow!("WebSocket shutdown exceeded {SHUTDOWN_DEADLINE:?}"));
+        .with_context(|| format!("WebSocket shutdown exceeded {SHUTDOWN_DEADLINE:?}"));
 
     let results = match stop {
         Stop::Signal(signal_result) => {
@@ -106,7 +105,7 @@ fn completed_task(name: &str, result: TaskResult) -> Result<()> {
 async fn join_task(deadline: Instant, name: &str, task: &mut JoinHandle<Result<()>>) -> Result<()> {
     timeout_at(deadline, task)
         .await
-        .map_err(|_elapsed| anyhow!("{name} did not stop before the shutdown deadline"))?
+        .with_context(|| format!("{name} did not stop before the shutdown deadline"))?
         .with_context(|| format!("join {name}"))?
 }
 
@@ -190,15 +189,15 @@ mod tests {
             .await
             .expect("RTP socket");
         let started = Daemon::start(
-            &Config {
-                path: script,
-                frame_rate: fps,
-                bitrate: Kbps::new(8_000).expect("bitrate"),
-                xkb_layout: XkbLayout::parse("us").expect("layout"),
-                resolution: FrameSize::new(800, 600).expect("resolution"),
-                pins: vec![],
-                session: vec![],
-            },
+            &Config::new(
+                script,
+                fps,
+                Kbps::new(8_000).expect("bitrate"),
+                XkbLayout::parse("us").expect("layout"),
+                FrameSize::new(800, 600).expect("resolution"),
+                vec![],
+                vec![],
+            ),
             rtp,
             VideoHub::new(fps),
             crate::audio::AudioHub::default(),
@@ -221,12 +220,12 @@ mod tests {
         let connections = SocketConnections::new();
         let held_socket = connections.hold_for_test();
         let shutdown = tokio::spawn(async move {
-            let mut daemon_task = started.supervisor;
+            let (daemon, mut daemon_task) = started.into_parts();
             let mut server = tokio::spawn(async { Ok(()) });
             finish_shutdown(
                 Stop::Signal(Ok(())),
                 connections,
-                &started.daemon,
+                &daemon,
                 &mut daemon_task,
                 &mut server,
             )

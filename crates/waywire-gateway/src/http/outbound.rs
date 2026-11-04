@@ -25,8 +25,15 @@ pub(super) const OUTBOUND_MESSAGE_LIMIT: usize = 32;
 pub(super) const OUTBOUND_BYTE_LIMIT: usize = 2 * MAX_CONTROL_MESSAGE_BYTES;
 
 pub(super) struct OutboundItem {
-    pub(super) message: Message,
+    message: Message,
     bytes: OwnedSemaphorePermit,
+}
+
+impl OutboundItem {
+    #[cfg(test)]
+    pub(super) fn into_message(self) -> Message {
+        self.message
+    }
 }
 
 #[derive(Debug, Error)]
@@ -51,11 +58,15 @@ impl From<OutboundError> for SocketEnd {
 
 #[derive(Clone)]
 pub(super) struct Outbound {
-    pub(super) tx: mpsc::Sender<OutboundItem>,
-    pub(super) bytes: Arc<Semaphore>,
+    tx: mpsc::Sender<OutboundItem>,
+    bytes: Arc<Semaphore>,
 }
 
 impl Outbound {
+    pub(super) fn new(tx: mpsc::Sender<OutboundItem>, bytes: Arc<Semaphore>) -> Self {
+        Self { tx, bytes }
+    }
+
     pub(super) fn enqueue(&self, message: Message) -> Result<(), OutboundError> {
         let size = message_size(&message);
         let permits = u32::try_from(size).unwrap_or(u32::MAX);

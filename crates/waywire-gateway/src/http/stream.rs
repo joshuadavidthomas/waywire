@@ -31,7 +31,7 @@ async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEn
     let mut announced_generation = None;
     loop {
         tokio::select! {
-            () = state.connections.cancellation.cancelled() => {
+            () = state.connections.cancellation().cancelled() => {
                 return SocketEnd::Shutdown;
             }
             incoming = socket.recv() => {
@@ -53,7 +53,7 @@ async fn run_stream_socket(socket: &mut WebSocket, state: &AppState) -> SocketEn
                     socket,
                     &frame,
                     &mut announced_generation,
-                    &state.connections.cancellation,
+                    state.connections.cancellation(),
                 ).await {
                     return reason;
                 }

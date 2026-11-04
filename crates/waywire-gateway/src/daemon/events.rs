@@ -283,7 +283,11 @@ enum EventReadError {
     #[error("peer output ended halfway through an event")]
     Truncated,
     #[error("peer output stalled for {after:?} halfway through an event")]
-    Stalled { after: Duration },
+    Stalled {
+        after: Duration,
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
     #[error("event pipe failed")]
     Io(#[source] io::Error),
     #[error(transparent)]
@@ -321,8 +325,9 @@ impl<R: AsyncRead + Unpin> EventReader<R> {
                     self.input.read(&mut bytes),
                 )
                 .await
-                .map_err(|_elapsed| EventReadError::Stalled {
+                .map_err(|source| EventReadError::Stalled {
                     after: partial_since.elapsed(),
+                    source,
                 })?
                 .map_err(EventReadError::Io)?,
                 None => self

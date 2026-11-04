@@ -33,17 +33,36 @@ use crate::video::VideoHub;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) readiness: Readiness,
-    pub(crate) events: AppEvents,
-    pub(crate) sessions: Sessions,
-    pub(crate) hub: VideoHub,
-    pub(crate) audio: AudioHub,
-    pub(crate) origin: Origin,
-    pub(crate) connections: SocketConnections,
-    pub(crate) next_socket_id: Arc<AtomicU64>,
+    readiness: Readiness,
+    events: AppEvents,
+    sessions: Sessions,
+    hub: VideoHub,
+    audio: AudioHub,
+    origin: Origin,
+    connections: SocketConnections,
+    next_socket_id: Arc<AtomicU64>,
 }
 
 impl AppState {
+    pub(crate) fn new(
+        daemon: &crate::daemon::Daemon,
+        hub: VideoHub,
+        audio: AudioHub,
+        origin: Origin,
+        connections: SocketConnections,
+    ) -> Self {
+        Self {
+            readiness: daemon.readiness(),
+            events: daemon.events(),
+            sessions: daemon.sessions(),
+            hub,
+            audio,
+            origin,
+            connections,
+            next_socket_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
     fn allocate_socket_id(&self) -> SocketId {
         SocketId::new(self.next_socket_id.fetch_add(1, Ordering::Relaxed))
     }

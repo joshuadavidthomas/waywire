@@ -25,7 +25,7 @@ async fn run_audio_socket(socket: &mut WebSocket, state: &AppState) -> SocketEnd
     let mut packets = state.audio.subscribe();
     loop {
         tokio::select! {
-            () = state.connections.cancellation.cancelled() => {
+            () = state.connections.cancellation().cancelled() => {
                 return SocketEnd::Shutdown;
             }
             incoming = socket.recv() => {
@@ -48,7 +48,7 @@ async fn run_audio_socket(socket: &mut WebSocket, state: &AppState) -> SocketEnd
                         if let Err(reason) = send(
                             socket,
                             Message::Binary(packet),
-                            &state.connections.cancellation,
+                            state.connections.cancellation(),
                         ).await {
                             return reason;
                         }

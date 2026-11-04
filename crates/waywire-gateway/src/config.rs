@@ -4,12 +4,29 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
-use serde::Deserialize;
 
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct FileConfig {
-    pins: Vec<String>,
+#[derive(Default, serde::Deserialize)]
+#[serde(try_from = "toml::Table")]
+struct FileConfig(Vec<String>);
+
+impl TryFrom<toml::Table> for FileConfig {
+    type Error = toml::de::Error;
+
+    fn try_from(mut table: toml::Table) -> std::result::Result<Self, Self::Error> {
+        use serde::de::Error;
+
+        let pins = table
+            .remove("pins")
+            .map(toml::Value::try_into)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(key) = table.keys().next() {
+            return Err(Self::Error::custom(format!(
+                "unknown field `{key}`, expected `pins`"
+            )));
+        }
+        Ok(Self(pins))
+    }
 }
 
 fn default_path(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
@@ -41,8 +58,8 @@ fn load_pins(path: &Path, source: ConfigSource, flags: Vec<String>) -> Result<Ve
     };
     let mut config: FileConfig =
         toml::from_str(&contents).with_context(|| format!("parse config {}", path.display()))?;
-    config.pins.extend(flags);
-    Ok(config.pins)
+    config.0.extend(flags);
+    Ok(config.0)
 }
 
 pub(super) fn pins(explicit: Option<&Path>, flags: Vec<String>) -> Result<Vec<String>> {

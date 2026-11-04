@@ -61,7 +61,7 @@ pub(crate) enum OriginError {
 pub(crate) struct SocketConnections {
     permits: Arc<Semaphore>,
     tasks: TaskTracker,
-    pub(super) cancellation: CancellationToken,
+    cancellation: CancellationToken,
 }
 
 pub(super) struct SocketAdmission {
@@ -104,8 +104,8 @@ impl SocketConnections {
         self.tasks.token()
     }
 
-    pub(crate) fn cancellation(&self) -> CancellationToken {
-        self.cancellation.clone()
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
     }
 }
 

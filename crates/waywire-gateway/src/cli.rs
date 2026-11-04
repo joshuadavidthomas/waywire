@@ -17,33 +17,63 @@ use crate::http::Origin;
 )]
 pub(super) struct Options {
     #[arg(long, default_value = "127.0.0.1:8080")]
-    pub(super) listen: String,
+    listen: String,
     #[arg(long, default_value = "waywire-compositor")]
-    pub(super) compositor: PathBuf,
+    compositor: PathBuf,
     #[arg(long = "public-url", env = "PUBLIC_URL", value_parser = Origin::parse)]
-    pub(super) origin: Origin,
+    origin: Origin,
     #[arg(long, default_value = "60", value_parser = parse_fps)]
-    pub(super) frame_rate: Fps,
+    frame_rate: Fps,
     #[arg(long, default_value = "16000", value_parser = parse_kbps)]
-    pub(super) bitrate: Kbps,
+    bitrate: Kbps,
     #[arg(long, default_value = "us", value_parser = XkbLayout::parse)]
-    pub(super) xkb_layout: XkbLayout,
+    xkb_layout: XkbLayout,
     #[arg(
         long,
         env = "WAYWIRE_RESOLUTION",
         default_value = "1920x1080",
         value_parser = parse_resolution
     )]
-    pub(super) resolution: FrameSize,
+    resolution: FrameSize,
     /// Read gateway configuration from this path instead of the default.
     #[arg(long)]
-    pub(super) config: Option<PathBuf>,
+    config: Option<PathBuf>,
     /// Pin an application command to the taskbar. May be supplied more than once.
     #[arg(long)]
-    pub(super) pin: Vec<String>,
+    pin: Vec<String>,
     /// Application to launch inside the desktop, followed by its arguments.
     #[arg(last = true, value_name = "COMMAND")]
-    pub(super) session: Vec<OsString>,
+    session: Vec<OsString>,
+}
+
+impl Options {
+    pub(super) fn listen(&self) -> &str {
+        &self.listen
+    }
+    pub(super) fn origin(&self) -> Origin {
+        self.origin.clone()
+    }
+    pub(super) fn frame_rate(&self) -> Fps {
+        self.frame_rate
+    }
+    pub(super) fn config(&self) -> Option<&std::path::Path> {
+        self.config.as_deref()
+    }
+    pub(super) fn take_pins(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pin)
+    }
+
+    pub(super) fn into_daemon_config(self, pins: Vec<String>) -> crate::daemon::Config {
+        crate::daemon::Config::new(
+            self.compositor,
+            self.frame_rate,
+            self.bitrate,
+            self.xkb_layout,
+            self.resolution,
+            pins,
+            self.session,
+        )
+    }
 }
 
 fn parse_fps(value: &str) -> Result<Fps, String> {

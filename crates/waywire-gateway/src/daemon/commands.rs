@@ -287,7 +287,7 @@ pub(super) enum CommandWriterError {
     #[error("write daemon command: {0}")]
     Write(#[source] std::io::Error),
     #[error("daemon command write stalled after {WRITE_DEADLINE:?}")]
-    WriteStalled,
+    WriteStalled(#[source] tokio::time::error::Elapsed),
 }
 
 pub(super) async fn write_commands<W>(
@@ -302,7 +302,7 @@ where
         let write_result = timeout(WRITE_DEADLINE, output.write_all(&encoded)).await;
         drop(permit);
         write_result
-            .map_err(|_elapsed| CommandWriterError::WriteStalled)?
+            .map_err(CommandWriterError::WriteStalled)?
             .map_err(CommandWriterError::Write)?;
     }
     Err(CommandWriterError::QueueClosed)
@@ -385,7 +385,7 @@ mod tests {
             .expect("writer must stop")
             .expect("writer task")
             .expect_err("stalled write must fail");
-        assert!(matches!(error, CommandWriterError::WriteStalled));
+        assert!(matches!(error, CommandWriterError::WriteStalled(_)));
     }
 
     #[tokio::test]

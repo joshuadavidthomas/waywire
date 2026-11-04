@@ -20,10 +20,14 @@ pub(super) const WRITE_LIMIT: Duration = Duration::from_secs(5);
 pub(super) struct SocketFailure {
     #[source]
     primary: anyhow::Error,
-    pub(super) cleanup: Option<anyhow::Error>,
+    cleanup: Option<anyhow::Error>,
 }
 
 impl SocketFailure {
+    pub(super) fn record_cleanup(&mut self, error: anyhow::Error) {
+        self.cleanup = Some(error);
+    }
+
     fn new(primary: impl Into<anyhow::Error>) -> Self {
         Self {
             primary: primary.into(),

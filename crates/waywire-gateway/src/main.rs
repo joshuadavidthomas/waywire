@@ -7,9 +7,6 @@ mod session;
 mod shutdown;
 mod video;
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -20,7 +17,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::audio::AudioHub;
 use crate::cli::Options;
-use crate::daemon::Config;
 use crate::daemon::Daemon;
 use crate::http::AppState;
 use crate::http::SocketConnections;
@@ -40,45 +36,35 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let options = Options::parse();
-    let pins = config::pins(options.config.as_deref(), options.pin)?;
-    let listener = http_listener(&options.listen).await?;
+    let mut options = Options::parse();
+    let pin_flags = options.take_pins();
+    let pins = config::pins(options.config(), pin_flags)?;
+    let listener = http_listener(options.listen()).await?;
     let rtp = UdpSocket::bind("127.0.0.1:0")
         .await
         .context("bind loopback RTP before daemon startup")?;
     SockRef::from(&rtp)
         .set_recv_buffer_size(4 << 20)
         .context("set loopback RTP receive buffer to 4 MiB")?;
-    let hub = VideoHub::new(options.frame_rate);
+    let hub = VideoHub::new(options.frame_rate());
     let audio = AudioHub::default();
+    let origin = options.origin();
     let started = Daemon::start(
-        &Config {
-            path: options.compositor,
-            frame_rate: options.frame_rate,
-            bitrate: options.bitrate,
-            xkb_layout: options.xkb_layout,
-            resolution: options.resolution,
-            pins,
-            session: options.session,
-        },
+        &options.into_daemon_config(pins),
         rtp,
         hub.clone(),
         audio.clone(),
     )?;
-    let daemon = started.daemon;
-    let mut daemon_task = started.supervisor;
+    let (daemon, mut daemon_task) = started.into_parts();
     let connections = SocketConnections::new();
-    let app = http::router(AppState {
-        readiness: daemon.readiness.clone(),
-        events: daemon.events.clone(),
-        sessions: daemon.sessions.clone(),
+    let app = http::router(AppState::new(
+        &daemon,
         hub,
         audio,
-        origin: options.origin,
-        connections: connections.clone(),
-        next_socket_id: Arc::new(AtomicU64::new(1)),
-    });
-    let server_shutdown = connections.cancellation();
+        origin,
+        connections.clone(),
+    ));
+    let server_shutdown = connections.cancellation().clone();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
