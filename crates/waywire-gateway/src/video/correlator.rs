@@ -72,13 +72,17 @@ pub(super) enum CorrelationOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimestampAnchor {
     Needed,
-    Present { timestamp: RtpTimestamp, fps: Fps },
+    /// The last correlated unit: later units of its generation count frames from it.
+    Present {
+        generation: Generation,
+        timestamp: RtpTimestamp,
+        fps: Fps,
+    },
 }
 
 pub(super) struct Correlator {
     metadata: VecDeque<Pending<FrameMetadata>>,
     units: VecDeque<Pending<PendingUnit>>,
-    last_generation: Option<Generation>,
     timestamp_anchor: TimestampAnchor,
     keyframe: GopState,
 }
@@ -88,7 +92,6 @@ impl Correlator {
         Self {
             metadata: VecDeque::new(),
             units: VecDeque::new(),
-            last_generation: None,
             timestamp_anchor: TimestampAnchor::Needed,
             keyframe: GopState::KeyframeCached,
         }
@@ -128,22 +131,22 @@ impl Correlator {
                 break;
             };
             let unit = &pending.value.unit;
-            let metadata_count = if self.last_generation == Some(unit.generation) {
-                match self.timestamp_anchor {
-                    TimestampAnchor::Needed => NonZeroUsize::MIN,
-                    TimestampAnchor::Present { timestamp, fps } => {
-                        let ticks = unit.timestamp.elapsed_since(timestamp);
-                        let Some(gap) = metadata_gap(ticks, fps) else {
-                            return self.resync(
-                                ResyncReason::TimestampGap { ticks, fps },
-                                unmatched_metadata,
-                            );
-                        };
-                        gap
-                    }
+            let metadata_count = match self.timestamp_anchor {
+                TimestampAnchor::Present {
+                    generation,
+                    timestamp,
+                    fps,
+                } if generation == unit.generation => {
+                    let ticks = unit.timestamp.elapsed_since(timestamp);
+                    let Some(gap) = metadata_gap(ticks, fps) else {
+                        return self.resync(
+                            ResyncReason::TimestampGap { ticks, fps },
+                            unmatched_metadata,
+                        );
+                    };
+                    gap
                 }
-            } else {
-                NonZeroUsize::MIN
+                TimestampAnchor::Present { .. } | TimestampAnchor::Needed => NonZeroUsize::MIN,
             };
             let matched = self.take_nth_generation_metadata(unit.generation, metadata_count);
             let (metadata, unmatched) = match matched {
@@ -174,7 +177,10 @@ impl Correlator {
                 rtp_timestamp = unit.timestamp.0,
                 at_ns = super::monotonic_nanos(),
             );
-            let generation_changed = self.last_generation != Some(metadata.generation);
+            let generation_changed = !matches!(
+                self.timestamp_anchor,
+                TimestampAnchor::Present { generation, .. } if generation == metadata.generation
+            );
             let recovering = self.keyframe == GopState::Recovering;
             let continuity = if recovering
                 || unit.continuity == Continuity::AfterGap
@@ -185,8 +191,8 @@ impl Correlator {
             } else {
                 Continuity::Continuous
             };
-            self.last_generation = Some(metadata.generation);
             self.timestamp_anchor = TimestampAnchor::Present {
+                generation: metadata.generation,
                 timestamp: unit.timestamp,
                 fps: metadata.fps,
             };
