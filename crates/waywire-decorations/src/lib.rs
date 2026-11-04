@@ -28,18 +28,66 @@ pub enum WindowAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is an independent chip state the taskbar paints"
-)]
 pub struct TaskbarChip {
-    pub window: Option<Window>,
-    pub pin: Option<usize>,
-    pub running: bool,
     pub title: String,
-    pub minimized: bool,
-    pub focused: bool,
-    pub urgent: bool,
+    pub target: ChipTarget,
+}
+
+/// What a taskbar chip stands for: a pin no window matched, or a window,
+/// which a pin may have matched.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChipTarget {
+    Pin {
+        index: usize,
+        process: PinProcess,
+    },
+    Window {
+        window: Window,
+        pin: Option<usize>,
+        visibility: Visibility,
+        attention: Attention,
+    },
+}
+
+/// Whether a pin without a window has a live child process; a stopped pin
+/// paints dimmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinProcess {
+    Stopped,
+    Running,
+}
+
+/// Whether a chip's window is shown or minimized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Shown,
+    Minimized,
+}
+
+/// The highlight a window chip paints: focus wins over an urgent request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    Normal,
+    Focused,
+    Urgent,
+}
+
+impl TaskbarChip {
+    #[must_use]
+    pub fn window(&self) -> Option<&Window> {
+        match &self.target {
+            ChipTarget::Window { window, .. } => Some(window),
+            ChipTarget::Pin { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn pin(&self) -> Option<usize> {
+        match self.target {
+            ChipTarget::Pin { index, .. } => Some(index),
+            ChipTarget::Window { pin, .. } => pin,
+        }
+    }
 }
 
 pub const BAR: i32 = Theme::dark().bar;
@@ -453,15 +501,23 @@ fn paint_taskbar(
         let Some(rect) = chip_rectangle(size.w, chips.len(), index) else {
             continue;
         };
-        if chip.focused || chip.urgent {
-            color(
-                &context,
-                if chip.focused {
-                    theme.accent
-                } else {
-                    theme.attention
-                },
-            );
+        let highlight = match chip.target {
+            ChipTarget::Window {
+                attention: Attention::Focused,
+                ..
+            } => Some(theme.accent),
+            ChipTarget::Window {
+                attention: Attention::Urgent,
+                ..
+            } => Some(theme.attention),
+            ChipTarget::Window {
+                attention: Attention::Normal,
+                ..
+            }
+            | ChipTarget::Pin { .. } => None,
+        };
+        if let Some(highlight) = highlight {
+            color(&context, highlight);
             context.rectangle(
                 f64::from(rect.loc.x),
                 2.0,
@@ -474,9 +530,15 @@ fn paint_taskbar(
         context.translate(f64::from(rect.loc.x), 2.0);
         color(
             &context,
-            if chip.focused || chip.urgent {
+            if highlight.is_some() {
                 theme.active.1
-            } else if !chip.running {
+            } else if matches!(
+                chip.target,
+                ChipTarget::Pin {
+                    process: PinProcess::Stopped,
+                    ..
+                }
+            ) {
                 theme.dim
             } else {
                 theme.inactive.1
@@ -490,7 +552,7 @@ fn paint_taskbar(
         )?;
         context.restore()?;
     }
-    let pin_count = chips.iter().take_while(|chip| chip.pin.is_some()).count();
+    let pin_count = chips.iter().take_while(|chip| chip.pin().is_some()).count();
     if pin_count > 0
         && let Some(rect) = chip_rectangle(size.w, chips.len(), pin_count - 1)
     {

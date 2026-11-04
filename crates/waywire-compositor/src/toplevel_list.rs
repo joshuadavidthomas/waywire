@@ -1527,6 +1527,21 @@ mod tests {
     #[test]
     fn taskbar_chips_follow_mapping_title_focus_and_minimization() {
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        let focused = |state: &crate::State| {
+            state
+                .taskbar_chips()
+                .iter()
+                .map(|chip| {
+                    matches!(
+                        chip.target,
+                        waywire_decorations::ChipTarget::Window {
+                            attention: waywire_decorations::Attention::Focused,
+                            ..
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let (mut display, mut state) = crate::tests::test_state();
         let (connection, mut queue, mut app) = connect_client(&mut display.handle());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
@@ -1566,25 +1581,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["First", "Second"]
         );
-        assert_eq!(
-            state
-                .taskbar_chips()
-                .iter()
-                .map(|chip| chip.focused)
-                .collect::<Vec<_>>(),
-            [false, true]
-        );
+        assert_eq!(focused(&state), [false, true]);
         state.window_action(&first, crate::WindowAction::Focus);
-        assert_eq!(
-            state
-                .taskbar_chips()
-                .iter()
-                .map(|chip| chip.focused)
-                .collect::<Vec<_>>(),
-            [true, false]
-        );
+        assert_eq!(focused(&state), [true, false]);
         state.window_action(&first, crate::WindowAction::Minimize);
-        assert!(state.taskbar_chips()[0].minimized);
+        assert!(matches!(
+            state.taskbar_chips()[0].target,
+            waywire_decorations::ChipTarget::Window {
+                visibility: waywire_decorations::Visibility::Minimized,
+                ..
+            }
+        ));
         let top = second.toplevel().expect("top").clone();
         state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen, true);
         assert_eq!(
@@ -1605,7 +1612,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let chips = state.taskbar_chips();
         assert_eq!(chips.len(), 1);
-        assert_eq!(chips[0].window, Some(second));
+        assert_eq!(chips[0].window(), Some(&second));
         assert_eq!(chips[0].title, "Renamed");
     }
 
@@ -1687,8 +1694,17 @@ mod tests {
             ["Kept"],
             "only the live window has a chip"
         );
-        assert_eq!(chips[0].window, Some(kept.clone()));
-        assert!(chips[0].focused, "focus passes to the remaining window");
+        assert_eq!(chips[0].window(), Some(&kept));
+        assert!(
+            matches!(
+                chips[0].target,
+                waywire_decorations::ChipTarget::Window {
+                    attention: waywire_decorations::Attention::Focused,
+                    ..
+                }
+            ),
+            "focus passes to the remaining window"
+        );
         assert!(
             state.chrome.window_menu().is_none(),
             "the killed window's menu closes"
@@ -1905,14 +1921,14 @@ mod tests {
         ];
         let chips = state.taskbar_chips();
         assert_eq!(chips.len(), 4);
-        assert_eq!(chips[0].pin, Some(0));
-        assert_eq!(chips[0].window, Some(second));
-        assert_eq!(chips[1].pin, Some(1));
-        assert_eq!(chips[1].window, Some(first));
-        assert_eq!(chips[2].pin, Some(2));
-        assert_eq!(chips[2].window, None);
-        assert_eq!(chips[3].pin, None);
-        assert_eq!(chips[3].window, Some(third));
+        assert_eq!(chips[0].pin(), Some(0));
+        assert_eq!(chips[0].window(), Some(&second));
+        assert_eq!(chips[1].pin(), Some(1));
+        assert_eq!(chips[1].window(), Some(&first));
+        assert_eq!(chips[2].pin(), Some(2));
+        assert_eq!(chips[2].window(), None);
+        assert_eq!(chips[3].pin(), None);
+        assert_eq!(chips[3].window(), Some(&third));
     }
 
     #[test]
@@ -1942,7 +1958,13 @@ mod tests {
         child.wait().expect("wait child");
         state.reap_pins();
         assert!(state.chrome.pins_mut()[0].pid.is_none());
-        assert!(!state.taskbar_chips()[0].running);
+        assert!(matches!(
+            state.taskbar_chips()[0].target,
+            waywire_decorations::ChipTarget::Pin {
+                process: waywire_decorations::PinProcess::Stopped,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1978,7 +2000,7 @@ mod tests {
             pid: None,
             child: None,
         });
-        assert_eq!(state.taskbar_chips()[0].window, Some(window.clone()));
+        assert_eq!(state.taskbar_chips()[0].window(), Some(&window));
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);

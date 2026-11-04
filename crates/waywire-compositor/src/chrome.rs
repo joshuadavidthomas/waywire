@@ -22,8 +22,12 @@ use smithay::utils::Logical;
 use smithay::utils::Point;
 use smithay::utils::Rectangle;
 use smithay::utils::Size;
+use waywire_decorations::Attention;
+use waywire_decorations::ChipTarget;
 use waywire_decorations::DecorationAction;
+use waywire_decorations::PinProcess;
 use waywire_decorations::TaskbarChip;
+use waywire_decorations::Visibility;
 use waywire_decorations::WindowAction;
 
 use crate::State;
@@ -471,26 +475,27 @@ impl Chrome {
                 matches[index] = Some(window.clone());
             }
         }
-        let make_chip = |window: Option<Window>, pin: Option<usize>, fallback: String| {
-            let title = window
-                .as_ref()
-                .and_then(toplevel_list::metadata)
-                .map_or(fallback, |metadata| metadata.0);
+        let window_chip = |window: Window, pin: Option<usize>, fallback: String| {
+            let title = toplevel_list::metadata(&window).map_or(fallback, |metadata| metadata.0);
+            let state = windows.get(&window);
             TaskbarChip {
-                running: window.is_some()
-                    || pin.is_some_and(|index| self.pins[index].child.is_some()),
-                minimized: window
-                    .as_ref()
-                    .and_then(|window| windows.get(window))
-                    .is_some_and(|state| state.minimized),
-                focused: window.as_ref().is_some_and(&focused),
-                urgent: window
-                    .as_ref()
-                    .and_then(|window| windows.get(window))
-                    .is_some_and(|state| state.urgent),
-                window,
-                pin,
                 title,
+                target: ChipTarget::Window {
+                    visibility: if state.is_some_and(|state| state.minimized) {
+                        Visibility::Minimized
+                    } else {
+                        Visibility::Shown
+                    },
+                    attention: if focused(&window) {
+                        Attention::Focused
+                    } else if state.is_some_and(|state| state.urgent) {
+                        Attention::Urgent
+                    } else {
+                        Attention::Normal
+                    },
+                    window,
+                    pin,
+                },
             }
         };
         let mut chips: Vec<_> = self
@@ -498,23 +503,34 @@ impl Chrome {
             .iter()
             .enumerate()
             .map(|(index, pin)| {
-                make_chip(
-                    matches[index].clone(),
-                    Some(index),
-                    pin.command
-                        .first()
-                        .and_then(|command| std::path::Path::new(command).file_name())
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                )
+                let name = pin
+                    .command
+                    .first()
+                    .and_then(|command| std::path::Path::new(command).file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                match matches[index].clone() {
+                    Some(window) => window_chip(window, Some(index), name),
+                    None => TaskbarChip {
+                        title: name,
+                        target: ChipTarget::Pin {
+                            index,
+                            process: if pin.child.is_some() {
+                                PinProcess::Running
+                            } else {
+                                PinProcess::Stopped
+                            },
+                        },
+                    },
+                }
             })
             .collect();
         chips.extend(
             listed
                 .into_iter()
                 .filter(|window| !used.contains(window))
-                .map(|window| make_chip(Some(window), None, String::new())),
+                .map(|window| window_chip(window, None, String::new())),
         );
         chips
     }
@@ -637,12 +653,16 @@ pub(crate) fn taskbar_click(
         let rect = waywire_decorations::chip_rectangle(output.size.w, count, index)?;
         rect.to_f64().contains(relative).then_some(chip)
     })?;
-    let action = if chip.minimized {
-        WindowAction::Restore
-    } else if chip.focused {
-        WindowAction::Minimize
-    } else {
-        WindowAction::Focus
+    let action = match chip.target {
+        ChipTarget::Window {
+            visibility: Visibility::Minimized,
+            ..
+        } => WindowAction::Restore,
+        ChipTarget::Window {
+            attention: Attention::Focused,
+            ..
+        } => WindowAction::Minimize,
+        ChipTarget::Window { .. } | ChipTarget::Pin { .. } => WindowAction::Focus,
     };
     Some((chip, action))
 }

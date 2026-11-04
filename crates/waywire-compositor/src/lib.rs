@@ -888,12 +888,16 @@ impl State {
                 && let Some((chip, action)) =
                     chrome::taskbar_click(self.taskbar_chips(), output, position)
             {
-                let window = chip.window.clone();
-                if let Some(window) = &window {
-                    self.window_action(window, action);
-                } else if let Some(pin) = chip.pin {
-                    self.launch_pin(pin);
-                }
+                let window = match chip.target {
+                    waywire_decorations::ChipTarget::Window { window, .. } => {
+                        self.window_action(&window, action);
+                        Some(window)
+                    }
+                    waywire_decorations::ChipTarget::Pin { index, .. } => {
+                        self.launch_pin(index);
+                        None
+                    }
+                };
                 self.chrome.consume_button(source, button, Chrome::Taskbar);
                 return Target::Compositor {
                     window,
