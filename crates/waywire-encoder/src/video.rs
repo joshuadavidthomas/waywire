@@ -652,14 +652,12 @@ impl Worker<'_> {
             return ControlFlow::Break(());
         }
         if current_generation(self.shared) == generation {
-            if !request_new_generation(
+            request_new_generation(
                 self.shared,
                 self.notifications,
                 self.notification_wake,
                 generation,
-            ) {
-                return ControlFlow::Break(());
-            }
+            )?;
             self.restart.schedule();
         }
         ControlFlow::Continue(())
@@ -676,7 +674,8 @@ impl Worker<'_> {
         self.consecutive_spawn_failures = self.consecutive_spawn_failures.saturating_add(1);
         if self.consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
             let attempts = self.consecutive_spawn_failures;
-            let _ = send_notification(
+            // The worker stops whether or not the failure reached the event loop.
+            let _stop_either_way = send_notification(
                 self.shared,
                 self.notifications,
                 self.notification_wake,
@@ -714,7 +713,8 @@ impl Worker<'_> {
         if self.consecutive_spawn_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
             release_slot(self.shared, slot, frame);
             let attempts = self.consecutive_spawn_failures;
-            let _ = send_notification(
+            // The worker stops whether or not the failure reached the event loop.
+            let _stop_either_way = send_notification(
                 self.shared,
                 self.notifications,
                 self.notification_wake,
@@ -752,12 +752,13 @@ impl Worker<'_> {
                 stop_process(self.shared, self.process.take());
                 release_slot(self.shared, slot, frame);
                 if current_generation(self.shared) == generation
-                    && !request_new_generation(
+                    && request_new_generation(
                         self.shared,
                         self.notifications,
                         self.notification_wake,
                         generation,
                     )
+                    .is_break()
                 {
                     return TransitionOutcome::Stop;
                 }
@@ -813,14 +814,12 @@ impl Worker<'_> {
         if current_generation(self.shared) != frame_generation {
             return ControlFlow::Continue(());
         }
-        if !request_new_generation(
+        request_new_generation(
             self.shared,
             self.notifications,
             self.notification_wake,
             frame_generation,
-        ) {
-            return ControlFlow::Break(());
-        }
+        )?;
         self.restart.schedule();
         ControlFlow::Continue(())
     }
@@ -846,7 +845,7 @@ impl Worker<'_> {
             }
 
             if let Some(wait_until) = self.restart.retry_at.take()
-                && !wait_until_or_stop(self.shared, wait_until)
+                && wait_until_or_stop(self.shared, wait_until).is_break()
             {
                 stop_process(self.shared, self.process.take());
                 return;
@@ -923,12 +922,14 @@ impl Worker<'_> {
 
             crate::latency::trace_frame("encoder_input", frame.metadata.sequence, taken_ns);
             // Correlation metadata follows only a complete raw-frame pipe write.
-            if !send_notification(
+            if send_notification(
                 self.shared,
                 self.notifications,
                 self.notification_wake,
                 Notification::Submitted(frame.metadata.clone()),
-            ) {
+            )
+            .is_break()
+            {
                 stop_process(self.shared, self.process.take());
                 release_slot(self.shared, slot, frame);
                 return;
@@ -965,15 +966,13 @@ fn request_new_generation(
     notifications: &mpsc::SyncSender<Notification>,
     notification_wake: &Ping,
     generation: Generation,
-) -> bool {
-    if !send_notification(
+) -> ControlFlow<()> {
+    send_notification(
         shared,
         notifications,
         notification_wake,
         Notification::RestartRequired { generation },
-    ) {
-        return false;
-    }
+    )?;
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
     while pool.generation == generation && !pool.stopping {
         pool = shared
@@ -981,7 +980,11 @@ fn request_new_generation(
             .wait(pool)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    !pool.stopping
+    if pool.stopping {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(())
+    }
 }
 
 fn send_notification(
@@ -989,7 +992,7 @@ fn send_notification(
     notifications: &mpsc::SyncSender<Notification>,
     notification_wake: &Ping,
     notification: Notification,
-) -> bool {
+) -> ControlFlow<()> {
     send_notification_until(
         shared,
         notifications,
@@ -1005,15 +1008,15 @@ fn send_notification_until(
     notification_wake: &Ping,
     mut notification: Notification,
     stall_limit: Duration,
-) -> bool {
+) -> ControlFlow<()> {
     let started = Instant::now();
     loop {
         match notifications.try_send(notification) {
             Ok(()) => {
                 notification_wake.ping();
-                return true;
+                return ControlFlow::Continue(());
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Disconnected(_)) => return ControlFlow::Break(()),
             Err(mpsc::TrySendError::Full(returned)) => {
                 // A full queue still needs a wake: it may have filled after the
                 // event loop drained an earlier, coalesced ping.
@@ -1021,7 +1024,7 @@ fn send_notification_until(
                 notification = returned;
                 let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
                 if pool.stopping {
-                    return false;
+                    return ControlFlow::Break(());
                 }
                 if started.elapsed() >= stall_limit {
                     pool.notification_failure =
@@ -1030,7 +1033,7 @@ fn send_notification_until(
                     // the event loop cannot clear readiness and miss it.
                     drop(pool);
                     notification_wake.ping();
-                    return false;
+                    return ControlFlow::Break(());
                 }
                 drop(pool);
                 thread::sleep(Duration::from_millis(5));
@@ -1039,11 +1042,11 @@ fn send_notification_until(
     }
 }
 
-fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> bool {
+fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> ControlFlow<()> {
     while Instant::now() < deadline {
         let pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.stopping {
-            return false;
+            return ControlFlow::Break(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let pool = shared
@@ -1052,10 +1055,10 @@ fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> bool {
             .unwrap_or_else(PoisonError::into_inner)
             .0;
         if pool.stopping {
-            return false;
+            return ControlFlow::Break(());
         }
     }
-    true
+    ControlFlow::Continue(())
 }
 
 fn is_stopping(shared: &Shared) -> bool {

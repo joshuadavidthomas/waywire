@@ -1290,12 +1290,15 @@ fn notification_wakeup_drains_a_burst_and_rearms_without_loss() {
         .expect("notification source should register with the test event loop");
 
     for sequence in 0..64 {
-        assert!(send_notification(
-            &shared,
-            &sender,
-            &notification_wake,
-            Notification::Submitted(frame(sequence, 1).metadata),
-        ));
+        assert!(
+            send_notification(
+                &shared,
+                &sender,
+                &notification_wake,
+                Notification::Submitted(frame(sequence, 1).metadata),
+            )
+            .is_continue()
+        );
     }
     let mut sequences = Vec::new();
     event_loop
@@ -1303,12 +1306,15 @@ fn notification_wakeup_drains_a_burst_and_rearms_without_loss() {
         .expect("test event loop should dispatch the notification");
     assert_eq!(sequences, (0..64).collect::<Vec<_>>());
 
-    assert!(send_notification(
-        &shared,
-        &sender,
-        &notification_wake,
-        Notification::Submitted(frame(64, 1).metadata),
-    ));
+    assert!(
+        send_notification(
+            &shared,
+            &sender,
+            &notification_wake,
+            Notification::Submitted(frame(64, 1).metadata),
+        )
+        .is_continue()
+    );
     event_loop
         .dispatch(Duration::from_millis(100), &mut sequences)
         .expect("test event loop should dispatch the notification");
@@ -1334,13 +1340,16 @@ fn full_notification_queue_wakes_for_fatal_side_channel() {
         })
         .expect("notification source should register with the test event loop");
 
-    assert!(!send_notification_until(
-        &shared,
-        &sender,
-        &notification_wake,
-        Notification::Submitted(frame(2, 1).metadata),
-        Duration::ZERO,
-    ));
+    assert!(
+        send_notification_until(
+            &shared,
+            &sender,
+            &notification_wake,
+            Notification::Submitted(frame(2, 1).metadata),
+            Duration::ZERO,
+        )
+        .is_break()
+    );
     let mut drained = 0;
     event_loop
         .dispatch(Duration::from_millis(100), &mut drained)
@@ -1373,12 +1382,15 @@ fn a_full_notification_queue_cannot_block_shutdown() {
         .stopping = true;
     let started = Instant::now();
 
-    assert!(!send_notification(
-        &shared,
-        &sender,
-        &notification_wake,
-        Notification::Submitted(frame(1, 1).metadata)
-    ));
+    assert!(
+        send_notification(
+            &shared,
+            &sender,
+            &notification_wake,
+            Notification::Submitted(frame(1, 1).metadata)
+        )
+        .is_break()
+    );
     assert!(started.elapsed() < Duration::from_millis(100));
     drop(receiver);
 }
