@@ -61,6 +61,15 @@ pub enum SizeMode {
     Maximized,
 }
 
+/// The close button's look: hovered paints it red, and pressed, which the
+/// compositor arms only while the pointer stays on it, paints it darker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseButton {
+    Idle,
+    Hovered,
+    Pressed,
+}
+
 /// The committed window state that shapes its decoration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowFlags {
@@ -142,8 +151,7 @@ enum NodeStyle {
         title: String,
         scale: f64,
         active: bool,
-        close_hovered: bool,
-        pressed: bool,
+        close: CloseButton,
         window_flags: WindowFlags,
         theme: Theme,
     },
@@ -172,8 +180,7 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
                 title: appearance.title.clone(),
                 scale: appearance.scale,
                 active: appearance.active,
-                close_hovered: appearance.hover == Some(DecorationAction::Close),
-                pressed: appearance.pressed,
+                close: appearance.close,
                 window_flags: appearance.window_flags,
                 theme,
             },
@@ -304,8 +311,7 @@ pub fn node_at(
         scale: 1.0,
         active: false,
         window_flags,
-        hover: None,
-        pressed: false,
+        close: CloseButton::Idle,
     };
     hit_test(&nodes(size, &appearance, Theme::dark()), point).cloned()
 }
@@ -322,8 +328,7 @@ pub struct Appearance {
     pub scale: f64,
     pub active: bool,
     pub window_flags: WindowFlags,
-    pub hover: Option<DecorationAction>,
-    pub pressed: bool,
+    pub close: CloseButton,
 }
 
 pub struct Decoration {
@@ -528,23 +533,15 @@ fn paint_nodes(nodes: &[Node]) -> Result<cairo::ImageSurface> {
 
 fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
     let node = &nodes[0];
-    let (theme, scale, active, hovered, pressed, title) = match &node.style {
+    let (theme, scale, active, close_button, title) = match &node.style {
         NodeStyle::Titlebar {
             title,
             scale,
             active,
-            close_hovered,
-            pressed,
+            close,
             theme,
             ..
-        } => (
-            *theme,
-            *scale,
-            *active,
-            *close_hovered,
-            *pressed,
-            title.as_str(),
-        ),
+        } => (*theme, *scale, *active, *close, title.as_str()),
         NodeStyle::Hit | NodeStyle::Taskbar { .. } => anyhow::bail!("invalid titlebar node"),
     };
     let width = node.rect.size.w;
@@ -561,10 +558,10 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
     context.paint()?;
     {
         let close = nodes[1].rect;
-        if hovered {
+        if close_button != CloseButton::Idle {
             color(
                 &context,
-                if pressed {
+                if close_button == CloseButton::Pressed {
                     theme.close_pressed
                 } else {
                     theme.close_hover
@@ -608,10 +605,10 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         let x = f64::from(close.loc.x) + f64::from(close.size.w) / 2.0;
         color(
             &context,
-            if hovered {
-                theme.close_hover_foreground
-            } else {
+            if close_button == CloseButton::Idle {
                 foreground
+            } else {
+                theme.close_hover_foreground
             },
         );
         context.set_line_width(1.5);
@@ -1090,8 +1087,7 @@ mod tests {
                 role: WindowRole::Normal,
                 size: SizeMode::Floating,
             },
-            hover: None,
-            pressed: false,
+            close: CloseButton::Idle,
         }
     }
 
@@ -1191,19 +1187,19 @@ mod tests {
     fn close_hover_changes_titlebar_paint_input() {
         let mut look = appearance(1.0);
         let normal = nodes((look.width, 57).into(), &look, Theme::dark());
-        look.hover = Some(DecorationAction::Close);
+        look.close = CloseButton::Hovered;
         let hovered = nodes((look.width, 57).into(), &look, Theme::dark());
         assert!(matches!(
             normal[0].style,
             NodeStyle::Titlebar {
-                close_hovered: false,
+                close: CloseButton::Idle,
                 ..
             }
         ));
         assert!(matches!(
             hovered[0].style,
             NodeStyle::Titlebar {
-                close_hovered: true,
+                close: CloseButton::Hovered,
                 theme: Theme {
                     close_hover: 0xb8_3245,
                     ..
@@ -1272,13 +1268,12 @@ mod tests {
             for width in [1, 13, 32, 501] {
                 let mut look = appearance(scale);
                 look.width = width;
-                for (hover, pressed, expected) in [
-                    (None, false, 0xff27_2e39),
-                    (Some(DecorationAction::Close), false, 0xffb8_3245),
-                    (Some(DecorationAction::Close), true, 0xff85_2936),
+                for (close, expected) in [
+                    (CloseButton::Idle, 0xff27_2e39),
+                    (CloseButton::Hovered, 0xffb8_3245),
+                    (CloseButton::Pressed, 0xff85_2936),
                 ] {
-                    look.hover = hover;
-                    look.pressed = pressed;
+                    look.close = close;
                     let mut surface = paint(&look, BAR).expect("titlebar");
                     let stride = usize::try_from(surface.stride()).expect("stride");
                     let pixels = surface.data().expect("pixels");
@@ -1336,9 +1331,9 @@ mod tests {
             for step in 0..7 {
                 let changed = match step {
                     0 => true,
+                    // Hovering a resize edge leaves the close button idle.
                     1 => {
-                        look.hover =
-                            Some(DecorationAction::Resize(xdg_toplevel::ResizeEdge::Bottom));
+                        look.close = CloseButton::Idle;
                         false
                     }
                     2 => {
@@ -1346,11 +1341,11 @@ mod tests {
                         true
                     }
                     3 => {
-                        look.hover = Some(DecorationAction::Close);
+                        look.close = CloseButton::Hovered;
                         true
                     }
                     4 => {
-                        look.pressed = true;
+                        look.close = CloseButton::Pressed;
                         true
                     }
                     5 => {

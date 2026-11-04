@@ -17,6 +17,7 @@ use smithay::wayland::shell::xdg::ToplevelSurface;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use waywire_decorations::Appearance;
+use waywire_decorations::CloseButton;
 use waywire_decorations::Decoration;
 use waywire_decorations::DecorationAction;
 use waywire_decorations::Node;
@@ -238,14 +239,19 @@ impl State {
                 scale,
                 active,
                 window_flags: window_flags(window),
-                hover: hover
-                    .as_ref()
-                    .filter(|(target, _)| target == window)
-                    .map(|(_, action)| *action),
-                pressed: self
+                close: if !hover.as_ref().is_some_and(|(target, action)| {
+                    target == window && *action == DecorationAction::Close
+                }) {
+                    CloseButton::Idle
+                } else if self
                     .chrome
                     .armed_close()
-                    .is_some_and(|(_, target)| target == window),
+                    .is_some_and(|(_, target)| target == window)
+                {
+                    CloseButton::Pressed
+                } else {
+                    CloseButton::Hovered
+                },
             };
             // One broken decoration must not fail the render — and the session
             // — so log it and skip this window's decoration.
