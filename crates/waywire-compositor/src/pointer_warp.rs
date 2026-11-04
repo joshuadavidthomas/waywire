@@ -33,6 +33,11 @@ use smithay::wayland::seat::WaylandFocus;
 use super::State;
 use crate::input::PointerMotionKind;
 
+pub(crate) enum Constrained {
+    Move(Point<f64, Logical>),
+    Locked(Point<f64, Logical>),
+}
+
 /// Advertise the pointer-constraints and relative-pointer globals Xwayland's
 /// warp emulator requires.
 pub(crate) fn install(display_handle: &DisplayHandle) {
@@ -130,16 +135,16 @@ impl State {
         &self,
         pointer: &PointerHandle<Self>,
         target: Point<f64, Logical>,
-    ) -> (Point<f64, Logical>, bool) {
+    ) -> Constrained {
         let current = pointer.current_location();
         let Some((surface, origin)) = self.surface_under(current) else {
-            return (target, false);
+            return Constrained::Move(target);
         };
         if !pointer
             .current_focus()
             .is_some_and(|focus| focus.is(&surface))
         {
-            return (target, false);
+            return Constrained::Move(target);
         }
         let active = with_pointer_constraint(&surface, pointer, |constraint| {
             let constraint = constraint.filter(|c| c.is_active())?;
@@ -149,8 +154,8 @@ impl State {
             }
         });
         match active {
-            None => (target, false),
-            Some(None) => (current, true),
+            None => Constrained::Move(target),
+            Some(None) => Constrained::Locked(current),
             Some(Some(region)) => {
                 let input = with_states(&surface, |states| {
                     states
@@ -175,13 +180,10 @@ impl State {
                             constraint.deactivate();
                         }
                     });
-                    return (target, false);
+                    return Constrained::Move(target);
                 }
                 let regions: Vec<_> = region.iter().chain(input.iter()).collect();
-                (
-                    clip_motion(current, target, origin, &regions, inside),
-                    false,
-                )
+                Constrained::Move(clip_motion(current, target, origin, &regions, inside))
             }
         }
     }

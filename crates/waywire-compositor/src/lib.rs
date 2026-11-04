@@ -178,10 +178,24 @@ pub enum EncoderChoice {
     OpenH264,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FrameRequest {
+    #[default]
     Idle,
-    Pending,
+    Damaged,
+    FullRedraw,
+}
+
+impl FrameRequest {
+    pub(crate) fn request(&mut self, request: Self) {
+        *self = (*self).max(request);
+    }
+}
+
+enum Run {
+    Running,
+    Stopping,
+    Failed(anyhow::Error),
 }
 
 #[expect(
@@ -223,15 +237,12 @@ pub(crate) struct State {
     loop_handle: Option<calloop::LoopHandle<'static, State>>,
     chrome: chrome::Chrome,
     start: Instant,
-    running: bool,
-    failure: Option<anyhow::Error>,
+    run: Run,
     stream: stream::Stream,
     /// The output's size in pixels, which the stream encodes.
     size: FrameSize,
     input: input::Input,
-    /// Redraw the whole output on the next frame.
-    pub(crate) dirty: bool,
-    pub(crate) frame_pending: FrameRequest,
+    frame_request: FrameRequest,
 }
 
 /// The seat's key repeat, in keys per second after a delay in milliseconds,
@@ -353,21 +364,24 @@ impl State {
             loop_handle: None,
             chrome: chrome::Chrome::new(&options.pins)?,
             start: Instant::now(),
-            running: true,
-            failure: None,
+            run: Run::Running,
             stream: stream::Stream::new(video, event_sink, options.frame_rate, options.bitrate)?,
             size: options.resolution,
             input: input::Input::default(),
-            dirty: true,
-            frame_pending: FrameRequest::Pending,
+            frame_request: FrameRequest::FullRedraw,
         })
     }
 
     pub(crate) fn fail(&mut self, error: anyhow::Error) {
-        if self.failure.is_none() {
-            self.failure = Some(error);
+        if !matches!(self.run, Run::Failed(_)) {
+            self.run = Run::Failed(error);
         }
-        self.running = false;
+    }
+
+    fn stop(&mut self) {
+        if matches!(self.run, Run::Running) {
+            self.run = Run::Stopping;
+        }
     }
 
     pub(crate) fn surface_under(
@@ -464,7 +478,7 @@ impl State {
         let Some(release) = self.input.set_control(control) else {
             return;
         };
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
         self.activation.void_tokens();
         for source in release {
             self.release_input(source);
@@ -579,7 +593,7 @@ impl State {
             && state == KeyState::Pressed
             && let Some(window) = self.chrome.escape_menu(source)
         {
-            self.dirty = true;
+            self.frame_request.request(crate::FrameRequest::FullRedraw);
             self.refresh_pointer_focus();
             return (
                 Target::Compositor {
@@ -738,12 +752,18 @@ impl State {
                 .clamp(0.0, (f64::from(self.size.height()) - 1.0) / scale),
         ));
         if let Some(pointer) = self.seat.get_pointer() {
-            let mut locked = false;
-            if self.input.pointer_motion_kind() == PointerMotionKind::Input {
-                (location, locked) = self.constrain_pointer_motion(&pointer, location);
-            }
-            self.dirty |= self.chrome.menu_motion(location);
-            if !locked {
+            let constrained = if self.input.pointer_motion_kind() == PointerMotionKind::Input {
+                self.constrain_pointer_motion(&pointer, location)
+            } else {
+                pointer_warp::Constrained::Move(location)
+            };
+            location = match constrained {
+                pointer_warp::Constrained::Move(point)
+                | pointer_warp::Constrained::Locked(point) => point,
+            };
+            self.frame_request
+                .request(self.chrome.menu_motion(location));
+            if matches!(constrained, pointer_warp::Constrained::Move(_)) {
                 pointer.motion(
                     self,
                     self.pointer_focus_under(location),
@@ -778,7 +798,7 @@ impl State {
         }
         if self.drag.is_some() {
             // The drag icon follows the pointer, and the drag keeps its cursor.
-            self.frame_pending = FrameRequest::Pending;
+            self.frame_request.request(crate::FrameRequest::Damaged);
         } else if let Some(shape) = self.decoration_cursor_under(location) {
             self.emit(Event::CursorShape(shape));
         } else if self.surface_under(location).is_none() {
@@ -886,11 +906,11 @@ impl State {
             if state == ButtonState::Pressed
                 && let Some(press) = self.chrome.press_menu(pointer.current_location(), button)
             {
-                let window = press.window;
-                if press.closed {
-                    self.dirty = true;
+                let (window, outcome) = press.into_parts();
+                if !matches!(outcome, chrome::MenuOutcome::Kept) {
+                    self.frame_request.request(crate::FrameRequest::FullRedraw);
                 }
-                if let Some(action) = press.action {
+                if let chrome::MenuOutcome::Chose(action) = outcome {
                     if matches!(action, WindowAction::Move | WindowAction::Resize(_)) {
                         pointer.button(
                             self,
@@ -1092,7 +1112,7 @@ impl State {
             });
         }
         let elements = self.scene_elements(renderer);
-        let forced = self.dirty || !self.stream.acknowledged();
+        let forced = self.frame_request == FrameRequest::FullRedraw || !self.stream.acknowledged();
         let clear = [0.08, 0.09, 0.12, 1.0];
         let (damage, changed) = {
             let mut target = renderer.bind(image)?;
@@ -1120,17 +1140,22 @@ impl State {
         if self.stream.rendered(
             image,
             self.size,
-            damage.as_deref(),
-            forced,
+            if forced {
+                stream::FrameDamage::Full
+            } else {
+                damage
+                    .as_deref()
+                    .map_or(stream::FrameDamage::Unchanged, stream::FrameDamage::Regions)
+            },
             render_started_ns,
-        )? && let Some(screencast) = &self.screencast
+        )? == stream::Rendered::Submitted
+            && let Some(screencast) = &self.screencast
         {
             screencast.frame(&cast_frame(image));
         }
         self.capture.serve_pending(image);
         self.screencopy.serve_pending(image);
-        self.dirty = false;
-        self.frame_pending = FrameRequest::Idle;
+        self.frame_request = FrameRequest::Idle;
         self.send_cursor_frame();
         for window in self.space.elements() {
             window.send_frame(
@@ -1231,7 +1256,7 @@ pub fn run(mut options: Config) -> Result<()> {
             Ok(PostAction::Continue)
         },
     )?;
-    handle.insert_source(signals, |_, (), state| state.running = false)?;
+    handle.insert_source(signals, |_, (), state| state.stop())?;
     handle
         .insert_source(notifications, |(), (), state| state.drain_video())
         .map_err(|error| anyhow!("register video source: {error}"))?;
@@ -1251,7 +1276,7 @@ pub fn run(mut options: Config) -> Result<()> {
                     {
                         state.fail(error.into());
                     }
-                    state.running = false;
+                    state.stop();
                     return Ok(PostAction::Remove);
                 }
                 Ok(count) => {
@@ -1346,7 +1371,7 @@ pub fn run(mut options: Config) -> Result<()> {
     let mut next_frame = Instant::now();
     let mut next_housekeeping = Instant::now() + Duration::from_secs(2);
     tracing::info!(socket = %socket_path.display(), "Wayland compositor ready");
-    while state.running {
+    while matches!(state.run, Run::Running) {
         if child.0.is_none()
             && let Some(display) = state.xwayland.display()
             && let Some(program) = options.session.first()
@@ -1370,7 +1395,7 @@ pub fn run(mut options: Config) -> Result<()> {
         state.clipboard_tick();
         let now = Instant::now();
         let mut deadline = next_housekeeping;
-        if state.dirty || state.frame_pending == FrameRequest::Pending {
+        if state.frame_request != FrameRequest::Idle {
             deadline = deadline.min(next_frame);
         }
         if state.clipboard.active() {
@@ -1391,9 +1416,7 @@ pub fn run(mut options: Config) -> Result<()> {
         state.space.refresh();
         state.sync_x11_stacking();
         state.publish_window_list();
-        if (state.dirty || state.frame_pending == FrameRequest::Pending)
-            && Instant::now() >= next_frame
-        {
+        if (state.frame_request != FrameRequest::Idle) && Instant::now() >= next_frame {
             let started = Instant::now();
             if let Err(error) = state.render(&mut renderer, &mut image.borrow_mut(), &mut tracker) {
                 state.fail(error);
@@ -1411,7 +1434,7 @@ pub fn run(mut options: Config) -> Result<()> {
         if Instant::now() >= next_housekeeping {
             next_housekeeping = Instant::now() + Duration::from_secs(2);
             if !state.stream.acknowledged() {
-                state.frame_pending = FrameRequest::Pending;
+                state.frame_request.request(crate::FrameRequest::Damaged);
             }
         }
         if let Err(error) = state.display_handle.flush_clients() {
@@ -1428,7 +1451,7 @@ pub fn run(mut options: Config) -> Result<()> {
         }
         if let Some(child) = child.0.as_mut() {
             match child.try_wait() {
-                Ok(Some(_)) => state.running = false,
+                Ok(Some(_)) => state.stop(),
                 Ok(None) => {}
                 Err(error) => state.fail(error.into()),
             }
@@ -1445,7 +1468,10 @@ pub fn run(mut options: Config) -> Result<()> {
         video.stop();
     }
     event_writer.stop();
-    state.failure.map_or(Ok(()), Err)
+    match state.run {
+        Run::Failed(error) => Err(error),
+        Run::Running | Run::Stopping => Ok(()),
+    }
 }
 
 /// Connect to the private `PipeWire` daemon and dispatch its events on the
@@ -1660,13 +1686,13 @@ mod tests {
     fn control_text_follows_gateway_lease() {
         let (_display, mut state) = test_state();
         assert_eq!(control_text(&state), "Agent driving");
-        state.dirty = false;
+        state.frame_request = FrameRequest::Idle;
         lease(&mut state, true);
         assert_eq!(control_text(&state), "You're driving");
-        assert!(state.dirty);
-        state.dirty = false;
+        assert_eq!(state.frame_request, FrameRequest::FullRedraw);
+        state.frame_request = FrameRequest::Idle;
         lease(&mut state, true);
-        assert!(!state.dirty);
+        assert_eq!(state.frame_request, FrameRequest::Idle);
         lease(&mut state, false);
         assert_eq!(control_text(&state), "Agent driving");
     }
@@ -1677,15 +1703,15 @@ mod tests {
         let time = UNIX_EPOCH + Duration::from_mins(28_333_334);
         state.update_clock(time).expect("local time");
         assert_eq!(state.chrome.clock(), local_clock(time).expect("local time"));
-        state.dirty = false;
+        state.frame_request = FrameRequest::Idle;
         state
             .update_clock(time + Duration::from_secs(30))
             .expect("local time");
-        assert!(!state.dirty);
+        assert_eq!(state.frame_request, FrameRequest::Idle);
         state
             .update_clock(time + Duration::from_mins(1))
             .expect("local time");
-        assert!(state.dirty);
+        assert_eq!(state.frame_request, FrameRequest::FullRedraw);
         assert_ne!(state.chrome.clock(), local_clock(time).expect("local time"));
     }
 

@@ -30,23 +30,31 @@ use waywire_decorations::TaskbarChip;
 use waywire_decorations::Visibility;
 use waywire_decorations::WindowAction;
 
+use crate::FrameRequest;
 use crate::State;
 use crate::delivery;
 use crate::focus;
-use crate::toplevel_list;
 use crate::input::InputControl;
+use crate::toplevel_list;
 use crate::wm::Windows;
 
 /// A title bar press that a drag or a second press can still turn into an
 /// action.
 pub(crate) struct TitlebarPress {
     source: KeyboardSource,
-    pub(crate) window: Window,
-    pub(crate) location: Point<f64, Logical>,
+    window: Window,
+    location: Point<f64, Logical>,
     time: Instant,
 }
 
 impl TitlebarPress {
+    pub(crate) fn window(&self) -> &Window {
+        &self.window
+    }
+    pub(crate) fn location(&self) -> Point<f64, Logical> {
+        self.location
+    }
+
     fn moved(&self, source: KeyboardSource, location: Point<f64, Logical>) -> bool {
         self.source == source
             && (location - self.location)
@@ -210,7 +218,7 @@ impl Chrome {
 
     /// Forget chrome that belongs to an unmapped window. Returns whether the
     /// window menu closed, which needs a redraw.
-    pub(crate) fn window_unmapped(&mut self, window: &Window) -> bool {
+    pub(crate) fn window_unmapped(&mut self, window: &Window) -> FrameRequest {
         if self
             .decoration_press
             .as_ref()
@@ -224,9 +232,9 @@ impl Chrome {
             .is_some_and(|menu| menu.window() == window)
         {
             self.window_menu = None;
-            return true;
+            return FrameRequest::FullRedraw;
         }
-        false
+        FrameRequest::Idle
     }
 
     pub(crate) fn window_menu(&self) -> Option<&waywire_decorations::WindowMenu> {
@@ -255,10 +263,16 @@ impl Chrome {
     }
 
     /// Track the pointer over the open menu. Returns whether it needs a redraw.
-    pub(crate) fn menu_motion(&mut self, location: Point<f64, Logical>) -> bool {
-        self.window_menu
+    pub(crate) fn menu_motion(&mut self, location: Point<f64, Logical>) -> FrameRequest {
+        if self
+            .window_menu
             .as_mut()
             .is_some_and(|menu| menu.motion(location))
+        {
+            FrameRequest::FullRedraw
+        } else {
+            FrameRequest::Idle
+        }
     }
 
     /// A button press while the window menu is open. A press outside the
@@ -635,15 +649,15 @@ impl Chrome {
 
     /// Forget pinned applications that exited. Returns whether any did,
     /// which needs a redraw.
-    pub(crate) fn reap_pins(&mut self) -> bool {
-        let mut reaped = false;
+    pub(crate) fn reap_pins(&mut self) -> FrameRequest {
+        let mut reaped = FrameRequest::Idle;
         for pin in &mut self.pins {
             if let Some(child) = &mut pin.child {
                 match child.try_wait() {
                     Ok(Some(_)) => {
                         pin.child = None;
                         pin.pid = None;
-                        reaped = true;
+                        reaped = FrameRequest::FullRedraw;
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(%error, "wait for pinned application"),
@@ -672,13 +686,13 @@ impl Chrome {
 
     /// Show the local time at `time`. Returns whether the displayed minute
     /// changed, which needs a redraw.
-    pub(crate) fn update_clock(&mut self, time: SystemTime) -> Result<bool> {
+    pub(crate) fn update_clock(&mut self, time: SystemTime) -> Result<FrameRequest> {
         let clock = local_clock(time)?;
         if self.clock == clock {
-            return Ok(false);
+            return Ok(FrameRequest::Idle);
         }
         self.clock = clock;
-        Ok(true)
+        Ok(FrameRequest::FullRedraw)
     }
 }
 
@@ -817,20 +831,16 @@ impl State {
             {
                 tracing::warn!(%error, "watch pinned application");
             }
-            self.dirty = true;
+            self.frame_request.request(crate::FrameRequest::FullRedraw);
         }
     }
 
     pub(crate) fn reap_pins(&mut self) {
-        if self.chrome.reap_pins() {
-            self.dirty = true;
-        }
+        self.frame_request.request(self.chrome.reap_pins());
     }
 
     pub(crate) fn update_clock(&mut self, time: SystemTime) -> Result<()> {
-        if self.chrome.update_clock(time)? {
-            self.dirty = true;
-        }
+        self.frame_request.request(self.chrome.update_clock(time)?);
         Ok(())
     }
 }

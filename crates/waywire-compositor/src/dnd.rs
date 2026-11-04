@@ -33,7 +33,6 @@ use smithay::wayland::selection::data_device::WaylandDndGrabHandler;
 use smithay::wayland::selection::data_device::WlOfferData;
 use smithay::xwayland::xwm::XwmOfferData;
 
-use crate::FrameRequest;
 use crate::State;
 use crate::focus::PointerFocus;
 
@@ -227,7 +226,7 @@ impl WaylandDndGrabHandler for State {
         // The source loses pointer focus for the drag, so its cursor would
         // otherwise freeze on whatever it last set.
         self.cursor_image(&seat, CursorImageStatus::Named(CursorIcon::Grabbing));
-        self.frame_pending = FrameRequest::Pending;
+        self.frame_request.request(crate::FrameRequest::Damaged);
     }
 }
 
@@ -250,7 +249,7 @@ impl DndGrabHandler for State {
 impl State {
     fn end_drag(&mut self) {
         if self.drag.take().is_some() {
-            self.frame_pending = FrameRequest::Pending;
+            self.frame_request.request(crate::FrameRequest::Damaged);
         }
     }
 
@@ -286,7 +285,7 @@ impl State {
         if let Some(drag) = &mut self.drag
             && drag.surface_destroyed(surface)
         {
-            self.frame_pending = FrameRequest::Pending;
+            self.frame_request.request(crate::FrameRequest::Damaged);
         }
         if !self.dnd_grab_active() {
             return;

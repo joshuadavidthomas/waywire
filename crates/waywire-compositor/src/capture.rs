@@ -180,7 +180,7 @@ impl ImageCopyCaptureHandler for State {
     fn frame(&mut self, _session: &SessionRef, frame: Frame) {
         // Complete from the next already-rendered frame instead of rendering.
         self.capture.queue(frame);
-        self.frame_pending = crate::FrameRequest::Pending;
+        self.frame_request.request(crate::FrameRequest::Damaged);
     }
 
     fn frame_aborted(&mut self, frame: FrameRef) {

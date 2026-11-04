@@ -121,11 +121,9 @@ enum Refresh {
 #[derive(Default)]
 pub(crate) struct Drained {
     /// Render the next frame: the event pipe dropped one, so the next is a key frame.
-    pub(crate) frame: bool,
-    /// Redraw the whole output: the encoder restarted on a new generation.
-    pub(crate) redraw: bool,
+    frame: FrameRequest,
     /// The first error, which ends the session.
-    pub(crate) failure: Option<anyhow::Error>,
+    failure: Option<anyhow::Error>,
 }
 
 impl Drained {
@@ -134,6 +132,19 @@ impl Drained {
             self.failure = Some(error);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FrameDamage<'a> {
+    Full,
+    Regions(&'a [Rectangle<i32, Physical>]),
+    Unchanged,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) enum Rendered {
+    Submitted,
+    Unchanged,
 }
 
 pub(crate) struct Stream {
@@ -253,17 +264,20 @@ impl Stream {
     }
 
     /// Record whether the gateway cached the key frame of `readiness.generation`.
-    /// Returns true when it lost it, so the compositor must render a frame for
+    /// Requests a frame when it lost it, so the compositor renders a frame for
     /// the key frame this requests.
-    pub(crate) fn keyframe_readiness(&mut self, readiness: pipe::KeyframeReadiness) -> bool {
+    pub(crate) fn keyframe_readiness(
+        &mut self,
+        readiness: pipe::KeyframeReadiness,
+    ) -> FrameRequest {
         if readiness.generation() != self.generation {
-            return false;
+            return FrameRequest::Idle;
         }
         let (acknowledged, lost) = match readiness.state() {
-            pipe::KeyframeState::Cached => (Some(readiness.generation()), false),
+            pipe::KeyframeState::Cached => (Some(readiness.generation()), FrameRequest::Idle),
             pipe::KeyframeState::Missing => {
                 self.request_key();
-                (None, true)
+                (None, FrameRequest::Damaged)
             }
         };
         self.acknowledged = acknowledged;
@@ -287,7 +301,7 @@ impl Stream {
                         Ok(()) => latency::trace_frame("emitted", sequence, 0),
                         Err(EventWriterError::QueueFull) => {
                             self.request_key();
-                            drained.frame = true;
+                            drained.frame.request(FrameRequest::Damaged);
                         }
                         Err(error) => drained.fail(error.into()),
                     }
@@ -303,7 +317,7 @@ impl Stream {
                     }
                 }
                 Notification::RestartRequired { generation } if generation == self.generation => {
-                    drained.redraw = true;
+                    drained.frame.request(FrameRequest::FullRedraw);
                     if let Err(error) = self.advance_generation() {
                         drained.fail(error);
                     }
@@ -323,20 +337,20 @@ impl Stream {
         &mut self,
         image: &Image<'static, 'static>,
         size: FrameSize,
-        damage: Option<&[Rectangle<i32, Physical>]>,
-        forced: bool,
+        damage: FrameDamage<'_>,
         render_started_ns: u64,
-    ) -> Result<bool> {
-        if damage.is_none() && !forced {
-            return Ok(false);
+    ) -> Result<Rendered> {
+        if matches!(damage, FrameDamage::Unchanged) {
+            return Ok(Rendered::Unchanged);
         }
         let full = [Rectangle::<i32, Physical>::from_size(
             (i32::try_from(size.width())?, i32::try_from(size.height())?).into(),
         )];
-        let damage = if forced {
-            &full[..]
-        } else {
-            damage.unwrap_or(&full)
+        let forced = matches!(damage, FrameDamage::Full);
+        let damage = match damage {
+            FrameDamage::Full => &full[..],
+            FrameDamage::Regions(regions) => regions,
+            FrameDamage::Unchanged => return Ok(Rendered::Unchanged),
         };
         // A forced redraw reports the whole output damaged. Hash only those, so
         // a redraw that changed no pixel is not encoded again.
@@ -344,7 +358,7 @@ impl Stream {
         let unchanged = hash.is_some() && hash == self.forced_frame_hash && self.acknowledged();
         self.forced_frame_hash = hash;
         if unchanged {
-            return Ok(false);
+            return Ok(Rendered::Unchanged);
         }
         latency::trace_frame("render", self.sequence, render_started_ns);
         self.submit(image, size, damage, FrameCause::Damage)?;
@@ -352,7 +366,7 @@ impl Stream {
             at: Instant::now() + REFRESH_DELAY,
             left: self.video.as_ref().map_or(0, Video::refresh_frames),
         };
-        Ok(true)
+        Ok(Rendered::Submitted)
     }
 
     /// When the screen has held still long enough to refresh it.
@@ -598,9 +612,8 @@ impl crate::State {
             }
             Command::ResetVideo(_) => self.advance_generation()?,
             Command::KeyframeReadiness(p) => {
-                if self.stream.keyframe_readiness(p) {
-                    self.frame_pending = FrameRequest::Pending;
-                }
+                self.frame_request
+                    .request(self.stream.keyframe_readiness(p));
             }
             Command::Text(p) => {
                 if matches!(p.action(), pipe::TextAction::Commit) {
@@ -651,18 +664,13 @@ impl crate::State {
     }
 
     fn advance_generation(&mut self) -> Result<()> {
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
         self.stream.advance_generation()
     }
 
     pub(crate) fn drain_video(&mut self) {
         let drained = self.stream.drain();
-        if drained.frame {
-            self.frame_pending = FrameRequest::Pending;
-        }
-        if drained.redraw {
-            self.dirty = true;
-        }
+        self.frame_request.request(drained.frame);
         if let Some(error) = drained.failure {
             self.fail(error);
         }
