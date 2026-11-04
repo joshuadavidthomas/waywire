@@ -163,14 +163,11 @@ fn shared() -> Arc<Shared> {
     Arc::new(Shared {
         pool: Mutex::new(Pool {
             slots: std::array::from_fn(|_| FrameSlot::Free(Vec::new())),
-            pending: None,
-            encoding: None,
             next_free: 0,
             generation: generation(1),
             stopping: false,
             notification_failure: None,
-            child_pid: None,
-            child_exited: false,
+            child: Child::None,
         }),
         work: Condvar::new(),
     })
@@ -249,13 +246,10 @@ fn shared_pending_sequence(shared: &Shared) -> Option<u64> {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned");
-    let slot = pool.pending?;
-    match &pool.slots[slot] {
+    pool.slots.iter().find_map(|slot| match slot {
         FrameSlot::Pending(frame) => Some(frame.metadata.sequence),
-        FrameSlot::Free(_) | FrameSlot::Encoding => {
-            panic!("pending slot state disagrees with pool index")
-        }
-    }
+        FrameSlot::Free(_) | FrameSlot::Encoding => None,
+    })
 }
 
 #[derive(Default)]
@@ -854,8 +848,13 @@ fn generation_change_and_stop_discard_spawn_retry_frame() {
             .pool
             .lock()
             .expect("frame pool mutex should not be poisoned");
-        assert!(pool.pending.is_none());
-        assert!(pool.encoding.is_none());
+        assert!(pool.pending().is_none());
+        assert!(
+            !pool
+                .slots
+                .iter()
+                .any(|slot| matches!(slot, FrameSlot::Encoding))
+        );
         assert!(matches!(pool.slots[slot], FrameSlot::Free(_)));
         drop(pool);
     }
@@ -893,7 +892,7 @@ fn latest_pending_replacement_does_not_touch_encoding_buffers() {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .pending
+        .pending()
         .expect("submitted test frame should have a pending slot index");
     let (pending_pointer, pending_capacity) = {
         let pool = shared
@@ -979,7 +978,7 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .pending
+        .pending()
         .expect("submitted test frame should have a pending slot index");
     let pending_pointer = {
         let pool = shared
@@ -1020,7 +1019,7 @@ fn generation_changes_reject_stale_input_without_replacing_pending_storage() {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned");
-    assert!(pool.pending.is_none());
+    assert!(pool.pending().is_none());
     match &pool.slots[pending_slot] {
         FrameSlot::Free(storage) => assert_eq!(storage.as_ptr(), pending_pointer),
         FrameSlot::Pending(_) | FrameSlot::Encoding => {

@@ -3,7 +3,6 @@ use std::io::Write;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
-use std::process::Child;
 use std::process::ChildStdin;
 use std::process::Command;
 use std::process::Stdio;
@@ -218,16 +217,31 @@ enum FrameSlot {
     Encoding,
 }
 
+/// The `FFmpeg` process the worker is writing to, as its exit monitor sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Child {
+    None,
+    Running(u32),
+    Exited(u32),
+}
+
 struct Pool {
     slots: [FrameSlot; SLOT_COUNT],
-    pending: Option<usize>,
-    encoding: Option<usize>,
     next_free: usize,
     generation: Generation,
     stopping: bool,
     notification_failure: Option<String>,
-    child_pid: Option<u32>,
-    child_exited: bool,
+    child: Child,
+}
+
+impl Pool {
+    /// The slot of the frame waiting for the worker. Submission replaces a waiting
+    /// frame rather than queueing another, so at most one slot is pending.
+    fn pending(&self) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot, FrameSlot::Pending(_)))
+    }
 }
 
 struct Shared {
@@ -288,14 +302,11 @@ impl VideoEncoder {
         let shared = Arc::new(Shared {
             pool: Mutex::new(Pool {
                 slots: std::array::from_fn(|_| FrameSlot::Free(Vec::new())),
-                pending: None,
-                encoding: None,
                 next_free: 0,
                 generation: initial_generation,
                 stopping: false,
                 notification_failure: None,
-                child_pid: None,
-                child_exited: false,
+                child: Child::None,
             }),
             work: Condvar::new(),
         });
@@ -356,7 +367,7 @@ impl VideoEncoder {
         if frame.metadata.generation != pool.generation {
             return Err(VideoError::InvalidFrame);
         }
-        let result = if let Some(slot) = pool.pending
+        let result = if let Some(slot) = pool.pending()
             && let FrameSlot::Pending(pending) = &mut pool.slots[slot]
         {
             pending.replace_from(frame);
@@ -374,7 +385,6 @@ impl VideoEncoder {
                 }
             };
             pool.slots[slot] = FrameSlot::Pending(RawFrame::copy_from(storage, frame));
-            pool.pending = Some(slot);
             SubmitResult::Queued
         };
         self.shared.work.notify_one();
@@ -396,7 +406,7 @@ impl VideoEncoder {
             return Err(VideoError::InvalidFrame);
         }
         pool.generation = generation;
-        if let Some(slot) = pool.pending {
+        if let Some(slot) = pool.pending() {
             let discard = matches!(
                 &pool.slots[slot],
                 FrameSlot::Pending(frame) if frame.metadata.generation != generation
@@ -409,7 +419,6 @@ impl VideoEncoder {
                         FrameSlot::Encoding => Vec::new(),
                     };
                 pool.slots[slot] = FrameSlot::Free(salvaged);
-                pool.pending = None;
             }
         }
         self.shared.work.notify_all();
@@ -478,11 +487,16 @@ impl VideoEncoder {
 
     #[cfg(test)]
     fn child_pid(&self) -> Option<u32> {
-        self.shared
+        match self
+            .shared
             .pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .child_pid
+            .child
+        {
+            Child::None => None,
+            Child::Running(pid) | Child::Exited(pid) => Some(pid),
+        }
     }
 }
 
@@ -520,7 +534,7 @@ impl Drop for WorkerFailureGuard {
 }
 
 struct EncoderProcess {
-    child: Child,
+    child: std::process::Child,
     input: ChildStdin,
     config: EncoderConfig,
     generation: Generation,
@@ -567,7 +581,7 @@ impl EncoderProcess {
     }
 }
 
-fn reap_child(child: &mut Child) {
+fn reap_child(child: &mut std::process::Child) {
     match child.try_wait() {
         Ok(Some(_status)) => return,
         Ok(None) => {}
@@ -928,21 +942,21 @@ impl Worker<'_> {
 
 fn take_pending_frame(shared: &Shared) -> Option<(usize, RawFrame)> {
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-    while pool.pending.is_none() && !pool.stopping && !pool.child_exited {
+    let child_exited = |pool: &Pool| matches!(pool.child, Child::Exited(_));
+    while pool.pending().is_none() && !pool.stopping && !child_exited(&pool) {
         pool = shared
             .work
             .wait(pool)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    if pool.stopping || pool.child_exited {
+    if pool.stopping || child_exited(&pool) {
         return None;
     }
-    let slot = pool.pending.take()?;
+    let slot = pool.pending()?;
     let FrameSlot::Pending(frame) = std::mem::replace(&mut pool.slots[slot], FrameSlot::Encoding)
     else {
         return None;
     };
-    pool.encoding = Some(slot);
     Some((slot, frame))
 }
 
@@ -1062,35 +1076,32 @@ fn current_generation(shared: &Shared) -> Generation {
 
 fn release_slot(shared: &Shared, slot: usize, frame: RawFrame) {
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(pool.encoding, Some(slot));
     assert!(matches!(pool.slots[slot], FrameSlot::Encoding));
-    pool.encoding = None;
     pool.slots[slot] = FrameSlot::Free(frame.pixels);
     shared.work.notify_all();
 }
 
 fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(pool.encoding, Some(slot));
     assert!(matches!(pool.slots[slot], FrameSlot::Encoding));
-    pool.encoding = None;
 
     // Any pending frame arrived after this worker took its frame. Keep it,
     // regardless of sequence wraparound; arrival owns the latest-frame policy.
-    if pool.stopping || pool.generation != frame.metadata.generation || pool.pending.is_some() {
+    if pool.stopping || pool.generation != frame.metadata.generation || pool.pending().is_some() {
         pool.slots[slot] = FrameSlot::Free(frame.pixels);
     } else {
         pool.slots[slot] = FrameSlot::Pending(frame);
-        pool.pending = Some(slot);
     }
     shared.work.notify_all();
 }
 
 fn stop_process(shared: &Shared, process: Option<EncoderProcess>) {
     {
-        let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        pool.child_pid = None;
-        pool.child_exited = false;
+        shared
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .child = Child::None;
     }
     if let Some(process) = process {
         process.stop();
@@ -1107,7 +1118,7 @@ fn watch_process(
         .pool
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .child_pid = Some(pid);
+        .child = Child::Running(pid);
     if let Err(error) = watch_child(Arc::clone(shared), wake.clone(), pid) {
         stop_process(shared, Some(process));
         return Err(error);
@@ -1128,14 +1139,14 @@ fn watch_child(shared: Arc<Shared>, wake: Ping, pid: u32) -> io::Result<()> {
                 }
             };
             let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-            if pool.child_pid == Some(pid) {
+            if pool.child == Child::Running(pid) {
                 if let Err(error) = result {
                     pool.notification_failure =
                         Some(format!("ffmpeg exit monitor failed: {error}"));
                     pool.stopping = true;
                     wake.ping();
                 } else {
-                    pool.child_exited = true;
+                    pool.child = Child::Exited(pid);
                 }
                 shared.work.notify_one();
             }
