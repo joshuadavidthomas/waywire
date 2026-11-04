@@ -340,16 +340,16 @@ mod tests {
     fn replaceable_cursor_does_not_discard_required_metadata() {
         let sink = EventSink::for_test();
         let shared = Arc::clone(&sink.shared);
-        sink.send(&Event::Frame(FrameMetadata {
-            generation: Generation::new(1).expect("test generation should be valid"),
-            width: FrameDimension::new(2).expect("test frame width should be valid"),
-            height: FrameDimension::new(2).expect("test frame height should be valid"),
-            capture_nanos: 1,
-            sequence: 1,
-            input_sequence: None,
-            fps: Fps::new(60).expect("test frame rate should be valid"),
-            chroma: Chroma::Yuv444,
-        }))
+        sink.send(&Event::Frame(FrameMetadata::new(
+            Generation::new(1).expect("test generation should be valid"),
+            FrameDimension::new(2).expect("test frame width should be valid"),
+            FrameDimension::new(2).expect("test frame height should be valid"),
+            1,
+            1,
+            None,
+            Fps::new(60).expect("test frame rate should be valid"),
+            Chroma::Yuv444,
+        )))
         .expect("frame metadata should queue");
         sink.send(&Event::CursorVisibility(CursorVisibility::Hidden))
             .expect("cursor hide should queue");
@@ -375,17 +375,17 @@ mod tests {
             .expect("new cursor shape should replace old shape");
         sink.send(&Event::CursorVisibility(CursorVisibility::Visible))
             .expect("cursor visibility should queue separately");
-        sink.send(&Event::CursorPosition(CursorPosition {
-            x: waywire_protocol::pipe::PointerCoordinate::new(1).expect("valid coordinate"),
-            y: waywire_protocol::pipe::PointerCoordinate::new(2).expect("valid coordinate"),
-            source: waywire_protocol::pipe::CursorSource::Browser,
-        }))
+        sink.send(&Event::CursorPosition(CursorPosition::new(
+            waywire_protocol::pipe::PointerCoordinate::new(1).expect("valid coordinate"),
+            waywire_protocol::pipe::PointerCoordinate::new(2).expect("valid coordinate"),
+            waywire_protocol::pipe::CursorSource::Browser,
+        )))
         .expect("first cursor position should queue");
-        let position = Event::CursorPosition(CursorPosition {
-            x: waywire_protocol::pipe::PointerCoordinate::new(3).expect("valid coordinate"),
-            y: waywire_protocol::pipe::PointerCoordinate::new(4).expect("valid coordinate"),
-            source: waywire_protocol::pipe::CursorSource::Agent,
-        });
+        let position = Event::CursorPosition(CursorPosition::new(
+            waywire_protocol::pipe::PointerCoordinate::new(3).expect("valid coordinate"),
+            waywire_protocol::pipe::PointerCoordinate::new(4).expect("valid coordinate"),
+            waywire_protocol::pipe::CursorSource::Agent,
+        ));
         sink.send(&position)
             .expect("new cursor position should replace old position");
 
@@ -403,10 +403,12 @@ mod tests {
     #[test]
     fn cursor_click_keeps_later_motion_after_the_click() {
         let sink = EventSink::for_test();
-        let position = |x| CursorPosition {
-            x: waywire_protocol::pipe::PointerCoordinate::new(x).expect("coordinate"),
-            y: waywire_protocol::pipe::PointerCoordinate::new(0).expect("coordinate"),
-            source: waywire_protocol::pipe::CursorSource::Agent,
+        let position = |x| {
+            CursorPosition::new(
+                waywire_protocol::pipe::PointerCoordinate::new(x).expect("coordinate"),
+                waywire_protocol::pipe::PointerCoordinate::new(0).expect("coordinate"),
+                waywire_protocol::pipe::CursorSource::Agent,
+            )
         };
         sink.send(&Event::CursorPosition(position(1)))
             .expect("position");
@@ -432,16 +434,16 @@ mod tests {
         let shared = Arc::clone(&sink.shared);
         sink.send(&clipboard("first"))
             .expect("first clipboard should queue");
-        sink.send(&Event::Frame(FrameMetadata {
-            generation: Generation::new(1).expect("test generation should be valid"),
-            width: FrameDimension::new(2).expect("test frame width should be valid"),
-            height: FrameDimension::new(2).expect("test frame height should be valid"),
-            capture_nanos: 1,
-            sequence: 1,
-            input_sequence: None,
-            fps: Fps::new(60).expect("test frame rate should be valid"),
-            chroma: Chroma::Yuv444,
-        }))
+        sink.send(&Event::Frame(FrameMetadata::new(
+            Generation::new(1).expect("test generation should be valid"),
+            FrameDimension::new(2).expect("test frame width should be valid"),
+            FrameDimension::new(2).expect("test frame height should be valid"),
+            1,
+            1,
+            None,
+            Fps::new(60).expect("test frame rate should be valid"),
+            Chroma::Yuv444,
+        )))
         .expect("frame metadata should queue");
         let latest = clipboard("latest");
         sink.send(&latest)

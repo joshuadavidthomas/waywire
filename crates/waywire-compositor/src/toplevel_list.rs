@@ -3509,11 +3509,11 @@ mod tests {
         let resize = |state: &mut crate::State, scale_v120: u16| {
             use waywire_protocol::pipe;
             state
-                .apply_command(pipe::Command::Resize(pipe::Resize {
-                    size: pipe::FrameSize::new(1920, 1080).expect("size"),
-                    scale_v120: pipe::ScaleV120::new(scale_v120).expect("scale"),
-                    request_id: pipe::RequestId::new(1).expect("request"),
-                }))
+                .apply_command(pipe::Command::Resize(pipe::Resize::new(
+                    pipe::FrameSize::new(1920, 1080).expect("size"),
+                    pipe::ScaleV120::new(scale_v120).expect("scale"),
+                    pipe::RequestId::new(1).expect("request"),
+                )))
                 .expect("resize");
         };
         // 1920x1080 pixels at 1.5 are 1280x720 logical; the 32-pixel taskbar
@@ -3877,12 +3877,17 @@ mod tests {
             })
             .expect("cursor image event");
         assert_eq!(
-            (image.width, image.height, image.hotspot_x, image.hotspot_y),
+            (
+                image.width(),
+                image.height(),
+                image.hotspot_x(),
+                image.hotspot_y()
+            ),
             (4, 4, 1, 2)
         );
-        assert!(image.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(image.png().starts_with(b"\x89PNG\r\n\x1a\n"));
         let mut decoded =
-            cairo::ImageSurface::create_from_png(&mut image.png.as_slice()).expect("decode PNG");
+            cairo::ImageSurface::create_from_png(&mut image.png().as_slice()).expect("decode PNG");
         assert_eq!(&decoded.data().expect("PNG pixels")[..4], &[0, 0, 255, 255]);
         cursor.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
@@ -3902,8 +3907,14 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(app.refresh_rates.last(), Some(&60_000));
-        let mut quality = state.stream.quality();
-        quality.fps = waywire_protocol::pipe::Fps::new(30).expect("valid fps");
+        let quality = state.stream.quality();
+        let quality = waywire_protocol::pipe::Quality::new(
+            quality.bitrate_kbps(),
+            waywire_protocol::pipe::Fps::new(30).expect("valid fps"),
+            quality.scale_percent(),
+            quality.crf(),
+            quality.chroma(),
+        );
         state
             .apply_command(waywire_protocol::pipe::Command::Quality(quality))
             .expect("quality change");
@@ -5012,11 +5023,11 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         state.stream.take_events();
         state
-            .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey {
-                key: pipe::KeyCode::new(30).expect("key"),
-                state: pipe::KeyState::Pressed,
-                sequence: pipe::InputSequence::new(41).expect("sequence"),
-            }))
+            .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey::new(
+                pipe::KeyCode::new(30).expect("key"),
+                pipe::KeyState::Pressed,
+                pipe::InputSequence::new(41).expect("sequence"),
+            )))
             .expect("key");
         let receipts: Vec<_> = state
             .stream
@@ -5031,10 +5042,10 @@ mod tests {
             })
             .collect();
         assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].sequence.get(), 41);
-        assert_eq!(receipts[0].delivery, pipe::ReceiptDelivery::Window);
-        assert_eq!(receipts[0].title.as_str(), "Notes");
-        assert_eq!(receipts[0].window_id.as_str(), app.handles[0].identifier);
+        assert_eq!(receipts[0].sequence().get(), 41);
+        assert_eq!(receipts[0].delivery(), pipe::ReceiptDelivery::Window);
+        assert_eq!(receipts[0].title().as_str(), "Notes");
+        assert_eq!(receipts[0].window_id().as_str(), app.handles[0].identifier);
     }
 
     /// A busy viewer page sends a key's release late. While a browser holds
@@ -5048,7 +5059,7 @@ mod tests {
         let (mut display, mut state, connection, mut queue, mut app, _keyboard) = typing_client();
         assert_eq!(app.repeat_info, Some((25, 200)), "clients repeat keys");
         state
-            .apply_command(pipe::Command::InputLease(pipe::InputLease { held: true }))
+            .apply_command(pipe::Command::InputLease(pipe::InputControl::Browser))
             .expect("takeover");
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(
@@ -5062,11 +5073,11 @@ mod tests {
         let mut key = |state: &mut crate::State, key, key_state| {
             sequence += 1;
             state
-                .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey {
-                    key: pipe::KeyCode::new(key).expect("key"),
-                    state: key_state,
-                    sequence: pipe::InputSequence::new(sequence).expect("sequence"),
-                }))
+                .apply_command(pipe::Command::KeyboardKey(pipe::KeyboardKey::new(
+                    pipe::KeyCode::new(key).expect("key"),
+                    key_state,
+                    pipe::InputSequence::new(sequence).expect("sequence"),
+                )))
                 .expect("key");
         };
         // Shift is held and the browser repeats it, as it does on Windows; A
@@ -5090,9 +5101,9 @@ mod tests {
             .filter_map(|event| {
                 if let pipe::Event::InputReceipt(receipt) = event {
                     Some((
-                        receipt.sequence.get(),
-                        receipt.delivery,
-                        receipt.window_id.as_str().to_owned(),
+                        receipt.sequence().get(),
+                        receipt.delivery(),
+                        receipt.window_id().as_str().to_owned(),
                     ))
                 } else {
                     None
@@ -5112,7 +5123,7 @@ mod tests {
 
         let held = app.keys.len();
         state
-            .apply_command(pipe::Command::InputLease(pipe::InputLease { held: false }))
+            .apply_command(pipe::Command::InputLease(pipe::InputControl::Agents))
             .expect("handback");
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(app.keys[held..], [48], "handback releases B");

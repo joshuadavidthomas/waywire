@@ -91,14 +91,14 @@ fn image(surface: &WlSurface, output_width: u16) -> Option<CursorImage> {
         context.paint().ok()?;
         let mut png = Vec::new();
         target.write_to_png(&mut png).ok()?;
-        Some(CursorImage {
-            width: u8::try_from(width).ok()?,
-            height: u8::try_from(height).ok()?,
-            hotspot_x: u8::try_from(hotspot_x).ok()?,
-            hotspot_y: u8::try_from(hotspot_y).ok()?,
+        Some(CursorImage::new(
+            u8::try_from(width).ok()?,
+            u8::try_from(height).ok()?,
+            u8::try_from(hotspot_x).ok()?,
+            u8::try_from(hotspot_y).ok()?,
             output_width,
             png,
-        })
+        ))
     })
 }
 

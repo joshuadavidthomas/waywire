@@ -163,13 +163,13 @@ impl Stream {
         Ok(Self {
             video: Some(video),
             event_sink,
-            quality: Quality {
+            quality: Quality::new(
+                bitrate,
                 fps,
-                bitrate_kbps: bitrate,
-                scale_percent: pipe::ScalePercent::new(100)?,
-                crf: pipe::Crf::new(27)?,
-                chroma: pipe::Chroma::Yuv420,
-            },
+                pipe::ScalePercent::new(100)?,
+                pipe::Crf::new(27)?,
+                pipe::Chroma::Yuv420,
+            ),
             generation: Generation::new(1)?,
             acknowledged: None,
             sequence: 0,
@@ -256,11 +256,11 @@ impl Stream {
     /// Returns true when it lost it, so the compositor must render a frame for
     /// the key frame this requests.
     pub(crate) fn keyframe_readiness(&mut self, readiness: pipe::KeyframeReadiness) -> bool {
-        if readiness.generation != self.generation {
+        if readiness.generation() != self.generation {
             return false;
         }
-        let (acknowledged, lost) = match readiness.state {
-            pipe::KeyframeState::Cached => (Some(readiness.generation), false),
+        let (acknowledged, lost) = match readiness.state() {
+            pipe::KeyframeState::Cached => (Some(readiness.generation()), false),
             pipe::KeyframeState::Missing => {
                 self.request_key();
                 (None, true)
@@ -282,7 +282,7 @@ impl Stream {
                 // A full stdout queue drops this frame rather than the session. The
                 // stripes it carried are now out of step, so code a key frame next.
                 Ok(frame) => {
-                    let sequence = frame.metadata.sequence;
+                    let sequence = frame.metadata().sequence();
                     match self.event_sink.send(&Event::EncodedFrame(frame)) {
                         Ok(()) => latency::trace_frame("emitted", sequence, 0),
                         Err(EventWriterError::QueueFull) => {
@@ -379,7 +379,7 @@ impl Stream {
         self.submit(image, size, &[], FrameCause::StillRefresh)?;
         self.refresh = match left.checked_sub(1) {
             Some(left @ 1..) => Refresh::Due {
-                at: now + Duration::from_secs_f64(1.0 / f64::from(self.quality.fps.get())),
+                at: now + Duration::from_secs_f64(1.0 / f64::from(self.quality.fps().get())),
                 left,
             },
             _ => Refresh::Idle,
@@ -397,8 +397,8 @@ impl Stream {
         let (width, height) = encoded_dimensions(
             size.width(),
             size.height(),
-            self.quality.scale_percent,
-            self.quality.fps,
+            self.quality.scale_percent(),
+            self.quality.fps(),
         );
         let config = EncoderConfig::new(
             (
@@ -406,21 +406,21 @@ impl Stream {
                 FrameDimension::new(size.height().try_into()?)?,
             ),
             (FrameDimension::new(width)?, FrameDimension::new(height)?),
-            self.quality.fps,
-            self.quality.bitrate_kbps,
-            self.quality.crf,
-            self.quality.chroma,
+            self.quality.fps(),
+            self.quality.bitrate_kbps(),
+            self.quality.crf(),
+            self.quality.chroma(),
         );
-        let metadata = FrameMetadata {
-            generation: self.generation,
-            width: config.encoded_size().0,
-            height: config.encoded_size().1,
-            capture_nanos: latency::monotonic_nanos(),
-            sequence: self.sequence,
-            input_sequence: self.latest_input_sequence,
-            fps: self.quality.fps,
-            chroma: self.quality.chroma,
-        };
+        let metadata = FrameMetadata::new(
+            self.generation,
+            config.encoded_size().0,
+            config.encoded_size().1,
+            latency::monotonic_nanos(),
+            self.sequence,
+            self.latest_input_sequence,
+            self.quality.fps(),
+            self.quality.chroma(),
+        );
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -443,8 +443,8 @@ impl Stream {
                     height: image.height(),
                     damage: &damage,
                     metadata,
-                    crf: self.quality.crf,
-                    bitrate: self.quality.bitrate_kbps,
+                    crf: self.quality.crf(),
+                    bitrate: self.quality.bitrate_kbps(),
                     cause,
                 })?;
             }
@@ -470,9 +470,9 @@ impl crate::State {
             Command::PointerAbsolute(p) => self.pointer_motion(
                 source,
                 (
-                    f64::from(p.x.get()) / 65535.0 * f64::from(self.size.width())
+                    f64::from(p.x().get()) / 65535.0 * f64::from(self.size.width())
                         / self.output.current_scale().fractional_scale(),
-                    f64::from(p.y.get()) / 65535.0 * f64::from(self.size.height())
+                    f64::from(p.y().get()) / 65535.0 * f64::from(self.size.height())
                         / self.output.current_scale().fractional_scale(),
                 )
                     .into(),
@@ -480,8 +480,10 @@ impl crate::State {
             Command::PointerRelative(p) => {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let scale = self.output.current_scale().fractional_scale();
-                    let delta =
-                        Point::from((f64::from(p.dx.get()) / scale, f64::from(p.dy.get()) / scale));
+                    let delta = Point::from((
+                        f64::from(p.dx().get()) / scale,
+                        f64::from(p.dy().get()) / scale,
+                    ));
                     self.pointer_motion_with_delta(
                         source,
                         pointer.current_location() + delta,
@@ -491,34 +493,36 @@ impl crate::State {
             }
             Command::PointerButton(p) => self.pointer_button(
                 source,
-                p.button.evdev_code(),
-                match p.state {
+                p.button().evdev_code(),
+                match p.state() {
                     pipe::ButtonState::Pressed => ButtonState::Pressed,
                     pipe::ButtonState::Released => ButtonState::Released,
                 },
             ),
-            Command::KeyboardKey(p) => match p.state {
+            Command::KeyboardKey(p) => match p.state() {
                 pipe::KeyState::Pressed => {
-                    self.keyboard_key(source, p.key.get(), KeyState::Pressed);
+                    self.keyboard_key(source, p.key().get(), KeyState::Pressed);
                 }
                 pipe::KeyState::Released => {
-                    self.keyboard_key(source, p.key.get(), KeyState::Released);
+                    self.keyboard_key(source, p.key().get(), KeyState::Released);
                 }
-                pipe::KeyState::Repeated => self.keyboard_repeat(source, p.key.get()),
+                pipe::KeyState::Repeated => self.keyboard_repeat(source, p.key().get()),
             },
             Command::ReleaseAll(_) => self.release_input(source),
-            Command::InputLease(p) => self.set_browser_lease(p.held),
+            Command::InputLease(p) => self.set_browser_lease(p == pipe::InputControl::Browser),
             Command::PointerScroll(p) => {
                 let frame = AxisFrame::new(InputTime::now())
                     .source(AxisSource::Finger)
-                    .value(Axis::Horizontal, f64::from(p.dx.get()))
-                    .value(Axis::Vertical, f64::from(p.dy.get()));
+                    .value(Axis::Horizontal, f64::from(p.dx().get()))
+                    .value(Axis::Vertical, f64::from(p.dy().get()));
                 self.pointer_axis(source, frame);
             }
             Command::PointerWheel(p) => {
                 let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
-                for (axis, value) in [(Axis::Horizontal, p.dx.get()), (Axis::Vertical, p.dy.get())]
-                {
+                for (axis, value) in [
+                    (Axis::Horizontal, p.dx().get()),
+                    (Axis::Vertical, p.dy().get()),
+                ] {
                     if value != 0.0 {
                         #[expect(
                             clippy::cast_possible_truncation,
@@ -532,28 +536,28 @@ impl crate::State {
             }
             Command::PointerScrollStop(p) => {
                 let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Finger);
-                if p.dx.get() != 0.0 {
+                if p.dx().get() != 0.0 {
                     frame = frame.stop(Axis::Horizontal);
                 }
-                if p.dy.get() != 0.0 {
+                if p.dy().get() != 0.0 {
                     frame = frame.stop(Axis::Vertical);
                 }
                 self.pointer_axis(source, frame);
             }
             Command::Resize(p) => {
-                self.size = p.size;
+                self.size = p.size();
                 let mode = smithay::output::Mode {
                     size: (
-                        i32::try_from(p.size.width())?,
-                        i32::try_from(p.size.height())?,
+                        i32::try_from(p.size().width())?,
+                        i32::try_from(p.size().height())?,
                     )
                         .into(),
-                    refresh: i32::try_from(self.stream.quality().fps.get())? * 1000,
+                    refresh: i32::try_from(self.stream.quality().fps().get())? * 1000,
                 };
                 self.output.change_current_state(
                     Some(mode),
                     None,
-                    Some(Scale::Fractional(f64::from(p.scale_v120.get()) / 120.0)),
+                    Some(Scale::Fractional(f64::from(p.scale_v120().get()) / 120.0)),
                     None,
                 );
                 self.output.set_preferred(mode);
@@ -564,26 +568,26 @@ impl crate::State {
                 self.capture.output_resized();
                 if let Some(screencast) = &self.screencast {
                     screencast.resize(
-                        (p.size.width(), p.size.height()),
-                        self.stream.quality().fps.get(),
+                        (p.size().width(), p.size().height()),
+                        self.stream.quality().fps().get(),
                     );
                 }
                 self.refresh_eis_regions();
                 self.advance_generation()?;
-                self.emit(Event::ResizeApplied(pipe::ResizeApplied {
-                    request_id: p.request_id,
-                    size: p.size,
-                    scale_v120: p.scale_v120,
-                    generation: self.stream.generation(),
-                }));
+                self.emit(Event::ResizeApplied(pipe::ResizeApplied::new(
+                    p.request_id(),
+                    p.size(),
+                    p.scale_v120(),
+                    self.stream.generation(),
+                )));
             }
             Command::Quality(q) => {
                 let current = self.stream.quality();
                 if q != current {
-                    if q.fps != current.fps
+                    if q.fps() != current.fps()
                         && let Some(mut mode) = self.output.current_mode()
                     {
-                        mode.refresh = i32::try_from(q.fps.get())? * 1000;
+                        mode.refresh = i32::try_from(q.fps().get())? * 1000;
                         self.output.set_preferred(mode);
                         self.output
                             .change_current_state(Some(mode), None, None, None);
@@ -599,7 +603,7 @@ impl crate::State {
                 }
             }
             Command::Text(p) => {
-                if matches!(p.action, pipe::TextAction::Commit) {
+                if matches!(p.action(), pipe::TextAction::Commit) {
                     let serial = self.delivery.begin_input(source, delivery::FocusCause::Key);
                     let (target, text_field) = self.keyboard_target();
                     self.finish_input(
@@ -610,24 +614,24 @@ impl crate::State {
                         Some(text_field),
                     );
                 }
-                let cursor = i32::try_from(p.text.as_str().len())?;
+                let cursor = i32::try_from(p.text().as_str().len())?;
                 let text_input = self.seat.text_input();
                 let mut active = false;
                 text_input.with_active_text_input(|text, _| {
                     active = true;
-                    match p.action {
+                    match p.action() {
                         pipe::TextAction::Commit => {
                             text.preedit_string(None, 0, 0);
-                            text.commit_string(Some(p.text.as_str().into()));
+                            text.commit_string(Some(p.text().as_str().into()));
                         }
                         pipe::TextAction::Preedit => {
-                            text.preedit_string(Some(p.text.as_str().into()), cursor, cursor);
+                            text.preedit_string(Some(p.text().as_str().into()), cursor, cursor);
                         }
                     }
                 });
                 text_input.done(false);
-                if !active && matches!(p.action, pipe::TextAction::Commit) {
-                    self.text_keyboard.queue(p.text.as_str().to_owned());
+                if !active && matches!(p.action(), pipe::TextAction::Commit) {
+                    self.text_keyboard.queue(p.text().as_str().to_owned());
                     self.flush_text_keyboard();
                 }
             }

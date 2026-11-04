@@ -213,16 +213,16 @@ fn idle_compositor_stops_rendering_and_emitting_frames() {
             .into_iter()
             .find_map(|event| {
                 if let Event::Frame(frame) = event {
-                    Some(frame.generation)
+                    Some(frame.generation())
                 } else {
                     None
                 }
             })
         {
-            let ack = Command::KeyframeReadiness(KeyframeReadiness {
+            let ack = Command::KeyframeReadiness(KeyframeReadiness::new(
                 generation,
-                state: KeyframeState::Cached,
-            });
+                KeyframeState::Cached,
+            ));
             compositor
                 .0
                 .stdin
@@ -311,14 +311,21 @@ fn in_process_encoder_starts_with_a_key_frame_whose_stripes_tile_the_output() {
         assert!(Instant::now() < deadline, "first frame deadline");
         thread::sleep(Duration::from_millis(10));
     };
-    assert_eq!(frame.kind, FrameKind::Key, "first frame is not a key frame");
     assert_eq!(
-        (frame.metadata.width.get(), frame.metadata.height.get()),
+        frame.kind(),
+        FrameKind::Key,
+        "first frame is not a key frame"
+    );
+    assert_eq!(
+        (
+            frame.metadata().width().get(),
+            frame.metadata().height().get()
+        ),
         (800, 600)
     );
     // Stripe container: y and height (u16 LE), flags, length (u32 LE), access unit.
     let mut rows = Vec::new();
-    let mut data = &frame.data[..];
+    let mut data = &frame.data()[..];
     while !data.is_empty() {
         let y = u16::from_le_bytes([data[0], data[1]]);
         let height = u16::from_le_bytes([data[2], data[3]]);
@@ -1176,11 +1183,11 @@ fn gtk3_x11_window_keeps_its_size_after_output_resizes() {
     let original = geometry();
     assert_eq!((original.2, original.3), (1100, 680));
     for i in 0..6 {
-        let resize = Command::Resize(Resize {
-            size: FrameSize::new(if i % 2 == 0 { 1282 } else { 1280 }, 720).expect("size"),
-            scale_v120: ScaleV120::new(120).expect("scale"),
-            request_id: RequestId::new(i + 1).expect("request id"),
-        });
+        let resize = Command::Resize(Resize::new(
+            FrameSize::new(if i % 2 == 0 { 1282 } else { 1280 }, 720).expect("size"),
+            ScaleV120::new(120).expect("scale"),
+            RequestId::new(i + 1).expect("request id"),
+        ));
         compositor
             .0
             .stdin
@@ -1283,25 +1290,25 @@ Gtk.main()
     let mut seq = 0;
     let mut send = |command: Command| stdin.write_all(&command.encode()).expect("input");
     seq += 1;
-    send(Command::PointerAbsolute(PointerAbsolute {
-        x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
-        y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
-        sequence: InputSequence::new(seq).expect("sequence"),
-    }));
+    send(Command::PointerAbsolute(PointerAbsolute::new(
+        PointerCoordinate::new(x * 65535 / 800).expect("x"),
+        PointerCoordinate::new(y * 65535 / 600).expect("y"),
+        InputSequence::new(seq).expect("sequence"),
+    )));
     for state in [ButtonState::Pressed, ButtonState::Released] {
         seq += 1;
-        send(Command::PointerButton(PointerButton {
-            button: Button::Right,
+        send(Command::PointerButton(PointerButton::new(
+            Button::Right,
             state,
-            sequence: InputSequence::new(seq).expect("sequence"),
-        }));
+            InputSequence::new(seq).expect("sequence"),
+        )));
     }
     seq += 1;
-    send(Command::PointerAbsolute(PointerAbsolute {
-        x: PointerCoordinate::new((x + 10) * 65535 / 800).expect("x"),
-        y: PointerCoordinate::new((y + 13) * 65535 / 600).expect("y"),
-        sequence: InputSequence::new(seq).expect("sequence"),
-    }));
+    send(Command::PointerAbsolute(PointerAbsolute::new(
+        PointerCoordinate::new((x + 10) * 65535 / 800).expect("x"),
+        PointerCoordinate::new((y + 13) * 65535 / 600).expect("y"),
+        InputSequence::new(seq).expect("sequence"),
+    )));
     let pixel = || {
         // grim can fail transiently on a loaded host; retry the capture only.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1338,11 +1345,11 @@ Gtk.main()
     pixel();
     for state in [ButtonState::Pressed, ButtonState::Released] {
         seq += 1;
-        send(Command::PointerButton(PointerButton {
-            button: Button::Left,
+        send(Command::PointerButton(PointerButton::new(
+            Button::Left,
             state,
-            sequence: InputSequence::new(seq).expect("sequence"),
-        }));
+            InputSequence::new(seq).expect("sequence"),
+        )));
     }
     thread::sleep(Duration::from_millis(300));
     pixel();
@@ -1423,11 +1430,11 @@ fn text_reaches_terminal(wayland: bool) {
     for (state, sequence) in [(KeyState::Pressed, 1), (KeyState::Released, 2)] {
         stdin
             .write_all(
-                &Command::KeyboardKey(KeyboardKey {
-                    key: KeyCode::new(30).expect("key"),
+                &Command::KeyboardKey(KeyboardKey::new(
+                    KeyCode::new(30).expect("key"),
                     state,
-                    sequence: InputSequence::new(sequence).expect("sequence"),
-                })
+                    InputSequence::new(sequence).expect("sequence"),
+                ))
                 .encode(),
             )
             .expect("send control key");
@@ -1439,11 +1446,11 @@ fn text_reaches_terminal(wayland: bool) {
     for text in texts {
         stdin
             .write_all(
-                &Command::Text(Text {
-                    action: TextAction::Commit,
-                    sequence: InputSequence::new(3).expect("sequence"),
-                    text: InputText::new(text.clone()).expect("text"),
-                })
+                &Command::Text(Text::new(
+                    TextAction::Commit,
+                    InputSequence::new(3).expect("sequence"),
+                    InputText::new(text.clone()).expect("text"),
+                ))
                 .encode(),
             )
             .expect("send text");
@@ -1460,11 +1467,11 @@ fn text_reaches_terminal(wayland: bool) {
     for (state, sequence) in [(KeyState::Pressed, 4), (KeyState::Released, 5)] {
         stdin
             .write_all(
-                &Command::KeyboardKey(KeyboardKey {
-                    key: KeyCode::new(48).expect("key"),
+                &Command::KeyboardKey(KeyboardKey::new(
+                    KeyCode::new(48).expect("key"),
                     state,
-                    sequence: InputSequence::new(sequence).expect("sequence"),
-                })
+                    InputSequence::new(sequence).expect("sequence"),
+                ))
                 .encode(),
             )
             .expect("send trailing control key");
@@ -1667,11 +1674,11 @@ fn x11_resize(mode: &str) {
     let (x, y, _, height) = geometry();
     loop {
         sequence += 1;
-        send(Command::PointerAbsolute(PointerAbsolute {
-            x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
-            y: PointerCoordinate::new((y + height / 2) * 65535 / 600).expect("y"),
-            sequence: InputSequence::new(sequence).expect("sequence"),
-        }));
+        send(Command::PointerAbsolute(PointerAbsolute::new(
+            PointerCoordinate::new(x * 65535 / 800).expect("x"),
+            PointerCoordinate::new((y + height / 2) * 65535 / 600).expect("y"),
+            InputSequence::new(sequence).expect("sequence"),
+        )));
         if events(&mut compositor.0, &mut decoder)
             .contains(&Event::CursorShape(CursorShape::WResize))
         {
@@ -1697,29 +1704,29 @@ fn x11_resize(mode: &str) {
             if dy == 0 { y + height / 2 } else { y - 28 },
         );
         sequence += 1;
-        send(Command::PointerAbsolute(PointerAbsolute {
-            x: PointerCoordinate::new(px * 65535 / 800).expect("x"),
-            y: PointerCoordinate::new(py * 65535 / 600).expect("y"),
-            sequence: InputSequence::new(sequence).expect("sequence"),
-        }));
+        send(Command::PointerAbsolute(PointerAbsolute::new(
+            PointerCoordinate::new(px * 65535 / 800).expect("x"),
+            PointerCoordinate::new(py * 65535 / 600).expect("y"),
+            InputSequence::new(sequence).expect("sequence"),
+        )));
         sequence += 1;
-        send(Command::PointerButton(PointerButton {
-            button: Button::Left,
-            state: ButtonState::Pressed,
-            sequence: InputSequence::new(sequence).expect("sequence"),
-        }));
+        send(Command::PointerButton(PointerButton::new(
+            Button::Left,
+            ButtonState::Pressed,
+            InputSequence::new(sequence).expect("sequence"),
+        )));
         sequence += 1;
-        send(Command::PointerAbsolute(PointerAbsolute {
-            x: PointerCoordinate::new((px + dx) * 65535 / 800).expect("x"),
-            y: PointerCoordinate::new((py + dy) * 65535 / 600).expect("y"),
-            sequence: InputSequence::new(sequence).expect("sequence"),
-        }));
+        send(Command::PointerAbsolute(PointerAbsolute::new(
+            PointerCoordinate::new((px + dx) * 65535 / 800).expect("x"),
+            PointerCoordinate::new((py + dy) * 65535 / 600).expect("y"),
+            InputSequence::new(sequence).expect("sequence"),
+        )));
         sequence += 1;
-        send(Command::PointerButton(PointerButton {
-            button: Button::Left,
-            state: ButtonState::Released,
-            sequence: InputSequence::new(sequence).expect("sequence"),
-        }));
+        send(Command::PointerButton(PointerButton::new(
+            Button::Left,
+            ButtonState::Released,
+            InputSequence::new(sequence).expect("sequence"),
+        )));
         if mode == "increment" || mode == "aspect" || mode == "xterm" {
             thread::sleep(Duration::from_millis(300));
             let actual = geometry();
@@ -1857,11 +1864,11 @@ root.mainloop()
     let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
     fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
     let mut decoder = Decoder::<Event>::new();
-    let resize = Command::Resize(Resize {
-        size: FrameSize::new(800, 600).expect("size"),
-        scale_v120: ScaleV120::new(scale).expect("scale"),
-        request_id: RequestId::new(1).expect("request"),
-    });
+    let resize = Command::Resize(Resize::new(
+        FrameSize::new(800, 600).expect("size"),
+        ScaleV120::new(scale).expect("scale"),
+        RequestId::new(1).expect("request"),
+    ));
     compositor
         .0
         .stdin
@@ -1905,11 +1912,11 @@ root.mainloop()
             .expect("number")
     };
     let (x, y) = (value("X=") + 100, value("Y=") + 100);
-    let command = Command::PointerAbsolute(PointerAbsolute {
-        x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
-        y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
-        sequence: InputSequence::new(1).expect("sequence"),
-    });
+    let command = Command::PointerAbsolute(PointerAbsolute::new(
+        PointerCoordinate::new(x * 65535 / 800).expect("x"),
+        PointerCoordinate::new(y * 65535 / 600).expect("y"),
+        InputSequence::new(1).expect("sequence"),
+    ));
     compositor
         .0
         .stdin
@@ -1930,11 +1937,11 @@ root.mainloop()
     }
     thread::sleep(Duration::from_millis(300));
     for state in [ButtonState::Pressed, ButtonState::Released] {
-        let command = Command::PointerButton(PointerButton {
-            button: Button::Left,
+        let command = Command::PointerButton(PointerButton::new(
+            Button::Left,
             state,
-            sequence: InputSequence::new(2).expect("sequence"),
-        });
+            InputSequence::new(2).expect("sequence"),
+        ));
         compositor
             .0
             .stdin
@@ -1966,7 +1973,7 @@ root.mainloop()
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let updates = events(&mut compositor.0, &mut decoder);
-        if updates.iter().any(|event| matches!(event, Event::CursorPosition(pos) if pos.x.get() > x * 65535 / 800 + 1000)) { break }
+        if updates.iter().any(|event| matches!(event, Event::CursorPosition(pos) if pos.x().get() > x * 65535 / 800 + 1000)) { break }
         assert!(
             Instant::now() < deadline,
             "relative warp did not reach compositor"
@@ -2006,11 +2013,11 @@ fn xwayland_resource_dpi_tracks_output_scale() {
     let flags = OFlag::from_bits_truncate(fcntl(stdout, FcntlArg::F_GETFL).expect("get flags"));
     fcntl(stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("nonblocking");
     let mut decoder = Decoder::<Event>::new();
-    let resize = Command::Resize(Resize {
-        size: FrameSize::new(800, 600).expect("size"),
-        scale_v120: ScaleV120::new(240).expect("scale"),
-        request_id: RequestId::new(1).expect("request"),
-    });
+    let resize = Command::Resize(Resize::new(
+        FrameSize::new(800, 600).expect("size"),
+        ScaleV120::new(240).expect("scale"),
+        RequestId::new(1).expect("request"),
+    ));
     compositor
         .0
         .stdin
@@ -2347,21 +2354,15 @@ Gtk.main()
     };
     let point = |x: u32, y: u32| {
         move |sequence| {
-            Command::PointerAbsolute(PointerAbsolute {
-                x: PointerCoordinate::new(x * 65535 / 800).expect("x"),
-                y: PointerCoordinate::new(y * 65535 / 600).expect("y"),
+            Command::PointerAbsolute(PointerAbsolute::new(
+                PointerCoordinate::new(x * 65535 / 800).expect("x"),
+                PointerCoordinate::new(y * 65535 / 600).expect("y"),
                 sequence,
-            })
+            ))
         }
     };
     let left = |state| {
-        move |sequence| {
-            Command::PointerButton(PointerButton {
-                button: Button::Left,
-                state,
-                sequence,
-            })
-        }
+        move |sequence| Command::PointerButton(PointerButton::new(Button::Left, state, sequence))
     };
     for ((from_x, to_x), received, expected) in [
         ((180, 600), "x11-received", "from-wayland"),

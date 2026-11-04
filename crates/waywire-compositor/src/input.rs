@@ -35,7 +35,7 @@ pub(crate) struct Input {
     /// Sources already logged as dropped during the current browser lease.
     dropped_agent_sources: HashSet<KeyboardSource>,
     /// The agent input state last published.
-    published: pipe::AgentInput,
+    published: pipe::AgentInputState,
     browser_lease: bool,
     pointer_motion_kind: PointerMotionKind,
     /// The source the cursor position was last reported for.
@@ -51,7 +51,7 @@ impl Default for Input {
             buttons: HashMap::new(),
             agent_sources: HashSet::new(),
             dropped_agent_sources: HashSet::new(),
-            published: pipe::AgentInput::default(),
+            published: pipe::AgentInputState::default(),
             browser_lease: false,
             pointer_motion_kind: PointerMotionKind::Input,
             cursor_source: pipe::CursorSource::Browser,
@@ -85,7 +85,7 @@ impl Input {
     /// Count an agent source as connected. Returns the agent input state to
     /// publish when it changed.
     #[must_use]
-    pub(crate) fn register(&mut self, source: KeyboardSource) -> Option<pipe::AgentInput> {
+    pub(crate) fn register(&mut self, source: KeyboardSource) -> Option<pipe::AgentInputState> {
         if source == KeyboardSource::MAIN || !self.agent_sources.insert(source) {
             return None;
         }
@@ -95,7 +95,7 @@ impl Input {
     /// Stop counting a source as connected, once its held input is released.
     /// Returns the agent input state to publish when it changed.
     #[must_use]
-    pub(crate) fn disconnect(&mut self, source: KeyboardSource) -> Option<pipe::AgentInput> {
+    pub(crate) fn disconnect(&mut self, source: KeyboardSource) -> Option<pipe::AgentInputState> {
         self.dropped_agent_sources.remove(&source);
         if self.agent_sources.remove(&source) {
             self.publish()
@@ -126,11 +126,14 @@ impl Input {
 
     /// The agent input state, when it changed since it was last published.
     #[must_use]
-    pub(crate) fn publish(&mut self) -> Option<pipe::AgentInput> {
+    pub(crate) fn publish(&mut self) -> Option<pipe::AgentInputState> {
         let connected = !self.agent_sources.is_empty();
-        let state = pipe::AgentInput {
-            connected,
-            dropped: self.browser_lease && (connected || self.published.dropped),
+        let dropped = self.browser_lease && (connected || self.published.dropped());
+        let state = match (connected, dropped) {
+            (false, false) => pipe::AgentInputState::None,
+            (true, false) => pipe::AgentInputState::Driving,
+            (true, true) => pipe::AgentInputState::Paused,
+            (false, true) => pipe::AgentInputState::PausedDisconnected,
         };
         (state != self.published).then(|| {
             self.published = state;
@@ -139,7 +142,7 @@ impl Input {
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_input(&self) -> pipe::AgentInput {
+    pub(crate) fn agent_input(&self) -> pipe::AgentInputState {
         self.published
     }
 

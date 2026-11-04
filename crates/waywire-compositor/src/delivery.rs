@@ -827,18 +827,18 @@ impl Receipt {
     pub(crate) fn for_viewer(&self, sequence: pipe::InputSequence) -> pipe::InputReceipt {
         let none = WindowRecord::default();
         let window = self.delivery.window().unwrap_or(&none);
-        pipe::InputReceipt {
+        pipe::InputReceipt::new(
             sequence,
-            delivery: match self.delivery {
+            match self.delivery {
                 Destination::Window { .. } => pipe::ReceiptDelivery::Window,
                 Destination::Compositor { .. } => pipe::ReceiptDelivery::Compositor,
                 Destination::Nowhere => pipe::ReceiptDelivery::Nowhere,
                 Destination::Dropped => pipe::ReceiptDelivery::Dropped,
             },
-            window_id: pipe::ReceiptText::truncated(&window.id),
-            app_id: pipe::ReceiptText::truncated(&window.app_id),
-            title: pipe::ReceiptText::truncated(&window.title),
-        }
+            pipe::ReceiptText::truncated(&window.id),
+            pipe::ReceiptText::truncated(&window.app_id),
+            pipe::ReceiptText::truncated(&window.title),
+        )
     }
 }
 

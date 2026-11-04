@@ -740,11 +740,11 @@ impl State {
             self.emit(Event::CursorShape(pipe::CursorShape::Default));
         }
         let cursor_source = self.input.move_cursor(source);
-        self.emit(Event::CursorPosition(pipe::CursorPosition {
-            x: normalized_coordinate(location.x * scale, self.size.width()),
-            y: normalized_coordinate(location.y * scale, self.size.height()),
-            source: cursor_source,
-        }));
+        self.emit(Event::CursorPosition(pipe::CursorPosition::new(
+            normalized_coordinate(location.x * scale, self.size.width()),
+            normalized_coordinate(location.y * scale, self.size.height()),
+            cursor_source,
+        )));
     }
 
     pub(crate) fn pointer_button(
@@ -763,11 +763,11 @@ impl State {
             {
                 let location = pointer.current_location();
                 let scale = self.output.current_scale().fractional_scale();
-                self.emit(Event::CursorClick(pipe::CursorPosition {
-                    x: normalized_coordinate(location.x * scale, self.size.width()),
-                    y: normalized_coordinate(location.y * scale, self.size.height()),
-                    source: pipe::CursorSource::Agent,
-                }));
+                self.emit(Event::CursorClick(pipe::CursorPosition::new(
+                    normalized_coordinate(location.x * scale, self.size.width()),
+                    normalized_coordinate(location.y * scale, self.size.height()),
+                    pipe::CursorSource::Agent,
+                )));
             }
             self.pointer_button_inner(source, button, state)
         } else {
@@ -1356,7 +1356,7 @@ pub fn run(mut options: Config) -> Result<()> {
             next_frame = frame_deadline(
                 next_frame.max(started),
                 Instant::now(),
-                Duration::from_secs_f64(1.0 / f64::from(state.stream.quality().fps.get())),
+                Duration::from_secs_f64(1.0 / f64::from(state.stream.quality().fps().get())),
             );
         }
         state.poll_settled(delivery::monotonic_usec());
@@ -1552,8 +1552,10 @@ mod tests {
 
     fn lease(state: &mut State, held: bool) {
         state
-            .apply_command(Command::InputLease(waywire_protocol::pipe::InputLease {
-                held,
+            .apply_command(Command::InputLease(if held {
+                waywire_protocol::pipe::InputControl::Browser
+            } else {
+                waywire_protocol::pipe::InputControl::Agents
             }))
             .expect("lease command");
     }
@@ -1587,11 +1589,11 @@ mod tests {
         // symbols, so they are among them.
         let text: String = ('\u{3b1}'..='\u{3c9}').collect();
         state
-            .apply_command(Command::Text(pipe::Text {
-                action: pipe::TextAction::Commit,
-                sequence: InputSequence::new(1).expect("sequence"),
-                text: pipe::InputText::new(text).expect("text"),
-            }))
+            .apply_command(Command::Text(pipe::Text::new(
+                pipe::TextAction::Commit,
+                InputSequence::new(1).expect("sequence"),
+                pipe::InputText::new(text).expect("text"),
+            )))
             .expect("commit text");
         for key in [85, 89, 124] {
             let composed = keysyms(&mut state, key + 8);
@@ -1669,7 +1671,7 @@ mod tests {
                 .into_iter()
                 .filter_map(|event| {
                     if let Event::CursorPosition(position) = event {
-                        Some(position.source)
+                        Some(position.source())
                     } else {
                         None
                     }
@@ -1678,7 +1680,7 @@ mod tests {
             assert_eq!(positions, vec![expected]);
         }
         state.pointer_button(virtual_pointer, 0x110, ButtonState::Pressed);
-        assert!(state.stream.take_events().iter().any(|event| matches!(event, Event::CursorClick(position) if position.source == pipe::CursorSource::Agent)));
+        assert!(state.stream.take_events().iter().any(|event| matches!(event, Event::CursorClick(position) if position.source() == pipe::CursorSource::Agent)));
     }
 
     #[test]
@@ -1697,13 +1699,7 @@ mod tests {
                 .is_some_and(|buttons| buttons.contains(&0x110)),
             "the agent's button must reach the seat"
         );
-        assert_eq!(
-            state.input.agent_input(),
-            pipe::AgentInput {
-                connected: true,
-                dropped: false,
-            }
-        );
+        assert_eq!(state.input.agent_input(), pipe::AgentInputState::Driving);
     }
 
     #[test]
@@ -1729,25 +1725,16 @@ mod tests {
         lease(&mut state, true);
         state.keyboard_key(source, 30, KeyState::Pressed);
         state.disconnect_input_source(source);
-        assert!(
-            state
-                .stream
-                .take_events()
-                .contains(&Event::AgentInput(pipe::AgentInput {
-                    connected: false,
-                    dropped: true
-                }))
-        );
+        assert!(state.stream.take_events().contains(&Event::AgentInput(
+            pipe::AgentInputState::PausedDisconnected
+        )));
 
         lease(&mut state, false);
         assert!(
             state
                 .stream
                 .take_events()
-                .contains(&Event::AgentInput(pipe::AgentInput {
-                    connected: false,
-                    dropped: false
-                }))
+                .contains(&Event::AgentInput(pipe::AgentInputState::None))
         );
         lease(&mut state, true);
         assert!(state.stream.take_events().is_empty());
@@ -1790,13 +1777,7 @@ mod tests {
             state.stream.take_events().is_empty(),
             "dropped agent motion must not move the cursor or emit an event"
         );
-        assert_eq!(
-            state.input.agent_input(),
-            pipe::AgentInput {
-                connected: true,
-                dropped: true,
-            }
-        );
+        assert_eq!(state.input.agent_input(), pipe::AgentInputState::Paused);
 
         // Browser input still reaches the seat during its lease.
         state.keyboard_key(KeyboardSource::MAIN, 32, KeyState::Pressed);
@@ -1832,32 +1813,26 @@ mod tests {
                 .is_some_and(|buttons| buttons.contains(&0x111)),
             "agent buttons resume after handback"
         );
-        assert_eq!(
-            state.input.agent_input(),
-            pipe::AgentInput {
-                connected: true,
-                dropped: false,
-            }
-        );
+        assert_eq!(state.input.agent_input(), pipe::AgentInputState::Driving);
     }
 
     fn resize(state: &mut State, width: u32, height: u32, scale_v120: u16) {
         state
-            .apply_command(Command::Resize(pipe::Resize {
-                size: FrameSize::new(width, height).expect("test size"),
-                scale_v120: pipe::ScaleV120::new(scale_v120).expect("test scale"),
-                request_id: pipe::RequestId::new(1).expect("test request"),
-            }))
+            .apply_command(Command::Resize(pipe::Resize::new(
+                FrameSize::new(width, height).expect("test size"),
+                pipe::ScaleV120::new(scale_v120).expect("test scale"),
+                pipe::RequestId::new(1).expect("test request"),
+            )))
             .expect("resize command");
     }
 
     fn browser_absolute(state: &mut State, x: u32, y: u32) {
         state
-            .apply_command(Command::PointerAbsolute(pipe::PointerAbsolute {
-                x: pipe::PointerCoordinate::new(x).expect("x"),
-                y: pipe::PointerCoordinate::new(y).expect("y"),
-                sequence: InputSequence::new(1).expect("sequence"),
-            }))
+            .apply_command(Command::PointerAbsolute(pipe::PointerAbsolute::new(
+                pipe::PointerCoordinate::new(x).expect("x"),
+                pipe::PointerCoordinate::new(y).expect("y"),
+                InputSequence::new(1).expect("sequence"),
+            )))
             .expect("pointer command");
     }
 
@@ -1869,7 +1844,7 @@ mod tests {
             .into_iter()
             .filter_map(|event| {
                 if let Event::CursorPosition(position) = event {
-                    Some((position.x.get(), position.y.get()))
+                    Some((position.x().get(), position.y().get()))
                 } else {
                     None
                 }
@@ -1939,11 +1914,11 @@ mod tests {
         browser_absolute(&mut state, 21845, 21845);
         let relative = |state: &mut State, dx: f32, dy: f32| {
             state
-                .apply_command(Command::PointerRelative(pipe::PointerRelative {
-                    dx: pipe::PointerDelta::new(dx).expect("dx"),
-                    dy: pipe::PointerDelta::new(dy).expect("dy"),
-                    sequence: InputSequence::new(2).expect("sequence"),
-                }))
+                .apply_command(Command::PointerRelative(pipe::PointerRelative::new(
+                    pipe::PointerDelta::new(dx).expect("dx"),
+                    pipe::PointerDelta::new(dy).expect("dy"),
+                    InputSequence::new(2).expect("sequence"),
+                )))
                 .expect("relative command");
         };
         // Three pixels right and six up at 1.5 are two and four logical units.
