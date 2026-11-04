@@ -400,20 +400,21 @@ impl Stream {
             self.quality.scale_percent,
             self.quality.fps,
         );
-        let config = EncoderConfig {
-            raw_width: FrameDimension::new(size.width().try_into()?)?,
-            raw_height: FrameDimension::new(size.height().try_into()?)?,
-            encoded_width: FrameDimension::new(width)?,
-            encoded_height: FrameDimension::new(height)?,
-            fps: self.quality.fps,
-            bitrate_kbps: self.quality.bitrate_kbps,
-            crf: self.quality.crf,
-            chroma: self.quality.chroma,
-        };
+        let config = EncoderConfig::new(
+            (
+                FrameDimension::new(size.width().try_into()?)?,
+                FrameDimension::new(size.height().try_into()?)?,
+            ),
+            (FrameDimension::new(width)?, FrameDimension::new(height)?),
+            self.quality.fps,
+            self.quality.bitrate_kbps,
+            self.quality.crf,
+            self.quality.chroma,
+        );
         let metadata = FrameMetadata {
             generation: self.generation,
-            width: config.encoded_width,
-            height: config.encoded_height,
+            width: config.encoded_size().0,
+            height: config.encoded_size().1,
             capture_nanos: latency::monotonic_nanos(),
             sequence: self.sequence,
             input_sequence: self.latest_input_sequence,

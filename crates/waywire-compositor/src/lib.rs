@@ -888,13 +888,13 @@ impl State {
                 && let Some((chip, action)) =
                     chrome::taskbar_click(self.taskbar_chips(), output, position)
             {
-                let window = match chip.target {
+                let window = match chip.target() {
                     waywire_decorations::ChipTarget::Window { window, .. } => {
-                        self.window_action(&window, action);
-                        Some(window)
+                        self.window_action(window, action);
+                        Some(window.clone())
                     }
                     waywire_decorations::ChipTarget::Pin { index, .. } => {
-                        self.launch_pin(index);
+                        self.launch_pin(*index);
                         None
                     }
                 };

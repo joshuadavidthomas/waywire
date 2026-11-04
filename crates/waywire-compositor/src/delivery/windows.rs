@@ -135,7 +135,7 @@ impl State {
         scale: f64,
     ) -> Option<WindowEntry> {
         let (geometry, frame) = bounds(window, self.space.element_location(window)?);
-        let maximized = waywire_decorations::window_flags(window).size
+        let maximized = waywire_decorations::window_flags(window).size()
             == waywire_decorations::SizeMode::Maximized;
         let fullscreen = window.toplevel().map_or_else(
             || {

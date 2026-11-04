@@ -177,7 +177,7 @@ impl Chrome {
         if self
             .window_menu
             .as_ref()
-            .is_some_and(|menu| &menu.window == window)
+            .is_some_and(|menu| menu.window() == window)
         {
             self.window_menu = None;
             return true;
@@ -204,7 +204,11 @@ impl Chrome {
             window,
             pointer,
             output,
-            always_on_top,
+            if always_on_top {
+                waywire_decorations::Stacking::AlwaysOnTop
+            } else {
+                waywire_decorations::Stacking::Normal
+            },
         ));
     }
 
@@ -231,7 +235,7 @@ impl Chrome {
         let menu = self.window_menu.as_ref()?;
         let selected = menu.click(position);
         let outside = !menu.contains(position);
-        let window = menu.window.clone();
+        let window = menu.window().clone();
         let closed = outside || (button == 0x110 && selected.is_some());
         if closed {
             self.window_menu = None;
@@ -248,7 +252,7 @@ impl Chrome {
     pub(crate) fn escape_menu(&mut self, source: KeyboardSource) -> Option<Window> {
         let menu = self.window_menu.take()?;
         self.menu_escape = Some(source);
-        Some(menu.window)
+        Some(menu.window().clone())
     }
 
     /// Whether this Escape release belongs to a press that closed the menu.
@@ -478,9 +482,9 @@ impl Chrome {
         let window_chip = |window: Window, pin: Option<usize>, fallback: String| {
             let title = toplevel_list::metadata(&window).map_or(fallback, |metadata| metadata.0);
             let state = windows.get(&window);
-            TaskbarChip {
+            TaskbarChip::new(
                 title,
-                target: ChipTarget::Window {
+                ChipTarget::Window {
                     visibility: if state.is_some_and(|state| state.minimized) {
                         Visibility::Minimized
                     } else {
@@ -496,7 +500,7 @@ impl Chrome {
                     window,
                     pin,
                 },
-            }
+            )
         };
         let mut chips: Vec<_> = self
             .pins
@@ -512,9 +516,9 @@ impl Chrome {
                     .to_owned();
                 match matches[index].clone() {
                     Some(window) => window_chip(window, Some(index), name),
-                    None => TaskbarChip {
-                        title: name,
-                        target: ChipTarget::Pin {
+                    None => TaskbarChip::new(
+                        name,
+                        ChipTarget::Pin {
                             index,
                             process: if pin.child.is_some() {
                                 PinProcess::Running
@@ -522,7 +526,7 @@ impl Chrome {
                                 PinProcess::Stopped
                             },
                         },
-                    },
+                    ),
                 }
             })
             .collect();
@@ -653,7 +657,7 @@ pub(crate) fn taskbar_click(
         let rect = waywire_decorations::chip_rectangle(output.size.w, count, index)?;
         rect.to_f64().contains(relative).then_some(chip)
     })?;
-    let action = match chip.target {
+    let action = match chip.target() {
         ChipTarget::Window {
             visibility: Visibility::Minimized,
             ..

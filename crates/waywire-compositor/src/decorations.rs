@@ -70,7 +70,7 @@ impl State {
         point: Point<f64, Logical>,
     ) -> Option<(Window, DecorationAction)> {
         self.decoration_node_under(point)
-            .and_then(|(window, node)| Some((window, node.action?)))
+            .and_then(|(window, node)| Some((window, node.action()?)))
     }
 
     pub(crate) fn decoration_cursor_under(
@@ -78,7 +78,7 @@ impl State {
         point: Point<f64, Logical>,
     ) -> Option<CursorShape> {
         self.decoration_node_under(point)
-            .map(|(_, node)| node.cursor)
+            .map(|(_, node)| node.cursor())
     }
 
     fn decoration_node_under(&self, point: Point<f64, Logical>) -> Option<(Window, Node)> {
@@ -229,17 +229,21 @@ impl State {
             let size = window.geometry().size;
             let width = decoration_width(size.w, output_width);
             let decoration = state.decoration.get_or_insert_with(Decoration::default);
-            let appearance = Appearance {
-                title: if title.is_empty() {
+            let appearance = Appearance::new(
+                if title.is_empty() {
                     "Untitled".into()
                 } else {
                     title
                 },
                 width,
                 scale,
-                active,
-                window_flags: window_flags(window),
-                close: if !hover.as_ref().is_some_and(|(target, action)| {
+                if active {
+                    waywire_decorations::Activation::Active
+                } else {
+                    waywire_decorations::Activation::Inactive
+                },
+                window_flags(window),
+                if !hover.as_ref().is_some_and(|(target, action)| {
                     target == window && *action == DecorationAction::Close
                 }) {
                     CloseButton::Idle
@@ -252,7 +256,7 @@ impl State {
                 } else {
                     CloseButton::Hovered
                 },
-            };
+            );
             // One broken decoration must not fail the render — and the session
             // — so log it and skip this window's decoration.
             if let Err(error) = decoration.update(appearance) {

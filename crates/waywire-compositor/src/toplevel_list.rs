@@ -1481,7 +1481,7 @@ mod tests {
             "pending fullscreen must not hide chrome"
         );
         assert!(
-            waywire_decorations::window_flags(&window).size
+            waywire_decorations::window_flags(&window).size()
                 == waywire_decorations::SizeMode::Floating,
             "pending maximize must not change chrome"
         );
@@ -1494,7 +1494,7 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert!(!waywire_decorations::decorated(&window));
         assert_eq!(
-            waywire_decorations::window_flags(&window).size,
+            waywire_decorations::window_flags(&window).size(),
             waywire_decorations::SizeMode::Maximized
         );
         assert!(waywire_decorations::above_taskbar(&window));
@@ -1533,7 +1533,7 @@ mod tests {
                 .iter()
                 .map(|chip| {
                     matches!(
-                        chip.target,
+                        chip.target(),
                         waywire_decorations::ChipTarget::Window {
                             attention: waywire_decorations::Attention::Focused,
                             ..
@@ -1577,7 +1577,7 @@ mod tests {
             state
                 .taskbar_chips()
                 .iter()
-                .map(|chip| chip.title.as_str())
+                .map(waywire_decorations::TaskbarChip::title)
                 .collect::<Vec<_>>(),
             ["First", "Second"]
         );
@@ -1586,7 +1586,7 @@ mod tests {
         assert_eq!(focused(&state), [true, false]);
         state.window_action(&first, crate::WindowAction::Minimize);
         assert!(matches!(
-            state.taskbar_chips()[0].target,
+            state.taskbar_chips()[0].target(),
             waywire_decorations::ChipTarget::Window {
                 visibility: waywire_decorations::Visibility::Minimized,
                 ..
@@ -1602,7 +1602,7 @@ mod tests {
         state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen, false);
         second_top.set_title("Renamed".into());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert_eq!(state.taskbar_chips()[1].title, "Renamed");
+        assert_eq!(state.taskbar_chips()[1].title(), "Renamed");
         second_top.set_parent(Some(&first_top));
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(state.taskbar_chips().len(), 1);
@@ -1613,7 +1613,7 @@ mod tests {
         let chips = state.taskbar_chips();
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].window(), Some(&second));
-        assert_eq!(chips[0].title, "Renamed");
+        assert_eq!(chips[0].title(), "Renamed");
     }
 
     /// A client killed with its window mapped never unmaps it; its chip must
@@ -1689,7 +1689,7 @@ mod tests {
         assert_eq!(
             chips
                 .iter()
-                .map(|chip| chip.title.as_str())
+                .map(waywire_decorations::TaskbarChip::title)
                 .collect::<Vec<_>>(),
             ["Kept"],
             "only the live window has a chip"
@@ -1697,7 +1697,7 @@ mod tests {
         assert_eq!(chips[0].window(), Some(&kept));
         assert!(
             matches!(
-                chips[0].target,
+                chips[0].target(),
                 waywire_decorations::ChipTarget::Window {
                     attention: waywire_decorations::Attention::Focused,
                     ..
@@ -1959,7 +1959,7 @@ mod tests {
         state.reap_pins();
         assert!(state.chrome.pins_mut()[0].pid.is_none());
         assert!(matches!(
-            state.taskbar_chips()[0].target,
+            state.taskbar_chips()[0].target(),
             waywire_decorations::ChipTarget::Pin {
                 process: waywire_decorations::PinProcess::Stopped,
                 ..
