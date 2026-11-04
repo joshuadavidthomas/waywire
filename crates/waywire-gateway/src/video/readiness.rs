@@ -7,9 +7,7 @@ use std::sync::PoisonError;
 /// Each critical section only reads the state or replaces the `Copy` value in one assignment, so
 /// recovering a poisoned mutex cannot expose a partly-applied transition.
 #[derive(Clone)]
-pub(crate) struct Readiness {
-    state: Arc<Mutex<ReadinessState>>,
-}
+pub(crate) struct Readiness(Arc<Mutex<ReadinessState>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadinessState {
@@ -21,13 +19,11 @@ pub(crate) enum ReadinessState {
 
 impl Readiness {
     pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ReadinessState::WaitingForFirstFrame)),
-        }
+        Self(Arc::new(Mutex::new(ReadinessState::WaitingForFirstFrame)))
     }
 
     pub(crate) fn mark_video_ready(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         *state = match *state {
             ReadinessState::WaitingForFirstFrame
             | ReadinessState::Ready
@@ -37,7 +33,7 @@ impl Readiness {
     }
 
     pub(crate) fn await_keyframe(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         *state = match *state {
             ReadinessState::WaitingForFirstFrame => ReadinessState::WaitingForFirstFrame,
             ReadinessState::Ready | ReadinessState::WaitingForKeyframe => {
@@ -48,21 +44,21 @@ impl Readiness {
     }
 
     pub(crate) fn stop(&self) {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = ReadinessState::Stopped;
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = ReadinessState::Stopped;
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) == ReadinessState::Ready
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) == ReadinessState::Ready
     }
 
     pub(crate) fn needs_startup_frame(&self) -> bool {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
             == ReadinessState::WaitingForFirstFrame
     }
 
     #[cfg(test)]
     pub(crate) fn state(&self) -> ReadinessState {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

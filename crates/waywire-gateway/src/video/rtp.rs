@@ -7,21 +7,44 @@ pub(super) const RTP_CLOCK_HZ: u32 = 90_000;
 const DYNAMIC_PAYLOAD_TYPE: u8 = 96;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RtpTimestamp(pub(super) u32);
+pub(super) struct RtpTimestamp(u32);
 
 impl RtpTimestamp {
+    #[cfg(test)]
+    pub(super) fn new(value: u32) -> Self {
+        Self(value)
+    }
+    pub(super) fn get(self) -> u32 {
+        self.0
+    }
+
     pub(super) fn elapsed_since(self, earlier: Self) -> RtpTicks {
         RtpTicks(self.0.wrapping_sub(earlier.0))
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RtpTicks(pub(super) u32);
+pub(super) struct RtpTicks(u32);
+
+impl RtpTicks {
+    #[cfg(test)]
+    pub(super) fn new(value: u32) -> Self {
+        Self(value)
+    }
+    pub(super) fn get(self) -> u32 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RtpSequence(pub(super) u16);
+pub(super) struct RtpSequence(u16);
 
 impl RtpSequence {
+    #[cfg(test)]
+    pub(super) fn new(value: u16) -> Self {
+        Self(value)
+    }
+
     pub(super) fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
     }
@@ -49,11 +72,45 @@ impl NalType {
 
 #[derive(Debug)]
 pub(super) struct Packet {
-    pub(super) end: AccessUnitEnd,
-    pub(super) sequence: RtpSequence,
-    pub(super) timestamp: RtpTimestamp,
-    pub(super) generation: Generation,
-    pub(super) payload: Vec<u8>,
+    end: AccessUnitEnd,
+    sequence: RtpSequence,
+    timestamp: RtpTimestamp,
+    generation: Generation,
+    payload: Vec<u8>,
+}
+
+impl Packet {
+    #[cfg(test)]
+    pub(super) fn new(
+        end: AccessUnitEnd,
+        sequence: RtpSequence,
+        timestamp: RtpTimestamp,
+        generation: Generation,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            end,
+            sequence,
+            timestamp,
+            generation,
+            payload,
+        }
+    }
+    pub(super) fn end(&self) -> AccessUnitEnd {
+        self.end
+    }
+    pub(super) fn sequence(&self) -> RtpSequence {
+        self.sequence
+    }
+    pub(super) fn timestamp(&self) -> RtpTimestamp {
+        self.timestamp
+    }
+    pub(super) fn generation(&self) -> Generation {
+        self.generation
+    }
+    pub(super) fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +136,7 @@ pub(super) enum PacketReject {
     #[error("wrong RTP payload type or empty payload")]
     WrongPayloadTypeOrEmptyPayload,
     #[error("RTP SSRC generation must be positive")]
-    ZeroGeneration,
+    ZeroGeneration(#[source] waywire_protocol::InvalidValue),
     #[error("non-loopback RTP source {address}")]
     NonLoopbackSource { address: SocketAddr },
     #[error("RTP timestamp changed during FU-A")]
@@ -137,16 +194,27 @@ pub(super) fn decode_packet(data: &[u8]) -> Result<Packet, PacketReject> {
     if start == end || data[1] & 0x7f != DYNAMIC_PAYLOAD_TYPE {
         return Err(PacketReject::WrongPayloadTypeOrEmptyPayload);
     }
-    let generation = Generation::new(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
-        .map_err(|_invalid_generation| PacketReject::ZeroGeneration)?;
+    let generation_bytes = data[8..12]
+        .first_chunk()
+        .ok_or(PacketReject::InvalidHeader)?;
+    let generation = Generation::new(u32::from_be_bytes(*generation_bytes))
+        .map_err(PacketReject::ZeroGeneration)?;
     Ok(Packet {
         end: if data[1] & 0x80 == 0 {
             AccessUnitEnd::More
         } else {
             AccessUnitEnd::Final
         },
-        sequence: RtpSequence(u16::from_be_bytes([data[2], data[3]])),
-        timestamp: RtpTimestamp(u32::from_be_bytes([data[4], data[5], data[6], data[7]])),
+        sequence: RtpSequence(u16::from_be_bytes(
+            *data[2..4]
+                .first_chunk()
+                .ok_or(PacketReject::InvalidHeader)?,
+        )),
+        timestamp: RtpTimestamp(u32::from_be_bytes(
+            *data[4..8]
+                .first_chunk()
+                .ok_or(PacketReject::InvalidHeader)?,
+        )),
         generation,
         payload: data[start..end].to_vec(),
     })
@@ -322,7 +390,7 @@ mod tests {
             );
             let mut changed = bytes;
             changed[8..12].fill(0);
-            prop_assert_eq!(decode_packet(&changed).err(), Some(PacketReject::ZeroGeneration));
+            prop_assert!(matches!(decode_packet(&changed), Err(PacketReject::ZeroGeneration(_))));
         }
     }
 

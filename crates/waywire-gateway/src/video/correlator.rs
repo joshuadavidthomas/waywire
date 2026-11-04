@@ -28,8 +28,14 @@ struct Pending<T> {
 }
 
 pub(super) struct PendingUnit {
-    pub(super) unit: Unit,
-    pub(super) bytes: OwnedSemaphorePermit,
+    unit: Unit,
+    bytes: OwnedSemaphorePermit,
+}
+
+impl PendingUnit {
+    pub(super) fn new(unit: Unit, bytes: OwnedSemaphorePermit) -> Self {
+        Self { unit, bytes }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,8 +65,23 @@ pub(super) enum ResyncReason {
 #[must_use]
 #[derive(Debug)]
 pub(super) struct Correlation {
-    pub(super) outcome: CorrelationOutcome,
-    pub(super) unmatched_metadata: usize,
+    outcome: CorrelationOutcome,
+    unmatched_metadata: usize,
+}
+
+impl Correlation {
+    pub(super) fn frames(frames: Vec<VideoSample>) -> Self {
+        Self {
+            outcome: CorrelationOutcome::Frames(frames),
+            unmatched_metadata: 0,
+        }
+    }
+    pub(super) fn unmatched_metadata(&self) -> usize {
+        self.unmatched_metadata
+    }
+    pub(super) fn into_outcome(self) -> CorrelationOutcome {
+        self.outcome
+    }
 }
 
 #[derive(Debug)]
@@ -136,8 +157,8 @@ impl Correlator {
                     generation,
                     timestamp,
                     fps,
-                } if generation == unit.generation => {
-                    let ticks = unit.timestamp.elapsed_since(timestamp);
+                } if generation == unit.generation() => {
+                    let ticks = unit.timestamp().elapsed_since(timestamp);
                     let Some(gap) = metadata_gap(ticks, fps) else {
                         return self.resync(
                             ResyncReason::TimestampGap { ticks, fps },
@@ -148,7 +169,7 @@ impl Correlator {
                 }
                 TimestampAnchor::Present { .. } | TimestampAnchor::Needed => NonZeroUsize::MIN,
             };
-            let matched = self.take_nth_generation_metadata(unit.generation, metadata_count);
+            let matched = self.take_nth_generation_metadata(unit.generation(), metadata_count);
             let (metadata, unmatched) = match matched {
                 MetadataMatch::Matched {
                     metadata,
@@ -173,8 +194,8 @@ impl Correlator {
                 target: "waywire_latency",
                 stage = "correlated",
                 sequence = metadata.sequence,
-                generation = unit.generation.get(),
-                rtp_timestamp = unit.timestamp.0,
+                generation = unit.generation().get(),
+                rtp_timestamp = unit.timestamp().get(),
                 at_ns = super::monotonic_nanos(),
             );
             let generation_changed = !matches!(
@@ -183,7 +204,7 @@ impl Correlator {
             );
             let recovering = self.keyframe == GopState::Recovering;
             let continuity = if recovering
-                || unit.continuity == Continuity::AfterGap
+                || unit.continuity() == Continuity::AfterGap
                 || unmatched > 0
                 || generation_changed
             {
@@ -193,19 +214,20 @@ impl Correlator {
             };
             self.timestamp_anchor = TimestampAnchor::Present {
                 generation: metadata.generation,
-                timestamp: unit.timestamp,
+                timestamp: unit.timestamp(),
                 fps: metadata.fps,
             };
-            if recovering && unit.kind != FrameKind::Key {
+            if recovering && unit.kind() != FrameKind::Key {
                 continue;
             }
             if recovering {
                 self.keyframe = GopState::KeyframeCached;
             }
+            let kind = unit.kind();
             samples.push(VideoSample {
-                data: unit.data,
+                data: unit.into_data(),
                 layout: Layout::Whole,
-                kind: unit.kind,
+                kind,
                 continuity,
                 metadata,
             });
@@ -266,10 +288,10 @@ impl Correlator {
 }
 
 fn metadata_gap(ticks: RtpTicks, fps: Fps) -> Option<NonZeroUsize> {
-    if ticks.0 == 0 {
+    if ticks.get() == 0 {
         return Some(NonZeroUsize::MIN);
     }
-    let count = (u64::from(ticks.0) * u64::from(fps.get()) + u64::from(RTP_CLOCK_HZ / 2))
+    let count = (u64::from(ticks.get()) * u64::from(fps.get()) + u64::from(RTP_CLOCK_HZ / 2))
         / u64::from(RTP_CLOCK_HZ);
     if count == 0 {
         return Some(NonZeroUsize::MIN);
@@ -408,7 +430,7 @@ mod tests {
             packet(2, 6_000, 2, AccessUnitEnd::Final, &[5, 4]),
         )
         .expect("current generation packet should complete an access unit");
-        assert_eq!(current.continuity, Continuity::Continuous);
+        assert_eq!(current.continuity(), Continuity::Continuous);
         let samples = push_unit(&mut correlator, pending(current, &budget));
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].metadata.sequence, 3);
@@ -441,7 +463,7 @@ mod tests {
     fn huge_timestamp_gap_fails_instead_of_guessing() {
         assert!(
             metadata_gap(
-                RtpTicks(u32::MAX),
+                RtpTicks::new(u32::MAX),
                 waywire_protocol::pipe::Fps::new(60).expect("test frame rate should be valid"),
             )
             .is_none()
@@ -613,7 +635,7 @@ mod tests {
 
         push_metadata(&mut correlator, metadata(3, 1));
         let mut delta = unit(2, 1);
-        delta.kind = FrameKind::Delta;
+        delta.set_kind(FrameKind::Delta);
         assert!(push_unit(&mut correlator, pending(delta, &budget)).is_empty());
 
         push_metadata(&mut correlator, metadata(4, 1));

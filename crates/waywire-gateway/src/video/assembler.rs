@@ -54,11 +54,52 @@ impl Default for Assembler {
 
 #[derive(Debug)]
 pub(super) struct Unit {
-    pub(super) data: Arc<[u8]>,
-    pub(super) kind: FrameKind,
-    pub(super) continuity: Continuity,
-    pub(super) timestamp: RtpTimestamp,
-    pub(super) generation: Generation,
+    data: Arc<[u8]>,
+    kind: FrameKind,
+    continuity: Continuity,
+    timestamp: RtpTimestamp,
+    generation: Generation,
+}
+
+impl Unit {
+    #[cfg(test)]
+    pub(super) fn new(
+        data: Arc<[u8]>,
+        kind: FrameKind,
+        continuity: Continuity,
+        timestamp: RtpTimestamp,
+        generation: Generation,
+    ) -> Self {
+        Self {
+            data,
+            kind,
+            continuity,
+            timestamp,
+            generation,
+        }
+    }
+    pub(super) fn data(&self) -> &[u8] {
+        &self.data
+    }
+    pub(super) fn into_data(self) -> Arc<[u8]> {
+        self.data
+    }
+    pub(super) fn kind(&self) -> FrameKind {
+        self.kind
+    }
+    pub(super) fn continuity(&self) -> Continuity {
+        self.continuity
+    }
+    pub(super) fn timestamp(&self) -> RtpTimestamp {
+        self.timestamp
+    }
+    pub(super) fn generation(&self) -> Generation {
+        self.generation
+    }
+    #[cfg(test)]
+    pub(super) fn set_kind(&mut self, kind: FrameKind) {
+        self.kind = kind;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,11 +161,18 @@ pub(super) enum AssemblyOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DroppedPackets {
-    pub(super) packets: NonZeroU64,
-    pub(super) reason: AssemblyDrop,
+    packets: NonZeroU64,
+    reason: AssemblyDrop,
 }
 
 impl DroppedPackets {
+    pub(super) fn packets(self) -> NonZeroU64 {
+        self.packets
+    }
+    pub(super) fn reason(self) -> AssemblyDrop {
+        self.reason
+    }
+
     fn record(slot: &mut Option<Self>, packets: NonZeroU64, reason: AssemblyDrop) {
         let packets = slot.map_or(packets, |dropped| {
             dropped.packets.saturating_add(packets.get())
@@ -135,11 +183,18 @@ impl DroppedPackets {
 
 #[derive(Debug)]
 pub(super) struct AssemblyResult {
-    pub(super) outcome: Result<AssemblyOutcome, PacketReject>,
-    pub(super) drops: Option<DroppedPackets>,
+    outcome: Result<AssemblyOutcome, PacketReject>,
+    drops: Option<DroppedPackets>,
 }
 
 impl AssemblyResult {
+    pub(super) fn drops(&self) -> Option<DroppedPackets> {
+        self.drops
+    }
+    pub(super) fn into_outcome(self) -> Result<AssemblyOutcome, PacketReject> {
+        self.outcome
+    }
+
     fn accepted(outcome: AssemblyOutcome, drops: Option<DroppedPackets>) -> Self {
         Self {
             outcome: Ok(outcome),
@@ -170,7 +225,10 @@ impl Assembler {
 
     pub(super) fn consume(&mut self, packet: Packet) -> AssemblyResult {
         let mut drops = None;
-        match self.cursor.advance(packet.generation, packet.sequence) {
+        let generation = packet.generation();
+        let timestamp = packet.timestamp();
+        let end = packet.end();
+        match self.cursor.advance(generation, packet.sequence()) {
             CursorAdvance::Stale => {
                 // SSRC is the monotonic frame generation. A packet from an older
                 // encoder must not alter access-unit or restart state.
@@ -186,7 +244,7 @@ impl Assembler {
             CursorAdvance::Started | CursorAdvance::Continuous => {}
         }
         if let AccessUnit::Collecting(unit) = &self.unit
-            && unit.timestamp != packet.timestamp
+            && unit.timestamp != timestamp
         {
             let fragment = unit.fragment;
             self.drop_unit(&mut drops, AssemblyDrop::TimestampDiscontinuity);
@@ -194,8 +252,8 @@ impl Assembler {
                 return AssemblyResult::rejected(PacketReject::TimestampChangedDuringFu, drops);
             }
         }
-        let payload = packet.payload;
-        let unit = match self.unit.append(packet.timestamp, &payload, packet.end) {
+        let payload = packet.into_payload();
+        let unit = match self.unit.append(timestamp, &payload, end) {
             Ok(UnitAppend::Incomplete) => {
                 return AssemblyResult::accepted(AssemblyOutcome::Incomplete, drops);
             }
@@ -233,7 +291,7 @@ impl Assembler {
                 kind: unit.kind,
                 continuity,
                 timestamp: unit.timestamp,
-                generation: packet.generation,
+                generation,
             }),
             drops,
         )
@@ -381,11 +439,11 @@ impl PartialUnit {
 
     fn append_stap(&mut self, mut payload: &[u8]) -> Result<(), PacketReject> {
         while !payload.is_empty() {
-            if payload.len() < 2 {
-                return Err(PacketReject::TruncatedStapLength);
-            }
-            let length = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
-            payload = &payload[2..];
+            let (length, rest) = payload
+                .split_first_chunk::<2>()
+                .ok_or(PacketReject::TruncatedStapLength)?;
+            let length = usize::from(u16::from_be_bytes(*length));
+            payload = rest;
             if length == 0 || length > payload.len() {
                 return Err(PacketReject::InvalidStapNalLength);
             }
@@ -573,7 +631,7 @@ mod tests {
             prop_assert_eq!(&*unit.data, annex_b.as_slice());
             let keyframe = units.iter().any(|(nal, _)| nal[0] & 31 == 5);
             prop_assert_eq!(unit.kind, if keyframe { FrameKind::Key } else { FrameKind::Delta });
-            prop_assert_eq!(unit.timestamp, RtpTimestamp(timestamp));
+            prop_assert_eq!(unit.timestamp, RtpTimestamp::new(timestamp));
         }
     }
 

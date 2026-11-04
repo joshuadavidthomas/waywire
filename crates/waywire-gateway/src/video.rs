@@ -8,8 +8,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
-use anyhow::anyhow;
+use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -92,6 +91,26 @@ enum PipelineMessage {
     Recovery,
 }
 
+#[derive(Debug, Error)]
+#[error("video pipeline stopped")]
+pub(crate) struct PipelineError(#[source] mpsc::error::SendError<PipelineMessage>);
+
+#[derive(Debug, Error)]
+pub(crate) enum ReceiveError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("access unit size overflow")]
+    Size(#[source] std::num::TryFromIntError),
+    #[error("video byte budget closed")]
+    ByteBudget(#[source] tokio::sync::AcquireError),
+    #[error(transparent)]
+    Pipeline(#[from] PipelineError),
+}
+
+#[derive(Debug, Error)]
+#[error("video pipeline closed")]
+pub(crate) struct PipelineClosed;
+
 enum WorkerWake {
     Message(PipelineMessage),
     KeyWanted,
@@ -108,9 +127,7 @@ struct PacketDropReport {
 }
 
 #[derive(Debug)]
-struct MetadataDropReport {
-    unmatched: usize,
-}
+struct MetadataDropReport(usize);
 
 #[derive(Debug)]
 struct DropSummary<R> {
@@ -184,10 +201,8 @@ impl MetadataDropSummary {
         if count == 0 {
             return;
         }
-        let pending = self
-            .pending
-            .get_or_insert(MetadataDropReport { unmatched: 0 });
-        pending.unmatched = pending.unmatched.saturating_add(count);
+        let pending = self.pending.get_or_insert(MetadataDropReport(0));
+        pending.0 = pending.0.saturating_add(count);
     }
 }
 
@@ -233,7 +248,7 @@ impl VideoPipeline {
         )
     }
 
-    pub(crate) async fn metadata(&self, value: FrameMetadata) -> anyhow::Result<()> {
+    pub(crate) async fn metadata(&self, value: FrameMetadata) -> Result<(), PipelineError> {
         debug!(
             target: "waywire_latency",
             stage = "metadata",
@@ -246,10 +261,10 @@ impl VideoPipeline {
         self.tx
             .send(PipelineMessage::Metadata(value))
             .await
-            .context("video pipeline stopped")
+            .map_err(PipelineError)
     }
 
-    pub(crate) async fn encoded(&self, value: EncodedFrame) -> anyhow::Result<()> {
+    pub(crate) async fn encoded(&self, value: EncodedFrame) -> Result<(), PipelineError> {
         debug!(
             target: "waywire_latency",
             stage = "encoded_received",
@@ -261,26 +276,24 @@ impl VideoPipeline {
         self.tx
             .send(PipelineMessage::Encoded(value))
             .await
-            .context("video pipeline stopped")
+            .map_err(PipelineError)
     }
 
-    async fn unit(&self, value: Unit) -> anyhow::Result<()> {
-        let bytes = u32::try_from(value.data.len()).context("access unit size overflow")?;
-        self.sessions.produced(value.data.len());
+    async fn unit(&self, value: Unit) -> Result<(), ReceiveError> {
+        let bytes = u32::try_from(value.data().len()).map_err(ReceiveError::Size)?;
+        self.sessions.produced(value.data().len());
         let permit = Arc::clone(&self.unit_budget)
             .acquire_many_owned(bytes)
             .await
-            .context("video byte budget closed")?;
+            .map_err(ReceiveError::ByteBudget)?;
         self.tx
-            .send(PipelineMessage::Unit(PendingUnit {
-                unit: value,
-                bytes: permit,
-            }))
+            .send(PipelineMessage::Unit(PendingUnit::new(value, permit)))
             .await
-            .context("video pipeline stopped")
+            .map_err(PipelineError)?;
+        Ok(())
     }
 
-    pub(crate) async fn receive(self, socket: UdpSocket) -> anyhow::Result<()> {
+    pub(crate) async fn receive(self, socket: UdpSocket) -> Result<(), ReceiveError> {
         let mut assembler = Assembler::default();
         let mut summary = PacketDropSummary::new();
         let mut buffer = vec![0; 65_536];
@@ -324,8 +337,8 @@ impl VideoPipeline {
             };
             let was_recovering = assembler.is_recovering();
             let result = assembler.consume(packet);
-            if let Some(dropped) = result.drops {
-                summary.record(dropped.packets, PacketFailure::Drop(dropped.reason));
+            if let Some(dropped) = result.drops() {
+                summary.record(dropped.packets(), PacketFailure::Drop(dropped.reason()));
             }
             if !was_recovering && assembler.is_recovering() {
                 // RTP loss put the assembler into recovery, so the compositor
@@ -336,16 +349,16 @@ impl VideoPipeline {
                 self.tx
                     .send(PipelineMessage::Recovery)
                     .await
-                    .context("video pipeline stopped")?;
+                    .map_err(PipelineError)?;
             }
-            match result.outcome {
+            match result.into_outcome() {
                 Ok(AssemblyOutcome::Complete(unit)) => {
                     debug!(
                         target: "waywire_latency",
                         stage = "encoded",
-                        generation = unit.generation.get(),
-                        rtp_timestamp = unit.timestamp.0,
-                        bytes = unit.data.len(),
+                        generation = unit.generation().get(),
+                        rtp_timestamp = unit.timestamp().get(),
+                        bytes = unit.data().len(),
                         at_ns = monotonic_nanos(),
                     );
                     self.unit(unit).await?;
@@ -386,7 +399,7 @@ impl VideoWorker {
         clippy::too_many_lines,
         reason = "one worker loop keeps timer priority, resync recovery, and frame broadcasts ordered"
     )]
-    pub(crate) async fn run(mut self) -> anyhow::Result<()> {
+    pub(crate) async fn run(mut self) -> Result<(), PipelineClosed> {
         let mut correlator = Correlator::new();
         let mut metadata_summary = MetadataDropSummary::new();
         let mut ready_generation = None;
@@ -400,10 +413,7 @@ impl VideoWorker {
                 correlator.deadline_expired()
             } else {
                 if let Some(report) = metadata_summary.report_if_due() {
-                    warn!(
-                        unmatched_metadata = report.unmatched,
-                        "frame metadata unmatched"
-                    );
+                    warn!(unmatched_metadata = report.0, "frame metadata unmatched");
                 }
                 let timer = match (correlator.deadline(), metadata_summary.deadline()) {
                     (Some(correlation), Some(metadata)) if correlation <= metadata => {
@@ -452,16 +462,15 @@ impl VideoWorker {
                     {
                         continue;
                     }
-                    WorkerWake::Message(PipelineMessage::Encoded(frame)) => Correlation {
-                        outcome: CorrelationOutcome::Frames(vec![VideoSample {
+                    WorkerWake::Message(PipelineMessage::Encoded(frame)) => {
+                        Correlation::frames(vec![VideoSample {
                             data: frame.data.into(),
                             layout: Layout::Stripes,
                             kind: frame.kind,
                             continuity: Continuity::Continuous,
                             metadata: frame.metadata,
-                        }]),
-                        unmatched_metadata: 0,
-                    },
+                        }])
+                    }
                     WorkerWake::KeyWanted => {
                         // Readiness stays as it is: existing viewers still play. Only
                         // the compositor's next frame becomes a key frame.
@@ -483,7 +492,7 @@ impl VideoWorker {
                         continue;
                     }
                     WorkerWake::PipelineClosed => {
-                        return Err(anyhow!("video pipeline closed"));
+                        return Err(PipelineClosed);
                     }
                     WorkerWake::CorrelatorDeadline => correlator.deadline_expired(),
                     WorkerWake::MetadataReportDeadline => {
@@ -492,9 +501,9 @@ impl VideoWorker {
                     }
                 }
             };
-            metadata_summary.record_unmatched(correlation.unmatched_metadata);
+            metadata_summary.record_unmatched(correlation.unmatched_metadata());
 
-            let frames = match correlation.outcome {
+            let frames = match correlation.into_outcome() {
                 CorrelationOutcome::Frames(frames) => frames,
                 CorrelationOutcome::Resync(reason) => {
                     warn!(reason = %reason, "video metadata/RTP correlation resynchronised");
@@ -541,13 +550,13 @@ mod tests {
         end: AccessUnitEnd,
         payload: &[u8],
     ) -> Packet {
-        Packet {
+        Packet::new(
             end,
-            sequence: RtpSequence(sequence),
-            timestamp: RtpTimestamp(timestamp),
-            generation: Generation::new(generation).expect("test RTP generation should be valid"),
-            payload: payload.to_vec(),
-        }
+            RtpSequence::new(sequence),
+            RtpTimestamp::new(timestamp),
+            Generation::new(generation).expect("test RTP generation should be valid"),
+            payload.to_vec(),
+        )
     }
 
     pub(super) fn fps(value: u32) -> Fps {
@@ -575,19 +584,19 @@ mod tests {
     }
 
     pub(super) fn unit(timestamp: u32, generation: u32) -> Unit {
-        Unit {
-            data: vec![1].into(),
-            kind: FrameKind::Key,
-            continuity: Continuity::Continuous,
-            timestamp: RtpTimestamp(timestamp),
-            generation: Generation::new(generation).expect("test unit generation should be valid"),
-        }
+        Unit::new(
+            vec![1].into(),
+            FrameKind::Key,
+            Continuity::Continuous,
+            RtpTimestamp::new(timestamp),
+            Generation::new(generation).expect("test unit generation should be valid"),
+        )
     }
 
     pub(super) fn consume(assembler: &mut Assembler, value: Packet) -> Option<Unit> {
         match assembler
             .consume(value)
-            .outcome
+            .into_outcome()
             .expect("test RTP packet should assemble without a protocol error")
         {
             AssemblyOutcome::Complete(unit) => Some(unit),
@@ -637,7 +646,7 @@ mod tests {
         let first = summary
             .report_if_due()
             .expect("initial unmatched metadata should become due");
-        assert_eq!(first.unmatched, 1);
+        assert_eq!(first.0, 1);
 
         summary.record_unmatched(2);
         let deadline = summary
@@ -647,7 +656,7 @@ mod tests {
         let second = summary
             .report_if_due()
             .expect("metadata summary should become due without another record");
-        assert_eq!(second.unmatched, 2);
+        assert_eq!(second.0, 2);
     }
 
     #[tokio::test]
@@ -836,7 +845,7 @@ mod tests {
             .await
             .expect("recovery delta metadata should queue");
         let mut delta = unit(2, 1);
-        delta.kind = FrameKind::Delta;
+        delta.set_kind(FrameKind::Delta);
         pipeline
             .unit(delta)
             .await
