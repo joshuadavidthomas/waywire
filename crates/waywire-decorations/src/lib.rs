@@ -969,13 +969,53 @@ const MENU_WIDTH: i32 = 180;
 const MENU_ROW: i32 = 26;
 const MENU_HEIGHT: i32 = MENU_ROW * 6;
 
+/// A window menu row, top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuItem {
+    Minimize,
+    MaximizeRestore,
+    AlwaysOnTop,
+    Move,
+    Resize,
+    Close,
+}
+
+impl MenuItem {
+    const ALL: [Self; 6] = [
+        Self::Minimize,
+        Self::MaximizeRestore,
+        Self::AlwaysOnTop,
+        Self::Move,
+        Self::Resize,
+        Self::Close,
+    ];
+
+    /// Each item with its row's top edge, relative to the menu.
+    fn rows() -> impl Iterator<Item = (i32, Self)> {
+        (0..).map(|row| row * MENU_ROW).zip(Self::ALL)
+    }
+
+    const fn label(self, size: SizeMode) -> &'static str {
+        match (self, size) {
+            (Self::Minimize, _) => "Minimize",
+            (Self::MaximizeRestore, SizeMode::Maximized) => "Restore",
+            (Self::MaximizeRestore, SizeMode::Floating) => "Maximize",
+            (Self::AlwaysOnTop, _) => "Always on Top",
+            (Self::Move, _) => "Move",
+            (Self::Resize, _) => "Resize",
+            (Self::Close, _) => "Close",
+        }
+    }
+}
+
 pub struct WindowMenu {
     pub window: Window,
     location: Point<i32, Logical>,
     size: SizeMode,
     always_on_top: bool,
-    painted: bool,
-    hover: Option<usize>,
+    /// The hover and output scale the buffer was last painted for.
+    painted_for: Option<(Option<MenuItem>, f64)>,
+    hover: Option<MenuItem>,
     buffer: MemoryRenderBuffer,
 }
 
@@ -998,7 +1038,7 @@ impl WindowMenu {
                 .into(),
             size,
             always_on_top,
-            painted: false,
+            painted_for: None,
             hover: None,
             buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
         }
@@ -1013,51 +1053,48 @@ impl WindowMenu {
             && point.y < f64::from(MENU_HEIGHT)
     }
 
-    fn item_at(&self, point: Point<f64, Logical>) -> Option<usize> {
+    fn item_at(&self, point: Point<f64, Logical>) -> Option<MenuItem> {
         if !self.contains(point) {
             return None;
         }
-        (0..6)
-            .find(|index| {
-                let y = point.y - f64::from(self.location.y);
-                y >= f64::from(*index * MENU_ROW) && y < f64::from((*index + 1) * MENU_ROW)
-            })
-            .and_then(|index| usize::try_from(index).ok())
+        let y = point.y - f64::from(self.location.y);
+        MenuItem::rows()
+            .find(|(top, _)| y >= f64::from(*top) && y < f64::from(top + MENU_ROW))
+            .map(|(_, item)| item)
     }
 
-    fn action(&self, index: usize) -> Option<WindowAction> {
-        match index {
-            0 if window_flags(&self.window).role == WindowRole::Normal => {
-                Some(WindowAction::Minimize)
-            }
-            1 => Some(match self.size {
+    /// What choosing `item` does, or `None` when the item is disabled.
+    fn action(&self, item: MenuItem) -> Option<WindowAction> {
+        let floating = self.size == SizeMode::Floating;
+        match item {
+            MenuItem::Minimize => (window_flags(&self.window).role == WindowRole::Normal)
+                .then_some(WindowAction::Minimize),
+            MenuItem::MaximizeRestore => Some(match self.size {
                 SizeMode::Maximized => WindowAction::Restore,
                 SizeMode::Floating => WindowAction::Maximize,
             }),
-            2 => Some(WindowAction::ToggleAlwaysOnTop),
-            3 if self.size == SizeMode::Floating => Some(WindowAction::Move),
-            4 if self.size == SizeMode::Floating => {
-                Some(WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight))
+            MenuItem::AlwaysOnTop => Some(WindowAction::ToggleAlwaysOnTop),
+            MenuItem::Move => floating.then_some(WindowAction::Move),
+            MenuItem::Resize => {
+                floating.then_some(WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight))
             }
-            5 => Some(WindowAction::Close),
-            _ => None,
+            MenuItem::Close => Some(WindowAction::Close),
         }
     }
 
     #[must_use]
     pub fn click(&self, point: Point<f64, Logical>) -> Option<WindowAction> {
-        self.item_at(point).and_then(|index| self.action(index))
+        self.item_at(point).and_then(|item| self.action(item))
     }
 
     pub fn motion(&mut self, point: Point<f64, Logical>) -> bool {
         let hover = self
             .item_at(point)
-            .filter(|index| self.action(*index).is_some());
+            .filter(|item| self.action(*item).is_some());
         if self.hover == hover {
             return false;
         }
         self.hover = hover;
-        self.painted = false;
         true
     }
 
@@ -1066,7 +1103,7 @@ impl WindowMenu {
         renderer: &mut PixmanRenderer,
         scale: f64,
     ) -> Result<MemoryRenderBufferRenderElement<PixmanRenderer>> {
-        if !self.painted {
+        if self.painted_for != Some((self.hover, scale)) {
             let size = raster_size((MENU_WIDTH, MENU_HEIGHT).into(), scale);
             let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, size.w, size.h)?;
             let context = cairo::Context::new(&surface)?;
@@ -1074,24 +1111,13 @@ impl WindowMenu {
             let theme = Theme::dark();
             color(&context, theme.inactive.background);
             context.paint()?;
-            let labels = [
-                "Minimize",
-                match self.size {
-                    SizeMode::Maximized => "Restore",
-                    SizeMode::Floating => "Maximize",
-                },
-                "Always on Top",
-                "Move",
-                "Resize",
-                "Close",
-            ];
-            for (index, label) in labels.iter().enumerate() {
-                let disabled = self.action(index).is_none();
-                if self.hover == Some(index) {
+            for (top, item) in MenuItem::rows() {
+                let disabled = self.action(item).is_none();
+                if self.hover == Some(item) {
                     color(&context, theme.active.background);
                     context.rectangle(
                         1.0,
-                        f64::from(i32::try_from(index)? * MENU_ROW),
+                        f64::from(top),
                         f64::from(MENU_WIDTH - 2),
                         f64::from(MENU_ROW),
                     );
@@ -1106,16 +1132,18 @@ impl WindowMenu {
                     },
                 );
                 context.save()?;
-                context.translate(
-                    0.0,
-                    f64::from(i32::try_from(index)? * MENU_ROW) - f64::from(BAR - MENU_ROW) / 2.0,
-                );
-                draw_title(&context, label, MENU_WIDTH - theme.title_padding * 2, theme)?;
+                context.translate(0.0, f64::from(top) - f64::from(BAR - MENU_ROW) / 2.0);
+                draw_title(
+                    &context,
+                    item.label(self.size),
+                    MENU_WIDTH - theme.title_padding * 2,
+                    theme,
+                )?;
                 context.restore()?;
-                if index == 2 && self.always_on_top {
-                    context.move_to(f64::from(MENU_WIDTH - 20), f64::from(MENU_ROW * 2 + 13));
-                    context.line_to(f64::from(MENU_WIDTH - 17), f64::from(MENU_ROW * 2 + 16));
-                    context.line_to(f64::from(MENU_WIDTH - 11), f64::from(MENU_ROW * 2 + 9));
+                if item == MenuItem::AlwaysOnTop && self.always_on_top {
+                    context.move_to(f64::from(MENU_WIDTH - 20), f64::from(top + 13));
+                    context.line_to(f64::from(MENU_WIDTH - 17), f64::from(top + 16));
+                    context.line_to(f64::from(MENU_WIDTH - 11), f64::from(top + 9));
                     context.stroke()?;
                 }
             }
@@ -1136,7 +1164,7 @@ impl WindowMenu {
                 bytes.copy_from_slice(&pixels);
                 Ok::<_, anyhow::Error>(vec![Rectangle::from_size(size)])
             })?;
-            self.painted = true;
+            self.painted_for = Some((self.hover, scale));
         }
         let pixels = raster_size((MENU_WIDTH, MENU_HEIGHT).into(), scale);
         Ok(MemoryRenderBufferRenderElement::from_buffer(
