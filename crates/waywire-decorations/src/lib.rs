@@ -421,9 +421,9 @@ impl Default for Decoration {
 }
 
 impl Decoration {
-    pub fn update(&mut self, appearance: Appearance) -> Result<bool> {
+    pub fn update(&mut self, appearance: Appearance) -> Result<()> {
         if self.appearance.as_ref() == Some(&appearance) {
-            return Ok(false);
+            return Ok(());
         }
         let next = nodes((appearance.width, 0).into(), &appearance, Theme::dark());
         let node = &next[0];
@@ -445,7 +445,7 @@ impl Decoration {
         }
         self.nodes = next;
         self.appearance = Some(appearance);
-        Ok(true)
+        Ok(())
     }
 
     pub fn elements(
@@ -1441,7 +1441,7 @@ mod tests {
             let mut tracker = OutputDamageTracker::new((1200, 500), scale, Transform::Normal);
             let mut cache = Decoration::default();
             let mut look = appearance(scale);
-            assert!(cache.update(look.clone()).expect("first paint"));
+            cache.update(look.clone()).expect("first paint");
             let mut previous = None;
             for step in 0..7 {
                 let changed = match step {
@@ -1473,16 +1473,16 @@ mod tests {
                     }
                 };
                 cache.update(look.clone()).expect("paint update");
-                assert!(!cache.update(look.clone()).expect("idle"));
-                let parts = cache
-                    .elements(
-                        &mut renderer,
-                        (look.width, 53).into(),
-                        (10, 42).into(),
-                        scale,
-                    )
-                    .expect("elements");
+                let elements = |cache: &Decoration, renderer: &mut PixmanRenderer| {
+                    cache
+                        .elements(renderer, (look.width, 53).into(), (10, 42).into(), scale)
+                        .expect("elements")
+                };
+                let painted = elements(&cache, &mut renderer)[0].current_commit();
+                cache.update(look.clone()).expect("idle");
+                let parts = elements(&cache, &mut renderer);
                 let commit = parts[0].current_commit();
+                assert_eq!(commit, painted, "idle update must not repaint");
                 let id = parts[0].id().clone();
                 if let Some((old_id, old_commit)) = previous {
                     assert_eq!(id, old_id, "stable buffer ID");
