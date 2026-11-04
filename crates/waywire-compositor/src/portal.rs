@@ -22,6 +22,7 @@ use smithay::reexports::pixman::Image;
 use waywire_portal::PortalDirs;
 use waywire_portal::PortalInput;
 use waywire_portal::PortalRequest;
+use waywire_portal::PortalService;
 use waywire_portal::write_portal_files;
 
 use crate::State;
@@ -120,10 +121,10 @@ pub(crate) fn start(
         tracing::error!(?error, "portal request channel failed to install");
         return Ok(None);
     }
-    if !waywire_portal::serve(requests, &dirs, bus_address)? {
-        return Ok(None);
+    match waywire_portal::serve(requests, &dirs, bus_address)? {
+        PortalService::Serving => Ok(Some(dirs)),
+        PortalService::Unavailable => Ok(None),
     }
-    Ok(Some(dirs))
 }
 
 #[expect(

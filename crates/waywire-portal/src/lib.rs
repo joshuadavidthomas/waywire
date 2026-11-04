@@ -249,15 +249,23 @@ fn portal_environment_from(
     ]
 }
 
+/// Whether the portal backends came up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortalService {
+    Serving,
+    /// The backends could not start, and `serve` logged why; the desktop
+    /// itself still runs.
+    Unavailable,
+}
+
 /// Serve the portal backends on `bus_address` for the lifetime of the
 /// compositor, sending the calls that need the seat or the rendered frame on
-/// `requests`. Returns `false`, having logged why, when the backends could not
-/// start; the desktop itself still runs.
+/// `requests`.
 pub fn serve(
     requests: Sender<PortalRequest>,
     dirs: &PortalDirs,
     bus_address: &str,
-) -> Result<bool> {
+) -> Result<PortalService> {
     // Connect and publish before the session program starts: its first portal
     // call may activate xdg-desktop-portal, which reads discovery variables
     // from the activation environment.
@@ -265,12 +273,12 @@ pub fn serve(
         Ok(connection) => connection,
         Err(error) => {
             tracing::error!(%error, "portal D-Bus service failed to start");
-            return Ok(false);
+            return Ok(PortalService::Unavailable);
         }
     };
     if let Err(error) = publish_environment(&connection, dirs, bus_address) {
         tracing::error!(%error, "portal activation environment");
-        return Ok(false);
+        return Ok(PortalService::Unavailable);
     }
     std::thread::Builder::new()
         .name("waywire-portal".to_owned())
@@ -282,7 +290,7 @@ pub fn serve(
                 std::thread::park();
             }
         })?;
-    Ok(true)
+    Ok(PortalService::Serving)
 }
 
 fn build_connection(requests: Sender<PortalRequest>, bus_address: &str) -> Result<Connection> {
