@@ -193,14 +193,14 @@ impl Correlator {
             tracing::debug!(
                 target: "waywire_latency",
                 stage = "correlated",
-                sequence = metadata.sequence,
+                sequence = metadata.sequence(),
                 generation = unit.generation().get(),
                 rtp_timestamp = unit.timestamp().get(),
                 at_ns = super::monotonic_nanos(),
             );
             let generation_changed = !matches!(
                 self.timestamp_anchor,
-                TimestampAnchor::Present { generation, .. } if generation == metadata.generation
+                TimestampAnchor::Present { generation, .. } if generation == metadata.generation()
             );
             let recovering = self.keyframe == GopState::Recovering;
             let continuity = if recovering
@@ -213,9 +213,9 @@ impl Correlator {
                 Continuity::Continuous
             };
             self.timestamp_anchor = TimestampAnchor::Present {
-                generation: metadata.generation,
+                generation: metadata.generation(),
                 timestamp: unit.timestamp(),
-                fps: metadata.fps,
+                fps: metadata.fps(),
             };
             if recovering && unit.kind() != FrameKind::Key {
                 continue;
@@ -224,13 +224,13 @@ impl Correlator {
                 self.keyframe = GopState::KeyframeCached;
             }
             let kind = unit.kind();
-            samples.push(VideoSample {
-                data: unit.into_data(),
-                layout: Layout::Whole,
+            samples.push(VideoSample::new(
+                unit.into_data(),
+                Layout::Whole,
                 kind,
                 continuity,
                 metadata,
-            });
+            ));
         }
         Correlation {
             outcome: CorrelationOutcome::Frames(samples),
@@ -257,7 +257,7 @@ impl Correlator {
     ) -> MetadataMatch {
         let mut matches = 0;
         for (index, item) in self.metadata.iter().enumerate() {
-            match item.value.generation.get().cmp(&generation.get()) {
+            match item.value.generation().get().cmp(&generation.get()) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => {
                     matches += 1;
@@ -358,8 +358,8 @@ mod tests {
 
         let samples = push_unit(&mut correlator, pending(unit(1, 2), &budget));
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 2);
-        assert_eq!(samples[0].metadata.generation.get(), 2);
+        assert_eq!(samples[0].metadata().sequence(), 2);
+        assert_eq!(samples[0].metadata().generation().get(), 2);
 
         push_metadata(&mut correlator, metadata(3, 3));
         let correlation = correlator.push_unit(pending(unit(2, 2), &budget));
@@ -382,8 +382,8 @@ mod tests {
 
         let samples = push_unit(&mut correlator, pending(unit(1, 3), &budget));
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 3);
-        assert_eq!(samples[0].metadata.generation.get(), 3);
+        assert_eq!(samples[0].metadata().sequence(), 3);
+        assert_eq!(samples[0].metadata().generation().get(), 3);
 
         push_metadata(&mut correlator, metadata(4, 4));
         let correlation = correlator.push_unit(pending(unit(2, 3), &budget));
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(current.continuity(), Continuity::Continuous);
         let samples = push_unit(&mut correlator, pending(current, &budget));
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 3);
+        assert_eq!(samples[0].metadata().sequence(), 3);
         assert!(correlator.deadline().is_none());
     }
 
@@ -453,8 +453,8 @@ mod tests {
             }
         };
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].metadata.sequence, 3);
-        assert_eq!(samples[0].continuity, Continuity::AfterGap);
+        assert_eq!(samples[0].metadata().sequence(), 3);
+        assert_eq!(samples[0].continuity(), Continuity::AfterGap);
         assert_eq!(correlation.unmatched_metadata, 0);
         assert!(correlator.deadline().is_none());
     }
@@ -588,8 +588,8 @@ mod tests {
         };
         assert_eq!(matched.unmatched_metadata, 0);
         assert_eq!(matched_frames.len(), 1);
-        assert_eq!(matched_frames[0].metadata.sequence, 42);
-        assert_eq!(matched_frames[0].metadata.generation.get(), 1);
+        assert_eq!(matched_frames[0].metadata().sequence(), 42);
+        assert_eq!(matched_frames[0].metadata().generation().get(), 1);
         assert_eq!(budget.available_permits(), 1);
     }
 
@@ -613,8 +613,8 @@ mod tests {
         push_metadata(&mut correlator, metadata(3, 3));
         let recovered = push_unit(&mut correlator, pending(unit(u32::MAX, 3), &budget));
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].kind, FrameKind::Key);
-        assert_eq!(recovered[0].continuity, Continuity::AfterGap);
+        assert_eq!(recovered[0].kind(), FrameKind::Key);
+        assert_eq!(recovered[0].continuity(), Continuity::AfterGap);
     }
 
     #[test]
@@ -641,6 +641,6 @@ mod tests {
         push_metadata(&mut correlator, metadata(4, 1));
         let recovered = push_unit(&mut correlator, pending(unit(3, 1), &budget));
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].continuity, Continuity::AfterGap);
+        assert_eq!(recovered[0].continuity(), Continuity::AfterGap);
     }
 }

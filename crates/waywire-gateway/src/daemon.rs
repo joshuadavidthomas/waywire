@@ -23,7 +23,7 @@ use tracing::warn;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameSize;
-use waywire_protocol::pipe::InputLease;
+use waywire_protocol::pipe::InputControl;
 use waywire_protocol::pipe::Kbps;
 
 use self::commands::CommandReader;
@@ -165,8 +165,7 @@ impl Daemon {
         let (shutdown, shutdown_rx) = mpsc::channel(1);
         let sessions = Sessions::new(commands.clone(), config.bitrate, config.frame_rate);
         anyhow::ensure!(
-            commands.try_system(&Command::InputLease(InputLease { held: false }))?
-                == Enqueued::Queued,
+            commands.try_system(&Command::InputLease(InputControl::Agents))? == Enqueued::Queued,
             "initial input lease could not be queued"
         );
         let (pipeline, video_worker) =

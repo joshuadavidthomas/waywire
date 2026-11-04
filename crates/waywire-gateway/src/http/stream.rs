@@ -68,9 +68,10 @@ async fn send_video(
     announced_generation: &mut Option<Generation>,
     cancellation: &CancellationToken,
 ) -> Result<(), SocketEnd> {
-    let generation = frame.metadata.generation;
+    let generation = frame.metadata().generation();
     if *announced_generation != Some(generation) {
-        let configuration = ClientEvent::video_config(frame.metadata.chroma.h264_profile().codec());
+        let configuration =
+            ClientEvent::video_config(frame.metadata().chroma().h264_profile().codec());
         let configuration = client_event_message(&configuration)?;
         // The JSON configuration and its generation's first keyframe share this
         // socket, so WebSocket message order is the decoder reconfiguration contract.
@@ -83,7 +84,7 @@ async fn send_video(
     tracing::debug!(
         target: "waywire_latency",
         stage = "gateway_send",
-        sequence = frame.metadata.sequence,
+        sequence = frame.metadata().sequence(),
         start_ns = started_ns,
         at_ns = crate::video::monotonic_nanos(),
     );

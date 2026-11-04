@@ -100,38 +100,38 @@ impl ViewerQueue {
     fn push(&mut self, mut sample: VideoSample) -> Pushed {
         let generation_reset = self
             .generation
-            .is_some_and(|current| current != sample.metadata.generation);
-        self.generation = Some(sample.metadata.generation);
-        let stream_reset = sample.continuity == Continuity::AfterGap || generation_reset;
+            .is_some_and(|current| current != sample.metadata().generation());
+        self.generation = Some(sample.metadata().generation());
+        let stream_reset = sample.continuity() == Continuity::AfterGap || generation_reset;
         if stream_reset {
             self.clear();
         }
         let recovering = self.keyframe == GopState::Recovering;
-        if recovering && sample.kind != FrameKind::Key {
+        if recovering && sample.kind() != FrameKind::Key {
             return Pushed::Dropped;
         }
-        if sample.kind == FrameKind::Key {
+        if sample.kind() == FrameKind::Key {
             self.keyframe = GopState::KeyframeCached;
         }
         let overflow = self.frames.len() >= self.bounds.frames
-            || self.bytes.saturating_add(sample.data.len()) > self.bounds.bytes;
+            || self.bytes.saturating_add(sample.data().len()) > self.bounds.bytes;
         if overflow {
             debug!(
                 frames = self.frames.len().saturating_add(1),
-                bytes = self.bytes.saturating_add(sample.data.len()),
-                kind = ?sample.kind,
+                bytes = self.bytes.saturating_add(sample.data().len()),
+                kind = ?sample.kind(),
                 "viewer queue overflow"
             );
             self.clear();
-            if sample.kind != FrameKind::Key {
+            if sample.kind() != FrameKind::Key {
                 return Pushed::Dropped;
             }
             self.keyframe = GopState::KeyframeCached;
         }
         if stream_reset || recovering || overflow {
-            sample.continuity = Continuity::AfterGap;
+            sample.set_continuity(Continuity::AfterGap);
         }
-        self.bytes += sample.data.len();
+        self.bytes += sample.data().len();
         self.frames.push_back(sample);
         Pushed::Queued
     }
@@ -139,7 +139,7 @@ impl ViewerQueue {
     fn pop(&mut self) -> Option<VideoSample> {
         let frame = self.frames.pop_front();
         if let Some(value) = &frame {
-            self.bytes -= value.data.len();
+            self.bytes -= value.data().len();
         }
         frame
     }
@@ -221,7 +221,7 @@ impl VideoHub {
             match viewer_queue.push(frame.clone()) {
                 Pushed::Queued => {}
                 Pushed::Dropped => {
-                    if frame.layout == Layout::Stripes {
+                    if frame.layout() == Layout::Stripes {
                         self.key_wanted.notify_one();
                     }
                     debug!(
@@ -264,32 +264,32 @@ impl VideoHub {
     // VideoWorker::run is the sole production caller. Fan-out happens without the hub lock, so
     // per-viewer ordering depends on that caller broadcasting each frame in sequence.
     pub(super) fn broadcast(&self, sample: &VideoSample) -> GopState {
-        let generation = sample.metadata.generation;
+        let generation = sample.metadata().generation();
         let (handles, state, continuity) = {
             let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            let continuity = if sample.continuity == Continuity::AfterGap
+            let continuity = if sample.continuity() == Continuity::AfterGap
                 || hub
                     .generation
-                    .is_some_and(|current| current != sample.metadata.generation)
+                    .is_some_and(|current| current != sample.metadata().generation())
             {
                 Continuity::AfterGap
             } else {
                 Continuity::Continuous
             };
-            hub.generation = Some(sample.metadata.generation);
+            hub.generation = Some(sample.metadata().generation());
             if continuity == Continuity::AfterGap {
                 hub.gop.clear();
                 hub.gop_bytes = 0;
             }
-            if sample.kind == FrameKind::Key {
+            if sample.kind() == FrameKind::Key {
                 hub.gop.clear();
-                hub.gop_bytes = sample.data.len();
+                hub.gop_bytes = sample.data().len();
                 hub.gop.push(sample.clone());
             } else if !hub.gop.is_empty() {
                 if hub.gop.len() < MAX_GOP_FRAMES
-                    && hub.gop_bytes + sample.data.len() <= MAX_GOP_BYTES
+                    && hub.gop_bytes + sample.data().len() <= MAX_GOP_BYTES
                 {
-                    hub.gop_bytes += sample.data.len();
+                    hub.gop_bytes += sample.data().len();
                     hub.gop.push(sample.clone());
                 } else {
                     hub.gop.clear();
@@ -297,7 +297,7 @@ impl VideoHub {
                 }
             }
             let state = if hub.gop.first().is_some_and(|frame| {
-                frame.kind == FrameKind::Key && frame.metadata.generation == generation
+                frame.kind() == FrameKind::Key && frame.metadata().generation() == generation
             }) {
                 GopState::KeyframeCached
             } else {
@@ -312,7 +312,7 @@ impl VideoHub {
 
         for handle in handles {
             let mut outgoing = sample.clone();
-            outgoing.continuity = continuity;
+            outgoing.set_continuity(continuity);
             let pushed = handle
                 .queue
                 .lock()
@@ -320,7 +320,7 @@ impl VideoHub {
                 .push(outgoing);
             match pushed {
                 Pushed::Queued => handle.notify.notify_one(),
-                Pushed::Dropped if sample.layout == Layout::Stripes => {
+                Pushed::Dropped if sample.layout() == Layout::Stripes => {
                     self.key_wanted.notify_one();
                 }
                 Pushed::Dropped => {}
@@ -348,7 +348,7 @@ mod tests {
             let hub = VideoHub::new(fps(max_fps));
             let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             let mut frames = hub.subscribe();
-            assert_eq!(frames.next().await.metadata.sequence, 0);
+            assert_eq!(frames.next().await.metadata().sequence(), 0);
 
             for sequence in 1..=frame_bound {
                 let _ = hub.broadcast(&sample(sequence, 1, FrameKind::Delta));
@@ -357,7 +357,7 @@ mod tests {
                 let frame = tokio::time::timeout(Duration::from_millis(100), frames.next())
                     .await
                     .expect("the literal frame bound should fit without overflow");
-                assert_eq!(frame.metadata.sequence, expected);
+                assert_eq!(frame.metadata().sequence(), expected);
             }
         }
     }
@@ -368,7 +368,7 @@ mod tests {
             let hub = VideoHub::new(fps(max_fps));
             let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             let mut frames = hub.subscribe();
-            assert_eq!(frames.next().await.metadata.sequence, 0);
+            assert_eq!(frames.next().await.metadata().sequence(), 0);
 
             for sequence in 1..=frame_bound {
                 let _ = hub.broadcast(&sample(sequence, 1, FrameKind::Delta));
@@ -378,9 +378,9 @@ mod tests {
             let _ = hub.broadcast(&sample(recovery_sequence, 1, FrameKind::Key));
 
             let recovered = frames.next().await;
-            assert_eq!(recovered.metadata.sequence, recovery_sequence);
-            assert_eq!(recovered.kind, FrameKind::Key);
-            assert_eq!(recovered.continuity, Continuity::AfterGap);
+            assert_eq!(recovered.metadata().sequence(), recovery_sequence);
+            assert_eq!(recovered.kind(), FrameKind::Key);
+            assert_eq!(recovered.continuity(), Continuity::AfterGap);
         }
     }
 
@@ -392,8 +392,8 @@ mod tests {
             queue
                 .pop()
                 .expect("queued keyframe should be present")
-                .metadata
-                .sequence,
+                .metadata()
+                .sequence(),
             0
         );
 
@@ -403,9 +403,9 @@ mod tests {
         assert_eq!(queue.push(sample(4, 1, FrameKind::Key)), Pushed::Queued);
 
         let recovered = queue.pop().expect("recovery keyframe should be queued");
-        assert_eq!(recovered.metadata.sequence, 4);
-        assert_eq!(recovered.kind, FrameKind::Key);
-        assert_eq!(recovered.continuity, Continuity::AfterGap);
+        assert_eq!(recovered.metadata().sequence(), 4);
+        assert_eq!(recovered.kind(), FrameKind::Key);
+        assert_eq!(recovered.continuity(), Continuity::AfterGap);
     }
 
     #[tokio::test]
@@ -426,11 +426,11 @@ mod tests {
         }
 
         let _ = hub.broadcast(&sample(20, 1, FrameKind::Delta));
-        assert_eq!(independent.next().await.metadata.sequence, 20);
+        assert_eq!(independent.next().await.metadata().sequence(), 20);
         let _ = hub.broadcast(&sample(21, 1, FrameKind::Key));
         let recovered = slow.next().await;
-        assert_eq!(recovered.kind, FrameKind::Key);
-        assert_eq!(recovered.continuity, Continuity::AfterGap);
+        assert_eq!(recovered.kind(), FrameKind::Key);
+        assert_eq!(recovered.continuity(), Continuity::AfterGap);
     }
 
     #[tokio::test]
@@ -447,7 +447,7 @@ mod tests {
         let frame = tokio::time::timeout(Duration::from_secs(1), subscription.next())
             .await
             .expect("replacement wait should be notified");
-        assert_eq!(frame.metadata.sequence, 1);
+        assert_eq!(frame.metadata().sequence(), 1);
     }
 
     #[tokio::test]
@@ -459,18 +459,20 @@ mod tests {
 
         let _ = hub.broadcast(&sample(1, 1, FrameKind::Delta));
         let mut replacement_delta = sample(2, 1, FrameKind::Delta);
-        replacement_delta.metadata.generation =
-            Generation::new(2).expect("replacement generation should be valid");
+        replacement_delta
+            .metadata_mut()
+            .set_generation(Generation::new(2).expect("replacement generation should be valid"));
         let _ = hub.broadcast(&replacement_delta);
         let mut replacement_key = sample(3, 1, FrameKind::Key);
-        replacement_key.metadata.generation =
-            Generation::new(2).expect("replacement generation should be valid");
+        replacement_key
+            .metadata_mut()
+            .set_generation(Generation::new(2).expect("replacement generation should be valid"));
         let _ = hub.broadcast(&replacement_key);
 
         let frame = subscription.next().await;
-        assert_eq!(frame.metadata.sequence, 3);
-        assert_eq!(frame.metadata.generation.get(), 2);
-        assert_eq!(frame.continuity, Continuity::AfterGap);
+        assert_eq!(frame.metadata().sequence(), 3);
+        assert_eq!(frame.metadata().generation().get(), 2);
+        assert_eq!(frame.continuity(), Continuity::AfterGap);
     }
 
     #[tokio::test]
@@ -481,7 +483,7 @@ mod tests {
 
         let _ = hub.broadcast(&sample(1, 1, FrameKind::Key));
         let mut replacement = hub.subscribe();
-        assert_eq!(replacement.next().await.metadata.sequence, 1);
+        assert_eq!(replacement.next().await.metadata().sequence(), 1);
     }
 
     #[tokio::test]
@@ -507,7 +509,10 @@ mod tests {
         let key_sequence = u64::try_from(bounds.frames + 2).expect("test sequence should fit");
         let _ = hub.broadcast(&sample(delta_sequence, 1, FrameKind::Delta));
         let _ = hub.broadcast(&sample(key_sequence, 1, FrameKind::Key));
-        assert_eq!(subscription.next().await.metadata.sequence, key_sequence);
+        assert_eq!(
+            subscription.next().await.metadata().sequence(),
+            key_sequence
+        );
     }
 
     #[tokio::test]
@@ -519,7 +524,7 @@ mod tests {
         let _ = hub.broadcast(&sample(2, 1, FrameKind::Delta));
 
         for expected in 0..=2 {
-            assert_eq!(subscription.next().await.metadata.sequence, expected);
+            assert_eq!(subscription.next().await.metadata().sequence(), expected);
         }
     }
 
@@ -528,23 +533,23 @@ mod tests {
         let hub = video_hub();
         let mut subscription = hub.subscribe();
         for sequence in 0..10 {
-            let _ = hub.broadcast(&VideoSample {
-                data: vec![1].into(),
-                layout: Layout::Whole,
-                kind: FrameKind::Delta,
-                continuity: Continuity::Continuous,
-                metadata: metadata(sequence, 1),
-            });
+            let _ = hub.broadcast(&VideoSample::new(
+                vec![1].into(),
+                Layout::Whole,
+                FrameKind::Delta,
+                Continuity::Continuous,
+                metadata(sequence, 1),
+            ));
         }
-        let _ = hub.broadcast(&VideoSample {
-            data: vec![1].into(),
-            layout: Layout::Whole,
-            kind: FrameKind::Key,
-            continuity: Continuity::Continuous,
-            metadata: metadata(11, 1),
-        });
+        let _ = hub.broadcast(&VideoSample::new(
+            vec![1].into(),
+            Layout::Whole,
+            FrameKind::Key,
+            Continuity::Continuous,
+            metadata(11, 1),
+        ));
         let value = subscription.next().await;
-        assert_eq!(value.kind, FrameKind::Key);
-        assert_eq!(value.continuity, Continuity::AfterGap);
+        assert_eq!(value.kind(), FrameKind::Key);
+        assert_eq!(value.continuity(), Continuity::AfterGap);
     }
 }

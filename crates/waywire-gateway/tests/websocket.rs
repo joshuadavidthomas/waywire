@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
-use waywire_protocol::pipe::InputLease;
+use waywire_protocol::pipe::InputControl;
 
 /// The gateway gives up on a compositor that sends no video for 15 seconds,
 /// so each test finishes well inside that.
@@ -193,7 +193,11 @@ const BUSY: &str = r#"{"type":"control-state","state":"busy"}"#;
 const READY: &str = r#"{"type":"control-state","state":"ready"}"#;
 
 fn lease(held: bool) -> Command {
-    Command::InputLease(InputLease { held })
+    Command::InputLease(if held {
+        InputControl::Browser
+    } else {
+        InputControl::Agents
+    })
 }
 
 #[test]

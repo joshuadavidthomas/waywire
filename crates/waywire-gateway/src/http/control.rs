@@ -557,11 +557,7 @@ async fn handle_text(
                     .sessions
                     .input(
                         socket_id,
-                        Command::Text(TextCommand {
-                            action,
-                            sequence,
-                            text,
-                        }),
+                        Command::Text(TextCommand::new(action, sequence, text)),
                     )
                     .await
                     .map_err(|error| SocketEnd::failed(error.context("send text input")))?;
@@ -640,7 +636,7 @@ mod tests {
     use waywire_protocol::pipe::Fps;
     use waywire_protocol::pipe::FrameSize;
     use waywire_protocol::pipe::Generation;
-    use waywire_protocol::pipe::InputLease;
+    use waywire_protocol::pipe::InputControl;
     use waywire_protocol::pipe::InputSequence;
     use waywire_protocol::pipe::InputText;
     use waywire_protocol::pipe::Kbps;
@@ -731,7 +727,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: true }))
+            Some(Command::InputLease(InputControl::Browser))
         ));
     }
     #[tokio::test]
@@ -760,7 +756,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: true }))
+            Some(Command::InputLease(InputControl::Browser))
         ));
     }
     #[tokio::test]
@@ -791,7 +787,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: false }))
+            Some(Command::InputLease(InputControl::Agents))
         ));
     }
     #[tokio::test]
@@ -850,7 +846,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: false }))
+            Some(Command::InputLease(InputControl::Agents))
         ));
         first_changes
             .changed()
@@ -946,7 +942,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: false }))
+            Some(Command::InputLease(InputControl::Agents))
         ));
 
         handle_text(
@@ -1040,12 +1036,11 @@ mod tests {
         .await
         .expect("quality preset should apply");
 
-        let expected = QualityLevels {
-            bitrate: Kbps::new(4_000).expect("test bitrate should be valid"),
-            fps: Fps::new(60).expect("test frame rate should be valid"),
-            scale: waywire_protocol::pipe::ScalePercent::new(100)
-                .expect("test scale should be valid"),
-        };
+        let expected = QualityLevels::new(
+            Kbps::new(4_000).expect("test bitrate should be valid"),
+            Fps::new(60).expect("test frame rate should be valid"),
+            waywire_protocol::pipe::ScalePercent::new(100).expect("test scale should be valid"),
+        );
         assert_eq!(
             next_text(&mut events).await,
             serde_json::to_string(&ClientEvent::Quality(expected))
@@ -1053,13 +1048,13 @@ mod tests {
         );
         assert_eq!(
             commands.recv().await,
-            Some(Command::Quality(QualityCommand {
-                bitrate_kbps: expected.bitrate,
-                fps: expected.fps,
-                scale_percent: expected.scale,
-                crf: waywire_protocol::pipe::Crf::new(32).expect("test CRF should be valid"),
-                chroma: waywire_protocol::pipe::Chroma::Yuv420,
-            }))
+            Some(Command::Quality(QualityCommand::new(
+                expected.bitrate(),
+                expected.fps(),
+                expected.scale(),
+                waywire_protocol::pipe::Crf::new(32).expect("test CRF should be valid"),
+                waywire_protocol::pipe::Chroma::Yuv420
+            )))
         );
     }
 
@@ -1112,11 +1107,11 @@ mod tests {
 
         assert_eq!(
             commands.recv().await,
-            Some(Command::Text(TextCommand {
-                action: TextAction::Commit,
-                text: InputText::new("hi".to_owned()).expect("test text should be valid"),
-                sequence: InputSequence::new(3).expect("test sequence should be valid"),
-            }))
+            Some(Command::Text(TextCommand::new(
+                TextAction::Commit,
+                InputSequence::new(3).expect("test sequence should be valid"),
+                InputText::new("hi".to_owned()).expect("test text should be valid")
+            )))
         );
         assert!(
             timeout(Duration::from_millis(20), events.recv())
@@ -1227,12 +1222,12 @@ mod tests {
         let (state, _commands) = test_state();
         let (outbound, mut events) = outbound();
         let (_snapshot, mut receiver) = state.events.subscribe();
-        let retained = ClientEvent::ResizeApplied(ResizeApplied {
-            request_id: RequestId::new(7).expect("test request ID should be valid"),
-            size: FrameSize::new(1280, 720).expect("test frame size should be valid"),
-            scale_v120: ScaleV120::new(120).expect("test scale should be valid"),
-            generation: Generation::new(2).expect("test generation should be valid"),
-        });
+        let retained = ClientEvent::ResizeApplied(ResizeApplied::new(
+            RequestId::new(7).expect("test request ID should be valid"),
+            FrameSize::new(1280, 720).expect("test frame size should be valid"),
+            ScaleV120::new(120).expect("test scale should be valid"),
+            Generation::new(2).expect("test generation should be valid"),
+        ));
 
         state.events.publish_for_test(ClientEvent::ControlState {
             state: ControlState::Busy,
@@ -1454,9 +1449,9 @@ mod tests {
             "a stalled pipe must not stop the writer"
         );
         let expected = [
-            Command::InputLease(InputLease { held: true }).encode(),
+            Command::InputLease(InputControl::Browser).encode(),
             Command::ReleaseAll(ReleaseAll).encode(),
-            Command::InputLease(InputLease { held: false }).encode(),
+            Command::InputLease(InputControl::Agents).encode(),
         ]
         .concat();
         let mut received = vec![0; expected.len()];
@@ -1513,11 +1508,11 @@ mod tests {
                 .expect("test HTTP server should not fail");
         });
         let mut client = control_websocket(address).await;
-        let mut resize = Command::Resize(Resize {
-            size: FrameSize::new(3840, 2160).expect("valid size"),
-            scale_v120: ScaleV120::new(120).expect("valid scale"),
-            request_id: RequestId::new(1).expect("valid request"),
-        })
+        let mut resize = Command::Resize(Resize::new(
+            FrameSize::new(3840, 2160).expect("valid size"),
+            ScaleV120::new(120).expect("valid scale"),
+            RequestId::new(1).expect("valid request"),
+        ))
         .encode();
         resize[8..12].copy_from_slice(&6000_u32.to_le_bytes());
         send_client_frame(&mut client, 0x82, &resize).await;
@@ -1549,7 +1544,7 @@ mod tests {
         send_client_text(&mut client, r#"{"type":"acquire"}"#).await;
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: true }))
+            Some(Command::InputLease(InputControl::Browser))
         ));
 
         // A ping halfway to the read deadline must reset it: the socket then
@@ -1582,7 +1577,7 @@ mod tests {
         }
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: false }))
+            Some(Command::InputLease(InputControl::Agents))
         ));
         server.abort();
     }

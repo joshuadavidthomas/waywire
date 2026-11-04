@@ -16,7 +16,7 @@ use waywire_protocol::browser::QualityPreset;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::FrameMetadata;
-use waywire_protocol::pipe::InputLease;
+use waywire_protocol::pipe::InputControl;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality as QualityCommand;
 use waywire_protocol::pipe::Resize;
@@ -116,7 +116,7 @@ impl Sessions {
         // no command from the new input owner can overtake it. The input ownership
         // lock can be held for at worst two PIPE_DEADLINEs while that write enters the FIFO.
         self.commands
-            .system(Command::InputLease(InputLease { held: true }))
+            .system(Command::InputLease(InputControl::Browser))
             .await?;
         let epoch = book.next_epoch;
         book.next_epoch = epoch.next();
@@ -142,7 +142,7 @@ impl Sessions {
         // the authority is cleared, the writer drops any late stale command.
         // The input ownership lock can be held for at worst two PIPE_DEADLINEs during the send.
         self.commands
-            .system(Command::InputLease(InputLease { held: false }))
+            .system(Command::InputLease(InputControl::Agents))
             .await?;
         self.commands.clear_active_ownership();
         book.input_owner = None;
@@ -293,13 +293,13 @@ impl Sessions {
         // A send failure ends only the requesting browser socket.
         let sent = self
             .commands
-            .browser_system(Command::Quality(QualityCommand {
-                bitrate_kbps: change.new_levels().bitrate,
-                fps: change.new_levels().fps,
-                scale_percent: change.new_levels().scale,
-                crf: change.new_crf(),
-                chroma: change.new_chroma(),
-            }))
+            .browser_system(Command::Quality(QualityCommand::new(
+                change.new_levels().bitrate(),
+                change.new_levels().fps(),
+                change.new_levels().scale(),
+                change.new_crf(),
+                change.new_chroma(),
+            )))
             .await;
         if sent.is_err() {
             *self.quality_ladder() = previous;
@@ -383,7 +383,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: true }))
+            Some(Command::InputLease(InputControl::Browser))
         ));
     }
 
@@ -399,26 +399,25 @@ mod tests {
         dropped: u32,
         rtt: f64,
     ) -> Feedback {
-        Feedback::new(FeedbackValues {
+        Feedback::new(FeedbackValues::new(
             received,
             presented,
             queue_peak,
             queue_busy_ms,
-            sample_ms: 1000.0,
+            1000.0,
             dropped,
             rtt,
-            // Unconstrained: the link carried everything that was sent.
-            bytes: u32::MAX,
-        })
+            u32::MAX,
+        ))
         .expect("test feedback should be valid")
     }
 
     fn resize_command(request_id: u16) -> Resize {
-        Resize {
-            size: value(FrameSize::new(1280, 720)),
-            scale_v120: value(ScaleV120::new(120)),
-            request_id: value(RequestId::new(request_id)),
-        }
+        Resize::new(
+            value(FrameSize::new(1280, 720)),
+            value(ScaleV120::new(120)),
+            value(RequestId::new(request_id)),
+        )
     }
 
     pub(super) fn bad_feedback() -> Feedback {
@@ -521,7 +520,7 @@ mod tests {
         );
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: false }))
+            Some(Command::InputLease(InputControl::Agents))
         ));
         first_waiter
             .changed()
@@ -583,7 +582,7 @@ mod tests {
         assert_eq!(commands.recv().await, Some(Command::Resize(resize)));
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: true }))
+            Some(Command::InputLease(InputControl::Browser))
         ));
     }
 
@@ -649,11 +648,11 @@ mod tests {
         let (sessions, mut commands) = test_sessions();
         let owner = SocketId::new(1);
         acquire_ownership_and_drain(&sessions, &mut commands, owner).await;
-        let expected = QualityLevels {
-            bitrate: value(Kbps::new(4_000)),
-            fps: value(Fps::new(60)),
-            scale: value(waywire_protocol::pipe::ScalePercent::new(100)),
-        };
+        let expected = QualityLevels::new(
+            value(Kbps::new(4_000)),
+            value(Fps::new(60)),
+            value(waywire_protocol::pipe::ScalePercent::new(100)),
+        );
 
         assert_eq!(
             sessions
@@ -664,13 +663,13 @@ mod tests {
         );
         assert_eq!(
             commands.recv().await,
-            Some(Command::Quality(QualityCommand {
-                bitrate_kbps: expected.bitrate,
-                fps: expected.fps,
-                scale_percent: expected.scale,
-                crf: value(waywire_protocol::pipe::Crf::new(32)),
-                chroma: waywire_protocol::pipe::Chroma::Yuv420,
-            }))
+            Some(Command::Quality(QualityCommand::new(
+                expected.bitrate(),
+                expected.fps(),
+                expected.scale(),
+                value(waywire_protocol::pipe::Crf::new(32)),
+                waywire_protocol::pipe::Chroma::Yuv420
+            )))
         );
         assert_eq!(
             sessions
@@ -717,13 +716,13 @@ mod tests {
         );
         assert_eq!(
             commands.recv().await,
-            Some(Command::Quality(QualityCommand {
-                bitrate_kbps: expected.bitrate,
-                fps: expected.fps,
-                scale_percent: expected.scale,
-                crf: value(waywire_protocol::pipe::Crf::new(22)),
-                chroma: waywire_protocol::pipe::Chroma::Yuv420,
-            }))
+            Some(Command::Quality(QualityCommand::new(
+                expected.bitrate(),
+                expected.fps(),
+                expected.scale(),
+                value(waywire_protocol::pipe::Crf::new(22)),
+                waywire_protocol::pipe::Chroma::Yuv420
+            )))
         );
     }
 
@@ -733,25 +732,25 @@ mod tests {
         let first = SocketId::new(1);
         let second = SocketId::new(2);
         acquire_ownership_and_drain(&sessions, &mut commands, first).await;
-        let mut metadata = FrameMetadata {
-            generation: value(waywire_protocol::pipe::Generation::new(1)),
-            sequence: 1,
-            capture_nanos: 0,
-            width: value(waywire_protocol::pipe::FrameDimension::new(1280)),
-            height: value(waywire_protocol::pipe::FrameDimension::new(720)),
-            input_sequence: None,
-            fps: value(Fps::new(60)),
-            chroma: waywire_protocol::pipe::Chroma::Yuv420,
-        };
+        let mut metadata = FrameMetadata::new(
+            value(waywire_protocol::pipe::Generation::new(1)),
+            value(waywire_protocol::pipe::FrameDimension::new(1280)),
+            value(waywire_protocol::pipe::FrameDimension::new(720)),
+            0,
+            1,
+            None,
+            value(Fps::new(60)),
+            waywire_protocol::pipe::Chroma::Yuv420,
+        );
         sessions.submitted(&metadata);
-        metadata.sequence += 1;
-        metadata.capture_nanos = 2_000_000_000;
+        metadata.set_sequence(metadata.sequence() + 1);
+        metadata.set_capture_nanos(2_000_000_000);
         sessions.submitted(&metadata);
         for _ in 0..2 {
-            metadata.sequence += 60;
-            metadata.capture_nanos += 1_000_000_000;
+            metadata.set_sequence(metadata.sequence() + 60);
+            metadata.set_capture_nanos(metadata.capture_nanos() + 1_000_000_000);
             sessions.submitted(&metadata);
-            if metadata.sequence == 62 {
+            if metadata.sequence() == 62 {
                 sessions
                     .feedback(first, good_feedback())
                     .await
@@ -761,7 +760,7 @@ mod tests {
         sessions.release(first).await.expect("release");
         assert!(matches!(
             commands.recv().await,
-            Some(Command::InputLease(InputLease { held: false }))
+            Some(Command::InputLease(InputControl::Agents))
         ));
         acquire_ownership_and_drain(&sessions, &mut commands, second).await;
         sessions
@@ -772,12 +771,12 @@ mod tests {
             sessions.quality_chroma(),
             waywire_protocol::pipe::Chroma::Yuv420
         );
-        assert_eq!(sessions.quality().scale.get(), 100);
-        assert_eq!(sessions.quality().fps.get(), 60);
+        assert_eq!(sessions.quality().scale().get(), 100);
+        assert_eq!(sessions.quality().fps().get(), 60);
         // Also reset the sequence baseline: old-owner frames cannot leak into
         // the new owner's first sample even without a generation change.
-        metadata.sequence += 1000;
-        metadata.capture_nanos += 2_000_000_000;
+        metadata.set_sequence(metadata.sequence() + 1000);
+        metadata.set_capture_nanos(metadata.capture_nanos() + 2_000_000_000);
         sessions.submitted(&metadata);
         sessions
             .feedback(second, good_feedback())
@@ -787,8 +786,8 @@ mod tests {
             sessions.quality_chroma(),
             waywire_protocol::pipe::Chroma::Yuv420
         );
-        assert_eq!(sessions.quality().scale.get(), 100);
-        assert_eq!(sessions.quality().fps.get(), 60);
+        assert_eq!(sessions.quality().scale().get(), 100);
+        assert_eq!(sessions.quality().fps().get(), 60);
         assert!(
             timeout(Duration::from_millis(20), commands.recv())
                 .await

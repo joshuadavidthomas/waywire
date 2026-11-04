@@ -163,18 +163,22 @@ struct EncoderPressure {
 impl EncoderPressure {
     fn observe(&mut self, metadata: &FrameMetadata) -> Baseline {
         let previous = self.previous.replace((
-            metadata.generation,
-            metadata.sequence,
-            metadata.capture_nanos,
+            metadata.generation(),
+            metadata.sequence(),
+            metadata.capture_nanos(),
         ));
         let Some((generation, sequence, captured)) = previous else {
-            self.warmup_until = metadata.capture_nanos.saturating_add(ENCODER_WARMUP_NANOS);
+            self.warmup_until = metadata
+                .capture_nanos()
+                .saturating_add(ENCODER_WARMUP_NANOS);
             return Baseline::Restarted;
         };
-        if generation != metadata.generation || metadata.sequence <= sequence {
+        if generation != metadata.generation() || metadata.sequence() <= sequence {
             self.rendered = 0;
             self.dropped = 0;
-            self.warmup_until = metadata.capture_nanos.saturating_add(ENCODER_WARMUP_NANOS);
+            self.warmup_until = metadata
+                .capture_nanos()
+                .saturating_add(ENCODER_WARMUP_NANOS);
             return Baseline::Restarted;
         }
         // The first second can replace frames while ffmpeg starts. Keep moving
@@ -182,7 +186,7 @@ impl EncoderPressure {
         if captured <= self.warmup_until {
             return Baseline::Continued;
         }
-        let rendered = metadata.sequence - sequence;
+        let rendered = metadata.sequence() - sequence;
         self.rendered = self.rendered.saturating_add(rendered);
         self.dropped = self.dropped.saturating_add(rendered - 1);
         Baseline::Continued
@@ -501,11 +505,7 @@ pub(super) struct Quality {
 impl Quality {
     pub(super) fn new(bitrate: Kbps, fps: Fps) -> Self {
         Self {
-            levels: QualityLevels {
-                bitrate,
-                fps,
-                scale: FULL_SCALE,
-            },
+            levels: QualityLevels::new(bitrate, fps, FULL_SCALE),
             max_bitrate: bitrate,
             max_fps: fps,
             crf: AUTOMATIC_CRF,
@@ -786,7 +786,7 @@ impl Quality {
 
     fn probing(&self) -> bool {
         self.link
-            .is_some_and(|link| self.levels.bitrate > link.held())
+            .is_some_and(|link| self.levels.bitrate() > link.held())
     }
 
     fn lower(&mut self, lowering: Lowering) {
@@ -807,7 +807,8 @@ impl Quality {
     fn fail_probe(&mut self) {
         let floor = self.bounds().bitrate_floor;
         if let Some(link) = self.link.as_mut() {
-            self.levels.bitrate = link.drain().at_least(floor).at_most(self.levels.bitrate);
+            self.levels
+                .set_bitrate(link.drain().at_least(floor).at_most(self.levels.bitrate()));
             link.patience = link
                 .patience
                 .saturating_mul(2)
@@ -821,21 +822,24 @@ impl Quality {
 
     fn clamp_to_bounds(&mut self) {
         let bounds = self.bounds();
-        self.levels.bitrate = self
-            .levels
-            .bitrate
-            .at_least(bounds.bitrate_floor)
-            .at_most(bounds.bitrate_ceiling);
-        self.levels.fps = self
-            .levels
-            .fps
-            .max(bounds.fps_floor)
-            .min(bounds.fps_ceiling);
-        self.levels.scale = self
-            .levels
-            .scale
-            .max(bounds.scale_floor)
-            .min(bounds.scale_ceiling);
+        self.levels.set_bitrate(
+            self.levels
+                .bitrate()
+                .at_least(bounds.bitrate_floor)
+                .at_most(bounds.bitrate_ceiling),
+        );
+        self.levels.set_fps(
+            self.levels
+                .fps()
+                .max(bounds.fps_floor)
+                .min(bounds.fps_ceiling),
+        );
+        self.levels.set_scale(
+            self.levels
+                .scale()
+                .max(bounds.scale_floor)
+                .min(bounds.scale_ceiling),
+        );
         self.crf = bounds.crf;
     }
 
@@ -847,7 +851,11 @@ impl Quality {
         let patience = if let Some(link) = self.link {
             link.patience
         } else {
-            self.levels.scale = self.levels.scale.lowered_by(SCALE_STEP, bounds.scale_floor);
+            self.levels.set_scale(
+                self.levels
+                    .scale()
+                    .lowered_by(SCALE_STEP, bounds.scale_floor),
+            );
             LINK_PROBE_PATIENCE
         };
         let link = LinkLimit {
@@ -855,10 +863,11 @@ impl Quality {
             patience,
         };
         self.link = Some(link);
-        self.levels.bitrate = link
-            .drain()
-            .at_least(bounds.bitrate_floor)
-            .at_most(self.levels.bitrate);
+        self.levels.set_bitrate(
+            link.drain()
+                .at_least(bounds.bitrate_floor)
+                .at_most(self.levels.bitrate()),
+        );
     }
 
     /// A probe waits at the held rate, longer after each failure. Its verdict waits
@@ -866,8 +875,8 @@ impl Quality {
     /// queue for the viewer.
     fn raise_patience(&self) -> u8 {
         match self.link {
-            Some(link) if self.levels.fps >= self.bounds().fps_ceiling => {
-                match self.levels.bitrate.cmp(&link.held()) {
+            Some(link) if self.levels.fps() >= self.bounds().fps_ceiling => {
+                match self.levels.bitrate().cmp(&link.held()) {
                     std::cmp::Ordering::Greater => LINK_PROBE_PATIENCE,
                     std::cmp::Ordering::Equal => link.patience,
                     std::cmp::Ordering::Less => GOOD_STREAK_THRESHOLD,
@@ -885,45 +894,54 @@ impl Quality {
     fn lower_one_level(&mut self) {
         let bounds = self.bounds();
         // Scale changes only the encoder frame, never the Wayland output.
-        if self.levels.scale > bounds.scale_floor {
-            self.levels.scale = self.levels.scale.lowered_by(SCALE_STEP, bounds.scale_floor);
-        } else if self.levels.bitrate > bounds.bitrate_floor {
-            self.levels.bitrate = self
-                .levels
-                .bitrate
-                .scaled(DOWN_STEP_PERCENT)
-                .at_least(bounds.bitrate_floor);
-        } else if self.levels.fps > bounds.fps_floor {
-            self.levels.fps = self.levels.fps.lowered_by(FPS_STEP, bounds.fps_floor);
+        if self.levels.scale() > bounds.scale_floor {
+            self.levels.set_scale(
+                self.levels
+                    .scale()
+                    .lowered_by(SCALE_STEP, bounds.scale_floor),
+            );
+        } else if self.levels.bitrate() > bounds.bitrate_floor {
+            self.levels.set_bitrate(
+                self.levels
+                    .bitrate()
+                    .scaled(DOWN_STEP_PERCENT)
+                    .at_least(bounds.bitrate_floor),
+            );
+        } else if self.levels.fps() > bounds.fps_floor {
+            self.levels
+                .set_fps(self.levels.fps().lowered_by(FPS_STEP, bounds.fps_floor));
         }
     }
 
     fn raise_one_level(&mut self) {
         let bounds = self.bounds();
-        if self.levels.fps < bounds.fps_ceiling {
-            self.levels.fps = self.levels.fps.raised_by(FPS_STEP, bounds.fps_ceiling);
-        } else if self.levels.bitrate < bounds.bitrate_ceiling {
+        if self.levels.fps() < bounds.fps_ceiling {
+            self.levels
+                .set_fps(self.levels.fps().raised_by(FPS_STEP, bounds.fps_ceiling));
+        } else if self.levels.bitrate() < bounds.bitrate_ceiling {
             let raised = match self.link {
                 // Return to the held rate the link already carried.
-                Some(link) if self.levels.bitrate < link.held() => self
+                Some(link) if self.levels.bitrate() < link.held() => self
                     .levels
-                    .bitrate
+                    .bitrate()
                     .scaled(UP_STEP_PERCENT)
                     .at_most(link.held()),
                 // The probe held for a whole recovery streak, so the link cleared.
-                Some(link) if self.levels.bitrate > link.delivered => {
+                Some(link) if self.levels.bitrate() > link.delivered => {
                     self.link = None;
-                    self.levels.bitrate.scaled(UP_STEP_PERCENT)
+                    self.levels.bitrate().scaled(UP_STEP_PERCENT)
                 }
-                Some(_) => self.levels.bitrate.scaled(LINK_PROBE_PERCENT),
-                None => self.levels.bitrate.scaled(UP_STEP_PERCENT),
+                Some(_) => self.levels.bitrate().scaled(LINK_PROBE_PERCENT),
+                None => self.levels.bitrate().scaled(UP_STEP_PERCENT),
             };
-            self.levels.bitrate = raised.at_most(bounds.bitrate_ceiling);
-        } else if self.levels.scale < bounds.scale_ceiling {
-            self.levels.scale = self
-                .levels
-                .scale
-                .raised_by(SCALE_STEP, bounds.scale_ceiling);
+            self.levels
+                .set_bitrate(raised.at_most(bounds.bitrate_ceiling));
+        } else if self.levels.scale() < bounds.scale_ceiling {
+            self.levels.set_scale(
+                self.levels
+                    .scale()
+                    .raised_by(SCALE_STEP, bounds.scale_ceiling),
+            );
         }
     }
 }
@@ -974,7 +992,7 @@ mod tests {
                     .update(&overloaded, now)
                     .expect("downshift")
                     .new
-                    .scale
+                    .scale()
                     .get(),
                 75
             );
@@ -1000,7 +1018,7 @@ mod tests {
                     .update(&good_feedback(), recovered_at)
                     .expect("recovery")
                     .new
-                    .scale
+                    .scale()
                     .get(),
                 100
             );
@@ -1029,19 +1047,19 @@ mod tests {
     }
 
     fn warmed_encoder(quality: &mut Quality) -> FrameMetadata {
-        let mut metadata = FrameMetadata {
-            generation: value(Generation::new(1)),
-            sequence: 1,
-            capture_nanos: 0,
-            width: value(waywire_protocol::pipe::FrameDimension::new(1280)),
-            height: value(waywire_protocol::pipe::FrameDimension::new(720)),
-            input_sequence: None,
-            fps: value(Fps::new(60)),
-            chroma: Chroma::Yuv420,
-        };
+        let mut metadata = FrameMetadata::new(
+            value(Generation::new(1)),
+            value(waywire_protocol::pipe::FrameDimension::new(1280)),
+            value(waywire_protocol::pipe::FrameDimension::new(720)),
+            0,
+            1,
+            None,
+            value(Fps::new(60)),
+            Chroma::Yuv420,
+        );
         quality.submitted(&metadata);
-        metadata.sequence = 2;
-        metadata.capture_nanos = 2_000_000_000;
+        metadata.set_sequence(2);
+        metadata.set_capture_nanos(2_000_000_000);
         quality.submitted(&metadata);
         metadata
     }
@@ -1052,10 +1070,10 @@ mod tests {
         submitted: u64,
         dropped: u64,
     ) {
-        metadata.sequence += dropped;
+        metadata.set_sequence(metadata.sequence() + dropped);
         for _ in 0..submitted {
-            metadata.sequence += 1;
-            metadata.capture_nanos += 20_000_000;
+            metadata.set_sequence(metadata.sequence() + 1);
+            metadata.set_capture_nanos(metadata.capture_nanos() + 20_000_000);
             quality.submitted(metadata);
         }
     }
@@ -1083,11 +1101,11 @@ mod tests {
             );
             assert_eq!(
                 quality.levels(),
-                QualityLevels {
-                    bitrate: value(Kbps::new(8_000)),
-                    fps: value(Fps::new(60)),
-                    scale: value(ScalePercent::new(if changes { 75 } else { 100 })),
-                }
+                QualityLevels::new(
+                    value(Kbps::new(8_000)),
+                    value(Fps::new(60)),
+                    value(ScalePercent::new(if changes { 75 } else { 100 }))
+                )
             );
             assert_eq!(quality.chroma, Chroma::Yuv420);
         }
@@ -1104,9 +1122,9 @@ mod tests {
                     encoder_sample(&mut quality, &mut metadata, 30, 30);
                     quality.update(&sample, now);
                 }
-                assert_eq!(quality.levels().fps.get(), 60);
-                assert_eq!(quality.levels().scale.get(), scale);
-                assert_eq!(quality.levels().bitrate.get(), bitrate);
+                assert_eq!(quality.levels().fps().get(), 60);
+                assert_eq!(quality.levels().scale().get(), scale);
+                assert_eq!(quality.levels().bitrate().get(), bitrate);
                 assert_eq!(quality.chroma, Chroma::Yuv420);
                 now += QUALITY_CHANGE_COOLDOWN;
             }
@@ -1123,13 +1141,13 @@ mod tests {
             assert_eq!(quality.update(&good_feedback(), now), None);
             assert_eq!(quality.update(&feedback(0, 0, 0, 0.0, 0, 20.0), now), None);
             // One damaged frame after a minute is not 3,599 lost frames.
-            metadata.capture_nanos += 60_000_000_000;
+            metadata.set_capture_nanos(metadata.capture_nanos() + 60_000_000_000);
             encoder_sample(&mut quality, &mut metadata, 1, 0);
             assert_eq!(quality.update(&feedback(1, 1, 0, 0.0, 0, 20.0), now), None);
         }
         assert_eq!(quality.chroma, Chroma::Yuv420);
-        assert_eq!(quality.levels().scale, FULL_SCALE);
-        assert_eq!(quality.levels().fps.get(), 60);
+        assert_eq!(quality.levels().scale(), FULL_SCALE);
+        assert_eq!(quality.levels().fps().get(), 60);
     }
 
     #[test]
@@ -1140,25 +1158,25 @@ mod tests {
         encoder_sample(&mut quality, &mut metadata, 30, 30);
         assert_eq!(quality.update(&good_feedback(), now), None);
         encoder_sample(&mut quality, &mut metadata, 30, 30);
-        metadata.generation = value(Generation::new(2));
-        metadata.sequence += 10_000;
+        metadata.set_generation(value(Generation::new(2)));
+        metadata.set_sequence(metadata.sequence() + 10_000);
         quality.submitted(&metadata);
         encoder_sample(&mut quality, &mut metadata, 30, 300);
         assert_eq!(quality.update(&good_feedback(), now), None);
         // The interval crossing the grace boundary is also discarded.
-        metadata.capture_nanos += 2_000_000_000;
+        metadata.set_capture_nanos(metadata.capture_nanos() + 2_000_000_000);
         encoder_sample(&mut quality, &mut metadata, 1, 300);
         assert_eq!(quality.update(&good_feedback(), now), None);
         encoder_sample(&mut quality, &mut metadata, 30, 30);
         assert_eq!(quality.update(&good_feedback(), now), None);
-        assert_eq!(quality.levels().fps.get(), 60);
+        assert_eq!(quality.levels().fps().get(), 60);
         encoder_sample(&mut quality, &mut metadata, 30, 30);
         assert_eq!(
             quality
                 .update(&good_feedback(), now)
                 .expect("two fresh bad windows")
                 .new
-                .scale,
+                .scale(),
             value(ScalePercent::new(75))
         );
         assert_eq!(quality.chroma, Chroma::Yuv420);
@@ -1177,7 +1195,7 @@ mod tests {
                 .update(&good_feedback(), now)
                 .expect("lower encoded scale under sustained pressure")
                 .new
-                .scale,
+                .scale(),
             value(ScalePercent::new(75))
         );
         for seconds in 1..5 {
@@ -1191,9 +1209,9 @@ mod tests {
         let change = quality
             .update(&good_feedback(), now + Duration::from_secs(5))
             .expect("next rung at five seconds");
-        assert_eq!(change.new.scale, value(ScalePercent::new(50)));
-        assert_eq!(change.new.bitrate, value(Kbps::new(8_000)));
-        assert_eq!(change.new.fps, value(Fps::new(60)));
+        assert_eq!(change.new.scale(), value(ScalePercent::new(50)));
+        assert_eq!(change.new.bitrate(), value(Kbps::new(8_000)));
+        assert_eq!(change.new.fps(), value(Fps::new(60)));
         for seconds in 6..13 {
             encoder_sample(&mut quality, &mut metadata, 49, 1);
             assert_eq!(
@@ -1220,7 +1238,7 @@ mod tests {
                 .update(&good_feedback(), now + Duration::from_secs(21))
                 .expect("eight healthy windows")
                 .new
-                .scale,
+                .scale(),
             value(ScalePercent::new(75))
         );
         assert_eq!(quality.chroma, Chroma::Yuv420);
@@ -1249,7 +1267,7 @@ mod tests {
             (120, 0, 0, false),
         ] {
             let mut quality = Quality::new(value(Kbps::new(16_000)), value(Fps::new(120)));
-            quality.levels.fps = value(Fps::new(90));
+            quality.levels.set_fps(value(Fps::new(90)));
             let sample = feedback(received, presented, 1, 0.0, dropped, 20.0);
             let now = Instant::now();
             for _ in 0..7 {
@@ -1285,16 +1303,16 @@ mod tests {
         assert_eq!(
             change,
             QualityChange {
-                old: QualityLevels {
-                    bitrate: value(Kbps::new(8_000)),
-                    fps: value(Fps::new(60)),
-                    scale: value(ScalePercent::new(100)),
-                },
-                new: QualityLevels {
-                    bitrate: value(Kbps::new(8_000)),
-                    fps: value(Fps::new(60)),
-                    scale: value(ScalePercent::new(75)),
-                },
+                old: QualityLevels::new(
+                    value(Kbps::new(8_000)),
+                    value(Fps::new(60)),
+                    value(ScalePercent::new(100))
+                ),
+                new: QualityLevels::new(
+                    value(Kbps::new(8_000)),
+                    value(Fps::new(60)),
+                    value(ScalePercent::new(75))
+                ),
                 old_crf: AUTOMATIC_CRF,
                 new_crf: AUTOMATIC_CRF,
                 old_chroma: Chroma::Yuv420,
@@ -1325,11 +1343,11 @@ mod tests {
             assert_eq!(
                 (change.new, change.new_chroma),
                 (
-                    QualityLevels {
-                        bitrate: value(Kbps::new(bitrate)),
-                        fps: value(Fps::new(frame_rate)),
-                        scale: value(ScalePercent::new(scale)),
-                    },
+                    QualityLevels::new(
+                        value(Kbps::new(bitrate)),
+                        value(Fps::new(frame_rate)),
+                        value(ScalePercent::new(scale))
+                    ),
                     chroma,
                 )
             );
@@ -1340,11 +1358,11 @@ mod tests {
         assert_eq!(
             (quality.levels(), quality.chroma),
             (
-                QualityLevels {
-                    bitrate: value(Kbps::new(300)),
-                    fps: value(Fps::new(20)),
-                    scale: value(ScalePercent::new(50)),
-                },
+                QualityLevels::new(
+                    value(Kbps::new(300)),
+                    value(Fps::new(20)),
+                    value(ScalePercent::new(50))
+                ),
                 Chroma::Yuv420,
             )
         );
@@ -1358,14 +1376,14 @@ mod tests {
         for expected_scale in [75, 50] {
             let change = trigger_bad(&mut quality, now)
                 .expect("scale steps should precede the bitrate floor");
-            assert_eq!(change.new.scale, value(ScalePercent::new(expected_scale)));
+            assert_eq!(change.new.scale(), value(ScalePercent::new(expected_scale)));
             assert_eq!(change.new_chroma, Chroma::Yuv420);
             now += QUALITY_CHANGE_COOLDOWN;
         }
         for expected in [400, 320, 300] {
             let change = trigger_bad(&mut quality, now)
                 .expect("bad streak should lower bitrate to its floor");
-            assert_eq!(change.new.bitrate, value(Kbps::new(expected)));
+            assert_eq!(change.new.bitrate(), value(Kbps::new(expected)));
             now += QUALITY_CHANGE_COOLDOWN;
         }
 
@@ -1375,11 +1393,11 @@ mod tests {
     #[test]
     fn good_ladder_reverses_the_bad_ladder_priority_exactly() {
         let mut quality = Quality::new(value(Kbps::new(1_000)), value(Fps::new(40)));
-        quality.levels = QualityLevels {
-            bitrate: value(Kbps::new(500)),
-            fps: value(Fps::new(20)),
-            scale: value(ScalePercent::new(50)),
-        };
+        quality.levels = QualityLevels::new(
+            value(Kbps::new(500)),
+            value(Fps::new(20)),
+            value(ScalePercent::new(50)),
+        );
         let mut now = Instant::now();
         let expected = [
             (500, 30, 50, Chroma::Yuv420),
@@ -1395,11 +1413,11 @@ mod tests {
             assert_eq!(
                 (change.new, change.new_chroma),
                 (
-                    QualityLevels {
-                        bitrate: value(Kbps::new(bitrate)),
-                        fps: value(Fps::new(frame_rate)),
-                        scale: value(ScalePercent::new(scale)),
-                    },
+                    QualityLevels::new(
+                        value(Kbps::new(bitrate)),
+                        value(Fps::new(frame_rate)),
+                        value(ScalePercent::new(scale))
+                    ),
                     chroma,
                 )
             );
@@ -1480,32 +1498,32 @@ mod tests {
 
             while let Some(change) = trigger_bad(&mut quality, now) {
                 assert_eq!(change.new_chroma, Chroma::Yuv420);
-                assert!(change.new.bitrate <= change.old.bitrate);
-                assert!(change.new.fps <= change.old.fps);
-                assert!(change.new.scale <= change.old.scale);
-                assert!(change.new.bitrate >= bounds.bitrate_floor);
-                assert!(change.new.fps >= bounds.fps_floor);
-                assert!(change.new.scale >= bounds.scale_floor);
+                assert!(change.new.bitrate() <= change.old.bitrate());
+                assert!(change.new.fps() <= change.old.fps());
+                assert!(change.new.scale() <= change.old.scale());
+                assert!(change.new.bitrate() >= bounds.bitrate_floor);
+                assert!(change.new.fps() >= bounds.fps_floor);
+                assert!(change.new.scale() >= bounds.scale_floor);
                 now += QUALITY_CHANGE_COOLDOWN;
             }
-            assert_eq!(quality.levels().bitrate, bounds.bitrate_floor);
-            assert_eq!(quality.levels().fps, bounds.fps_floor);
-            assert_eq!(quality.levels().scale, bounds.scale_floor);
+            assert_eq!(quality.levels().bitrate(), bounds.bitrate_floor);
+            assert_eq!(quality.levels().fps(), bounds.fps_floor);
+            assert_eq!(quality.levels().scale(), bounds.scale_floor);
             assert_eq!(quality.chroma, Chroma::Yuv420);
 
             while let Some(change) = trigger_good(&mut quality, now) {
                 assert_eq!(change.new_chroma, Chroma::Yuv420);
-                assert!(change.new.bitrate >= change.old.bitrate);
-                assert!(change.new.fps >= change.old.fps);
-                assert!(change.new.scale >= change.old.scale);
-                assert!(change.new.bitrate <= bounds.bitrate_ceiling);
-                assert!(change.new.fps <= bounds.fps_ceiling);
-                assert!(change.new.scale <= bounds.scale_ceiling);
+                assert!(change.new.bitrate() >= change.old.bitrate());
+                assert!(change.new.fps() >= change.old.fps());
+                assert!(change.new.scale() >= change.old.scale());
+                assert!(change.new.bitrate() <= bounds.bitrate_ceiling);
+                assert!(change.new.fps() <= bounds.fps_ceiling);
+                assert!(change.new.scale() <= bounds.scale_ceiling);
                 now += QUALITY_CHANGE_COOLDOWN;
             }
-            assert_eq!(quality.levels().bitrate, bounds.bitrate_ceiling);
-            assert_eq!(quality.levels().fps, bounds.fps_ceiling);
-            assert_eq!(quality.levels().scale, bounds.scale_ceiling);
+            assert_eq!(quality.levels().bitrate(), bounds.bitrate_ceiling);
+            assert_eq!(quality.levels().fps(), bounds.fps_ceiling);
+            assert_eq!(quality.levels().scale(), bounds.scale_ceiling);
             assert_eq!(quality.chroma, Chroma::Yuv420);
         }
     }
@@ -1527,11 +1545,11 @@ mod tests {
         }
         assert_eq!(
             quality.levels(),
-            QualityLevels {
-                bitrate: value(Kbps::new(8_000)),
-                fps: value(Fps::new(60)),
-                scale: value(ScalePercent::new(100)),
-            }
+            QualityLevels::new(
+                value(Kbps::new(8_000)),
+                value(Fps::new(60)),
+                value(ScalePercent::new(100))
+            )
         );
     }
 
@@ -1561,7 +1579,7 @@ mod tests {
         assert_eq!(
             quality
                 .select_preset(QualityPreset::Medium)
-                .map(|change| change.new.bitrate),
+                .map(|change| change.new.bitrate()),
             Some(value(Kbps::new(4_000)))
         );
         assert_eq!(quality.update(&bad_feedback(), now), None);
@@ -1591,8 +1609,8 @@ mod tests {
                 .update(&bad_feedback(), now + QUALITY_CHANGE_COOLDOWN)
                 .is_some()
         );
-        assert_eq!(quality.levels().bitrate, value(Kbps::new(8_000)));
-        assert_eq!(quality.levels().scale, value(ScalePercent::new(50)));
+        assert_eq!(quality.levels().bitrate(), value(Kbps::new(8_000)));
+        assert_eq!(quality.levels().scale(), value(ScalePercent::new(50)));
         assert_eq!(quality.chroma, Chroma::Yuv420);
     }
 
@@ -1608,7 +1626,7 @@ mod tests {
         assert_eq!(quality.streak, Streak::None);
         assert_eq!(quality.update(&bad_feedback(), now), None);
         assert_eq!(quality.chroma, Chroma::Yuv420);
-        assert_eq!(quality.levels().scale, FULL_SCALE);
+        assert_eq!(quality.levels().scale(), FULL_SCALE);
     }
 
     #[test]
@@ -1639,7 +1657,7 @@ mod tests {
         }
         assert!(quality.update(&good_feedback(), now).is_some());
         assert_eq!(quality.chroma, Chroma::Yuv420);
-        assert_eq!(quality.levels().scale, FULL_SCALE);
+        assert_eq!(quality.levels().scale(), FULL_SCALE);
     }
 
     #[test]
@@ -1655,7 +1673,7 @@ mod tests {
             let recovered = feedback(received, received - dropped, 0, 0.0, dropped, 20.0);
             assert!(quality.update(&recovered, now).is_some());
             assert_eq!(quality.chroma, Chroma::Yuv420);
-            assert_eq!(quality.levels().scale, FULL_SCALE);
+            assert_eq!(quality.levels().scale(), FULL_SCALE);
         }
     }
 
@@ -1693,7 +1711,7 @@ mod tests {
         /// One second of video that fills its bitrate target. Nothing is late or
         /// lost yet: only the bytes show the link.
         fn second(&mut self, quality: &mut Quality) -> Feedback {
-            let produced = quality.levels().bitrate.get() * 125;
+            let produced = quality.levels().bitrate().get() * 125;
             quality.produced(produced as usize);
             self.queued += produced;
             let delivered = self
@@ -1708,16 +1726,16 @@ mod tests {
             } else {
                 0
             };
-            Feedback::new(waywire_protocol::browser::FeedbackValues {
-                received: 30,
-                presented: 30 - dropped,
-                queue_peak: 0,
-                queue_busy_ms: 0.0,
-                sample_ms: 1000.0,
+            Feedback::new(waywire_protocol::browser::FeedbackValues::new(
+                30,
+                30 - dropped,
+                0,
+                0.0,
+                1000.0,
                 dropped,
-                rtt: 20.0,
-                bytes: delivered,
-            })
+                20.0,
+                delivered,
+            ))
             .expect("link feedback should be valid")
         }
     }
@@ -1735,9 +1753,9 @@ mod tests {
                 let change = quality.update(&sample, start + Duration::from_secs(second))?;
                 Some((
                     second,
-                    change.new.bitrate.get(),
-                    change.new.fps.get(),
-                    change.new.scale.get(),
+                    change.new.bitrate().get(),
+                    change.new.fps().get(),
+                    change.new.scale().get(),
                 ))
             })
             .collect()
@@ -1797,7 +1815,7 @@ mod tests {
             .map(|(second, ..)| second)
             .collect();
         assert_eq!(probes, [26, 71, 146, 221, 296, 371]);
-        assert_eq!(quality.levels().bitrate, value(Kbps::new(425)));
+        assert_eq!(quality.levels().bitrate(), value(Kbps::new(425)));
     }
 
     #[test]
@@ -1809,7 +1827,7 @@ mod tests {
             queued: 0,
         };
         drive(&mut quality, &mut link, start, 1..=11);
-        assert_eq!(quality.levels().bitrate, value(Kbps::new(425)));
+        assert_eq!(quality.levels().bitrate(), value(Kbps::new(425)));
         quality.reset_samples();
         // The new owner's link is clear, so recovery doubles without probing.
         let mut clear = Link::default();
@@ -1828,7 +1846,7 @@ mod tests {
             queued: 0,
         };
         drive(&mut quality, &mut link, start, 1..=20);
-        assert_eq!(quality.levels().bitrate, value(Kbps::new(1_700)));
+        assert_eq!(quality.levels().bitrate(), value(Kbps::new(1_700)));
         // The link narrows further: jump to half of what it now carries.
         assert_eq!(
             {
@@ -1842,16 +1860,9 @@ mod tests {
     #[test]
     fn a_backlog_is_measured_over_two_seconds_after_its_first_and_then_drains_quietly() {
         let sample = |bytes, dropped| {
-            Feedback::new(waywire_protocol::browser::FeedbackValues {
-                received: 30,
-                presented: 30,
-                queue_peak: 0,
-                queue_busy_ms: 0.0,
-                sample_ms: 1000.0,
-                dropped,
-                rtt: 20.0,
-                bytes,
-            })
+            Feedback::new(waywire_protocol::browser::FeedbackValues::new(
+                30, 30, 0, 0.0, 1000.0, dropped, 20.0, bytes,
+            ))
             .expect("link feedback should be valid")
         };
         let mut quality = Quality::new(value(Kbps::new(12_000)), value(Fps::new(30)));
@@ -1867,8 +1878,8 @@ mod tests {
         let change = quality
             .update(&sample(50_000, 0), now)
             .expect("two measured seconds jump");
-        assert_eq!(change.new.bitrate, value(Kbps::new(500)));
-        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
+        assert_eq!(change.new.bitrate(), value(Kbps::new(500)));
+        assert_eq!(change.new.scale(), value(ScalePercent::new(75)));
         // The link then carries video queued before the jump faster than the encoder
         // produces it, and frames the gateway dropped then show up as losses.
         for second in 1..=12 {
@@ -1886,8 +1897,8 @@ mod tests {
                 None
             );
         }
-        assert_eq!(quality.levels().bitrate, value(Kbps::new(500)));
-        assert_eq!(quality.levels().scale, value(ScalePercent::new(75)));
+        assert_eq!(quality.levels().bitrate(), value(Kbps::new(500)));
+        assert_eq!(quality.levels().scale(), value(ScalePercent::new(75)));
     }
 
     #[test]
@@ -1895,22 +1906,15 @@ mod tests {
         // A busy decoder on a quiet screen: the low delivery rate is the screen,
         // not the link, so the bitrate target keeps its value.
         let mut quality = Quality::new(value(Kbps::new(8_000)), value(Fps::new(60)));
-        let busy = Feedback::new(waywire_protocol::browser::FeedbackValues {
-            received: 50,
-            presented: 50,
-            queue_peak: 5,
-            queue_busy_ms: 200.0,
-            sample_ms: 1000.0,
-            dropped: 0,
-            rtt: 20.0,
-            bytes: 12_500,
-        })
+        let busy = Feedback::new(waywire_protocol::browser::FeedbackValues::new(
+            50, 50, 5, 200.0, 1000.0, 0, 20.0, 12_500,
+        ))
         .expect("decoder feedback should be valid");
         let now = Instant::now();
         assert_eq!(quality.update(&busy, now), None);
         let change = quality.update(&busy, now).expect("decoder pressure lowers");
-        assert_eq!(change.new.bitrate, value(Kbps::new(8_000)));
-        assert_eq!(change.new.scale, value(ScalePercent::new(75)));
+        assert_eq!(change.new.bitrate(), value(Kbps::new(8_000)));
+        assert_eq!(change.new.scale(), value(ScalePercent::new(75)));
     }
 
     #[test]

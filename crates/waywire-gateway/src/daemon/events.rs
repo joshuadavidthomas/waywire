@@ -18,7 +18,7 @@ use waywire_protocol::Decoder;
 use waywire_protocol::ProtocolError as DecodeError;
 use waywire_protocol::browser::ClientEvent;
 use waywire_protocol::browser::CursorState;
-use waywire_protocol::pipe::AgentInput;
+use waywire_protocol::pipe::AgentInputState;
 use waywire_protocol::pipe::ClipboardText;
 use waywire_protocol::pipe::CursorPosition;
 use waywire_protocol::pipe::Event;
@@ -84,7 +84,7 @@ pub(crate) struct AppEvents {
     tx: broadcast::Sender<ClientEvent>,
     latest_clipboard: Arc<Mutex<Option<ClipboardText>>>,
     latest_cursor: Arc<Mutex<CursorState>>,
-    latest_agent: Arc<Mutex<Option<AgentInput>>>,
+    latest_agent: Arc<Mutex<Option<AgentInputState>>>,
 }
 
 impl AppEvents {
@@ -118,10 +118,7 @@ impl AppEvents {
             values.push(ClientEvent::ClipboardSnapshot { text });
         }
         if let Some(agent) = agent {
-            values.push(ClientEvent::AgentInput {
-                connected: agent.connected,
-                dropped: agent.dropped,
-            });
+            values.push(ClientEvent::AgentInput(agent));
         }
         values
     }
@@ -182,30 +179,29 @@ pub(super) async fn read_events(
                     }
                     Event::CursorShape(shape) => {
                         publish_cursor(&events, |cursor| {
-                            cursor.shape = shape;
-                            cursor.image = None;
+                            cursor.set_shape(shape);
                         });
                     }
                     Event::CursorImage(image) => {
                         use base64::Engine;
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(&image.png);
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(image.png());
                         publish_cursor(&events, |cursor| {
-                            cursor.image = Some(waywire_protocol::browser::CursorImage {
-                                url: format!("data:image/png;base64,{encoded}"),
-                                width: image.width,
-                                height: image.height,
-                                hotspot_x: image.hotspot_x,
-                                hotspot_y: image.hotspot_y,
-                                output_width: image.output_width,
-                            });
+                            cursor.set_image(waywire_protocol::browser::CursorImage::new(
+                                format!("data:image/png;base64,{encoded}"),
+                                image.width(),
+                                image.height(),
+                                image.hotspot_x(),
+                                image.hotspot_y(),
+                                image.output_width(),
+                            ));
                         });
                     }
                     Event::CursorVisibility(visibility) => {
-                        publish_cursor(&events, |cursor| cursor.visibility = visibility);
+                        publish_cursor(&events, |cursor| cursor.set_visibility(visibility));
                     }
                     Event::CursorPosition(position) => {
                         if let Some(position) = position_gate.push(position, Instant::now()) {
-                            publish_cursor(&events, |cursor| cursor.position = Some(position));
+                            publish_cursor(&events, |cursor| cursor.set_position(position));
                         }
                     }
                     Event::CursorClick(position) => {
@@ -213,12 +209,13 @@ pub(super) async fn read_events(
                         publish_cursor_click(&events, position);
                     }
                     Event::InputReceipt(receipt) => {
+                        let (sequence, delivery, window_id, app_id, title) = receipt.into_parts();
                         events.publish(ClientEvent::InputReceipt {
-                            sequence: receipt.sequence,
-                            delivery: receipt.delivery,
-                            window_id: receipt.window_id,
-                            app_id: receipt.app_id,
-                            title: receipt.title,
+                            sequence,
+                            delivery,
+                            window_id,
+                            app_id,
+                            title,
                         });
                     }
                     Event::AgentInput(agent) => {
@@ -226,10 +223,7 @@ pub(super) async fn read_events(
                             .latest_agent
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner) = Some(agent);
-                        events.publish(ClientEvent::AgentInput {
-                            connected: agent.connected,
-                            dropped: agent.dropped,
-                        });
+                        events.publish(ClientEvent::AgentInput(agent));
                     }
                 }
             }
@@ -240,7 +234,7 @@ pub(super) async fn read_events(
                 }
             } => {
                 if let Some(position) = position_gate.flush(Instant::now()) {
-                    publish_cursor(&events, |cursor| cursor.position = Some(position));
+                    publish_cursor(&events, |cursor| cursor.set_position(position));
                 }
             }
         }
@@ -268,10 +262,8 @@ fn publish_cursor_click(events: &AppEvents, position: CursorPosition) {
             .latest_cursor
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        cursor.position = Some(position);
-        let mut click = cursor.clone();
-        click.click = true;
-        ClientEvent::Cursor(click)
+        cursor.set_position(position);
+        ClientEvent::Cursor(cursor.clone().clicked(position))
     };
     events.publish(event);
 }
@@ -371,11 +363,11 @@ mod tests {
     use super::*;
 
     fn event(x: u32) -> Event {
-        Event::CursorPosition(CursorPosition {
-            x: PointerCoordinate::new(x).expect("valid test position"),
-            y: PointerCoordinate::new(x + 1).expect("valid test position"),
-            source: waywire_protocol::pipe::CursorSource::Browser,
-        })
+        Event::CursorPosition(CursorPosition::new(
+            PointerCoordinate::new(x).expect("valid test position"),
+            PointerCoordinate::new(x + 1).expect("valid test position"),
+            waywire_protocol::pipe::CursorSource::Browser,
+        ))
     }
 
     #[tokio::test]
@@ -552,21 +544,21 @@ mod tests {
     #[test]
     fn cursor_position_gate_publishes_first_and_latest_without_idle_deadline() {
         let now = Instant::now();
-        let first = CursorPosition {
-            x: PointerCoordinate::new(1).expect("valid test position"),
-            y: PointerCoordinate::new(2).expect("valid test position"),
-            source: waywire_protocol::pipe::CursorSource::Browser,
-        };
-        let replaced = CursorPosition {
-            x: PointerCoordinate::new(3).expect("valid test position"),
-            y: PointerCoordinate::new(4).expect("valid test position"),
-            source: waywire_protocol::pipe::CursorSource::Browser,
-        };
-        let latest = CursorPosition {
-            x: PointerCoordinate::new(5).expect("valid test position"),
-            y: PointerCoordinate::new(6).expect("valid test position"),
-            source: waywire_protocol::pipe::CursorSource::Agent,
-        };
+        let first = CursorPosition::new(
+            PointerCoordinate::new(1).expect("valid test position"),
+            PointerCoordinate::new(2).expect("valid test position"),
+            waywire_protocol::pipe::CursorSource::Browser,
+        );
+        let replaced = CursorPosition::new(
+            PointerCoordinate::new(3).expect("valid test position"),
+            PointerCoordinate::new(4).expect("valid test position"),
+            waywire_protocol::pipe::CursorSource::Browser,
+        );
+        let latest = CursorPosition::new(
+            PointerCoordinate::new(5).expect("valid test position"),
+            PointerCoordinate::new(6).expect("valid test position"),
+            waywire_protocol::pipe::CursorSource::Agent,
+        );
         let mut gate = CursorPositionGate::Open;
 
         assert_eq!(gate.push(first, now), Some(first));
@@ -590,11 +582,11 @@ mod tests {
     fn cursor_click_is_forwarded_once_and_not_replayed_in_snapshots() {
         let events = AppEvents::new();
         let (_, mut receiver) = events.subscribe();
-        let position = CursorPosition {
-            x: PointerCoordinate::new(120).expect("valid position"),
-            y: PointerCoordinate::new(240).expect("valid position"),
-            source: waywire_protocol::pipe::CursorSource::Agent,
-        };
+        let position = CursorPosition::new(
+            PointerCoordinate::new(120).expect("valid position"),
+            PointerCoordinate::new(240).expect("valid position"),
+            waywire_protocol::pipe::CursorSource::Agent,
+        );
         publish_cursor_click(&events, position);
         let event = receiver.try_recv().expect("click event");
         assert_eq!(

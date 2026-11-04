@@ -252,7 +252,7 @@ impl VideoPipeline {
         debug!(
             target: "waywire_latency",
             stage = "metadata",
-            sequence = value.sequence,
+            sequence = value.sequence(),
             at_ns = monotonic_nanos(),
         );
         // Observe ordered Submitted events before correlation can discard them.
@@ -268,11 +268,11 @@ impl VideoPipeline {
         debug!(
             target: "waywire_latency",
             stage = "encoded_received",
-            sequence = value.metadata.sequence,
+            sequence = value.metadata().sequence(),
             at_ns = monotonic_nanos(),
         );
-        self.sessions.submitted(&value.metadata);
-        self.sessions.produced(value.data.len());
+        self.sessions.submitted(value.metadata());
+        self.sessions.produced(value.data().len());
         self.tx
             .send(PipelineMessage::Encoded(value))
             .await
@@ -381,10 +381,9 @@ impl VideoWorker {
         };
         match self
             .commands
-            .try_system(&Command::KeyframeReadiness(KeyframeReadiness {
-                generation,
-                state,
-            })) {
+            .try_system(&Command::KeyframeReadiness(KeyframeReadiness::new(
+                generation, state,
+            ))) {
             Ok(Enqueued::Queued) => {}
             Ok(Enqueued::DroppedUnderBackpressure) => debug!(
                 generation = generation.get(),
@@ -458,18 +457,19 @@ impl VideoWorker {
                     // A frame in which no stripe changed counted as submitted; it has
                     // nothing for a viewer.
                     WorkerWake::Message(PipelineMessage::Encoded(frame))
-                        if frame.data.is_empty() =>
+                        if frame.data().is_empty() =>
                     {
                         continue;
                     }
                     WorkerWake::Message(PipelineMessage::Encoded(frame)) => {
-                        Correlation::frames(vec![VideoSample {
-                            data: frame.data.into(),
-                            layout: Layout::Stripes,
-                            kind: frame.kind,
-                            continuity: Continuity::Continuous,
-                            metadata: frame.metadata,
-                        }])
+                        let (kind, metadata, data) = frame.into_parts();
+                        Correlation::frames(vec![VideoSample::new(
+                            data.into(),
+                            Layout::Stripes,
+                            kind,
+                            Continuity::Continuous,
+                            metadata,
+                        )])
                     }
                     WorkerWake::KeyWanted => {
                         // Readiness stays as it is: existing viewers still play. Only
@@ -513,7 +513,7 @@ impl VideoWorker {
                 }
             };
             for frame in frames {
-                let generation = frame.metadata.generation;
+                let generation = frame.metadata().generation();
                 match self.hub.broadcast(&frame) {
                     GopState::KeyframeCached => {
                         self.readiness.mark_video_ready();
@@ -568,19 +568,18 @@ mod tests {
     }
 
     pub(super) fn metadata(sequence: u64, generation: u32) -> FrameMetadata {
-        FrameMetadata {
-            generation: Generation::new(generation)
-                .expect("test metadata generation should be valid"),
-            width: waywire_protocol::pipe::FrameDimension::new(1280)
+        FrameMetadata::new(
+            Generation::new(generation).expect("test metadata generation should be valid"),
+            waywire_protocol::pipe::FrameDimension::new(1280)
                 .expect("test frame width should be valid"),
-            height: waywire_protocol::pipe::FrameDimension::new(720)
+            waywire_protocol::pipe::FrameDimension::new(720)
                 .expect("test frame height should be valid"),
-            capture_nanos: sequence,
             sequence,
-            input_sequence: None,
-            fps: fps(30),
-            chroma: Chroma::Yuv444,
-        }
+            sequence,
+            None,
+            fps(30),
+            Chroma::Yuv444,
+        )
     }
 
     pub(super) fn unit(timestamp: u32, generation: u32) -> Unit {
@@ -605,13 +604,13 @@ mod tests {
     }
 
     pub(super) fn sample(sequence: u64, bytes: usize, kind: FrameKind) -> VideoSample {
-        VideoSample {
-            data: vec![1; bytes].into(),
-            layout: Layout::Whole,
+        VideoSample::new(
+            vec![1; bytes].into(),
+            Layout::Whole,
             kind,
-            continuity: Continuity::Continuous,
-            metadata: metadata(sequence, 1),
-        }
+            Continuity::Continuous,
+            metadata(sequence, 1),
+        )
     }
 
     #[test]
@@ -663,7 +662,7 @@ mod tests {
     async fn submitted_gaps_adapt_only_for_the_owner_before_rtp_correlation() {
         use waywire_protocol::browser::Feedback;
         use waywire_protocol::browser::FeedbackValues;
-        use waywire_protocol::pipe::InputLease;
+        use waywire_protocol::pipe::InputControl;
         use waywire_protocol::pipe::Kbps;
         use waywire_protocol::pipe::ScalePercent;
 
@@ -681,7 +680,7 @@ mod tests {
             sessions.acquire(owner).await.expect("acquire");
             assert!(matches!(
                 command_events.recv().await,
-                Some(Command::InputLease(InputLease { held: true }))
+                Some(Command::InputLease(InputControl::Browser))
             ));
             let (pipeline, mut worker) = VideoPipeline::new(
                 video_hub(),
@@ -693,27 +692,18 @@ mod tests {
             // Drain metadata without ever correlating RTP: producer pressure must
             // not depend on successful encoded delivery or correlate-time drops.
             let drain = tokio::spawn(async move { while worker.rx.recv().await.is_some() {} });
-            let feedback = Feedback::new(FeedbackValues {
-                received: 30,
-                presented: 30,
-                dropped: 0,
-                queue_peak: 0,
-                queue_busy_ms: 0.0,
-                sample_ms: 1000.0,
-                rtt: 20.0,
-                bytes: 0,
-            })
-            .expect("healthy browser feedback");
+            let feedback = Feedback::new(FeedbackValues::new(30, 30, 0, 0.0, 1000.0, 0, 20.0, 0))
+                .expect("healthy browser feedback");
             let mut frame = metadata(1, 1);
-            frame.chroma = Chroma::Yuv420;
+            frame.set_chroma(Chroma::Yuv420);
             pipeline.metadata(frame.clone()).await.expect("baseline");
-            frame.sequence += 1;
-            frame.capture_nanos = 2_000_000_000;
+            frame.set_sequence(frame.sequence() + 1);
+            frame.set_capture_nanos(2_000_000_000);
             pipeline.metadata(frame.clone()).await.expect("warmup");
             for _ in 0..2 {
                 for _ in 0..30 {
-                    frame.sequence += step;
-                    frame.capture_nanos += 33_000_000;
+                    frame.set_sequence(frame.sequence() + step);
+                    frame.set_capture_nanos(frame.capture_nanos() + 33_000_000);
                     pipeline.metadata(frame.clone()).await.expect("submitted");
                 }
                 assert_eq!(
@@ -729,21 +719,21 @@ mod tests {
                     .expect("owner feedback");
             }
             assert_eq!(sessions.quality_chroma(), Chroma::Yuv420);
-            assert_eq!(sessions.quality().fps.get(), 60);
+            assert_eq!(sessions.quality().fps().get(), 60);
             assert_eq!(
-                sessions.quality().scale.get(),
+                sessions.quality().scale().get(),
                 if step == 1 { 100 } else { 75 }
             );
             if step == 2 {
                 assert_eq!(
                     command_events.recv().await,
-                    Some(Command::Quality(waywire_protocol::pipe::Quality {
-                        bitrate_kbps: Kbps::new(8_000).expect("bitrate"),
-                        fps: fps(60),
-                        scale_percent: ScalePercent::new(75).expect("scale"),
-                        crf: waywire_protocol::pipe::Crf::new(27).expect("crf"),
-                        chroma: Chroma::Yuv420,
-                    }))
+                    Some(Command::Quality(waywire_protocol::pipe::Quality::new(
+                        Kbps::new(8_000).expect("bitrate"),
+                        fps(60),
+                        ScalePercent::new(75).expect("scale"),
+                        waywire_protocol::pipe::Crf::new(27).expect("crf"),
+                        Chroma::Yuv420
+                    )))
                 );
             }
             drop(pipeline);
@@ -780,7 +770,7 @@ mod tests {
         let frame = tokio::time::timeout(Duration::from_secs(1), viewer.next())
             .await
             .expect("frame despite full command queue");
-        assert_eq!(frame.metadata.sequence, 1);
+        assert_eq!(frame.metadata().sequence(), 1);
         assert_eq!(readiness.state(), ReadinessState::Ready);
         assert!(fatal.try_recv().is_err());
         drop(pipeline);
@@ -816,14 +806,11 @@ mod tests {
             .expect("first keyframe should queue");
         assert!(matches!(
             command_events.recv().await,
-            Some(Command::KeyframeReadiness(KeyframeReadiness {
-                state: KeyframeState::Cached,
-                ..
-            }))
+            Some(Command::KeyframeReadiness(readiness)) if readiness.state() == KeyframeState::Cached
         ));
         assert_eq!(readiness.state(), ReadinessState::Ready);
         let mut viewer = hub.subscribe();
-        assert_eq!(viewer.next().await.metadata.sequence, 1);
+        assert_eq!(viewer.next().await.metadata().sequence(), 1);
 
         for sequence in 2..=(PENDING_RECORD_CAPACITY as u64 + 2) {
             pipeline
@@ -833,10 +820,7 @@ mod tests {
         }
         assert!(matches!(
             command_events.recv().await,
-            Some(Command::KeyframeReadiness(KeyframeReadiness {
-                state: KeyframeState::Missing,
-                ..
-            }))
+            Some(Command::KeyframeReadiness(readiness)) if readiness.state() == KeyframeState::Missing
         ));
         assert_eq!(readiness.state(), ReadinessState::WaitingForKeyframe);
 
@@ -871,16 +855,13 @@ mod tests {
             .expect("recovery keyframe should queue");
         assert!(matches!(
             command_events.recv().await,
-            Some(Command::KeyframeReadiness(KeyframeReadiness {
-                state: KeyframeState::Cached,
-                ..
-            }))
+            Some(Command::KeyframeReadiness(readiness)) if readiness.state() == KeyframeState::Cached
         ));
         assert_eq!(readiness.state(), ReadinessState::Ready);
         let frame = viewer.next().await;
-        assert_eq!(frame.metadata.sequence, 501);
-        assert_eq!(frame.kind, FrameKind::Key);
-        assert_eq!(frame.continuity, Continuity::AfterGap);
+        assert_eq!(frame.metadata().sequence(), 501);
+        assert_eq!(frame.kind(), FrameKind::Key);
+        assert_eq!(frame.continuity(), Continuity::AfterGap);
 
         drop(pipeline);
         assert!(worker_task.await.expect("worker task should run").is_err());
@@ -950,8 +931,8 @@ mod tests {
         let Some(Command::KeyframeReadiness(command)) = command else {
             panic!("cached keyframe should queue a readiness command");
         };
-        assert_eq!(command.generation.get(), 1);
-        assert_eq!(command.state, KeyframeState::Cached);
+        assert_eq!(command.generation().get(), 1);
+        assert_eq!(command.state(), KeyframeState::Cached);
         assert_eq!(readiness.state(), ReadinessState::Ready);
 
         // A sequence jump drops the stream into recovery and must ask the
@@ -963,8 +944,8 @@ mod tests {
         let Some(Command::KeyframeReadiness(command)) = command else {
             panic!("assembler recovery should queue a readiness command");
         };
-        assert_eq!(command.generation.get(), 1);
-        assert_eq!(command.state, KeyframeState::Missing);
+        assert_eq!(command.generation().get(), 1);
+        assert_eq!(command.state(), KeyframeState::Missing);
         assert_eq!(readiness.state(), ReadinessState::WaitingForKeyframe);
 
         // Packets that drop while already recovering must not repeat the ask.

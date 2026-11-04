@@ -319,7 +319,7 @@ mod tests {
     use waywire_protocol::browser::FeedbackValues;
     use waywire_protocol::pipe::Fps;
     use waywire_protocol::pipe::Generation;
-    use waywire_protocol::pipe::InputLease;
+    use waywire_protocol::pipe::InputControl;
     use waywire_protocol::pipe::Kbps;
     use waywire_protocol::pipe::KeyframeReadiness;
     use waywire_protocol::pipe::KeyframeState;
@@ -397,10 +397,10 @@ mod tests {
         let second = first.next();
 
         commands.set_active_ownership(first);
-        let first_input = Command::KeyframeReadiness(KeyframeReadiness {
-            generation: Generation::new(1).expect("test generation should be valid"),
-            state: KeyframeState::Cached,
-        });
+        let first_input = Command::KeyframeReadiness(KeyframeReadiness::new(
+            Generation::new(1).expect("test generation should be valid"),
+            KeyframeState::Cached,
+        ));
         let first_bytes = first_input.encode();
         commands
             .input(first, first_input)
@@ -421,20 +421,20 @@ mod tests {
         commands
             .input(
                 first,
-                Command::KeyframeReadiness(KeyframeReadiness {
-                    generation: Generation::new(2).expect("test generation should be valid"),
-                    state: KeyframeState::Missing,
-                }),
+                Command::KeyframeReadiness(KeyframeReadiness::new(
+                    Generation::new(2).expect("test generation should be valid"),
+                    KeyframeState::Missing,
+                )),
             )
             .await
             .expect("stale input-owner command should enter the queue before filtering");
-        let second_input = Command::Quality(Quality {
-            bitrate_kbps: Kbps::new(8_000).expect("test bitrate should be valid"),
-            fps: Fps::new(60).expect("test frame rate should be valid"),
-            scale_percent: ScalePercent::new(100).expect("test scale should be valid"),
-            crf: waywire_protocol::pipe::Crf::new(23).expect("test CRF should be valid"),
-            chroma: waywire_protocol::pipe::Chroma::Yuv444,
-        });
+        let second_input = Command::Quality(Quality::new(
+            Kbps::new(8_000).expect("test bitrate should be valid"),
+            Fps::new(60).expect("test frame rate should be valid"),
+            ScalePercent::new(100).expect("test scale should be valid"),
+            waywire_protocol::pipe::Crf::new(23).expect("test CRF should be valid"),
+            waywire_protocol::pipe::Chroma::Yuv444,
+        ));
         let mut expected = Command::ReleaseAll(ReleaseAll).encode();
         expected.extend_from_slice(&second_input.encode());
         commands
@@ -505,17 +505,8 @@ mod tests {
             Fps::new(60).expect("test frame rate should be valid"),
         );
         let socket = SocketId::new(1);
-        let feedback = Feedback::new(FeedbackValues {
-            received: 50,
-            presented: 50,
-            queue_peak: 5,
-            queue_busy_ms: 200.0,
-            sample_ms: 1_000.0,
-            dropped: 0,
-            rtt: 20.0,
-            bytes: 0,
-        })
-        .expect("test feedback should be valid");
+        let feedback = Feedback::new(FeedbackValues::new(50, 50, 5, 200.0, 1_000.0, 0, 20.0, 0))
+            .expect("test feedback should be valid");
 
         assert!(matches!(
             sessions.acquire(socket).await.expect("acquire ownership"),
@@ -527,7 +518,7 @@ mod tests {
             .expect("initial lease should queue");
         assert!(matches!(
             Command::decode(&initial_release.encoded),
-            Ok(Command::InputLease(InputLease { held: true }))
+            Ok(Command::InputLease(InputControl::Browser))
         ));
 
         sessions
@@ -542,7 +533,7 @@ mod tests {
         let feedback_task =
             tokio::spawn(async move { feedback_sessions.feedback(socket, feedback).await });
         timeout(Duration::from_secs(1), async {
-            while sessions.quality().scale.get() == 100 {
+            while sessions.quality().scale().get() == 100 {
                 tokio::task::yield_now().await;
             }
         })
@@ -571,13 +562,13 @@ mod tests {
         let decoded = Command::decode(&quality.encoded).expect("quality command should decode");
         assert_eq!(
             decoded,
-            Command::Quality(Quality {
-                bitrate_kbps: Kbps::new(8_000).expect("expected bitrate should be valid"),
-                fps: Fps::new(60).expect("expected frame rate should be valid"),
-                scale_percent: ScalePercent::new(75).expect("expected scale should be valid"),
-                crf: waywire_protocol::pipe::Crf::new(27).expect("test CRF should be valid"),
-                chroma: waywire_protocol::pipe::Chroma::Yuv420,
-            })
+            Command::Quality(Quality::new(
+                Kbps::new(8_000).expect("expected bitrate should be valid"),
+                Fps::new(60).expect("expected frame rate should be valid"),
+                ScalePercent::new(75).expect("expected scale should be valid"),
+                waywire_protocol::pipe::Crf::new(27).expect("test CRF should be valid"),
+                waywire_protocol::pipe::Chroma::Yuv420
+            ))
         );
         release_task
             .await
@@ -589,7 +580,7 @@ mod tests {
             .expect("final handback should queue");
         assert!(matches!(
             Command::decode(&final_release.encoded),
-            Ok(Command::InputLease(InputLease { held: false }))
+            Ok(Command::InputLease(InputControl::Agents))
         ));
         assert_eq!(
             sessions
