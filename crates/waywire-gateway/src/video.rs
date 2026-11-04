@@ -60,7 +60,9 @@ use self::rtp::RtpSequence;
 use self::rtp::RtpTimestamp;
 use self::rtp::decode_packet;
 use crate::audio::AudioHub;
+use crate::audio::RtpClaim;
 use crate::daemon::CommandSink;
+use crate::daemon::Enqueued;
 use crate::session::Sessions;
 
 const MAX_ACCESS_UNIT: usize = MAX_VIDEO_DATA_BYTES;
@@ -311,7 +313,7 @@ impl VideoPipeline {
                 }));
                 continue;
             }
-            if self.audio.offer_rtp(&buffer[..length]) {
+            if self.audio.offer_rtp(&buffer[..length]) == RtpClaim::Audio {
                 continue;
             }
             let packet = match decode_packet(&buffer[..length]) {
@@ -371,8 +373,8 @@ impl VideoWorker {
                 generation,
                 state,
             })) {
-            Ok(true) => {}
-            Ok(false) => debug!(
+            Ok(Enqueued::Queued) => {}
+            Ok(Enqueued::DroppedUnderBackpressure) => debug!(
                 generation = generation.get(),
                 state = ?state,
                 "keyframe readiness command dropped under command-pipe backpressure"

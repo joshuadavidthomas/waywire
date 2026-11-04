@@ -30,11 +30,10 @@ impl AudioHub {
         self.0.subscribe()
     }
 
-    /// Pass the Opus packet in an audio RTP packet to every viewer. Returns
-    /// whether `packet` had the audio payload type; other packets are video's.
-    pub(crate) fn offer_rtp(&self, packet: &[u8]) -> bool {
+    /// Pass the Opus packet in an audio RTP packet to every viewer.
+    pub(crate) fn offer_rtp(&self, packet: &[u8]) -> RtpClaim {
         if packet.len() < RTP_HEADER_BYTES || packet[1] & 0x7f != PAYLOAD_TYPE {
-            return false;
+            return RtpClaim::NotAudio;
         }
         // The compositor writes a bare version 2 header: no padding,
         // extension or CSRCs.
@@ -45,6 +44,16 @@ impl AudioHub {
                     .send(Bytes::copy_from_slice(&packet[RTP_HEADER_BYTES..])),
             );
         }
-        true
+        RtpClaim::Audio
     }
+}
+
+/// Whose an RTP packet is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RtpClaim {
+    /// The audio payload type: forwarded to viewers, or discarded when its header
+    /// is not the compositor's bare one.
+    Audio,
+    /// Video's to decode.
+    NotAudio,
 }

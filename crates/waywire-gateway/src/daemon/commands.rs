@@ -232,9 +232,9 @@ impl CommandSink {
 
     /// Sends a gateway-internal command without blocking.
     ///
-    /// Returns `Ok(false)` when backpressure dropped the command. Use this only
-    /// for idempotent state where losing an update under backpressure is fine.
-    pub(crate) fn try_system(&self, command: &Command) -> Result<bool, CommandSinkError> {
+    /// Use this only for idempotent state where losing an update under
+    /// backpressure is fine.
+    pub(crate) fn try_system(&self, command: &Command) -> Result<Enqueued, CommandSinkError> {
         let encoded = command.encode();
         let length = encoded.len();
         let Ok(count) = u32::try_from(length) else {
@@ -243,7 +243,7 @@ impl CommandSink {
         let permit = match Arc::clone(&self.budget).try_acquire_many_owned(count) {
             Ok(permit) => permit,
             Err(TryAcquireError::Closed) => return Err(CommandSinkError::ByteBudgetClosed),
-            Err(TryAcquireError::NoPermits) => return Ok(false),
+            Err(TryAcquireError::NoPermits) => return Ok(Enqueued::DroppedUnderBackpressure),
         };
         let request = Request {
             authority: Authority::System,
@@ -251,8 +251,8 @@ impl CommandSink {
             permit,
         };
         match self.tx.try_send(request) {
-            Ok(()) => Ok(true),
-            Err(TrySendError::Full(_)) => Ok(false),
+            Ok(()) => Ok(Enqueued::Queued),
+            Err(TrySendError::Full(_)) => Ok(Enqueued::DroppedUnderBackpressure),
             Err(TrySendError::Closed(_)) => Err(CommandSinkError::WriterStopped),
         }
     }
@@ -270,6 +270,14 @@ impl CommandSink {
         // remain ordered by the channel.
         self.active_ownership.store(0, Ordering::Release);
     }
+}
+
+/// What became of a command sent without blocking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Enqueued {
+    Queued,
+    /// The byte budget or the channel was full.
+    DroppedUnderBackpressure,
 }
 
 #[derive(Debug, Error)]

@@ -29,6 +29,7 @@ use waywire_protocol::pipe::Kbps;
 use self::commands::CommandReader;
 pub(crate) use self::commands::CommandSink;
 pub(crate) use self::commands::CommandSinkError;
+pub(crate) use self::commands::Enqueued;
 #[cfg(test)]
 pub(crate) use self::commands::TestCommandReceiver;
 #[cfg(test)]
@@ -126,7 +127,8 @@ impl Daemon {
         let (shutdown, shutdown_rx) = mpsc::channel(1);
         let sessions = Sessions::new(commands.clone(), config.bitrate, config.frame_rate);
         anyhow::ensure!(
-            commands.try_system(&Command::InputLease(InputLease { held: false }))?,
+            commands.try_system(&Command::InputLease(InputLease { held: false }))?
+                == Enqueued::Queued,
             "initial input lease could not be queued"
         );
         let (pipeline, video_worker) =

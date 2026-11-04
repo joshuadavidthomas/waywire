@@ -20,10 +20,21 @@ fn default_path(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf
     Some(directory.join("waywire/config.toml"))
 }
 
-fn load_pins(path: &Path, explicit: bool, flags: Vec<String>) -> Result<Vec<String>> {
+/// Where the config path came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigSource {
+    /// Named on the command line: a missing file is an error.
+    Explicit,
+    /// The default location: a missing file means no config.
+    Default,
+}
+
+fn load_pins(path: &Path, source: ConfigSource, flags: Vec<String>) -> Result<Vec<String>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if source == ConfigSource::Default && error.kind() == std::io::ErrorKind::NotFound =>
+        {
             return Ok(flags);
         }
         Err(error) => return Err(error).with_context(|| format!("read config {}", path.display())),
@@ -36,14 +47,14 @@ fn load_pins(path: &Path, explicit: bool, flags: Vec<String>) -> Result<Vec<Stri
 
 pub(super) fn pins(explicit: Option<&Path>, flags: Vec<String>) -> Result<Vec<String>> {
     if let Some(path) = explicit {
-        return load_pins(path, true, flags);
+        return load_pins(path, ConfigSource::Explicit, flags);
     }
     // Without XDG_CONFIG_HOME or HOME there is no default file to read.
     match default_path(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
     ) {
-        Some(path) => load_pins(&path, false, flags),
+        Some(path) => load_pins(&path, ConfigSource::Default, flags),
         None => Ok(flags),
     }
 }
@@ -57,7 +68,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "pins = [\"foot\", \"xterm -title 'My Window'\"]").expect("config");
-        let pins = load_pins(&path, true, vec!["editor --file 'two words'".into()]).expect("pins");
+        let pins = load_pins(
+            &path,
+            ConfigSource::Explicit,
+            vec!["editor --file 'two words'".into()],
+        )
+        .expect("pins");
         assert_eq!(
             pins,
             [
@@ -73,10 +89,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("config.toml");
         assert_eq!(
-            load_pins(&path, false, vec!["foot".into()]).expect("default"),
+            load_pins(&path, ConfigSource::Default, vec!["foot".into()]).expect("default"),
             ["foot"]
         );
-        let error = load_pins(&path, true, vec![]).expect_err("explicit config");
+        let error = load_pins(&path, ConfigSource::Explicit, vec![]).expect_err("explicit config");
         assert!(format!("{error:#}").contains(&path.display().to_string()));
     }
 
@@ -86,7 +102,8 @@ mod tests {
         let path = dir.path().join("config.toml");
         for contents in ["pins = [", "unknown = true"] {
             std::fs::write(&path, contents).expect("config");
-            let error = load_pins(&path, true, vec![]).expect_err("invalid config");
+            let error =
+                load_pins(&path, ConfigSource::Explicit, vec![]).expect_err("invalid config");
             assert!(format!("{error:#}").contains(&path.display().to_string()));
         }
     }
