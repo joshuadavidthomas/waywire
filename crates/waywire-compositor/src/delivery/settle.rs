@@ -101,13 +101,21 @@ impl Audience {
     }
 }
 
+/// What a serial names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SerialKind {
+    /// An input event, in its receipt.
+    Input,
+    /// A focus or window event.
+    Notice,
+}
+
 #[derive(Debug)]
 struct Issued {
     serial: u64,
     usec: u64,
     audience: Audience,
-    /// A receipt's serial, not another signal's.
-    input: bool,
+    kind: SerialKind,
 }
 
 #[derive(Debug)]
@@ -222,7 +230,7 @@ pub(crate) struct Settle {
 }
 
 impl Settle {
-    pub(super) fn issue(&mut self, serial: u64, audience: Audience, input: bool) {
+    pub(super) fn issue(&mut self, serial: u64, audience: Audience, kind: SerialKind) {
         if self.serials.len() == SERIALS {
             self.serials.pop_front();
         }
@@ -230,7 +238,7 @@ impl Settle {
             serial,
             usec: monotonic_usec(),
             audience,
-            input,
+            kind,
         });
     }
 
@@ -240,7 +248,7 @@ impl Settle {
             .iter()
             .rev()
             .take_while(|issued| issued.usec >= since)
-            .find(|issued| issued.input && issued.audience.includes(pid))
+            .find(|issued| issued.kind == SerialKind::Input && issued.audience.includes(pid))
             .map(|issued| issued.usec)
     }
 

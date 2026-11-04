@@ -37,6 +37,7 @@ use smithay::xwayland::X11Surface;
 use waywire_protocol::pipe;
 
 pub(crate) use self::bus::start;
+use self::settle::SerialKind;
 use self::settle::Settle;
 pub(crate) use self::windows::WindowList;
 pub(crate) use self::windows::WindowsChanged;
@@ -505,14 +506,14 @@ impl Delivery {
     }
 
     fn next_serial(&mut self) -> u64 {
-        self.issue(settle::Audience::Everyone, false)
+        self.issue(settle::Audience::Everyone, SerialKind::Notice)
     }
 
-    /// Allocate a serial that `audience` may name in `WaitSettled`;
-    /// `input` for a receipt's.
-    fn issue(&mut self, audience: settle::Audience, input: bool) -> u64 {
+    /// Allocate a serial of `kind` that `audience` may name in
+    /// `WaitSettled`.
+    fn issue(&mut self, audience: settle::Audience, kind: SerialKind) -> u64 {
         self.serial += 1;
-        self.settle.issue(self.serial, audience, input);
+        self.settle.issue(self.serial, audience, kind);
         self.serial
     }
 
@@ -609,7 +610,7 @@ impl Delivery {
             .get(&source)
             .map_or(&[][..], |info| &info.lineage);
         let audience = settle::Audience::of(self.kind(source), lineage);
-        let serial = self.issue(audience, true);
+        let serial = self.issue(audience, SerialKind::Input);
         self.dispatching = Some(Dispatching {
             source,
             serial,
