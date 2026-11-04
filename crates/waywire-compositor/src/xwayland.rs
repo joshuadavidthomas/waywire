@@ -53,16 +53,20 @@ use waywire_decorations::WindowAction;
 
 use crate::State;
 
-/// The Xwayland server's Wayland client, the X11 window manager running on
-/// it, and the stacking order last sent to it.
+/// The Xwayland server's Wayland client, and the X11 window manager running
+/// on it once Xwayland is ready.
 #[derive(Default)]
 pub(crate) struct XWayland {
     /// Xwayland's own Wayland client, from spawn on.
     client: Option<Client>,
-    /// The window manager, once Xwayland is ready.
-    wm: Option<X11Wm>,
-    /// The X11 display number, once Xwayland is ready.
-    display: Option<u32>,
+    ready: Option<Ready>,
+}
+
+/// What exists once Xwayland is ready, until its window manager disconnects.
+struct Ready {
+    wm: X11Wm,
+    /// The X11 display number.
+    display: u32,
     /// Last X11 stacking order sent to the XWM; `None` forces the next sync,
     /// which also flushes requests such as `new_selection` that do not flush.
     stacking: Option<Vec<u32>>,
@@ -74,18 +78,20 @@ impl XWayland {
     }
 
     fn ready(&mut self, wm: X11Wm, display: u32) {
-        self.wm = Some(wm);
-        self.display = Some(display);
+        self.ready = Some(Ready {
+            wm,
+            display,
+            stacking: None,
+        });
     }
 
     fn disconnected(&mut self) {
-        self.wm = None;
-        self.display = None;
+        self.ready = None;
     }
 
     /// The X11 display number, once Xwayland is ready.
-    pub(crate) const fn display(&self) -> Option<u32> {
-        self.display
+    pub(crate) fn display(&self) -> Option<u32> {
+        self.ready.as_ref().map(|ready| ready.display)
     }
 
     /// The factor Xwayland's clients scale X11 coordinates by; 1 before
@@ -102,20 +108,24 @@ impl XWayland {
         reason = "XWM events are dispatched only after registration"
     )]
     fn wm(&mut self) -> &mut X11Wm {
-        self.wm
+        &mut self
+            .ready
             .as_mut()
             .expect("XWM callback before WM registration")
+            .wm
     }
 
     /// Make the next [`Self::sync_stacking`] talk to the XWM, which also
     /// flushes its pending requests.
     pub(crate) fn restack(&mut self) {
-        self.stacking = None;
+        if let Some(ready) = &mut self.ready {
+            ready.stacking = None;
+        }
     }
 
     pub(crate) fn raise(&mut self, surface: &X11Surface) {
-        if let Some(wm) = &mut self.wm
-            && let Err(error) = wm.raise_window(surface)
+        if let Some(ready) = &mut self.ready
+            && let Err(error) = ready.wm.raise_window(surface)
         {
             tracing::warn!(%error, "raise X11 window");
         }
@@ -128,9 +138,11 @@ impl XWayland {
         target: SelectionTarget,
         mime_types: Option<Vec<String>>,
     ) -> Result<(), ReplyOrIdError> {
-        self.stacking = None;
-        match &mut self.wm {
-            Some(wm) => wm.new_selection(target, mime_types),
+        match &mut self.ready {
+            Some(ready) => {
+                ready.stacking = None;
+                ready.wm.new_selection(target, mime_types)
+            }
             None => Ok(()),
         }
     }
@@ -142,8 +154,8 @@ impl XWayland {
         mime_type: String,
         fd: OwnedFd,
     ) -> Result<()> {
-        if let Some(wm) = &mut self.wm {
-            wm.send_selection(target, mime_type, fd)?;
+        if let Some(ready) = &mut self.ready {
+            ready.wm.send_selection(target, mime_type, fd)?;
         }
         Ok(())
     }
@@ -152,7 +164,7 @@ impl XWayland {
     // requests issued by Wayland callbacks (notably new_selection, which does not
     // flush its SetSelectionOwner request in the pinned Smithay revision).
     pub(crate) fn sync_stacking(&mut self, space: &Space<Window>) {
-        let Some(wm) = &mut self.wm else {
+        let Some(ready) = &mut self.ready else {
             return;
         };
         // Smithay grabs and ungrabs the X server on every call, which woke
@@ -164,11 +176,14 @@ impl XWayland {
             .filter_map(Window::x11_surface)
             .map(X11Surface::window_id)
             .collect();
-        if self.stacking.as_ref() == Some(&order) {
+        if ready.stacking.as_ref() == Some(&order) {
             return;
         }
-        match wm.update_stacking_order_upwards(space.elements().filter_map(Window::x11_surface)) {
-            Ok(()) => self.stacking = Some(order),
+        match ready
+            .wm
+            .update_stacking_order_upwards(space.elements().filter_map(Window::x11_surface))
+        {
+            Ok(()) => ready.stacking = Some(order),
             Err(error) => tracing::warn!(%error, "X11 stacking synchronization failed"),
         }
     }
@@ -176,10 +191,11 @@ impl XWayland {
     /// Tell Xwayland and its toolkits the output's `scale`. Returns whether
     /// the client scale changed, so X11 windows need configuring again.
     fn set_scale(&mut self, scale: f64) -> Result<bool> {
-        let (Some(client), Some(display), Some(wm)) = (&self.client, self.display, &mut self.wm)
+        let (Some(client), Some(Ready { wm, display, .. })) = (&self.client, &mut self.ready)
         else {
             return Ok(false);
         };
+        let display = *display;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "output scale and DPI are bounded"
@@ -209,13 +225,33 @@ impl XWayland {
     }
 }
 
-/// What a `_NET_WM_STATE` request to remove (0), add (1) or toggle (2)
-/// HIDDEN asks of a window that is `minimized` or not.
-fn hidden_request(action: u32, minimized: bool) -> Option<WindowAction> {
+/// What a `_NET_WM_STATE` client message asks to do with the states it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetWmStateAction {
+    Remove,
+    Add,
+    Toggle,
+}
+
+impl NetWmStateAction {
+    /// The action in a message's first data word; `None` for an unknown one.
+    const fn parse(action: u32) -> Option<Self> {
+        match action {
+            0 => Some(Self::Remove),
+            1 => Some(Self::Add),
+            2 => Some(Self::Toggle),
+            _ => None,
+        }
+    }
+}
+
+/// What a `_NET_WM_STATE` `action` on HIDDEN asks of a window that is
+/// `minimized` or not.
+const fn hidden_request(action: NetWmStateAction, minimized: bool) -> Option<WindowAction> {
     match (action, minimized) {
-        (0 | 2, true) => Some(WindowAction::Restore),
-        (1 | 2, false) => Some(WindowAction::Minimize),
-        _ => None,
+        (NetWmStateAction::Remove | NetWmStateAction::Toggle, true) => Some(WindowAction::Restore),
+        (NetWmStateAction::Add | NetWmStateAction::Toggle, false) => Some(WindowAction::Minimize),
+        (NetWmStateAction::Remove, false) | (NetWmStateAction::Add, true) => None,
     }
 }
 
@@ -355,7 +391,9 @@ fn watch_hidden_requests(handle: &LoopHandle<'static, State>, display: u32) -> R
                                 .windows
                                 .get(&window)
                                 .is_some_and(|state| state.minimized);
-                            if let Some(action) = hidden_request(data[0], minimized) {
+                            if let Some(action) = NetWmStateAction::parse(data[0])
+                                .and_then(|action| hidden_request(action, minimized))
+                            {
                                 state.window_action(&window, action);
                             }
                         }
