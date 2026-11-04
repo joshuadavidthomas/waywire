@@ -11,54 +11,133 @@ use smithay::utils::Logical;
 use smithay::utils::Physical;
 use smithay::utils::Rectangle;
 
+use super::Modality;
 use super::WindowRecord;
 use crate::State;
 use crate::focus::KeyboardFocus;
 
 /// One listed window.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each state is a separate key in the D-Bus record"
-)]
 pub(crate) struct WindowEntry {
-    pub(crate) record: WindowRecord,
+    record: WindowRecord,
     /// The client's content, without the compositor's titlebar.
-    pub(crate) geometry: Rectangle<i32, Physical>,
+    geometry: Rectangle<i32, Physical>,
     /// The content and the compositor's titlebar, when it draws one.
-    pub(crate) frame: Rectangle<i32, Physical>,
+    frame: Rectangle<i32, Physical>,
     /// Position in the stacking order; 0 is the topmost window.
-    pub(crate) stack: u32,
-    pub(crate) focused: bool,
-    pub(crate) minimized: bool,
-    pub(crate) maximized: bool,
-    pub(crate) fullscreen: bool,
+    stack: u32,
+    focus: Focus,
+    visibility: waywire_decorations::Visibility,
+    size: waywire_decorations::SizeMode,
+    extent: Extent,
     /// The parent window's identifier, for dialogs; empty otherwise.
-    pub(crate) parent: String,
-    pub(crate) modal: bool,
+    parent: String,
+    modality: Modality,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Focused,
+    Unfocused,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Extent {
+    Windowed,
+    Fullscreen,
+}
+
+impl WindowEntry {
+    pub(crate) fn record(&self) -> &WindowRecord {
+        &self.record
+    }
+    pub(crate) fn geometry(&self) -> Rectangle<i32, Physical> {
+        self.geometry
+    }
+    pub(crate) fn frame(&self) -> Rectangle<i32, Physical> {
+        self.frame
+    }
+    pub(crate) fn stack(&self) -> u32 {
+        self.stack
+    }
+    pub(crate) fn focused(&self) -> bool {
+        self.focus == Focus::Focused
+    }
+    pub(crate) fn minimized(&self) -> bool {
+        self.visibility == waywire_decorations::Visibility::Minimized
+    }
+    pub(crate) fn maximized(&self) -> bool {
+        self.size == waywire_decorations::SizeMode::Maximized
+    }
+    pub(crate) fn fullscreen(&self) -> bool {
+        self.extent == Extent::Fullscreen
+    }
+    pub(crate) fn parent(&self) -> &str {
+        &self.parent
+    }
+    pub(crate) fn modal(&self) -> bool {
+        self.modality == Modality::Modal
+    }
 }
 
 /// The whole list and the output it is measured on.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowList {
     /// Output size in pixels.
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    width: u32,
+    height: u32,
     /// Output pixels per logical unit, the factor between these bounds and
     /// `RemoteDesktop` portal coordinates.
-    pub(crate) scale: f64,
+    scale: f64,
     /// The area windows are placed in: the output above the taskbar.
-    pub(crate) work_area: Rectangle<i32, Physical>,
+    work_area: Rectangle<i32, Physical>,
     /// Topmost first.
-    pub(crate) windows: Vec<WindowEntry>,
+    windows: Vec<WindowEntry>,
+}
+
+impl WindowList {
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
+    pub(crate) fn work_area(&self) -> Rectangle<i32, Physical> {
+        self.work_area
+    }
+    pub(crate) fn windows(&self) -> &[WindowEntry] {
+        &self.windows
+    }
 }
 
 /// A `WindowsChanged` signal.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowsChanged {
-    pub(crate) serial: u64,
-    pub(crate) time_usec: u64,
-    pub(crate) list: WindowList,
+    serial: u64,
+    time_usec: u64,
+    list: WindowList,
+}
+
+impl WindowsChanged {
+    pub(super) fn new(serial: u64, time_usec: u64, list: WindowList) -> Self {
+        Self {
+            serial,
+            time_usec,
+            list,
+        }
+    }
+    pub(super) fn serial(&self) -> u64 {
+        self.serial
+    }
+    pub(super) fn time_usec(&self) -> u64 {
+        self.time_usec
+    }
+    pub(crate) fn list(&self) -> &WindowList {
+        &self.list
+    }
 }
 
 /// Logical bounds in output pixels. Both edges are rounded, so adjacent
@@ -135,8 +214,7 @@ impl State {
         scale: f64,
     ) -> Option<WindowEntry> {
         let (geometry, frame) = bounds(window, self.space.element_location(window)?);
-        let maximized = waywire_decorations::window_flags(window).size()
-            == waywire_decorations::SizeMode::Maximized;
+        let size = waywire_decorations::window_flags(window).size();
         let fullscreen = window.toplevel().map_or_else(
             || {
                 window
@@ -158,17 +236,30 @@ impl State {
             geometry: to_pixels(geometry, scale),
             frame: to_pixels(frame, scale),
             stack: 0,
-            focused: focus.is_some() && focus.cloned() == KeyboardFocus::window(window),
-            minimized: self
-                .windows
-                .get(window)
-                .is_some_and(|state| state.minimized),
-            maximized,
-            fullscreen,
+            focus: if focus.is_some() && focus.cloned() == KeyboardFocus::window(window) {
+                Focus::Focused
+            } else {
+                Focus::Unfocused
+            },
+            visibility: if self.windows.is_minimized(window) {
+                waywire_decorations::Visibility::Minimized
+            } else {
+                waywire_decorations::Visibility::Shown
+            },
+            size,
+            extent: if fullscreen {
+                Extent::Fullscreen
+            } else {
+                Extent::Windowed
+            },
             parent: crate::wm::parent_window(&self.space, window)
                 .and_then(|parent| self.toplevel_list.identifier(&parent))
                 .unwrap_or_default(),
-            modal: crate::wm::modal_dialog(window),
+            modality: if crate::wm::modal_dialog(window) {
+                Modality::Modal
+            } else {
+                Modality::Modeless
+            },
         })
     }
 

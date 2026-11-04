@@ -83,9 +83,9 @@ impl SourceKind {
 /// What the compositor knows about one input source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceInfo {
-    pub(crate) kind: SourceKind,
+    kind: SourceKind,
     /// The process that sends the input, when the transport says.
-    pub(crate) pid: Option<u32>,
+    pid: Option<u32>,
     /// The process and its ancestors when the source appeared. A subscriber
     /// whose process is in this list owns the source's input.
     lineage: Vec<u32>,
@@ -196,11 +196,42 @@ pub(crate) enum Part {
 pub(crate) struct WindowRecord {
     /// The ext-foreign-toplevel-list identifier; empty for windows that have
     /// no foreign-toplevel handle.
-    pub(crate) id: String,
-    pub(crate) app_id: String,
-    pub(crate) title: String,
-    pub(crate) pid: Option<u32>,
-    pub(crate) x11: bool,
+    id: String,
+    app_id: String,
+    title: String,
+    pid: Option<u32>,
+    protocol: Protocol,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Protocol {
+    #[default]
+    Wayland,
+    X11,
+}
+
+impl WindowRecord {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    #[cfg(test)]
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+    #[cfg(test)]
+    pub(crate) fn app_id(&self) -> &str {
+        &self.app_id
+    }
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Modality {
+    Modeless,
+    Modal,
 }
 
 /// Whether the client that holds keyboard focus has a text field focused,
@@ -288,12 +319,31 @@ impl FocusCause {
 /// One receipt, as sent.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Receipt {
-    pub(crate) serial: u64,
-    pub(crate) time_usec: u64,
-    pub(crate) source: SourceKind,
-    pub(crate) source_pid: Option<u32>,
-    pub(crate) input: InputKind,
-    pub(crate) delivery: Destination,
+    serial: u64,
+    time_usec: u64,
+    source: SourceKind,
+    source_pid: Option<u32>,
+    input: InputKind,
+    delivery: Destination,
+}
+
+#[cfg(test)]
+impl Receipt {
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
+    pub(crate) fn source(&self) -> SourceKind {
+        self.source
+    }
+    pub(crate) fn source_pid(&self) -> Option<u32> {
+        self.source_pid
+    }
+    pub(crate) fn input(&self) -> InputKind {
+        self.input
+    }
+    pub(crate) fn delivery(&self) -> &Destination {
+        &self.delivery
+    }
 }
 
 /// One focus or window event, as sent.
@@ -313,7 +363,7 @@ pub(crate) enum Notice {
         time_usec: u64,
         window: WindowRecord,
         parent: Option<WindowRecord>,
-        modal: bool,
+        modal: Modality,
     },
     TextFieldChanged {
         serial: u64,
@@ -341,8 +391,21 @@ pub(crate) enum Signal {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Outgoing {
-    pub(crate) to: Vec<String>,
-    pub(crate) signal: Signal,
+    to: Vec<String>,
+    signal: Signal,
+}
+
+#[cfg(test)]
+impl Outgoing {
+    pub(crate) fn recipients(&self) -> &[String] {
+        &self.to
+    }
+    pub(crate) fn signal(&self) -> &Signal {
+        &self.signal
+    }
+    pub(crate) fn into_signal(self) -> Signal {
+        self.signal
+    }
 }
 
 /// Work for the bus thread, in the order the loop produced it.
@@ -763,7 +826,7 @@ impl Delivery {
         &mut self,
         window: WindowRecord,
         parent: Option<WindowRecord>,
-        modal: bool,
+        modal: Modality,
     ) {
         let everyone = self.everyone();
         if everyone.is_empty() {
@@ -810,11 +873,7 @@ impl Delivery {
             return;
         }
         self.reported_windows = Some(list.clone());
-        let changed = WindowsChanged {
-            serial: self.next_serial(),
-            time_usec: monotonic_usec(),
-            list,
-        };
+        let changed = WindowsChanged::new(self.next_serial(), monotonic_usec(), list);
         self.send(
             self.everyone(),
             Signal::Notice(Notice::WindowsChanged(Box::new(changed))),
@@ -856,7 +915,7 @@ pub(crate) fn x11_record(surface: &X11Surface) -> WindowRecord {
         app_id: surface.class(),
         title: surface.title(),
         pid: surface.pid(),
-        x11: true,
+        protocol: Protocol::X11,
     }
 }
 
@@ -1000,7 +1059,11 @@ impl State {
             app_id,
             title,
             pid: self.window_pid(window),
-            x11: window.x11_surface().is_some(),
+            protocol: if window.x11_surface().is_some() {
+                Protocol::X11
+            } else {
+                Protocol::Wayland
+            },
         }
     }
 
@@ -1104,8 +1167,15 @@ impl State {
         let parent =
             crate::wm::parent_window(&self.space, window).map(|parent| self.window_record(&parent));
         let record = self.window_record(window);
-        self.delivery
-            .window_mapped(record, parent, crate::wm::modal_dialog(window));
+        self.delivery.window_mapped(
+            record,
+            parent,
+            if crate::wm::modal_dialog(window) {
+                Modality::Modal
+            } else {
+                Modality::Modeless
+            },
+        );
     }
 
     /// A mapped window's title or app id changed. Clients often set the

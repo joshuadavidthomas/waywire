@@ -13,8 +13,8 @@
 //! never drawn into frames, so `overlay_cursor` is ignored and captures are
 //! always cursor-free.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use smithay::output::Output;
@@ -51,38 +51,34 @@ use super::capture::monotonic;
 const VERSION: u32 = 3;
 
 /// Capture protocol global and the copies waiting for the next rendered frame.
-pub(crate) struct Screencopy {
-    pending: Vec<PendingCopy>,
-}
+pub(crate) struct Screencopy(Vec<PendingCopy>);
 
 impl Screencopy {
     pub(crate) fn new(display_handle: &DisplayHandle) -> Self {
         display_handle
             .create_global::<State, ZwlrScreencopyManagerV1, ManagerData>(VERSION, ManagerData);
-        Self {
-            pending: Vec::new(),
-        }
+        Self(Vec::new())
     }
 
     fn queue(&mut self, copy: PendingCopy) {
-        self.pending.push(copy);
+        self.0.push(copy);
     }
 
     fn forget(&mut self, frame: &ZwlrScreencopyFrameV1) {
-        self.pending.retain(|pending| pending.frame != *frame);
+        self.0.retain(|pending| pending.frame != *frame);
     }
 
     /// Complete queued copies by copying the rendered image into the
     /// clients' `wl_shm` buffers. Call once per rendered frame, after
     /// rendering.
     pub(crate) fn serve_pending(&mut self, image: &Image<'static, 'static>) {
-        if self.pending.is_empty() {
+        if self.0.is_empty() {
             return;
         }
         let pixels = image_pixels(image);
         let presented = monotonic();
         let (tv_sec_hi, tv_sec_lo, tv_nsec) = timestamp_parts(presented);
-        for mut pending in std::mem::take(&mut self.pending) {
+        for mut pending in std::mem::take(&mut self.0) {
             let (width, height) = region_extents(pending.region);
             let copied = region_args(pending.region).is_some_and(|region| {
                 with_buffer_contents_mut(&pending.buffer, |pool, pool_len, shm| {
@@ -91,7 +87,7 @@ impl Screencopy {
                 .is_ok_and(|result| result.is_ok())
             });
             if copied {
-                if pending.with_damage {
+                if pending.request == CopyRequest::WithDamage {
                     // No damage tracking: report the whole captured region as the
                     // damage since the previous copy from this manager.
                     pending.frame.damage(0, 0, width, height);
@@ -103,7 +99,7 @@ impl Screencopy {
             } else {
                 pending.frame.failed();
             }
-            pending.submitted = true;
+            pending.verdict = Verdict::Submitted;
         }
     }
 }
@@ -120,7 +116,7 @@ enum FrameData {
     Pending {
         /// Physical render-buffer rectangle this frame copies.
         region: Rectangle<i32, Physical>,
-        copied: AtomicBool,
+        phase: Mutex<CopyPhase>,
     },
 }
 
@@ -129,15 +125,32 @@ struct PendingCopy {
     frame: ZwlrScreencopyFrameV1,
     buffer: WlBuffer,
     region: Rectangle<i32, Physical>,
-    with_damage: bool,
+    request: CopyRequest,
     /// Set once the frame received `ready` or `failed`; the protocol forbids
     /// events after either, so the drop guard below stays silent afterwards.
-    submitted: bool,
+    verdict: Verdict,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyRequest {
+    Copy,
+    WithDamage,
+}
+
+enum CopyPhase {
+    AwaitingRequest,
+    Requested,
+}
+
+#[derive(PartialEq, Eq)]
+enum Verdict {
+    Owed,
+    Submitted,
 }
 
 impl Drop for PendingCopy {
     fn drop(&mut self) {
-        if !self.submitted {
+        if self.verdict == Verdict::Owed {
             // A queued copy outlived by the compositor still owes the client a
             // verdict. Sending to a destroyed frame is a no-op.
             self.frame.failed();
@@ -188,7 +201,7 @@ fn start_frame(
         frame,
         FrameData::Pending {
             region,
-            copied: AtomicBool::new(false),
+            phase: Mutex::new(CopyPhase::AwaitingRequest),
         },
     );
     let (width, height) = region_extents(region);
@@ -308,17 +321,20 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
         _display_handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, State>,
     ) {
-        let FrameData::Pending { region, copied } = self else {
+        let FrameData::Pending { region, phase } = self else {
             return;
         };
-        let (buffer, with_damage) = match request {
-            zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, false),
-            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
+        let (buffer, request) = match request {
+            zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, CopyRequest::Copy),
+            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => {
+                (buffer, CopyRequest::WithDamage)
+            }
             // Destroy and any future request leave the frame alone; Destroy is
             // a destructor, valid after a copy, and cleanup runs in `destroyed`.
             _ => return,
         };
-        if copied.load(Ordering::SeqCst) {
+        let mut phase = phase.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*phase, CopyPhase::Requested) {
             frame.post_error(
                 zwlr_screencopy_frame_v1::Error::AlreadyUsed,
                 "copy was already requested",
@@ -342,13 +358,13 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
             return;
         }
 
-        copied.store(true, Ordering::SeqCst);
+        *phase = CopyPhase::Requested;
         state.screencopy.queue(PendingCopy {
             frame: frame.clone(),
             buffer,
             region: *region,
-            with_damage,
-            submitted: false,
+            request,
+            verdict: Verdict::Owed,
         });
         state.frame_pending = crate::FrameRequest::Pending;
     }
@@ -418,6 +434,14 @@ mod tests {
         assert!(region_rect(-100, -100, 50, 50, 1.0, Transform::Normal, output_size).is_none());
     }
 
+    #[derive(Default)]
+    struct CaptureApp {
+        shm: Option<wayland_client::protocol::wl_shm::WlShm>,
+        output: Option<wayland_client::protocol::wl_output::WlOutput>,
+        manager: Option<wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
+        ready: bool,
+    }
+
     mod client {
         use wayland_client::Connection;
         use wayland_client::Dispatch;
@@ -431,13 +455,7 @@ mod tests {
         use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1;
         use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
-        #[derive(Default)]
-        pub(super) struct App {
-            pub(super) shm: Option<WlShm>,
-            pub(super) output: Option<WlOutput>,
-            pub(super) manager: Option<ZwlrScreencopyManagerV1>,
-            pub(super) ready: bool,
-        }
+        use super::CaptureApp as App;
 
         impl Dispatch<wl_registry::WlRegistry, ()> for App {
             fn event(
@@ -491,8 +509,8 @@ mod tests {
         display: &mut smithay::reexports::wayland_server::Display<State>,
         state: &mut State,
         connection: &wayland_client::Connection,
-        queue: &mut wayland_client::EventQueue<client::App>,
-        app: &mut client::App,
+        queue: &mut wayland_client::EventQueue<CaptureApp>,
+        app: &mut CaptureApp,
     ) {
         for _ in 0..2 {
             // A protocol error closes the connection, so flushing can fail;
@@ -511,8 +529,8 @@ mod tests {
         display: smithay::reexports::wayland_server::Display<State>,
         state: State,
         connection: wayland_client::Connection,
-        queue: wayland_client::EventQueue<client::App>,
-        app: client::App,
+        queue: wayland_client::EventQueue<CaptureApp>,
+        app: CaptureApp,
         /// A 4x4 `Xrgb8888` buffer matching a 4x4 region capture.
         buffer: wayland_client::protocol::wl_buffer::WlBuffer,
     }
@@ -536,7 +554,7 @@ mod tests {
         let connection = Connection::from_socket(client_socket).expect("client connection");
         let mut queue = connection.new_event_queue();
         let qh = queue.handle();
-        let mut app = client::App::default();
+        let mut app = CaptureApp::default();
         connection.display().get_registry(&qh, ());
         round_trip(&mut display, &mut state, &connection, &mut queue, &mut app);
 

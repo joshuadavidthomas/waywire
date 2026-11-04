@@ -85,12 +85,7 @@ pub(crate) fn start<D: 'static>(
         .map_err(|error| anyhow::anyhow!("register input delivery requests: {error}"))?;
     let connection = zbus::blocking::connection::Builder::address(bus_address)?
         .name(BUS_NAME)?
-        .serve_at(
-            OBJECT_PATH,
-            InputDelivery {
-                requests: requests.clone(),
-            },
-        )?
+        .serve_at(OBJECT_PATH, InputDelivery(requests.clone()))?
         .build()?;
     let (outgoing, signals) = mpsc::channel::<Message>();
     let emitter = connection.clone();
@@ -189,9 +184,7 @@ impl State {
     }
 }
 
-struct InputDelivery {
-    requests: calloop::channel::Sender<Request>,
-}
+struct InputDelivery(calloop::channel::Sender<Request>);
 
 #[interface(name = "io.github.joshuadavidthomas.waywire.InputDelivery1")]
 impl InputDelivery {
@@ -211,7 +204,7 @@ impl InputDelivery {
             .await
             .ok();
         let (reply, wait) = oneshot::channel();
-        self.requests
+        self.0
             .send(Request::Subscribe {
                 name: sender.to_string(),
                 pid,
@@ -228,7 +221,7 @@ impl InputDelivery {
     )]
     fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         if let Some(sender) = header.sender() {
-            self.requests
+            self.0
                 .send(Request::Unsubscribe {
                     name: sender.to_string(),
                 })
@@ -240,7 +233,7 @@ impl InputDelivery {
     /// The window that holds keyboard focus now and its text-field state.
     async fn get_focus(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
         let (reply, wait) = oneshot::channel();
-        self.requests
+        self.0
             .send(Request::Focus { reply })
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         wait.await
@@ -250,7 +243,7 @@ impl InputDelivery {
     /// Every window with its screen bounds, stacking and state.
     async fn get_windows(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
         let (reply, wait) = oneshot::channel();
-        self.requests
+        self.0
             .send(Request::Windows { reply })
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         wait.await
@@ -275,7 +268,7 @@ impl InputDelivery {
             None => None,
         };
         let (reply, wait) = oneshot::channel();
-        self.requests
+        self.0
             .send(Request::Settle {
                 pid,
                 options,
@@ -342,31 +335,31 @@ fn settle_options(options: &HashMap<String, OwnedValue>) -> zbus::fdo::Result<Se
             )))
         }
     }
-    Ok(SettleOptions {
-        serial: get::<u64>(options, "serial")?,
-        quiet_ms: within(
+    Ok(SettleOptions::new(
+        get::<u64>(options, "serial")?,
+        within(
             "quiet_ms",
             get::<u32>(options, "quiet_ms")?.unwrap_or(settle::DEFAULT_QUIET_MS),
             &settle::QUIET_MS,
         )?,
-        timeout_ms: within(
+        within(
             "timeout_ms",
             get::<u32>(options, "timeout_ms")?.unwrap_or(settle::DEFAULT_TIMEOUT_MS),
             &settle::TIMEOUT_MS,
         )?,
-        window: get::<String>(options, "window")?.filter(|id| !id.is_empty()),
-    })
+        get::<String>(options, "window")?.filter(|id| !id.is_empty()),
+    ))
 }
 
 /// A window record; an empty dictionary means no window.
 fn window_dict(window: Option<&WindowRecord>) -> HashMap<String, Value<'static>> {
     let mut dict = HashMap::new();
     if let Some(window) = window {
-        insert(&mut dict, "id", window.id.clone());
+        insert(&mut dict, "id", window.id().to_owned());
         insert(&mut dict, "app_id", window.app_id.clone());
         insert(&mut dict, "title", window.title.clone());
         insert(&mut dict, "pid", window.pid.unwrap_or(0));
-        insert(&mut dict, "x11", window.x11);
+        insert(&mut dict, "x11", window.protocol == super::Protocol::X11);
     }
     dict
 }
@@ -380,24 +373,24 @@ fn rect(rect: Rectangle<i32, Physical>) -> (i32, i32, i32, i32) {
 /// first.
 fn list_dict(list: &WindowList) -> HashMap<String, Value<'static>> {
     let mut dict = HashMap::new();
-    insert(&mut dict, "width", list.width);
-    insert(&mut dict, "height", list.height);
-    insert(&mut dict, "scale", list.scale);
-    insert(&mut dict, "work_area", rect(list.work_area));
+    insert(&mut dict, "width", list.width());
+    insert(&mut dict, "height", list.height());
+    insert(&mut dict, "scale", list.scale());
+    insert(&mut dict, "work_area", rect(list.work_area()));
     let windows: Vec<HashMap<String, Value<'static>>> = list
-        .windows
+        .windows()
         .iter()
         .map(|entry| {
-            let mut window = window_dict(Some(&entry.record));
-            insert(&mut window, "geometry", rect(entry.geometry));
-            insert(&mut window, "frame", rect(entry.frame));
-            insert(&mut window, "stack", entry.stack);
-            insert(&mut window, "focused", entry.focused);
-            insert(&mut window, "minimized", entry.minimized);
-            insert(&mut window, "maximized", entry.maximized);
-            insert(&mut window, "fullscreen", entry.fullscreen);
-            insert(&mut window, "parent", entry.parent.clone());
-            insert(&mut window, "modal", entry.modal);
+            let mut window = window_dict(Some(entry.record()));
+            insert(&mut window, "geometry", rect(entry.geometry()));
+            insert(&mut window, "frame", rect(entry.frame()));
+            insert(&mut window, "stack", entry.stack());
+            insert(&mut window, "focused", entry.focused());
+            insert(&mut window, "minimized", entry.minimized());
+            insert(&mut window, "maximized", entry.maximized());
+            insert(&mut window, "fullscreen", entry.fullscreen());
+            insert(&mut window, "parent", entry.parent().to_owned());
+            insert(&mut window, "modal", entry.modal());
             window
         })
         .collect();
@@ -496,7 +489,7 @@ pub(crate) fn notice_dict(notice: &Notice) -> (&'static str, HashMap<String, Val
             insert(&mut dict, "time_usec", *time_usec);
             insert(&mut dict, "window", window_dict(Some(window)));
             insert(&mut dict, "parent", window_dict(parent.as_ref()));
-            insert(&mut dict, "modal", *modal);
+            insert(&mut dict, "modal", *modal == super::Modality::Modal);
             ("WindowMapped", dict)
         }
         Notice::TextFieldChanged {
@@ -522,9 +515,9 @@ pub(crate) fn notice_dict(notice: &Notice) -> (&'static str, HashMap<String, Val
             ("WindowChanged", dict)
         }
         Notice::WindowsChanged(changed) => {
-            let mut dict = list_dict(&changed.list);
-            insert(&mut dict, "serial", changed.serial);
-            insert(&mut dict, "time_usec", changed.time_usec);
+            let mut dict = list_dict(changed.list());
+            insert(&mut dict, "serial", changed.serial());
+            insert(&mut dict, "time_usec", changed.time_usec());
             ("WindowsChanged", dict)
         }
     }

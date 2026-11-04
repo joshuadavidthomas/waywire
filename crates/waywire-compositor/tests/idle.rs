@@ -327,9 +327,9 @@ fn in_process_encoder_starts_with_a_key_frame_whose_stripes_tile_the_output() {
     let mut rows = Vec::new();
     let mut data = &frame.data()[..];
     while !data.is_empty() {
-        let y = u16::from_le_bytes([data[0], data[1]]);
-        let height = u16::from_le_bytes([data[2], data[3]]);
-        let length = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+        let y = u16::from_le_bytes(data[..2].try_into().expect("stripe y"));
+        let height = u16::from_le_bytes(data[2..4].try_into().expect("stripe height"));
+        let length = u32::from_le_bytes(data[5..9].try_into().expect("stripe length")) as usize;
         assert_eq!(data[4], 1, "stripe at {y} is not a key frame");
         assert!(
             data[9..9 + length].starts_with(&[0, 0, 0, 1]),
@@ -2427,7 +2427,13 @@ mod toplevel_watch {
 
     use super::ToplevelLog;
 
-    pub(super) struct Watch(pub(super) ToplevelLog);
+    pub(super) struct Watch(ToplevelLog);
+
+    impl Watch {
+        pub(super) fn new(log: ToplevelLog) -> Self {
+            Self(log)
+        }
+    }
 
     impl Dispatch<wl_registry::WlRegistry, ()> for Watch {
         fn event(
@@ -2522,7 +2528,7 @@ impl Desktop {
         let mut queue = connection.new_event_queue();
         connection.display().get_registry(&queue.handle(), ());
         let log = ToplevelLog::default();
-        let mut watch = toplevel_watch::Watch(std::sync::Arc::clone(&log));
+        let mut watch = toplevel_watch::Watch::new(std::sync::Arc::clone(&log));
         thread::spawn(move || while queue.blocking_dispatch(&mut watch).is_ok() {});
         log
     }

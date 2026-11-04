@@ -433,17 +433,21 @@ mod tests {
                 .expect("dispatch EIS");
             for message in received.try_iter() {
                 if let crate::delivery::Message::Send(message) = message
-                    && let crate::delivery::Signal::Receipt(receipt) = message.signal
+                    && let crate::delivery::Signal::Receipt(receipt) = message.signal()
                 {
-                    receipts.push((message.to, receipt));
+                    receipts.push((message.recipients().to_vec(), receipt.clone()));
                 }
             }
         }
         let (to, receipt) = &receipts[0];
         assert_eq!(to, &["owner".to_owned()]);
-        assert_eq!(receipt.source, SourceKind::PortalEis);
-        assert_eq!(receipt.source_pid, Some(std::process::id()));
-        assert_eq!(receipt.delivery.as_str(), "nowhere", "no window has focus");
+        assert_eq!(receipt.source(), SourceKind::PortalEis);
+        assert_eq!(receipt.source_pid(), Some(std::process::id()));
+        assert_eq!(
+            receipt.delivery().as_str(),
+            "nowhere",
+            "no window has focus"
+        );
         server
             .shutdown(std::net::Shutdown::Both)
             .expect("shut down EI connection");

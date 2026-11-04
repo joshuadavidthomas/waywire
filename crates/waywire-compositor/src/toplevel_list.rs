@@ -58,7 +58,7 @@ impl ToplevelList {
         self.handles.insert(window.clone(), handle);
         let states = crate::foreign_toplevel::states(
             window,
-            crate::foreign_toplevel::activated(window),
+            crate::foreign_toplevel::activation(window),
             false,
         );
         self.foreign.publish(window, title, app_id, states);
@@ -974,7 +974,7 @@ mod tests {
                 wlr_handle::Event::State { state } => {
                     events.states = state
                         .chunks_exact(4)
-                        .map(|entry| u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]))
+                        .map(|entry| u32::from_ne_bytes(entry.try_into().expect("state word")))
                         .collect();
                 }
                 wlr_handle::Event::Done => events.done += 1,
@@ -4411,8 +4411,8 @@ mod tests {
     ) -> Vec<crate::delivery::Signal> {
         sent(received)
             .into_iter()
-            .filter(|message| message.to.iter().any(|to| to == name))
-            .map(|message| message.signal)
+            .filter(|message| message.recipients().iter().any(|to| to == name))
+            .map(crate::delivery::Outgoing::into_signal)
             .collect()
     }
 
@@ -4460,22 +4460,26 @@ mod tests {
         let receipts = receipts(&signals);
         assert_eq!(receipts.len(), 2, "one receipt per key event");
         let down = &receipts[0];
-        assert_eq!(down.source, SourceKind::VirtualKeyboard);
-        assert_eq!(down.source_pid, Some(std::process::id()));
+        assert_eq!(down.source(), SourceKind::VirtualKeyboard);
+        assert_eq!(down.source_pid(), Some(std::process::id()));
         assert_eq!(
-            down.input,
+            down.input(),
             InputKind::Key {
                 state: smithay::backend::input::KeyState::Pressed
             }
         );
-        assert_eq!(down.delivery.as_str(), "window");
-        let window = down.delivery.window().cloned().expect("receiving window");
-        assert_eq!(window.id, identifier, "the id lswt and lswt-like tools see");
-        assert_eq!(window.title, "Registration form");
-        assert_eq!(window.app_id, "chromium");
-        assert_eq!(window.pid, Some(std::process::id()));
-        assert_eq!(down.delivery.text_field(), Some(TextField::Unknown));
-        assert!(receipts[1].serial > down.serial);
+        assert_eq!(down.delivery().as_str(), "window");
+        let window = down.delivery().window().cloned().expect("receiving window");
+        assert_eq!(
+            window.id(),
+            identifier,
+            "the id lswt and lswt-like tools see"
+        );
+        assert_eq!(window.title(), "Registration form");
+        assert_eq!(window.app_id(), "chromium");
+        assert_eq!(window.pid(), Some(std::process::id()));
+        assert_eq!(down.delivery().text_field(), Some(TextField::Unknown));
+        assert!(receipts[1].serial() > down.serial());
         assert!(
             self::receipts(&delivered(&received, "observer")).is_empty(),
             "another client's keys stay private"
@@ -4487,11 +4491,11 @@ mod tests {
         assert_eq!(
             dropped
                 .iter()
-                .map(|r| r.delivery.as_str())
+                .map(|r| r.delivery().as_str())
                 .collect::<Vec<_>>(),
             ["dropped", "dropped"]
         );
-        assert_eq!(dropped[0].delivery.window(), None);
+        assert_eq!(dropped[0].delivery().window(), None);
 
         state.set_browser_lease(false);
         state.focus_window(None);
@@ -4500,7 +4504,7 @@ mod tests {
         assert_eq!(
             nowhere
                 .iter()
-                .map(|r| r.delivery.as_str())
+                .map(|r| r.delivery().as_str())
                 .collect::<Vec<_>>(),
             ["nowhere", "nowhere"]
         );
@@ -4665,7 +4669,7 @@ mod tests {
 
         let signals: Vec<_> = sent(&received)
             .into_iter()
-            .map(|message| message.signal)
+            .map(crate::delivery::Outgoing::into_signal)
             .collect();
         let receipts = receipts(&signals);
         assert_eq!(
@@ -4674,21 +4678,21 @@ mod tests {
             "one receipt per key event"
         );
         assert!(receipts.iter().all(|receipt| {
-            receipt.source == SourceKind::VirtualKeyboard
-                && receipt.delivery.as_str() == "window"
+            receipt.source() == SourceKind::VirtualKeyboard
+                && receipt.delivery().as_str() == "window"
                 && receipt
-                    .delivery
+                    .delivery()
                     .window()
-                    .is_some_and(|window| window.id == identifier)
+                    .is_some_and(|window| window.id() == identifier)
         }));
         assert_eq!(
-            receipts[0].input,
+            receipts[0].input(),
             InputKind::Key {
                 state: smithay::backend::input::KeyState::Pressed
             }
         );
         assert_eq!(
-            receipts[1].input,
+            receipts[1].input(),
             InputKind::Key {
                 state: smithay::backend::input::KeyState::Released
             }
@@ -4745,7 +4749,7 @@ mod tests {
         let received = delivery_subscribers(&mut state, source);
         press(&mut state, source);
         let before = receipts(&delivered(&received, "agent"));
-        let form_id = before[0].delivery.window().cloned().expect("form").id;
+        let form_id = before[0].delivery().window().expect("form").id().to_owned();
 
         let qh = queue.handle();
         let surface = app
@@ -4772,8 +4776,8 @@ mod tests {
         for name in ["agent", "observer"] {
             let notices: Vec<Notice> = sent
                 .iter()
-                .filter(|message| message.to.iter().any(|to| to == name))
-                .map(|message| message.signal.clone())
+                .filter(|message| message.recipients().iter().any(|to| to == name))
+                .map(|message| message.signal().clone())
                 .filter_map(|signal| match signal {
                     Signal::Notice(notice) => Some(notice),
                     Signal::Receipt(_) => None,
@@ -4796,22 +4800,27 @@ mod tests {
             else {
                 panic!("{name}: expected a mapped dialog and a focus change, got {notices:?}");
             };
-            assert_eq!(mapped.title, "Session expiring", "{name}");
+            assert_eq!(mapped.title(), "Session expiring", "{name}");
             assert_eq!(
-                parent.as_ref().map(|p| p.id.as_str()),
+                parent.as_ref().map(crate::delivery::WindowRecord::id),
                 Some(form_id.as_str())
             );
-            assert_eq!(focused.id, mapped.id, "{name}: focus names the new dialog");
-            assert_eq!(previous.id, form_id);
+            assert_eq!(
+                focused.id(),
+                mapped.id(),
+                "{name}: focus names the new dialog"
+            );
+            assert_eq!(previous.id(), form_id);
             assert_eq!(*cause, FocusCause::NewDialog);
             assert_eq!(*receipt, None, "no input caused it");
         }
         press(&mut state, source);
         let after = receipts(&delivered(&received, "agent"));
-        let window = after[0].delivery.window().cloned().expect("dialog");
-        assert_eq!(window.title, "Session expiring");
+        let window = after[0].delivery().window().cloned().expect("dialog");
+        assert_eq!(window.title(), "Session expiring");
         assert_ne!(
-            window.id, form_id,
+            window.id(),
+            form_id,
             "keys now reach the dialog, not the form"
         );
     }
@@ -4888,9 +4897,16 @@ mod tests {
         else {
             panic!("expected the popup to map and then take focus, got {notices:?}");
         };
-        assert!(!mapped.id.is_empty(), "the mapped popup has its identifier");
-        assert_eq!(focused.id, mapped.id, "focus names the popup by that id");
-        assert_eq!(focused.title, "Session expiring");
+        assert!(
+            !mapped.id().is_empty(),
+            "the mapped popup has its identifier"
+        );
+        assert_eq!(
+            focused.id(),
+            mapped.id(),
+            "focus names the popup by that id"
+        );
+        assert_eq!(focused.title(), "Session expiring");
         assert_eq!(*cause, FocusCause::Activation, "the token moved focus");
     }
 
@@ -4921,7 +4937,7 @@ mod tests {
                 Signal::Notice(_) | Signal::Receipt(_) => None,
             })
             .expect("the window maps");
-        assert_eq!(mapped.title, "Untitled - Chromium");
+        assert_eq!(mapped.title(), "Untitled - Chromium");
 
         toplevel.set_title("Registration form - Chromium".into());
         surface.commit();
@@ -4939,9 +4955,13 @@ mod tests {
         let [change] = changes.as_slice() else {
             panic!("expected one change for one new title, got {changes:?}");
         };
-        assert_eq!(change.id, mapped.id, "the change names the mapped window");
-        assert_eq!(change.title, "Registration form - Chromium");
-        assert_eq!(change.app_id, "chromium");
+        assert_eq!(
+            change.id(),
+            mapped.id(),
+            "the change names the mapped window"
+        );
+        assert_eq!(change.title(), "Registration form - Chromium");
+        assert_eq!(change.app_id(), "chromium");
     }
 
     #[test]
@@ -4969,7 +4989,7 @@ mod tests {
         let text_field = |received: &std::sync::mpsc::Receiver<_>, state: &mut crate::State| {
             press(state, source);
             receipts(&delivered(received, "agent"))[0]
-                .delivery
+                .delivery()
                 .text_field()
         };
         assert_eq!(text_field(&received, &mut state), Some(TextField::Unknown));
@@ -5198,7 +5218,7 @@ mod tests {
     ) -> Option<crate::delivery::WindowList> {
         signals.iter().rev().find_map(|signal| match signal {
             crate::delivery::Signal::Notice(crate::delivery::Notice::WindowsChanged(changed)) => {
-                Some(changed.list.clone())
+                Some(changed.list().clone())
             }
             crate::delivery::Signal::Notice(_) | crate::delivery::Signal::Receipt(_) => None,
         })
@@ -5279,24 +5299,24 @@ mod tests {
         let received = delivery_subscribers(&mut state, source);
 
         let list = state.window_list();
-        assert_eq!((list.width, list.height), (1920, 1080));
-        assert_eq!(bounds(list.work_area), (0, 0, 1920, 1048));
-        let titles: Vec<_> = list
-            .windows
-            .iter()
-            .map(|w| w.record.title.as_str())
-            .collect();
+        assert_eq!((list.width(), list.height()), (1920, 1080));
+        assert_eq!(bounds(list.work_area()), (0, 0, 1920, 1048));
+        let titles: Vec<_> = list.windows().iter().map(|w| w.record().title()).collect();
         assert_eq!(titles, ["Terminal", "Editor"], "topmost first");
-        let (terminal, editor) = (&list.windows[0], &list.windows[1]);
-        assert_eq!(terminal.record.id, app.handles[1].identifier);
-        assert_eq!(editor.record.id, app.handles[0].identifier);
-        assert_eq!((terminal.stack, editor.stack), (0, 1));
-        assert!(terminal.focused && !editor.focused);
-        assert_eq!(bounds(terminal.geometry), (700, 400, 200, 100));
-        assert_eq!(bounds(terminal.frame), (700, 400, 200, 100), "no titlebar");
-        assert_eq!(bounds(editor.geometry), (100, 100, 400, 300));
+        let (terminal, editor) = (&list.windows()[0], &list.windows()[1]);
+        assert_eq!(terminal.record().id(), app.handles[1].identifier);
+        assert_eq!(editor.record().id(), app.handles[0].identifier);
+        assert_eq!((terminal.stack(), editor.stack()), (0, 1));
+        assert!(terminal.focused() && !editor.focused());
+        assert_eq!(bounds(terminal.geometry()), (700, 400, 200, 100));
         assert_eq!(
-            bounds(editor.frame),
+            bounds(terminal.frame()),
+            (700, 400, 200, 100),
+            "no titlebar"
+        );
+        assert_eq!(bounds(editor.geometry()), (100, 100, 400, 300));
+        assert_eq!(
+            bounds(editor.frame()),
             (100, 72, 400, 328),
             "with its titlebar"
         );
@@ -5313,24 +5333,20 @@ mod tests {
         state.publish_window_list();
 
         let list = state.window_list();
-        let titles: Vec<_> = list
-            .windows
-            .iter()
-            .map(|w| w.record.title.as_str())
-            .collect();
+        let titles: Vec<_> = list.windows().iter().map(|w| w.record().title()).collect();
         assert_eq!(
             titles,
             ["Editor", "Terminal"],
             "the click raised the editor"
         );
-        let editor = list.windows[0].clone();
-        assert!(editor.focused && !list.windows[1].focused);
+        let editor = list.windows()[0].clone();
+        assert!(editor.focused() && !list.windows()[1].focused());
         assert_eq!(
-            bounds(editor.geometry),
+            bounds(editor.geometry()),
             (400, 300, 400, 300),
             "bounds after the move"
         );
-        assert_eq!(bounds(editor.frame), (400, 272, 400, 328));
+        assert_eq!(bounds(editor.frame()), (400, 272, 400, 328));
         let signals = delivered(&received, "observer");
         assert_eq!(
             latest_windows_changed(&signals).as_ref(),
@@ -5346,26 +5362,26 @@ mod tests {
         // A click at the centre of each window's reported bounds lands in
         // the window on top there: the editor covers the terminal's centre.
         for (target, expected) in [
-            (&editor, &editor.record.id),
-            (&list.windows[1], &editor.record.id),
+            (&editor, editor.record().id()),
+            (&list.windows()[1], editor.record().id()),
         ] {
             let centre = (
-                f64::from(target.geometry.loc.x + target.geometry.size.w / 2),
-                f64::from(target.geometry.loc.y + target.geometry.size.h / 2),
+                f64::from(target.geometry().loc.x + target.geometry().size.w / 2),
+                f64::from(target.geometry().loc.y + target.geometry().size.h / 2),
             );
             click(&mut state, source, centre);
             let receipts = receipts(&delivered(&received, "agent"));
             let landed = receipts[0]
-                .delivery
+                .delivery()
                 .window()
                 .cloned()
                 .expect("a window took the click");
-            assert_eq!(&landed.id, expected, "click at {centre:?}");
+            assert_eq!(landed.id(), expected, "click at {centre:?}");
         }
         // The editor's old centre is bare desktop.
         click(&mut state, source, (300.0, 250.0));
         let receipts = receipts(&delivered(&received, "agent"));
-        assert_eq!(receipts[0].delivery.as_str(), "nowhere");
+        assert_eq!(receipts[0].delivery().as_str(), "nowhere");
     }
 
     #[test]
@@ -5379,12 +5395,12 @@ mod tests {
             None,
         );
         let list = state.window_list();
-        assert_eq!((list.width, list.height), (1920, 1080));
-        assert!((list.scale - 1.5).abs() < f64::EPSILON);
-        let editor = &list.windows[1];
-        assert_eq!(bounds(editor.geometry), (150, 150, 600, 450));
-        assert_eq!(bounds(editor.frame), (150, 108, 600, 492));
-        assert_eq!(bounds(list.windows[0].geometry), (1050, 600, 300, 150));
+        assert_eq!((list.width(), list.height()), (1920, 1080));
+        assert!((list.scale() - 1.5).abs() < f64::EPSILON);
+        let editor = &list.windows()[1];
+        assert_eq!(bounds(editor.geometry()), (150, 150, 600, 450));
+        assert_eq!(bounds(editor.frame()), (150, 108, 600, 492));
+        assert_eq!(bounds(list.windows()[0].geometry()), (1050, 600, 300, 150));
     }
 
     #[test]
@@ -5394,11 +5410,11 @@ mod tests {
         state.window_action(&terminal, crate::WindowAction::Minimize);
         let list = state.window_list();
         let terminal_entry = list
-            .windows
+            .windows()
             .iter()
-            .find(|w| w.record.title == "Terminal")
+            .find(|w| w.record().title() == "Terminal")
             .expect("a minimized window stays listed");
-        assert!(terminal_entry.minimized && !terminal_entry.focused);
+        assert!(terminal_entry.minimized() && !terminal_entry.focused());
 
         // A dialog is its own toplevel, listed above its parent with the
         // parent's id.
@@ -5424,17 +5440,13 @@ mod tests {
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let list = state.window_list();
-        let titles: Vec<_> = list
-            .windows
-            .iter()
-            .map(|w| w.record.title.as_str())
-            .collect();
+        let titles: Vec<_> = list.windows().iter().map(|w| w.record().title()).collect();
         assert_eq!(titles[..2], ["Save changes?", "Editor"]);
-        let dialog_entry = &list.windows[0];
-        assert_eq!(dialog_entry.parent, list.windows[1].record.id);
-        assert!(dialog_entry.focused);
+        let dialog_entry = &list.windows()[0];
+        assert_eq!(dialog_entry.parent(), list.windows()[1].record().id());
+        assert!(dialog_entry.focused());
         assert_eq!(
-            bounds(dialog_entry.geometry),
+            bounds(dialog_entry.geometry()),
             (250, 225, 100, 50),
             "centred on the editor's content"
         );
@@ -5446,13 +5458,13 @@ mod tests {
         commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         let list = state.window_list();
         let editor_entry = list
-            .windows
+            .windows()
             .iter()
-            .find(|w| w.record.title == "Editor")
+            .find(|w| w.record().title() == "Editor")
             .expect("editor");
-        assert!(editor_entry.maximized && !editor_entry.fullscreen);
+        assert!(editor_entry.maximized() && !editor_entry.fullscreen());
         assert_eq!(
-            editor_entry.frame.loc,
+            editor_entry.frame().loc,
             (0, 0).into(),
             "maximized titlebar at the top"
         );
@@ -5505,12 +5517,7 @@ mod tests {
         let (reply, answer) = tokio::sync::oneshot::channel();
         state.wait_settled(
             pid,
-            crate::delivery::settle::SettleOptions {
-                serial,
-                quiet_ms,
-                timeout_ms,
-                window,
-            },
+            crate::delivery::settle::SettleOptions::new(serial, quiet_ms, timeout_ms, window),
             reply,
         );
         answer
@@ -5558,7 +5565,7 @@ mod tests {
         let mut frames = Frames::new(&state);
         frames.render(&mut state);
         press(&mut state, source);
-        let serial = receipts(&delivered(&received, "agent"))[0].serial;
+        let serial = receipts(&delivered(&received, "agent"))[0].serial();
 
         // Only the input's owner may name it.
         let mut refused = wait_settled(&mut state, None, Some(serial), 1000, 20_000, None);
@@ -5608,7 +5615,7 @@ mod tests {
         let mut frames = Frames::new(&state);
         frames.render(&mut state);
         state.keyboard_key(source, 30, smithay::backend::input::KeyState::Pressed);
-        let pressed = receipts(&delivered(&received, "agent"))[0].serial;
+        let pressed = receipts(&delivered(&received, "agent"))[0].serial();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let releasing = crate::delivery::monotonic_usec();
         state.keyboard_key(source, 30, smithay::backend::input::KeyState::Released);
@@ -5643,12 +5650,13 @@ mod tests {
         frames.render(&mut state);
         let editor = state
             .window_list()
-            .windows
-            .into_iter()
-            .find(|window| window.record.title == "Editor")
+            .windows()
+            .iter()
+            .find(|window| window.record().title() == "Editor")
             .expect("editor")
-            .record
-            .id;
+            .record()
+            .id()
+            .to_owned();
 
         let called = crate::delivery::monotonic_usec();
         let mut screen = wait_settled(&mut state, None, None, 1000, 500, None);

@@ -64,11 +64,27 @@ pub(crate) type Reply =
 pub(crate) struct SettleOptions {
     /// The input to measure from; `None` measures from when the compositor
     /// handles the call.
-    pub(crate) serial: Option<u64>,
-    pub(crate) quiet_ms: u32,
-    pub(crate) timeout_ms: u32,
+    serial: Option<u64>,
+    quiet_ms: u32,
+    timeout_ms: u32,
     /// A window id from `GetWindows`; `None` watches the whole output.
-    pub(crate) window: Option<String>,
+    window: Option<String>,
+}
+
+impl SettleOptions {
+    pub(crate) fn new(
+        serial: Option<u64>,
+        quiet_ms: u32,
+        timeout_ms: u32,
+        window: Option<String>,
+    ) -> Self {
+        Self {
+            serial,
+            quiet_ms,
+            timeout_ms,
+            window,
+        }
+    }
 }
 
 /// Who may name a serial in `WaitSettled`: the same processes that receive
@@ -174,10 +190,16 @@ impl Waiter {
 #[derive(Debug)]
 struct Caret {
     text_input: ZwpTextInputV3,
-    pending: Option<Rectangle<i32, Logical>>,
-    /// Enable or disable since the last commit, which resets the state.
-    reset: bool,
+    pending: PendingCaret,
     current: Option<Rectangle<i32, Logical>>,
+}
+
+#[derive(Debug, Default)]
+enum PendingCaret {
+    #[default]
+    Unchanged,
+    Clear,
+    Set(Rectangle<i32, Logical>),
 }
 
 /// Where the focused text field's caret can blink, in output pixels.
@@ -311,8 +333,7 @@ impl Delivery {
                 carets.retain(|caret| caret.text_input.is_alive());
                 carets.push(Caret {
                     text_input: text_input.clone(),
-                    pending: None,
-                    reset: false,
+                    pending: PendingCaret::Unchanged,
                     current: None,
                 });
                 carets.len() - 1
@@ -320,23 +341,22 @@ impl Delivery {
         let caret = &mut carets[index];
         match request {
             zwp_text_input_v3::Request::Enable | zwp_text_input_v3::Request::Disable => {
-                caret.reset = true;
-                caret.pending = None;
+                caret.pending = PendingCaret::Clear;
             }
             zwp_text_input_v3::Request::SetCursorRectangle {
                 x,
                 y,
                 width,
                 height,
-            } => caret.pending = Some(Rectangle::new((*x, *y).into(), (*width, *height).into())),
-            zwp_text_input_v3::Request::Commit => {
-                if std::mem::take(&mut caret.reset) {
-                    caret.current = None;
-                }
-                if let Some(rect) = caret.pending.take() {
-                    caret.current = Some(rect);
-                }
+            } => {
+                caret.pending =
+                    PendingCaret::Set(Rectangle::new((*x, *y).into(), (*width, *height).into()));
             }
+            zwp_text_input_v3::Request::Commit => match std::mem::take(&mut caret.pending) {
+                PendingCaret::Unchanged => {}
+                PendingCaret::Clear => caret.current = None,
+                PendingCaret::Set(rect) => caret.current = Some(rect),
+            },
             zwp_text_input_v3::Request::Destroy
             | zwp_text_input_v3::Request::SetSurroundingText { .. }
             | zwp_text_input_v3::Request::SetTextChangeCause { .. }
@@ -515,7 +535,7 @@ impl Delivery {
     pub(crate) fn poll_settled(
         &mut self,
         now: u64,
-        pending: bool,
+        pending: FrameRequest,
         region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
     ) -> Vec<Settled> {
         let mut settled = Vec::new();
@@ -524,7 +544,11 @@ impl Delivery {
             return settled;
         }
         // A pending frame bounds how long the screen is known quiet.
-        let quiet_until = if pending { settle.rendered } else { now };
+        let quiet_until = if pending == FrameRequest::Pending {
+            settle.rendered
+        } else {
+            now
+        };
         let mut index = 0;
         while let Some(waiter) = settle.waiters.get(index) {
             let closed = waiter
@@ -580,7 +604,7 @@ impl Delivery {
 
     /// When the loop must wake to answer a wait, in `CLOCK_MONOTONIC`
     /// microseconds. `pending` says a frame is owed.
-    pub(crate) fn settle_wake(&self, pending: bool) -> Option<u64> {
+    pub(crate) fn settle_wake(&self, pending: FrameRequest) -> Option<u64> {
         // A quiet window that ended with a frame pending is answered after
         // that frame, which wakes the loop itself.
         self.settle
@@ -588,7 +612,7 @@ impl Delivery {
             .iter()
             .map(|waiter| {
                 let quiet = waiter.quiet_from() + waiter.quiet;
-                if pending && quiet <= monotonic_usec() {
+                if pending == FrameRequest::Pending && quiet <= monotonic_usec() {
                     waiter.deadline
                 } else {
                     quiet.min(waiter.deadline)
@@ -673,8 +697,12 @@ fn touches(damage: &[Rectangle<i32, Physical>], region: Option<Rectangle<i32, Ph
 impl State {
     /// Whether a frame is owed: commits since the last frame are not on
     /// screen yet.
-    fn frame_owed(&self) -> bool {
-        self.dirty || self.frame_pending == FrameRequest::Pending
+    fn frame_owed(&self) -> FrameRequest {
+        if self.dirty {
+            FrameRequest::Pending
+        } else {
+            self.frame_pending
+        }
     }
 
     /// The focused text field's caret, in output pixels. `None` unless the

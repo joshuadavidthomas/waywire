@@ -82,9 +82,7 @@ impl Dispatch2<ZwlrForeignToplevelManagerV1, State> for ManagerData {
 }
 
 /// Per-handle server data. The window identifies the managed toplevel.
-struct HandleData {
-    window: Window,
-}
+struct HandleData(Window);
 
 impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
     fn request(
@@ -100,7 +98,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
 
         // A closed or otherwise retired handle is inert. Requests are ignored;
         // the client's destroy still reaches the `destroyed` callback.
-        if !state.toplevel_list.holds_handle(&self.window, resource) {
+        if !state.toplevel_list.holds_handle(&self.0, resource) {
             return;
         }
 
@@ -117,30 +115,30 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
         match request {
             Request::Activate { seat } => {
                 state.with_focus_cause(crate::delivery::FocusCause::WindowRequest, |state| {
-                    state.activate_foreign_toplevel(&self.window, &seat);
+                    state.activate_foreign_toplevel(&self.0, &seat);
                 });
             }
-            Request::Close => state.window_action(&self.window, WindowAction::Close),
+            Request::Close => state.window_action(&self.0, WindowAction::Close),
             Request::SetMaximized => {
-                state.window_action(&self.window, WindowAction::Maximize);
+                state.window_action(&self.0, WindowAction::Maximize);
             }
             Request::UnsetMaximized => {
-                state.set_window_expanded(&self.window, xdg_toplevel::State::Maximized, false);
+                state.set_window_expanded(&self.0, xdg_toplevel::State::Maximized, false);
             }
             Request::SetFullscreen { output: _ } => {
-                state.set_window_expanded(&self.window, xdg_toplevel::State::Fullscreen, true);
+                state.set_window_expanded(&self.0, xdg_toplevel::State::Fullscreen, true);
             }
             Request::UnsetFullscreen => {
-                state.set_window_expanded(&self.window, xdg_toplevel::State::Fullscreen, false);
+                state.set_window_expanded(&self.0, xdg_toplevel::State::Fullscreen, false);
             }
-            Request::SetMinimized => state.window_action(&self.window, WindowAction::Minimize),
+            Request::SetMinimized => state.window_action(&self.0, WindowAction::Minimize),
             Request::UnsetMinimized => {
                 if state
                     .windows
-                    .get(&self.window)
+                    .get(&self.0)
                     .is_some_and(|window| window.minimized)
                 {
-                    state.window_action(&self.window, WindowAction::Restore);
+                    state.window_action(&self.0, WindowAction::Restore);
                 }
             }
             // Destroy, the rectangle hint, and any future requests are
@@ -160,7 +158,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
 }
 
 /// The states exposed by the protocol.
-pub(crate) fn states(window: &Window, activated: bool, minimized: bool) -> Vec<u32> {
+pub(crate) fn states(window: &Window, activation: Activation, minimized: bool) -> Vec<u32> {
     let (maximized, fullscreen) = if let Some(top) = window.toplevel() {
         top.with_pending_state(|state| {
             (
@@ -180,7 +178,7 @@ pub(crate) fn states(window: &Window, activated: bool, minimized: bool) -> Vec<u
     if fullscreen {
         states.push(zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32);
     }
-    if activated {
+    if activation == Activation::Active {
         states.push(zwlr_foreign_toplevel_handle_v1::State::Activated as u32);
     }
     if minimized {
@@ -191,12 +189,29 @@ pub(crate) fn states(window: &Window, activated: bool, minimized: bool) -> Vec<u
 
 /// Whether the window itself currently carries the activated state. Initial
 /// publication uses this; focus changes then call [`ForeignToplevels::refresh`].
-pub(crate) fn activated(window: &Window) -> bool {
-    if let Some(top) = window.toplevel() {
+pub(crate) fn activation(window: &Window) -> Activation {
+    let active = if let Some(top) = window.toplevel() {
         top.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Activated))
     } else {
         window.x11_surface().is_some_and(X11Surface::is_activated)
+    };
+    if active {
+        Activation::Active
+    } else {
+        Activation::Inactive
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Activation {
+    Active,
+    Inactive,
+}
+
+#[derive(PartialEq, Eq)]
+enum LeaseLog {
+    Unlogged,
+    Logged,
 }
 
 struct Manager {
@@ -216,7 +231,7 @@ pub(crate) struct ForeignToplevels {
     managers: Vec<Manager>,
     toplevels: HashMap<Window, Toplevel>,
     next_manager: u64,
-    lease_drop_logged: bool,
+    lease_log: LeaseLog,
 }
 
 impl ForeignToplevels {
@@ -227,7 +242,7 @@ impl ForeignToplevels {
             managers: Vec::new(),
             toplevels: HashMap::new(),
             next_manager: 1,
-            lease_drop_logged: false,
+            lease_log: LeaseLog::Unlogged,
         }
     }
 
@@ -369,10 +384,14 @@ impl ForeignToplevels {
     ) {
         let published: Vec<Window> = self.toplevels.keys().cloned().collect();
         for window in published {
-            let activated = crate::focus::KeyboardFocus::window(&window).as_ref() == focused;
+            let activation = if crate::focus::KeyboardFocus::window(&window).as_ref() == focused {
+                Activation::Active
+            } else {
+                Activation::Inactive
+            };
             self.update_states(
                 &window,
-                states(&window, activated, minimized.contains(&window)),
+                states(&window, activation, minimized.contains(&window)),
             );
         }
     }
@@ -391,8 +410,8 @@ impl ForeignToplevels {
         if !browser_holds_input {
             return true;
         }
-        if !self.lease_drop_logged {
-            self.lease_drop_logged = true;
+        if self.lease_log == LeaseLog::Unlogged {
+            self.lease_log = LeaseLog::Logged;
             tracing::debug!("dropped foreign toplevel request while a browser holds input control");
         }
         false
@@ -400,7 +419,7 @@ impl ForeignToplevels {
 
     /// Reset the one-log-per-lease guard whenever control changes hands.
     pub(crate) fn lease_changed(&mut self) {
-        self.lease_drop_logged = false;
+        self.lease_log = LeaseLog::Unlogged;
     }
 
     fn create_handle(
@@ -416,9 +435,7 @@ impl ForeignToplevels {
             .create_resource::<ZwlrForeignToplevelHandleV1, _, State>(
                 &self.display,
                 manager.resource.version(),
-                HandleData {
-                    window: window.clone(),
-                },
+                HandleData(window.clone()),
             )
             .ok()?;
         manager.resource.toplevel(&handle);
