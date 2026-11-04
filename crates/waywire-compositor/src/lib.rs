@@ -484,7 +484,9 @@ impl State {
         self.finish_input(
             source,
             serial,
-            delivery::InputKind::Key { pressed: true },
+            delivery::InputKind::Key {
+                state: KeyState::Pressed,
+            },
             &target,
             Some(text_field),
         );
@@ -511,9 +513,7 @@ impl State {
     ) {
         let serial = self.delivery.begin_input(source, delivery::FocusCause::Key);
         let (target, text_field) = self.dispatch_key(source, key, state, reclaim);
-        let input = delivery::InputKind::Key {
-            pressed: state == KeyState::Pressed,
-        };
+        let input = delivery::InputKind::Key { state };
         self.finish_input(source, serial, input, &target, text_field);
     }
 
@@ -773,10 +773,7 @@ impl State {
         } else {
             delivery::Target::Dropped
         };
-        let input = delivery::InputKind::Button {
-            button,
-            pressed: state == ButtonState::Pressed,
-        };
+        let input = delivery::InputKind::Button { button, state };
         self.finish_input(source, serial, input, &target, None);
     }
 

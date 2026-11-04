@@ -23,6 +23,8 @@ mod windows;
 use std::collections::HashMap;
 use std::sync::mpsc;
 
+use smithay::backend::input::ButtonState;
+use smithay::backend::input::KeyState;
 use smithay::desktop::Window;
 use smithay::desktop::find_popup_root_surface;
 use smithay::input::keyboard::KeyboardSource;
@@ -131,8 +133,8 @@ fn lineage(pid: u32) -> Vec<u32> {
 /// The kind of input a receipt describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputKind {
-    Key { pressed: bool },
-    Button { button: u32, pressed: bool },
+    Key { state: KeyState },
+    Button { button: u32, state: ButtonState },
     Scroll,
     Text,
 }

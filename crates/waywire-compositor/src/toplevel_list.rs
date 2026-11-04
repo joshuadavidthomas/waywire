@@ -4425,7 +4425,12 @@ mod tests {
         let down = &receipts[0];
         assert_eq!(down.source, SourceKind::VirtualKeyboard);
         assert_eq!(down.source_pid, Some(std::process::id()));
-        assert_eq!(down.input, InputKind::Key { pressed: true });
+        assert_eq!(
+            down.input,
+            InputKind::Key {
+                state: smithay::backend::input::KeyState::Pressed
+            }
+        );
         assert_eq!(down.delivery.as_str(), "window");
         let window = down.delivery.window().cloned().expect("receiving window");
         assert_eq!(window.id, identifier, "the id lswt and lswt-like tools see");
@@ -4639,8 +4644,18 @@ mod tests {
                     .window()
                     .is_some_and(|window| window.id == identifier)
         }));
-        assert_eq!(receipts[0].input, InputKind::Key { pressed: true });
-        assert_eq!(receipts[1].input, InputKind::Key { pressed: false });
+        assert_eq!(
+            receipts[0].input,
+            InputKind::Key {
+                state: smithay::backend::input::KeyState::Pressed
+            }
+        );
+        assert_eq!(
+            receipts[1].input,
+            InputKind::Key {
+                state: smithay::backend::input::KeyState::Released
+            }
+        );
     }
 
     /// `wtype -M ctrl c -m ctrl` reaches the client as Control+C, and a

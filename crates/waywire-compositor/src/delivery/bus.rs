@@ -10,6 +10,8 @@ use std::sync::mpsc;
 use anyhow::Result;
 use calloop::LoopHandle;
 use calloop::channel::Event;
+use smithay::backend::input::ButtonState;
+use smithay::backend::input::KeyState;
 use smithay::utils::Physical;
 use smithay::utils::Rectangle;
 use tokio::sync::oneshot;
@@ -423,8 +425,10 @@ pub(crate) fn receipt_dict(receipt: &Receipt) -> HashMap<String, Value<'static>>
     insert(&mut dict, "source", receipt.source.as_str());
     insert(&mut dict, "source_pid", receipt.source_pid.unwrap_or(0));
     let (event, pressed, button) = match receipt.input {
-        InputKind::Key { pressed } => ("key", Some(pressed), None),
-        InputKind::Button { button, pressed } => ("button", Some(pressed), Some(button)),
+        InputKind::Key { state } => ("key", Some(state == KeyState::Pressed), None),
+        InputKind::Button { button, state } => {
+            ("button", Some(state == ButtonState::Pressed), Some(button))
+        }
         InputKind::Scroll => ("scroll", None, None),
         InputKind::Text => ("text", None, None),
     };
