@@ -366,7 +366,7 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for FrameData {
             request,
             verdict: Verdict::Owed,
         });
-        state.frame_pending = crate::FrameRequest::Pending;
+        state.frame_request.request(crate::FrameRequest::Damaged);
     }
 
     fn destroyed(&self, state: &mut State, _client: ClientId, frame: &ZwlrScreencopyFrameV1) {

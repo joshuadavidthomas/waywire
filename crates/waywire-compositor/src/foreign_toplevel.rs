@@ -28,9 +28,12 @@ use smithay::reexports::wayland_server::{
 use smithay::wayland::Dispatch2;
 use smithay::wayland::GlobalDispatch2;
 use smithay::xwayland::X11Surface;
+use waywire_protocol::pipe::InputControl;
 
 use crate::State;
 use crate::WindowAction;
+use crate::wm::ExpandRequest;
+use crate::wm::Visibility;
 
 /// The newest protocol version we serve. Version 2 adds fullscreen state and
 /// requests; version 3 adds parent handles, which this compositor does not
@@ -106,9 +109,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
         // valid while the browser holds input. Every other request is agent
         // input and follows the lease.
         if !matches!(request, Request::Destroy | Request::SetRectangle { .. })
-            && !state
-                .toplevel_list
-                .accepts_request(state.input.browser_holds_input())
+            && !state.toplevel_list.accepts_request(state.input.control())
         {
             return;
         }
@@ -123,20 +124,20 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
                 state.window_action(&self.0, WindowAction::Maximize);
             }
             Request::UnsetMaximized => {
-                state.set_window_expanded(&self.0, xdg_toplevel::State::Maximized, false);
+                state.set_window_expanded(&self.0, ExpandRequest::Unmaximize);
             }
             Request::SetFullscreen { output: _ } => {
-                state.set_window_expanded(&self.0, xdg_toplevel::State::Fullscreen, true);
+                state.set_window_expanded(&self.0, ExpandRequest::Fullscreen);
             }
             Request::UnsetFullscreen => {
-                state.set_window_expanded(&self.0, xdg_toplevel::State::Fullscreen, false);
+                state.set_window_expanded(&self.0, ExpandRequest::Unfullscreen);
             }
             Request::SetMinimized => state.window_action(&self.0, WindowAction::Minimize),
             Request::UnsetMinimized => {
                 if state
                     .windows
                     .get(&self.0)
-                    .is_some_and(|window| window.minimized)
+                    .is_some_and(crate::wm::WindowState::is_minimized)
                 {
                     state.window_action(&self.0, WindowAction::Restore);
                 }
@@ -158,7 +159,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for HandleData {
 }
 
 /// The states exposed by the protocol.
-pub(crate) fn states(window: &Window, activation: Activation, minimized: bool) -> Vec<u32> {
+pub(crate) fn states(window: &Window, activation: Activation, visibility: Visibility) -> Vec<u32> {
     let (maximized, fullscreen) = if let Some(top) = window.toplevel() {
         top.with_pending_state(|state| {
             (
@@ -181,7 +182,7 @@ pub(crate) fn states(window: &Window, activation: Activation, minimized: bool) -
     if activation == Activation::Active {
         states.push(zwlr_foreign_toplevel_handle_v1::State::Activated as u32);
     }
-    if minimized {
+    if visibility == Visibility::Mapped(waywire_decorations::Visibility::Minimized) {
         states.push(zwlr_foreign_toplevel_handle_v1::State::Minimized as u32);
     }
     states
@@ -389,9 +390,14 @@ impl ForeignToplevels {
             } else {
                 Activation::Inactive
             };
+            let visibility = if minimized.contains(&window) {
+                waywire_decorations::Visibility::Minimized
+            } else {
+                waywire_decorations::Visibility::Shown
+            };
             self.update_states(
                 &window,
-                states(&window, activation, minimized.contains(&window)),
+                states(&window, activation, Visibility::Mapped(visibility)),
             );
         }
     }
@@ -406,8 +412,8 @@ impl ForeignToplevels {
 
     /// True while requests may act on windows. A browser lease drops them and
     /// logs once, not once per request.
-    pub(crate) fn accepts_request(&mut self, browser_holds_input: bool) -> bool {
-        if !browser_holds_input {
+    pub(crate) fn accepts_request(&mut self, control: InputControl) -> bool {
+        if control == InputControl::Agents {
             return true;
         }
         if self.lease_log == LeaseLog::Unlogged {

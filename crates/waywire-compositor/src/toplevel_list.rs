@@ -19,6 +19,7 @@ use smithay::wayland::foreign_toplevel_list::ForeignToplevelListHandler;
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::xwayland::X11Surface;
+use waywire_protocol::pipe::InputControl;
 
 use crate::State;
 use crate::foreign_toplevel::ForeignToplevels;
@@ -59,7 +60,7 @@ impl ToplevelList {
         let states = crate::foreign_toplevel::states(
             window,
             crate::foreign_toplevel::activation(window),
-            false,
+            crate::wm::Visibility::Mapped(waywire_decorations::Visibility::Shown),
         );
         self.foreign.publish(window, title, app_id, states);
     }
@@ -144,8 +145,8 @@ impl ToplevelList {
         self.foreign.holds_handle(window, handle)
     }
 
-    pub(crate) fn accepts_request(&mut self, browser_holds_input: bool) -> bool {
-        self.foreign.accepts_request(browser_holds_input)
+    pub(crate) fn accepts_request(&mut self, control: InputControl) -> bool {
+        self.foreign.accepts_request(control)
     }
 
     pub(crate) fn lease_changed(&mut self) {
@@ -195,6 +196,7 @@ mod tests {
     use smithay::backend::input::ButtonState;
     use smithay::desktop::Window;
     use smithay::input::keyboard::KeyboardSource;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
     use smithay::wayland::seat::WaylandFocus;
     use wayland_client::Connection;
     use wayland_client::Dispatch;
@@ -270,6 +272,7 @@ mod tests {
     use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::{
         self as wlr_manager,
     };
+    use waywire_protocol::pipe::InputControl;
 
     use crate::focus::KeyboardFocus;
 
@@ -1249,7 +1252,13 @@ mod tests {
         let window = Window::new_x11_window(surface);
         let (_display, mut state) = crate::tests::test_state();
         state.space.map_element(window.clone(), (32, 32), false);
-        state.windows.entry(window.clone()).or_default().mapped = true;
+        state
+            .windows
+            .entry(window.clone())
+            .or_default()
+            .set_visibility(crate::wm::Visibility::Mapped(
+                waywire_decorations::Visibility::Shown,
+            ));
         state.window_unmapped(&window);
         assert!(!state.windows.contains_key(&window));
     }
@@ -1257,7 +1266,6 @@ mod tests {
     #[test]
     fn uncommitted_toplevel_receives_no_configure() {
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as TopState;
         use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 
         #[derive(Debug)]
@@ -1291,7 +1299,7 @@ mod tests {
                 Path::Decoration => state.request_mode(top, Mode::ServerSide),
                 Path::Focus => state.focus_window(Some(window)),
                 Path::Resize => state.output_resized(),
-                Path::Expand => state.set_expanded(&top, TopState::Maximized, true),
+                Path::Expand => state.set_expanded(&top, crate::wm::ExpandRequest::Maximize),
             }
             sync(&mut display, &mut state, &connection, &mut queue, &mut app);
             if app.last_configure.is_some() {
@@ -1378,17 +1386,23 @@ mod tests {
         attach_buffer(&surface, &app, &queue.handle(), 1);
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(state.windows.get(&window).expect("window state").mapped);
+        assert!(
+            state
+                .windows
+                .get(&window)
+                .expect("window state")
+                .is_mapped()
+        );
     }
 
     #[test]
     fn repeated_maximize_still_sends_configure() {
         let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
         let top = window.toplevel().expect("toplevel").clone();
-        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized, true);
+        state.set_expanded(&top, crate::wm::ExpandRequest::Maximize);
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         let first = app.last_configure.expect("first maximize configure");
-        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized, true);
+        state.set_expanded(&top, crate::wm::ExpandRequest::Maximize);
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_ne!(
             app.last_configure,
@@ -1399,7 +1413,7 @@ mod tests {
 
     #[test]
     fn destroying_a_window_ends_its_move_and_resize_grabs() {
-        for resize in [false, true] {
+        for edge in [None, Some(ResizeEdge::BottomRight)] {
             let (mut display, mut state) = crate::tests::test_state();
             let (connection, mut queue, mut app) = connect_client(&mut display.handle());
             sync(&mut display, &mut state, &connection, &mut queue, &mut app);
@@ -1423,10 +1437,10 @@ mod tests {
                 "other",
             );
             let pointer = state.seat.get_pointer().expect("pointer");
-            state.start_decoration_grab(
+            state.start_decoration_action(
                 window,
                 smithay::utils::SERIAL_COUNTER.next_serial(),
-                resize,
+                edge,
             );
             assert!(pointer.is_grabbed());
             other.destroy();
@@ -1593,13 +1607,13 @@ mod tests {
             }
         ));
         let top = second.toplevel().expect("top").clone();
-        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen, true);
+        state.set_expanded(&top, crate::wm::ExpandRequest::Fullscreen);
         assert_eq!(
             state.taskbar_chips().len(),
             2,
             "fullscreen retains its chip"
         );
-        state.set_expanded(&top, smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen, false);
+        state.set_expanded(&top, crate::wm::ExpandRequest::Unfullscreen);
         second_top.set_title("Renamed".into());
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert_eq!(state.taskbar_chips()[1].title(), "Renamed");
@@ -1903,21 +1917,13 @@ mod tests {
         );
         let third = top_window(&state);
         *state.chrome.pins_mut() = vec![
-            crate::chrome::Pin {
-                command: vec!["/usr/bin/beta".into()],
-                pid: None,
-                child: None,
-            },
-            crate::chrome::Pin {
-                command: vec!["different-name".into()],
-                pid: state.window_pid(&first),
-                child: None,
-            },
-            crate::chrome::Pin {
-                command: vec!["absent".into()],
-                pid: None,
-                child: None,
-            },
+            crate::chrome::Pin::new(vec!["/usr/bin/beta".into()], None, None),
+            crate::chrome::Pin::new(
+                vec!["different-name".into()],
+                state.window_pid(&first),
+                None,
+            ),
+            crate::chrome::Pin::new(vec!["absent".into()], None, None),
         ];
         let chips = state.taskbar_chips();
         assert_eq!(chips.len(), 4);
@@ -1937,27 +1943,28 @@ mod tests {
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
-        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(state.windows.get(&window).expect("window").is_minimized());
     }
 
     #[test]
     fn clicking_unmatched_pin_spawns_and_reaps_process() {
         let (_, mut state, _, _, _, _) = action_fixture();
-        state.chrome.pins_mut().push(crate::chrome::Pin {
-            command: vec!["sleep".into(), "5".into()],
-            pid: None,
-            child: None,
-        });
+        state.chrome.pins_mut().push(crate::chrome::Pin::new(
+            vec!["sleep".into(), "5".into()],
+            None,
+            None,
+        ));
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
         let pin = &mut state.chrome.pins_mut()[0];
-        let child = pin.child.as_mut().expect("spawned process");
-        assert_eq!(pin.pid, Some(child.id()));
+        let pid = pin.pid();
+        let child = pin.child_mut().expect("spawned process");
+        assert_eq!(pid, Some(child.id()));
         child.kill().expect("stop child");
         child.wait().expect("wait child");
         state.reap_pins();
-        assert!(state.chrome.pins_mut()[0].pid.is_none());
+        assert!(state.chrome.pins_mut()[0].pid().is_none());
         assert!(matches!(
             state.taskbar_chips()[0].target(),
             waywire_decorations::ChipTarget::Pin {
@@ -1970,14 +1977,14 @@ mod tests {
     #[test]
     fn dropping_state_reaps_pinned_child() {
         let (_, mut state, _, _, _, _) = action_fixture();
-        state.chrome.pins_mut().push(crate::chrome::Pin {
-            command: vec!["sleep".into(), "30".into()],
-            pid: None,
-            child: None,
-        });
+        state.chrome.pins_mut().push(crate::chrome::Pin::new(
+            vec!["sleep".into(), "30".into()],
+            None,
+            None,
+        ));
         state.launch_pin(0);
         let pid = nix::unistd::Pid::from_raw(
-            i32::try_from(state.chrome.pins_mut()[0].pid.expect("spawned process"))
+            i32::try_from(state.chrome.pins_mut()[0].pid().expect("spawned process"))
                 .expect("valid pid"),
         );
         drop(state);
@@ -1995,16 +2002,15 @@ mod tests {
     #[test]
     fn clicking_running_pin_minimizes_its_window() {
         let (_, mut state, _, _, _, window) = action_fixture();
-        state.chrome.pins_mut().push(crate::chrome::Pin {
-            command: vec!["window".into()],
-            pid: None,
-            child: None,
-        });
+        state
+            .chrome
+            .pins_mut()
+            .push(crate::chrome::Pin::new(vec!["window".into()], None, None));
         assert_eq!(state.taskbar_chips()[0].window(), Some(&window));
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
-        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(state.windows.get(&window).expect("window").is_minimized());
     }
 
     #[test]
@@ -2014,7 +2020,7 @@ mod tests {
         state.pointer_motion(KeyboardSource::MAIN, (40.0, 1060.0).into());
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Pressed);
         state.pointer_button(KeyboardSource::MAIN, 0x110, ButtonState::Released);
-        assert!(!state.windows.get(&window).expect("window").minimized);
+        assert!(!state.windows.get(&window).expect("window").is_minimized());
         assert_eq!(
             state.seat.get_keyboard().expect("keyboard").current_focus(),
             KeyboardFocus::window(&window)
@@ -2046,7 +2052,7 @@ mod tests {
         );
         let second = top_window(&state);
         state.window_action(&second, crate::WindowAction::Minimize);
-        assert!(state.windows.get(&second).expect("window").minimized);
+        assert!(state.windows.get(&second).expect("window").is_minimized());
         assert!(state.space.element_location(&second).is_some());
         assert_eq!(
             state.windows.topmost_focusable(&state.space, None),
@@ -2082,8 +2088,8 @@ mod tests {
         for key in [125, 42, 50] {
             state.keyboard_key(KeyboardSource::MAIN, key, KeyState::Pressed);
         }
-        assert!(!state.windows.get(&second).expect("window").minimized);
-        assert!(state.windows.get(&first).expect("window").minimized);
+        assert!(!state.windows.get(&second).expect("window").is_minimized());
+        assert!(state.windows.get(&first).expect("window").is_minimized());
         assert_eq!(
             state.seat.get_keyboard().expect("keyboard").current_focus(),
             KeyboardFocus::window(&second)
@@ -2124,7 +2130,7 @@ mod tests {
                 .windows
                 .get(&window)
                 .expect("window")
-                .resize
+                .resize()
                 .as_ref()
                 .map(|resize| resize.0),
             Some(5)
@@ -2364,7 +2370,6 @@ mod tests {
     #[test]
     fn fullscreen_and_menu_render_above_taskbar() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
-        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
         use waywire_decorations::SceneElement;
 
         let (mut display, mut state, connection, mut queue, mut app, window) = action_fixture();
@@ -2392,7 +2397,7 @@ mod tests {
         );
 
         let top = window.toplevel().expect("toplevel").clone();
-        state.set_expanded(&top, xdg_toplevel::State::Fullscreen, true);
+        state.set_expanded(&top, crate::wm::ExpandRequest::Fullscreen);
         commit_configure(&mut display, &mut state, &connection, &mut queue, &mut app);
         let fullscreen = state.scene_elements(&mut renderer);
         assert!(matches!(fullscreen.first(), Some(SceneElement::Surface(_))));
@@ -2418,12 +2423,11 @@ mod tests {
     #[test]
     fn normal_window_above_fullscreen_stays_above_it_in_scene() {
         use smithay::backend::renderer::pixman::PixmanRenderer;
-        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
         use waywire_decorations::SceneElement;
 
         let (mut display, mut state, connection, mut queue, mut app, fullscreen) = action_fixture();
         let top = fullscreen.toplevel().expect("toplevel").clone();
-        state.set_expanded(&top, xdg_toplevel::State::Fullscreen, true);
+        state.set_expanded(&top, crate::wm::ExpandRequest::Fullscreen);
         let _normal = map_toplevel(
             &mut display,
             &mut state,
@@ -2587,7 +2591,7 @@ mod tests {
         state.window_action(&window, crate::WindowAction::ShowMenu);
         state.keyboard_key(agent, 1, smithay::backend::input::KeyState::Pressed);
         assert_eq!(state.chrome.menu_escape(), Some(agent));
-        state.set_browser_lease(true);
+        state.set_input_control(InputControl::Browser);
         assert_eq!(state.chrome.menu_escape(), None);
     }
 
@@ -2640,7 +2644,13 @@ mod tests {
         dialog_top.set_parent(Some(&parent_top));
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         click_menu_item(&mut state, &dialog, 0);
-        assert!(!state.windows.get(&dialog).expect("dialog state").minimized);
+        assert!(
+            !state
+                .windows
+                .get(&dialog)
+                .expect("dialog state")
+                .is_minimized()
+        );
     }
 
     #[test]
@@ -2648,7 +2658,7 @@ mod tests {
         let (_, mut state, _, _, _, window) = action_fixture();
         click_menu_item(&mut state, &window, 0);
         assert!(state.chrome.window_menu().is_none());
-        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(state.windows.get(&window).expect("window").is_minimized());
     }
 
     #[test]
@@ -2685,7 +2695,7 @@ mod tests {
                 .windows
                 .get(&window)
                 .expect("window")
-                .resize
+                .resize()
                 .as_ref()
                 .map(|resize| resize.0),
             Some(10)
@@ -2729,7 +2739,10 @@ mod tests {
         );
         let other = top_window(&state);
         click_menu_item(&mut state, &pinned, 2);
-        assert!(state.windows.get(&pinned).expect("window").always_on_top);
+        assert_eq!(
+            state.windows.stacking(&pinned),
+            crate::wm::Stacking::AlwaysOnTop
+        );
         state.focus_window(Some(other.clone()));
         assert_eq!(top_window(&state), pinned);
         assert_eq!(
@@ -2737,7 +2750,7 @@ mod tests {
             KeyboardFocus::window(&other)
         );
         click_menu_item(&mut state, &pinned, 2);
-        assert!(!state.windows.get(&pinned).expect("window").always_on_top);
+        assert_eq!(state.windows.stacking(&pinned), crate::wm::Stacking::Normal);
         state.focus_window(Some(other.clone()));
         assert_eq!(top_window(&state), other);
     }
@@ -2786,7 +2799,7 @@ mod tests {
                 state
                     .windows
                     .get(&window)
-                    .and_then(|state| state.resize)
+                    .and_then(crate::wm::WindowState::resize)
                     .map(|resize| resize.0),
                 Some(edge)
             );
@@ -3146,16 +3159,33 @@ mod tests {
         );
         let window = top_window(&state);
         let pointer = state.seat.get_pointer().expect("pointer");
-        for mode in [
-            smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
-            smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
+        for (expand, restore) in [
+            (
+                crate::wm::ExpandRequest::Maximize,
+                crate::wm::ExpandRequest::Unmaximize,
+            ),
+            (
+                crate::wm::ExpandRequest::Fullscreen,
+                crate::wm::ExpandRequest::Unfullscreen,
+            ),
         ] {
-            state.set_window_expanded(&window, mode, true);
-            state.start_decoration_grab(window.clone(), smithay::utils::SERIAL_COUNTER.next_serial(), true);
-            assert!(!pointer.is_grabbed(), "expanded window must not begin resizing");
-            state.set_window_expanded(&window, mode, false);
+            state.set_window_expanded(&window, expand);
+            state.start_decoration_action(
+                window.clone(),
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                Some(ResizeEdge::BottomRight),
+            );
+            assert!(
+                !pointer.is_grabbed(),
+                "expanded window must not begin resizing"
+            );
+            state.set_window_expanded(&window, restore);
         }
-        state.start_decoration_grab(window, smithay::utils::SERIAL_COUNTER.next_serial(), true);
+        state.start_decoration_action(
+            window,
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            Some(ResizeEdge::BottomRight),
+        );
         assert!(pointer.is_grabbed(), "normal window can begin resizing");
     }
 
@@ -3193,10 +3223,10 @@ mod tests {
                 .map(|surface| crate::focus::PointerFocus::Wayland(surface.into_owned()))
         };
         assert_eq!(pointer.current_focus(), focus_of(&first));
-        state.start_decoration_grab(
+        state.start_decoration_action(
             first.clone(),
             smithay::utils::SERIAL_COUNTER.next_serial(),
-            false,
+            None,
         );
         assert!(pointer.is_grabbed());
         let (second_surface, _, _) = map_toplevel(
@@ -3231,10 +3261,10 @@ mod tests {
             app.button_targets,
             [second_surface.clone(), second_surface.clone()]
         );
-        state.start_decoration_grab(
+        state.start_decoration_action(
             second.clone(),
             smithay::utils::SERIAL_COUNTER.next_serial(),
-            true,
+            Some(ResizeEdge::BottomRight),
         );
         state.focus_window(Some(first.clone()));
         pointer.unset_grab(
@@ -3676,7 +3706,7 @@ mod tests {
         state.window_action(&window_a, crate::WindowAction::Minimize);
         managed_handle(&app, "A").activate(app.seat.as_ref().expect("seat bound"));
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(!state.windows.get(&window_a).expect("window").minimized);
+        assert!(!state.windows.get(&window_a).expect("window").is_minimized());
 
         assert_eq!(
             state
@@ -3705,15 +3735,15 @@ mod tests {
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         handle.set_minimized();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(state.windows.get(&window).expect("window").is_minimized());
         assert!(managed_states(&app, "Window").contains(&(WlrState::Minimized as u32)));
         handle.unset_maximized();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(state.windows.get(&window).expect("window").minimized);
+        assert!(state.windows.get(&window).expect("window").is_minimized());
         assert!(!managed_states(&app, "Window").contains(&(WlrState::Maximized as u32)));
         handle.unset_minimized();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
-        assert!(!state.windows.get(&window).expect("window").minimized);
+        assert!(!state.windows.get(&window).expect("window").is_minimized());
         assert!(!managed_states(&app, "Window").contains(&(WlrState::Minimized as u32)));
     }
 
@@ -3752,7 +3782,7 @@ mod tests {
             .expect("managed A")
             .done;
 
-        state.set_browser_lease(true);
+        state.set_input_control(InputControl::Browser);
         handle_a.activate(app.seat.as_ref().expect("seat bound"));
         handle_a.close();
         handle_a.set_maximized();
@@ -3781,7 +3811,7 @@ mod tests {
             "dropping a request sends no done"
         );
 
-        state.set_browser_lease(false);
+        state.set_input_control(InputControl::Agents);
         assert_eq!(
             state
                 .seat
@@ -4166,7 +4196,7 @@ mod tests {
     fn takeover_cancels_a_drag_without_dropping() {
         let (mut display, mut state) = crate::tests::test_state();
         let (mut source, mut target, _data) = drag_into_target(&mut display, &mut state);
-        state.set_browser_lease(true);
+        state.set_input_control(InputControl::Browser);
         sync_peer(&mut display, &mut state, &mut target);
         sync_peer(&mut display, &mut state, &mut source);
         assert!(source.2.dnd.cancelled, "the source learns the drag ended");
@@ -4272,7 +4302,7 @@ mod tests {
         state
             .windows
             .get(window)
-            .is_some_and(|window| window.urgent)
+            .is_some_and(crate::wm::WindowState::is_urgent)
     }
 
     #[test]
@@ -4354,8 +4384,8 @@ mod tests {
             serial,
             &source_surface,
         );
-        state.set_browser_lease(true);
-        state.set_browser_lease(false);
+        state.set_input_control(InputControl::Browser);
+        state.set_input_control(InputControl::Agents);
         activate(
             &mut display,
             &mut state,
@@ -4485,7 +4515,7 @@ mod tests {
             "another client's keys stay private"
         );
 
-        state.set_browser_lease(true);
+        state.set_input_control(InputControl::Browser);
         press(&mut state, source);
         let dropped = self::receipts(&delivered(&received, "agent"));
         assert_eq!(
@@ -4497,7 +4527,7 @@ mod tests {
         );
         assert_eq!(dropped[0].delivery().window(), None);
 
-        state.set_browser_lease(false);
+        state.set_input_control(InputControl::Agents);
         state.focus_window(None);
         press(&mut state, source);
         let nowhere = self::receipts(&delivered(&received, "agent"));

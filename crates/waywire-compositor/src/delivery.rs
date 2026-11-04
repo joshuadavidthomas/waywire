@@ -1113,7 +1113,10 @@ impl State {
         // has no identifier yet; report it once it maps.
         if let Target::Client { window, .. } = &target
             && window.toplevel().is_some()
-            && !self.windows.get(window).is_some_and(|state| state.mapped)
+            && !self
+                .windows
+                .get(window)
+                .is_some_and(crate::wm::WindowState::is_mapped)
         {
             self.delivery.defer_focus();
             return;

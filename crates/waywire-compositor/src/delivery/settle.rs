@@ -544,10 +544,10 @@ impl Delivery {
             return settled;
         }
         // A pending frame bounds how long the screen is known quiet.
-        let quiet_until = if pending == FrameRequest::Pending {
-            settle.rendered
-        } else {
+        let quiet_until = if pending == FrameRequest::Idle {
             now
+        } else {
+            settle.rendered
         };
         let mut index = 0;
         while let Some(waiter) = settle.waiters.get(index) {
@@ -612,7 +612,7 @@ impl Delivery {
             .iter()
             .map(|waiter| {
                 let quiet = waiter.quiet_from() + waiter.quiet;
-                if pending == FrameRequest::Pending && quiet <= monotonic_usec() {
+                if pending != FrameRequest::Idle && quiet <= monotonic_usec() {
                     waiter.deadline
                 } else {
                     quiet.min(waiter.deadline)
@@ -698,11 +698,7 @@ impl State {
     /// Whether a frame is owed: commits since the last frame are not on
     /// screen yet.
     fn frame_owed(&self) -> FrameRequest {
-        if self.dirty {
-            FrameRequest::Pending
-        } else {
-            self.frame_pending
-        }
+        self.frame_request
     }
 
     /// The focused text field's caret, in output pixels. `None` unless the
