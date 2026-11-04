@@ -252,7 +252,54 @@ impl QualityBounds {
     }
 }
 
-type Signals = [(bool, &'static str); 7];
+/// Something in a sample that counts against quality or blocks its recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reason {
+    EncoderReplacement,
+    DecoderBusy,
+    DecoderPeak,
+    Rtt,
+    BrowserLoss,
+    LinkLoss,
+    LinkBacklog,
+    NoPresentation,
+}
+
+impl Reason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EncoderReplacement => "encoder-replacement",
+            Self::DecoderBusy => "decoder-busy",
+            Self::DecoderPeak => "decoder-peak",
+            Self::Rtt => "rtt",
+            Self::BrowserLoss => "browser-loss",
+            Self::LinkLoss => "link-loss",
+            Self::LinkBacklog => "link-backlog",
+            Self::NoPresentation => "no-presentation",
+        }
+    }
+
+    /// The viewer's link, not the encoder or decoder, explains this reason.
+    fn is_link(self) -> bool {
+        match self {
+            Self::LinkLoss | Self::LinkBacklog => true,
+            Self::EncoderReplacement
+            | Self::DecoderBusy
+            | Self::DecoderPeak
+            | Self::Rtt
+            | Self::BrowserLoss
+            | Self::NoPresentation => false,
+        }
+    }
+}
+
+/// The reasons that apply, in order.
+fn applying<const N: usize>(candidates: [(bool, Reason); N]) -> Vec<Reason> {
+    candidates
+        .into_iter()
+        .filter_map(|(applies, reason)| applies.then_some(reason))
+        .collect()
+}
 
 /// What counts against quality in a sample, and what blocks its recovery.
 fn signals(
@@ -261,35 +308,35 @@ fn signals(
     lossy: bool,
     encoder_bad: bool,
     encoder_good: bool,
-) -> (Signals, Signals) {
+) -> (Vec<Reason>, Vec<Reason>) {
     let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
     let active = link.active;
-    let pressure = [
-        (encoder_bad, "encoder-replacement"),
-        (active && queue_pressure >= 0.10, "decoder-busy"),
-        (active && feedback.queue_peak() >= 24, "decoder-peak"),
-        (active && feedback.rtt() > 250.0, "rtt"),
-        (lossy && !link.loss, "browser-loss"),
-        (link.loss, "link-loss"),
-        (link.backlog, "link-backlog"),
-    ];
+    let pressure = applying([
+        (encoder_bad, Reason::EncoderReplacement),
+        (active && queue_pressure >= 0.10, Reason::DecoderBusy),
+        (active && feedback.queue_peak() >= 24, Reason::DecoderPeak),
+        (active && feedback.rtt() > 250.0, Reason::Rtt),
+        (lossy && !link.loss, Reason::BrowserLoss),
+        (link.loss, Reason::LinkLoss),
+        (link.backlog, Reason::LinkBacklog),
+    ]);
     // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
     // so one dropped frame does not erase an otherwise healthy recovery streak.
     // Feedback excludes newest-due presentation skips. A 60Hz display may
     // legitimately draw half a 120 FPS stream; zero draws cannot recover.
-    let recovery_vetoes = [
-        (!encoder_good, "encoder-replacement"),
-        (queue_pressure >= 0.05, "decoder-busy"),
-        (feedback.queue_peak() >= 24, "decoder-peak"),
+    let recovery_vetoes = applying([
+        (!encoder_good, Reason::EncoderReplacement),
+        (queue_pressure >= 0.05, Reason::DecoderBusy),
+        (feedback.queue_peak() >= 24, Reason::DecoderPeak),
         (
             u64::from(feedback.dropped()) * 100
                 > u64::from(feedback.received()) * GOOD_DROP_PERCENT,
-            "browser-loss",
+            Reason::BrowserLoss,
         ),
-        (feedback.rtt() >= 120.0, "rtt"),
-        (link.backlog, "link-backlog"),
-        (feedback.presented() == 0, "no-presentation"),
-    ];
+        (feedback.rtt() >= 120.0, Reason::Rtt),
+        (link.backlog, Reason::LinkBacklog),
+        (feedback.presented() == 0, Reason::NoPresentation),
+    ]);
     (pressure, recovery_vetoes)
 }
 
@@ -416,8 +463,8 @@ impl Quality {
             replaced,
             sufficient_encoder_sample = attempted >= ENCODER_MIN_RENDERED,
             ?feedback,
-            bad_reasons = ?pressure.iter().filter_map(|(active, reason)| active.then_some(*reason)).collect::<Vec<_>>(),
-            recovery_vetoes = ?recovery_vetoes.iter().filter_map(|(active, reason)| active.then_some(*reason)).collect::<Vec<_>>(),
+            bad_reasons = ?pressure.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
+            recovery_vetoes = ?recovery_vetoes.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
             streak_before = ?self.streak,
             delivered = link.delivered,
             queued = self.queued,
@@ -441,11 +488,9 @@ impl Quality {
             debug!(decision = "draining", streak_after = ?self.streak, "quality decision");
             return None;
         }
-        let is_bad = pressure.iter().any(|(active, _)| *active);
-        let local_pressure = pressure
-            .iter()
-            .any(|(active, reason)| *active && !reason.starts_with("link-"));
-        let is_good = !recovery_vetoes.iter().any(|(active, _)| *active);
+        let is_bad = !pressure.is_empty();
+        let local_pressure = pressure.iter().any(|reason| !reason.is_link());
+        let is_good = recovery_vetoes.is_empty();
         self.streak = self.streak.next(is_bad, is_good);
         let streak_lowers =
             matches!(self.streak, Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD);
