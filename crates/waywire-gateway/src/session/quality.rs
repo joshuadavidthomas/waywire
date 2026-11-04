@@ -198,12 +198,33 @@ impl EncoderPressure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct QualityChange {
-    pub(super) old: QualityLevels,
-    pub(super) new: QualityLevels,
-    pub(super) old_crf: Crf,
-    pub(super) new_crf: Crf,
-    pub(super) old_chroma: Chroma,
-    pub(super) new_chroma: Chroma,
+    old: QualityLevels,
+    new: QualityLevels,
+    old_crf: Crf,
+    new_crf: Crf,
+    old_chroma: Chroma,
+    new_chroma: Chroma,
+}
+
+impl QualityChange {
+    pub(super) fn old_levels(self) -> QualityLevels {
+        self.old
+    }
+    pub(super) fn new_levels(self) -> QualityLevels {
+        self.new
+    }
+    pub(super) fn old_crf(self) -> Crf {
+        self.old_crf
+    }
+    pub(super) fn new_crf(self) -> Crf {
+        self.new_crf
+    }
+    pub(super) fn old_chroma(self) -> Chroma {
+        self.old_chroma
+    }
+    pub(super) fn new_chroma(self) -> Chroma {
+        self.new_chroma
+    }
 }
 
 /// What the viewer received over some time.
@@ -254,12 +275,18 @@ enum LinkSample {
 
 struct ActiveLink {
     /// More than `LINK_BACKLOG_MILLIS` of video waits for the link.
-    backlog: bool,
+    backlog: Backlog,
     loss: Loss,
     flow: Flow,
     delivered: u64,
     /// What the link carries, once congestion has lasted long enough to tell.
     measured: Option<Kbps>,
+}
+
+#[derive(Clone, Copy)]
+enum Backlog {
+    Clear,
+    BackedUp,
 }
 
 impl LinkSample {
@@ -270,7 +297,13 @@ impl LinkSample {
     }
 
     fn backlog(&self) -> bool {
-        matches!(self, Self::Active(ActiveLink { backlog: true, .. }))
+        matches!(
+            self,
+            Self::Active(ActiveLink {
+                backlog: Backlog::BackedUp,
+                ..
+            })
+        )
     }
 
     fn loss(&self) -> Loss {
@@ -399,14 +432,6 @@ impl Reason {
     }
 }
 
-/// The reasons that apply, in order.
-fn applying<const N: usize>(candidates: [(bool, Reason); N]) -> Vec<Reason> {
-    candidates
-        .into_iter()
-        .filter_map(|(applies, reason)| applies.then_some(reason))
-        .collect()
-}
-
 /// What counts against quality in a sample, and what blocks its recovery.
 fn signals(
     feedback: &Feedback,
@@ -415,38 +440,35 @@ fn signals(
 ) -> (Vec<Reason>, Vec<Reason>) {
     let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
     let active = matches!(link, LinkSample::Active(_));
-    let pressure = applying([
-        (
-            encoder == EncoderHealth::Overloaded,
-            Reason::EncoderReplacement,
-        ),
-        (active && queue_pressure >= 0.10, Reason::DecoderBusy),
-        (active && feedback.queue_peak() >= 24, Reason::DecoderPeak),
-        (active && feedback.rtt() > 250.0, Reason::Rtt),
-        (link.loss() == Loss::Browser, Reason::BrowserLoss),
-        (link.loss() == Loss::Link, Reason::LinkLoss),
-        (link.backlog(), Reason::LinkBacklog),
-    ]);
+    let pressure = [
+        (encoder == EncoderHealth::Overloaded).then_some(Reason::EncoderReplacement),
+        (active && queue_pressure >= 0.10).then_some(Reason::DecoderBusy),
+        (active && feedback.queue_peak() >= 24).then_some(Reason::DecoderPeak),
+        (active && feedback.rtt() > 250.0).then_some(Reason::Rtt),
+        (link.loss() == Loss::Browser).then_some(Reason::BrowserLoss),
+        (link.loss() == Loss::Link).then_some(Reason::LinkLoss),
+        link.backlog().then_some(Reason::LinkBacklog),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
     // so one dropped frame does not erase an otherwise healthy recovery streak.
     // Feedback excludes newest-due presentation skips. A 60Hz display may
     // legitimately draw half a 120 FPS stream; zero draws cannot recover.
-    let recovery_vetoes = applying([
-        (
-            encoder != EncoderHealth::Healthy,
-            Reason::EncoderReplacement,
-        ),
-        (queue_pressure >= 0.05, Reason::DecoderBusy),
-        (feedback.queue_peak() >= 24, Reason::DecoderPeak),
-        (
-            u64::from(feedback.dropped()) * 100
-                > u64::from(feedback.received()) * GOOD_DROP_PERCENT,
-            Reason::BrowserLoss,
-        ),
-        (feedback.rtt() >= 120.0, Reason::Rtt),
-        (link.backlog(), Reason::LinkBacklog),
-        (feedback.presented() == 0, Reason::NoPresentation),
-    ]);
+    let recovery_vetoes = [
+        (encoder != EncoderHealth::Healthy).then_some(Reason::EncoderReplacement),
+        (queue_pressure >= 0.05).then_some(Reason::DecoderBusy),
+        (feedback.queue_peak() >= 24).then_some(Reason::DecoderPeak),
+        (u64::from(feedback.dropped()) * 100 > u64::from(feedback.received()) * GOOD_DROP_PERCENT)
+            .then_some(Reason::BrowserLoss),
+        (feedback.rtt() >= 120.0).then_some(Reason::Rtt),
+        link.backlog().then_some(Reason::LinkBacklog),
+        (feedback.presented() == 0).then_some(Reason::NoPresentation),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     (pressure, recovery_vetoes)
 }
 
@@ -729,7 +751,11 @@ impl Quality {
                 })
         });
         LinkSample::Active(ActiveLink {
-            backlog,
+            backlog: if backlog {
+                Backlog::BackedUp
+            } else {
+                Backlog::Clear
+            },
             loss,
             flow,
             delivered: delivered.bytes,

@@ -279,12 +279,12 @@ impl Sessions {
     ) -> Result<()> {
         info!(
             ?socket,
-            old = ?change.old,
-            new = ?change.new,
-            old_crf = ?change.old_crf,
-            new_crf = ?change.new_crf,
-            old_chroma = ?change.old_chroma,
-            new_chroma = ?change.new_chroma,
+            old = ?change.old_levels(),
+            new = ?change.new_levels(),
+            old_crf = ?change.old_crf(),
+            new_crf = ?change.new_crf(),
+            old_chroma = ?change.old_chroma(),
+            new_chroma = ?change.new_chroma(),
             "quality levels changed"
         );
         // Quality is daemon state, not user input. Callers hold the input ownership
@@ -294,11 +294,11 @@ impl Sessions {
         let sent = self
             .commands
             .browser_system(Command::Quality(QualityCommand {
-                bitrate_kbps: change.new.bitrate,
-                fps: change.new.fps,
-                scale_percent: change.new.scale,
-                crf: change.new_crf,
-                chroma: change.new_chroma,
+                bitrate_kbps: change.new_levels().bitrate,
+                fps: change.new_levels().fps,
+                scale_percent: change.new_levels().scale,
+                crf: change.new_crf(),
+                chroma: change.new_chroma(),
             }))
             .await;
         if sent.is_err() {
