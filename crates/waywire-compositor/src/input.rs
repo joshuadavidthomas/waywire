@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::KeyboardSource;
 use waywire_protocol::pipe;
+pub(crate) use waywire_protocol::pipe::InputControl;
 
 /// Why the pointer is moving.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,13 +25,6 @@ pub(crate) enum PointerMotionKind {
     /// A client's pointer warp hint. Like a focus refresh, it skips pointer
     /// constraints and titlebar drags.
     WarpHint,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum InputControl {
-    #[default]
-    Agents,
-    Browser,
 }
 
 #[derive(Default)]
