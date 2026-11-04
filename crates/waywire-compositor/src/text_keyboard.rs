@@ -18,16 +18,55 @@ const CHARACTER_KEYS: [u32; 2] = [89 + 8, 124 + 8];
 #[derive(Default)]
 pub(crate) struct TextKeyboard {
     pending: VecDeque<String>,
-    base: Option<String>,
-    installed: Option<KeymapFileId>,
+    keymap: Keymap,
     slots: Vec<Slot>,
     clock: u64,
 }
 
+enum Keymap {
+    Unread { previous: Option<KeymapFileId> },
+    Base(String),
+    Installed { base: String, id: KeymapFileId },
+}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Self::Unread { previous: None }
+    }
+}
+
+impl Keymap {
+    fn installed(&self) -> Option<KeymapFileId> {
+        match self {
+            Self::Unread { previous } => *previous,
+            Self::Base(_) => None,
+            Self::Installed { id, .. } => Some(*id),
+        }
+    }
+}
+
+enum SlotName {
+    Existing(String),
+    Added(String),
+}
+
+impl SlotName {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Existing(name) | Self::Added(name) => name,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeymapEdit {
+    Unchanged,
+    Changed,
+}
+
 struct Slot {
     code: u32,
-    name: String,
-    new_name: bool,
+    name: SlotName,
     character: Option<char>,
     last_used: u64,
 }
@@ -49,7 +88,10 @@ impl TextKeyboard {
 
     /// The keymap with the slots' characters became the seat's keymap.
     fn installed(&mut self, id: KeymapFileId) {
-        self.installed = Some(id);
+        self.keymap = match std::mem::take(&mut self.keymap) {
+            Keymap::Base(base) | Keymap::Installed { base, .. } => Keymap::Installed { base, id },
+            Keymap::Unread { .. } => Keymap::Unread { previous: Some(id) },
+        };
     }
 
     fn base(&mut self, base: String, slots: Vec<Slot>) {
@@ -58,42 +100,44 @@ impl TextKeyboard {
             wayland = slots.iter().filter(|slot| slot.code > 255).count(),
             "text keyboard spare keycodes"
         );
-        self.base = Some(base);
+        self.keymap = match self.keymap.installed() {
+            Some(id) => Keymap::Installed { base, id },
+            None => Keymap::Base(base),
+        };
         self.slots = slots;
     }
 
-    /// Stop editing the keymap after it failed to build or install.
+    /// Re-read the seat's keymap on the next attempt after a failed edit.
     fn abandon(&mut self) {
-        self.base = None;
+        self.keymap = Keymap::Unread {
+            previous: self.keymap.installed(),
+        };
     }
 
     /// Start over from the seat's keymap when something else replaced the
-    /// one this installed. Returns whether the spare keycodes must be read
-    /// from the seat's keymap again.
-    fn prepare(&mut self, active: KeymapFileId) -> bool {
-        if self.installed.is_some_and(|id| active != id) {
-            self.base = None;
-            self.installed = None;
+    /// one this installed.
+    fn sync(&mut self, active: KeymapFileId) {
+        if self.keymap.installed().is_some_and(|id| active != id) {
+            self.keymap = Keymap::default();
             self.slots.clear();
         }
-        self.base.is_none()
     }
 
     /// Empty the spare keycode `code` when it holds a character of the keymap
     /// `active`. Returns whether the keymap must be installed again.
-    fn reclaim(&mut self, active: KeymapFileId, code: u32) -> bool {
-        if self.installed != Some(active) {
-            return false;
+    fn reclaim(&mut self, active: KeymapFileId, code: u32) -> KeymapEdit {
+        if self.keymap.installed() != Some(active) {
+            return KeymapEdit::Unchanged;
         }
         let Some(slot) = self
             .slots
             .iter_mut()
             .find(|slot| slot.code == code && slot.character.is_some())
         else {
-            return false;
+            return KeymapEdit::Unchanged;
         };
         slot.character = None;
-        true
+        KeymapEdit::Changed
     }
 
     /// Whether a spare keycode is one of the real character keys.
@@ -105,7 +149,7 @@ impl TextKeyboard {
 
     /// Spare keycodes, among those `usable` allows, that type `text`, and
     /// whether the keymap has to change for them.
-    fn assign(&mut self, text: &str, usable: impl Fn(u32) -> bool) -> (Vec<u32>, bool) {
+    fn assign(&mut self, text: &str, usable: impl Fn(u32) -> bool) -> (Vec<u32>, KeymapEdit) {
         let eligible = |slot: &Slot| usable(slot.code);
         let capacity = self.slots.iter().filter(|slot| eligible(slot)).count();
         let mut characters = HashSet::new();
@@ -124,7 +168,7 @@ impl TextKeyboard {
             .map(|(index, _)| index)
             .collect();
         let mut codes = Vec::new();
-        let mut changed = false;
+        let mut changed = KeymapEdit::Unchanged;
         for character in text.chars() {
             if !characters.contains(&character) {
                 tracing::warn!(%character, "text keyboard spare keycodes exhausted; character dropped");
@@ -148,7 +192,7 @@ impl TextKeyboard {
             let slot = &mut self.slots[index];
             if slot.character != Some(character) {
                 slot.character = Some(character);
-                changed = true;
+                changed = KeymapEdit::Changed;
             }
             slot.last_used = self.clock;
             codes.push(slot.code);
@@ -157,7 +201,10 @@ impl TextKeyboard {
     }
 
     fn keymap(&self) -> Option<String> {
-        let mut keymap = self.base.clone()?;
+        let mut keymap = match &self.keymap {
+            Keymap::Unread { .. } => return None,
+            Keymap::Base(base) | Keymap::Installed { base, .. } => base.clone(),
+        };
         let symbols_end = keymap.rfind("};\n\n};")?;
         let mut symbols = String::new();
         let mut names = String::new();
@@ -166,12 +213,12 @@ impl TextKeyboard {
                 writeln!(
                     symbols,
                     "\tkey <{}> {{ [ U{:04X} ] }};",
-                    slot.name,
+                    slot.name.as_str(),
                     u32::from(c)
                 )
                 .ok()?;
-                if slot.new_name {
-                    writeln!(names, "\t<{}> = {};", slot.name, slot.code).ok()?;
+                if let SlotName::Added(name) = &slot.name {
+                    writeln!(names, "\t<{}> = {};", name, slot.code).ok()?;
                 }
             }
         }
@@ -201,13 +248,12 @@ impl State {
                         .any(|level| !keymap.key_get_syms_by_level(key, layout, level).is_empty())
                 });
                 if !used {
-                    let (name, new_name) = match keymap.key_get_name(key) {
-                        Some(name) => (name.to_owned(), false),
-                        None => (format!("W{code:03}"), true),
+                    let name = match keymap.key_get_name(key) {
+                        Some(name) => SlotName::Existing(name.to_owned()),
+                        None => SlotName::Added(format!("W{code:03}")),
                     };
                     slots.push(Slot {
                         code,
-                        new_name,
                         name,
                         character: None,
                         last_used: 0,
@@ -253,6 +299,7 @@ impl State {
         if self
             .text_keyboard
             .reclaim(keyboard.keymap_file().id(), code)
+            == KeymapEdit::Changed
         {
             self.install_text_keymap();
         }
@@ -280,7 +327,7 @@ impl State {
             &|code| (code > 255) == wayland
         };
         let (codes, changed) = self.text_keyboard.assign(&character.to_string(), usable);
-        if changed && !self.install_text_keymap() {
+        if changed == KeymapEdit::Changed && !self.install_text_keymap() {
             return None;
         }
         codes.first().copied()
@@ -289,7 +336,8 @@ impl State {
     /// Start over from the seat's keymap when something else replaced the
     /// one this installed.
     fn prepare_text_keyboard(&mut self, active: KeymapFileId) {
-        if self.text_keyboard.prepare(active) {
+        self.text_keyboard.sync(active);
+        if matches!(self.text_keyboard.keymap, Keymap::Unread { .. }) {
             self.init_text_keyboard();
         }
     }
@@ -310,7 +358,7 @@ impl State {
             let (codes, changed) = self
                 .text_keyboard
                 .assign(&text, |code| (code > 255) == wayland);
-            if changed && !self.install_text_keymap() {
+            if changed == KeymapEdit::Changed && !self.install_text_keymap() {
                 return;
             }
             for code in codes {
