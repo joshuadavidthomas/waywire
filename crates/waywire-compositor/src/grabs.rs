@@ -39,15 +39,6 @@ pub(super) struct WindowGrab {
 }
 
 impl State {
-    #[cfg(test)]
-    pub(super) fn start_decoration_grab(&mut self, window: Window, serial: Serial, resize: bool) {
-        self.start_decoration_action(
-            window,
-            serial,
-            resize.then_some(xdg_toplevel::ResizeEdge::BottomRight),
-        );
-    }
-
     pub(super) fn start_decoration_action(
         &mut self,
         window: Window,
@@ -135,9 +126,10 @@ impl State {
             });
         let initial = Rectangle::new(location, size);
         if let Some(edges) = edges {
-            self.windows.entry(window.clone()).or_default().resize = Some((edges, initial, None));
+            *self.windows.entry(window.clone()).or_default().resize_mut() =
+                Some((edges, initial, None));
         } else {
-            self.windows.entry(window.clone()).or_default().resize = None;
+            *self.windows.entry(window.clone()).or_default().resize_mut() = None;
         }
         pointer.set_grab(
             self,
@@ -150,11 +142,17 @@ impl State {
             serial,
             Focus::Clear,
         );
-        self.windows.entry(window).or_default().grab_serial = Some(serial);
+        self.windows
+            .entry(window)
+            .or_default()
+            .set_grab_serial(Some(serial));
     }
 
     pub(super) fn end_window_grab(&mut self, window: &Window) {
-        let serial = self.windows.get(window).and_then(|state| state.grab_serial);
+        let serial = self
+            .windows
+            .get(window)
+            .and_then(super::wm::WindowState::grab_serial);
         if let (Some(pointer), Some(serial)) = (self.seat.get_pointer(), serial)
             && pointer.has_grab(serial)
         {
@@ -170,7 +168,7 @@ impl State {
         let Some(state) = self.windows.get_mut(window) else {
             return;
         };
-        let Some((edges, initial, final_serial)) = state.resize else {
+        let Some((edges, initial, final_serial)) = state.resize() else {
             return;
         };
         let mut location = initial.loc;
@@ -181,7 +179,12 @@ impl State {
         if edges & 1 != 0 {
             location.y += initial.size.h - size.h;
         }
-        self.space.map_element(window.clone(), location, false);
+        crate::wm::map_window(
+            &mut self.space,
+            window.clone(),
+            location,
+            crate::wm::Activation::Inactive,
+        );
         if let (Some(serial), Some(top)) = (final_serial, window.toplevel()) {
             let committed = with_states(top.wl_surface(), |states| {
                 states
@@ -192,7 +195,7 @@ impl State {
                     .unwrap_or(false)
             });
             if committed {
-                state.resize = None;
+                *state.resize_mut() = None;
             }
         }
     }
@@ -349,16 +352,24 @@ impl PointerGrab<State> for WindowGrab {
                 if let Err(error) = surface.configure(Some(rect + surface.frame_extents())) {
                     tracing::warn!(%error, "configure X11 resize");
                 }
-                state
-                    .space
-                    .map_element(self.window.clone(), rect.loc, false);
+                crate::wm::map_window(
+                    &mut state.space,
+                    self.window.clone(),
+                    rect.loc,
+                    crate::wm::Activation::Inactive,
+                );
             }
         } else {
             let mut location = (self.initial.loc.to_f64() + delta).to_i32_round::<i32>();
             if let Some(area) = state.work_area() {
                 location.y = location.y.min(area.loc.y + area.size.h);
             }
-            state.space.map_element(self.window.clone(), location, true);
+            crate::wm::map_window(
+                &mut state.space,
+                self.window.clone(),
+                location,
+                crate::wm::Activation::Active,
+            );
             state.enforce_topmost();
             if let Some(surface) = self.window.x11_surface()
                 && let Err(error) = surface.configure(Some(Rectangle::new(
@@ -369,7 +380,7 @@ impl PointerGrab<State> for WindowGrab {
                 tracing::warn!(%error, "configure X11 move");
             }
         }
-        state.dirty = true;
+        state.frame_request.request(crate::FrameRequest::FullRedraw);
     }
     fn button(
         &mut self,
@@ -379,12 +390,13 @@ impl PointerGrab<State> for WindowGrab {
     ) {
         handle.button(state, event);
         if !handle.current_pressed().contains(&self.start.button) {
-            handle.unset_grab(self, state, event.serial, event.time, true);
+            let restore_focus = true;
+            handle.unset_grab(self, state, event.serial, event.time, restore_focus);
         }
     }
     fn unset(&mut self, state: &mut State) {
         if let Some(window_state) = state.windows.get_mut(&self.window) {
-            window_state.grab_serial = None;
+            window_state.set_grab_serial(None);
         }
         if self.edges.is_some()
             && let Some(top) = self.window.toplevel()
@@ -397,7 +409,7 @@ impl PointerGrab<State> for WindowGrab {
                 .windows
                 .entry(self.window.clone())
                 .or_default()
-                .resize
+                .resize_mut()
                 .as_mut()
             {
                 *final_serial = Some(serial);
@@ -408,11 +420,18 @@ impl PointerGrab<State> for WindowGrab {
         {
             // X11 has no xdg configure acknowledgment to retire the resize anchor.
             // Keep the final configured position even if an older buffer commits later.
-            state.windows.entry(self.window.clone()).or_default().resize = None;
+            *state
+                .windows
+                .entry(self.window.clone())
+                .or_default()
+                .resize_mut() = None;
             let location = surface.last_configure().loc + surface.geometry().loc;
-            state
-                .space
-                .map_element(self.window.clone(), location, false);
+            crate::wm::map_window(
+                &mut state.space,
+                self.window.clone(),
+                location,
+                crate::wm::Activation::Inactive,
+            );
         }
     }
     fn start_data(&self) -> &GrabStartData<State> {

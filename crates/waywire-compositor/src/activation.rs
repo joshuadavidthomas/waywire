@@ -30,41 +30,47 @@ const TOKEN_LIFETIME: Duration = Duration::from_secs(30);
 struct Granted;
 
 /// The xdg-activation global and the tokens it issued.
-pub(crate) struct Activation {
-    state: XdgActivationState,
+pub(crate) struct Activation(XdgActivationState);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenAction {
+    Raise,
+    MarkUrgent,
 }
 
 impl Activation {
     pub(crate) fn new(display_handle: &DisplayHandle) -> Self {
-        Self {
-            state: XdgActivationState::new::<State>(display_handle),
-        }
+        Self(XdgActivationState::new::<State>(display_handle))
     }
 
     pub(crate) fn state(&mut self) -> &mut XdgActivationState {
-        &mut self.state
+        &mut self.0
     }
 
     /// A client created a token. Expired tokens go; `granted` marks this one
     /// as able to raise its window. Every token is kept, so a request with an
     /// ungranted token still arrives and can mark its window urgent.
-    fn created(&mut self, data: &XdgActivationTokenData, granted: bool) {
-        self.state
+    fn created(&mut self, data: &XdgActivationTokenData, action: TokenAction) {
+        self.0
             .retain_tokens(|_, data| data.timestamp.elapsed() < TOKEN_LIFETIME);
-        if granted {
+        if action == TokenAction::Raise {
             data.user_data.insert_if_missing(|| Granted);
         }
     }
 
     /// Use up a token and say whether it may raise its window.
-    fn redeem(&mut self, token: &XdgActivationToken, data: &XdgActivationTokenData) -> bool {
-        self.state.remove_token(token);
-        data.timestamp.elapsed() < TOKEN_LIFETIME && data.user_data.get::<Granted>().is_some()
+    fn redeem(&mut self, token: &XdgActivationToken, data: &XdgActivationTokenData) -> TokenAction {
+        self.0.remove_token(token);
+        if data.timestamp.elapsed() < TOKEN_LIFETIME && data.user_data.get::<Granted>().is_some() {
+            TokenAction::Raise
+        } else {
+            TokenAction::MarkUrgent
+        }
     }
 
     /// A token for an application the compositor launches.
     pub(crate) fn launch_token(&mut self) -> String {
-        let (token, data) = self.state.create_external_token(None);
+        let (token, data) = self.0.create_external_token(None);
         data.user_data.insert_if_missing(|| Granted);
         token.to_string()
     }
@@ -72,7 +78,7 @@ impl Activation {
     /// A takeover or handback changes who drives the desktop; activations
     /// requested by the previous driver must not move focus afterwards.
     pub(crate) fn void_tokens(&mut self) {
-        self.state.retain_tokens(|_, _| false);
+        self.0.retain_tokens(|_, _| false);
     }
 }
 
@@ -82,8 +88,12 @@ impl XdgActivationHandler for State {
     }
 
     fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        let granted = self.granted_by_focus(&data);
-        self.activation.created(&data, granted);
+        let action = if self.granted_by_focus(&data) {
+            TokenAction::Raise
+        } else {
+            TokenAction::MarkUrgent
+        };
+        self.activation.created(&data, action);
         true
     }
 
@@ -93,18 +103,18 @@ impl XdgActivationHandler for State {
         data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        let granted = self.activation.redeem(&token, &data);
+        let action = self.activation.redeem(&token, &data);
         let Some(window) = self.toplevel_window(&surface) else {
             return;
         };
-        tracing::debug!(granted, "xdg-activation request");
-        if granted {
+        tracing::debug!(?action, "xdg-activation request");
+        if action == TokenAction::Raise {
             self.with_focus_cause(crate::delivery::FocusCause::Activation, |state| {
                 state.activate_window(&window);
             });
         } else if !self.window_focused(&window) {
-            self.windows.entry(window).or_default().urgent = true;
-            self.dirty = true;
+            self.windows.entry(window).or_default().mark_urgent();
+            self.frame_request.request(crate::FrameRequest::FullRedraw);
         }
     }
 }

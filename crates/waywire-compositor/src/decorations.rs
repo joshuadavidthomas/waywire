@@ -45,7 +45,7 @@ impl XdgDecorationHandler for State {
             self.windows
                 .entry(window.clone())
                 .or_default()
-                .decoration_mode = Some(mode);
+                .set_decoration_mode(mode);
         }
         top.with_pending_state(|state| state.decoration_mode = Some(mode));
         if let Some(bounds) = window
@@ -57,7 +57,7 @@ impl XdgDecorationHandler for State {
         if top.is_initial_configure_sent() {
             top.send_pending_configure();
         }
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
     fn unset_mode(&mut self, top: ToplevelSurface) {
         self.request_mode(top, Mode::ServerSide);
@@ -92,7 +92,7 @@ impl State {
             if self
                 .windows
                 .get(window)
-                .is_some_and(|state| state.minimized)
+                .is_some_and(super::wm::WindowState::is_minimized)
             {
                 continue;
             }
@@ -100,7 +100,10 @@ impl State {
             let surface_location = location - window.geometry().loc;
             if !decorated(window)
                 || window.geometry().size.is_empty()
-                || !self.windows.get(window).is_some_and(|state| state.mapped)
+                || !self
+                    .windows
+                    .get(window)
+                    .is_some_and(super::wm::WindowState::is_mapped)
             {
                 if window
                     .surface_under(point - surface_location.to_f64(), WindowSurfaceType::ALL)
@@ -183,7 +186,7 @@ impl State {
             if self
                 .windows
                 .get(window)
-                .is_some_and(|state| state.minimized)
+                .is_some_and(super::wm::WindowState::is_minimized)
             {
                 continue;
             }
@@ -200,7 +203,10 @@ impl State {
             ));
             if !decorated(window)
                 || window.geometry().size.is_empty()
-                || !self.windows.get(window).is_some_and(|state| state.mapped)
+                || !self
+                    .windows
+                    .get(window)
+                    .is_some_and(super::wm::WindowState::is_mapped)
             {
                 continue;
             }
@@ -228,7 +234,9 @@ impl State {
             let state = self.windows.entry(window.clone()).or_default();
             let size = window.geometry().size;
             let width = decoration_width(size.w, output_width);
-            let decoration = state.decoration.get_or_insert_with(Decoration::default);
+            let decoration = state
+                .decoration_mut()
+                .get_or_insert_with(Decoration::default);
             let appearance = Appearance::new(
                 if title.is_empty() {
                     "Untitled".into()

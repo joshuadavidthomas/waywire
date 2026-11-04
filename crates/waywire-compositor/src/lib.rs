@@ -1332,12 +1332,12 @@ pub fn run(mut options: Config) -> Result<()> {
     };
     state
         .chrome
-        .set_launch_environment(chrome::LaunchEnvironment {
-            socket: socket_path.clone(),
-            runtime: runtime.path().to_path_buf(),
-            eis: eis_path.clone(),
-            portal: session_environment,
-        });
+        .set_launch_environment(chrome::LaunchEnvironment::new(
+            socket_path.clone(),
+            runtime.path().to_path_buf(),
+            eis_path.clone(),
+            session_environment,
+        ));
     state.loop_handle = Some(handle.clone());
     if let Some(daemon) = &pipewire_daemon {
         state.screencast = start_screencast(&handle, daemon, Rc::clone(&image));

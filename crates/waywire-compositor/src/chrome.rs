@@ -57,9 +57,26 @@ impl TitlebarPress {
 }
 
 pub(crate) struct Pin {
-    pub(crate) command: Vec<String>,
-    pub(crate) pid: Option<u32>,
-    pub(crate) child: Option<Child>,
+    command: Vec<String>,
+    pid: Option<u32>,
+    child: Option<Child>,
+}
+
+#[cfg(test)]
+impl Pin {
+    pub(crate) fn new(command: Vec<String>, pid: Option<u32>, child: Option<Child>) -> Self {
+        Self {
+            command,
+            pid,
+            child,
+        }
+    }
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+    pub(crate) fn child_mut(&mut self) -> Option<&mut Child> {
+        self.child.as_mut()
+    }
 }
 
 impl Drop for Pin {
@@ -73,19 +90,44 @@ impl Drop for Pin {
 
 /// What applications launched on the desktop need to find it.
 pub(crate) struct LaunchEnvironment {
-    pub(crate) socket: std::path::PathBuf,
-    pub(crate) runtime: std::path::PathBuf,
-    pub(crate) eis: std::path::PathBuf,
-    pub(crate) portal: Option<Vec<(String, String)>>,
+    socket: std::path::PathBuf,
+    runtime: std::path::PathBuf,
+    eis: std::path::PathBuf,
+    portal: Option<Vec<(String, String)>>,
+}
+
+impl LaunchEnvironment {
+    pub(crate) fn new(
+        socket: std::path::PathBuf,
+        runtime: std::path::PathBuf,
+        eis: std::path::PathBuf,
+        portal: Option<Vec<(String, String)>>,
+    ) -> Self {
+        Self {
+            socket,
+            runtime,
+            eis,
+            portal,
+        }
+    }
 }
 
 /// A press while the window menu is open.
 pub(crate) struct MenuPress {
-    pub(crate) window: Window,
-    /// The press closed the menu.
-    pub(crate) closed: bool,
-    /// The item a left press chose.
-    pub(crate) action: Option<WindowAction>,
+    window: Window,
+    outcome: MenuOutcome,
+}
+
+pub(crate) enum MenuOutcome {
+    Kept,
+    Dismissed,
+    Chose(WindowAction),
+}
+
+impl MenuPress {
+    pub(crate) fn into_parts(self) -> (Window, MenuOutcome) {
+        (self.window, self.outcome)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,17 +242,10 @@ impl Chrome {
         window: Window,
         pointer: Point<f64, Logical>,
         output: Size<i32, Logical>,
-        always_on_top: bool,
+        stacking: crate::wm::Stacking,
     ) {
         self.window_menu = Some(waywire_decorations::WindowMenu::new(
-            window,
-            pointer,
-            output,
-            if always_on_top {
-                waywire_decorations::Stacking::AlwaysOnTop
-            } else {
-                waywire_decorations::Stacking::Normal
-            },
+            window, pointer, output, stacking,
         ));
     }
 
@@ -242,11 +277,12 @@ impl Chrome {
         if closed {
             self.window_menu = None;
         }
-        Some(MenuPress {
-            window,
-            closed,
-            action: selected.filter(|_| button == 0x110),
-        })
+        let outcome = match selected.filter(|_| button == 0x110) {
+            Some(action) => MenuOutcome::Chose(action),
+            None if closed => MenuOutcome::Dismissed,
+            None => MenuOutcome::Kept,
+        };
+        Some(MenuPress { window, outcome })
     }
 
     /// Escape closes the window menu. Returns the menu's window when it was
@@ -426,19 +462,17 @@ impl Chrome {
         self.pending_restore_drag.take()
     }
 
-    /// The pointer moved with the left button `held`. A drag is not the
+    /// The pointer moved with the left button held. A drag is not the
     /// first press of a double click.
     pub(crate) fn titlebar_motion(
         &mut self,
         source: KeyboardSource,
         location: Point<f64, Logical>,
-        held: bool,
     ) {
-        if held
-            && self
-                .last_titlebar_press
-                .as_ref()
-                .is_some_and(|press| press.moved(source, location))
+        if self
+            .last_titlebar_press
+            .as_ref()
+            .is_some_and(|press| press.moved(source, location))
         {
             self.last_titlebar_press = None;
         }
@@ -499,14 +533,14 @@ impl Chrome {
             TaskbarChip::new(
                 title,
                 ChipTarget::Window {
-                    visibility: if state.is_some_and(|state| state.minimized) {
+                    visibility: if state.is_some_and(super::wm::WindowState::is_minimized) {
                         Visibility::Minimized
                     } else {
                         Visibility::Shown
                     },
                     attention: if focused(&window) {
                         Attention::Focused
-                    } else if state.is_some_and(|state| state.urgent) {
+                    } else if state.is_some_and(super::wm::WindowState::is_urgent) {
                         Attention::Urgent
                     } else {
                         Attention::Normal
@@ -807,7 +841,7 @@ mod tests {
 
     #[test]
     fn consumed_presses_survive_other_presses_and_end_with_their_source() {
-        let mut chrome = Chrome::new(&[]).unwrap();
+        let mut chrome = Chrome::new(&[]).expect("test chrome");
         let first = KeyboardSource::new_auxiliary();
         let second = KeyboardSource::new_auxiliary();
         chrome.consume_button(first, 0x110, delivery::Chrome::Taskbar);

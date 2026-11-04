@@ -24,28 +24,147 @@ use smithay::utils::Size;
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
+pub(crate) use waywire_decorations::Activation;
+pub(crate) use waywire_decorations::Stacking;
+use waywire_decorations::Visibility as MappedVisibility;
 use waywire_decorations::WindowAction;
 
 use crate::State;
 use crate::delivery;
 use crate::focus;
 
-#[derive(Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "mapping, minimizing, stacking and urgency change independently"
-)]
+pub(crate) fn map_window(
+    space: &mut Space<Window>,
+    window: Window,
+    location: impl Into<Point<i32, Logical>>,
+    activation: Activation,
+) {
+    space.map_element(window, location, matches!(activation, Activation::Active));
+}
+
+pub(crate) fn raise_window(space: &mut Space<Window>, window: &Window, activation: Activation) {
+    space.raise_element(window, matches!(activation, Activation::Active));
+}
+
+pub(crate) fn raise_window_above(
+    space: &mut Space<Window>,
+    window: &Window,
+    reference: &Window,
+    activation: Activation,
+) {
+    space.raise_element_above(window, reference, matches!(activation, Activation::Active));
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    #[default]
+    Unmapped,
+    Mapped(MappedVisibility),
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Urgency {
+    #[default]
+    Normal,
+    Urgent,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExpandRequest {
+    Maximize,
+    Unmaximize,
+    Fullscreen,
+    Unfullscreen,
+}
+
+impl ExpandRequest {
+    pub(crate) fn mode(self) -> xdg_toplevel::State {
+        match self {
+            Self::Maximize | Self::Unmaximize => xdg_toplevel::State::Maximized,
+            Self::Fullscreen | Self::Unfullscreen => xdg_toplevel::State::Fullscreen,
+        }
+    }
+
+    pub(crate) fn enabled(self) -> bool {
+        matches!(self, Self::Maximize | Self::Fullscreen)
+    }
+}
+
 pub(crate) struct WindowState {
-    pub mapped: bool,
-    pub minimized: bool,
-    pub always_on_top: bool,
+    visibility: Visibility,
+    always_on_top: Stacking,
     /// An activation request without a valid token asked for attention.
-    pub urgent: bool,
-    pub decoration: Option<waywire_decorations::Decoration>,
-    pub decoration_mode: Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>,
-    pub restore: Option<Rectangle<i32, Logical>>,
-    pub resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
-    pub grab_serial: Option<Serial>,
+    urgency: Urgency,
+    decoration: Option<waywire_decorations::Decoration>,
+    decoration_mode: Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>,
+    restore: Option<Rectangle<i32, Logical>>,
+    resize: Option<(u32, Rectangle<i32, Logical>, Option<Serial>)>,
+    grab_serial: Option<Serial>,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            visibility: Visibility::Unmapped,
+            always_on_top: Stacking::Normal,
+            urgency: Urgency::Normal,
+            decoration: None,
+            decoration_mode: None,
+            restore: None,
+            resize: None,
+            grab_serial: None,
+        }
+    }
+}
+
+impl WindowState {
+    pub(crate) fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+    pub(crate) fn set_visibility(&mut self, visibility: Visibility) {
+        self.visibility = visibility;
+    }
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self.visibility, Visibility::Mapped(_))
+    }
+    pub(crate) fn is_minimized(&self) -> bool {
+        self.visibility == Visibility::Mapped(MappedVisibility::Minimized)
+    }
+    pub(crate) fn is_urgent(&self) -> bool {
+        self.urgency == Urgency::Urgent
+    }
+    pub(crate) fn mark_urgent(&mut self) {
+        self.urgency = Urgency::Urgent;
+    }
+    pub(crate) fn decoration_mut(&mut self) -> &mut Option<waywire_decorations::Decoration> {
+        &mut self.decoration
+    }
+    pub(crate) fn decoration_mode(&self) -> Option<smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode>{
+        self.decoration_mode
+    }
+    pub(crate) fn set_decoration_mode(
+        &mut self,
+        mode: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+    ) {
+        self.decoration_mode = Some(mode);
+    }
+    pub(crate) fn restore_mut(&mut self) -> &mut Option<Rectangle<i32, Logical>> {
+        &mut self.restore
+    }
+    pub(crate) fn resize(&self) -> Option<(u32, Rectangle<i32, Logical>, Option<Serial>)> {
+        self.resize
+    }
+    pub(crate) fn resize_mut(
+        &mut self,
+    ) -> &mut Option<(u32, Rectangle<i32, Logical>, Option<Serial>)> {
+        &mut self.resize
+    }
+    pub(crate) fn grab_serial(&self) -> Option<Serial> {
+        self.grab_serial
+    }
+    pub(crate) fn set_grab_serial(&mut self, serial: Option<Serial>) {
+        self.grab_serial = serial;
+    }
 }
 
 #[derive(Default)]
@@ -80,7 +199,9 @@ impl Windows {
     }
 
     pub(crate) fn is_minimized(&self, window: &Window) -> bool {
-        self.states.get(window).is_some_and(|state| state.minimized)
+        self.states
+            .get(window)
+            .is_some_and(WindowState::is_minimized)
     }
 
     pub(crate) fn mapped_order(&self) -> &[Window] {
@@ -103,8 +224,7 @@ impl Windows {
         self.mapped_order.retain(|item| item != window);
         self.minimized_order.retain(|item| item != window);
         if let Some(state) = self.states.get_mut(window) {
-            state.mapped = false;
-            state.minimized = false;
+            state.visibility = Visibility::Unmapped;
             state.resize = None;
             state.decoration = None;
         }
@@ -120,38 +240,45 @@ impl Windows {
     /// Mark a window minimized. Returns whether it was not minimized before.
     pub(crate) fn minimize(&mut self, window: &Window) -> bool {
         let state = self.states.entry(window.clone()).or_default();
-        if state.minimized {
+        if state.is_minimized() {
             return false;
         }
-        state.minimized = true;
+        state.visibility = Visibility::Mapped(MappedVisibility::Minimized);
         self.minimized_order.push(window.clone());
         true
     }
 
     /// Clear a window's minimized state. Returns whether it was minimized.
     pub(crate) fn unminimize(&mut self, window: &Window) -> bool {
-        let Some(state) = self.states.get_mut(window).filter(|state| state.minimized) else {
+        let Some(state) = self
+            .states
+            .get_mut(window)
+            .filter(|state| state.is_minimized())
+        else {
             return false;
         };
-        state.minimized = false;
+        state.visibility = Visibility::Mapped(MappedVisibility::Shown);
         self.minimized_order.retain(|item| item != window);
         true
     }
 
     pub(crate) fn toggle_always_on_top(&mut self, window: &Window) {
         let state = self.states.entry(window.clone()).or_default();
-        state.always_on_top = !state.always_on_top;
+        state.always_on_top = match state.always_on_top {
+            Stacking::Normal => Stacking::AlwaysOnTop,
+            Stacking::AlwaysOnTop => Stacking::Normal,
+        };
     }
 
-    pub(crate) fn always_on_top(&self, window: &Window) -> bool {
+    pub(crate) fn stacking(&self, window: &Window) -> Stacking {
         self.states
             .get(window)
-            .is_some_and(|state| state.always_on_top)
+            .map_or(Stacking::Normal, |state| state.always_on_top)
     }
 
     pub(crate) fn clear_urgent(&mut self, window: &Window) {
         if let Some(state) = self.states.get_mut(window) {
-            state.urgent = false;
+            state.urgency = Urgency::Normal;
         }
     }
 
@@ -167,10 +294,9 @@ impl Windows {
             .find(|window| {
                 Some(*window) != except
                     && !is_override_redirect(window)
-                    && self
-                        .states
-                        .get(*window)
-                        .is_some_and(|state| state.mapped && !state.minimized)
+                    && self.states.get(*window).is_some_and(|state| {
+                        state.visibility == Visibility::Mapped(MappedVisibility::Shown)
+                    })
             })
             .cloned()
     }
@@ -180,10 +306,9 @@ impl Windows {
         space
             .elements()
             .filter(|candidate| {
-                self.states
-                    .get(*candidate)
-                    .is_some_and(|state| state.mapped && !state.minimized)
-                    && parent_window(space, candidate).as_ref() == Some(parent)
+                self.states.get(*candidate).is_some_and(|state| {
+                    state.visibility == Visibility::Mapped(MappedVisibility::Shown)
+                }) && parent_window(space, candidate).as_ref() == Some(parent)
             })
             .cloned()
             .collect()
@@ -204,7 +329,7 @@ impl Windows {
                     if self
                         .states
                         .get(&target)
-                        .is_some_and(|state| state.always_on_top)
+                        .is_some_and(|state| state.always_on_top == Stacking::AlwaysOnTop)
                     {
                         return true;
                     }
@@ -396,29 +521,34 @@ impl State {
         location: Point<f64, Logical>,
     ) {
         if let Some(press) = self.chrome.start_restore_drag(source, location)
-            && let Some(maximized) = self.window_output_geometry(&press.window)
+            && let Some(maximized) = self.window_output_geometry(press.window())
         {
             let restored = self
                 .windows
-                .get(&press.window)
+                .get(press.window())
                 .and_then(|state| state.restore);
-            self.window_action(&press.window, WindowAction::Restore);
+            self.window_action(press.window(), WindowAction::Restore);
             let restored_size = restored.map_or_else(
                 || {
                     press
-                        .window
+                        .window()
                         .x11_surface()
-                        .map_or(press.window.geometry().size, |surface| {
+                        .map_or(press.window().geometry().size, |surface| {
                             surface.last_configure().size
                         })
                 },
                 |geometry| geometry.size,
             );
             let position =
-                restored_drag_location(press.location, location, maximized, restored_size);
-            self.space.map_element(press.window.clone(), position, true);
+                restored_drag_location(press.location(), location, maximized, restored_size);
+            crate::wm::map_window(
+                &mut self.space,
+                press.window().clone(),
+                position,
+                crate::wm::Activation::Active,
+            );
             self.enforce_topmost();
-            if let Some(surface) = press.window.x11_surface()
+            if let Some(surface) = press.window().x11_surface()
                 && let Err(error) = surface.configure(Some(
                     smithay::utils::Rectangle::new(position, restored_size)
                         + surface.frame_extents(),
@@ -426,13 +556,15 @@ impl State {
             {
                 tracing::warn!(%error, "position restored X11 window");
             }
-            self.window_action(&press.window, WindowAction::Move);
+            self.window_action(press.window(), WindowAction::Move);
         }
         let held = self
             .input
             .buttons(source)
             .is_some_and(|buttons| buttons.contains(&0x110));
-        self.chrome.titlebar_motion(source, location, held);
+        if held {
+            self.chrome.titlebar_motion(source, location);
+        }
     }
 
     pub(crate) fn window_action(&mut self, window: &Window, action: WindowAction) {
@@ -451,7 +583,7 @@ impl State {
                 }
             }
             WindowAction::Maximize => {
-                self.set_window_expanded(window, xdg_toplevel::State::Maximized, true);
+                self.set_window_expanded(window, crate::wm::ExpandRequest::Maximize);
             }
             WindowAction::Minimize => {
                 if self.windows.minimize(window) {
@@ -475,7 +607,7 @@ impl State {
                     }
                     self.refresh_toplevel_states();
                     self.refresh_pointer_focus();
-                    self.dirty = true;
+                    self.frame_request.request(crate::FrameRequest::FullRedraw);
                 }
             }
             WindowAction::Restore => {
@@ -490,14 +622,14 @@ impl State {
                     }
                     self.focus_window(Some(window.clone()));
                 } else {
-                    self.set_window_expanded(window, xdg_toplevel::State::Maximized, false);
+                    self.set_window_expanded(window, crate::wm::ExpandRequest::Unmaximize);
                 }
             }
             WindowAction::Close => close_window(window),
             WindowAction::ToggleAlwaysOnTop => {
                 self.windows.toggle_always_on_top(window);
                 self.enforce_topmost();
-                self.dirty = true;
+                self.frame_request.request(crate::FrameRequest::FullRedraw);
             }
             WindowAction::ShowMenu => {
                 if let (Some(pointer), Some(output)) = (
@@ -508,10 +640,10 @@ impl State {
                         window.clone(),
                         pointer.current_location(),
                         output.size,
-                        self.windows.always_on_top(window),
+                        self.windows.stacking(window),
                     );
                     self.refresh_pointer_focus();
-                    self.dirty = true;
+                    self.frame_request.request(crate::FrameRequest::FullRedraw);
                 }
             }
         }
@@ -539,16 +671,11 @@ impl State {
     /// Apply a maximize or fullscreen request to the window's native surface.
     /// Both paths already exist for client requests; this only selects the
     /// Wayland or X11 one.
-    pub(crate) fn set_window_expanded(
-        &mut self,
-        window: &Window,
-        mode: xdg_toplevel::State,
-        enabled: bool,
-    ) {
+    pub(crate) fn set_window_expanded(&mut self, window: &Window, request: ExpandRequest) {
         if let Some(top) = window.toplevel() {
-            self.set_expanded(top, mode, enabled);
+            self.set_expanded(top, request);
         } else if let Some(surface) = window.x11_surface() {
-            self.x11_zoom(surface, mode == xdg_toplevel::State::Fullscreen, enabled);
+            self.x11_zoom(surface, request);
         }
     }
 
@@ -565,7 +692,7 @@ impl State {
     /// Raise always-on-top windows and their dialogs above the rest.
     pub(crate) fn enforce_topmost(&mut self) {
         for window in self.windows.topmost(&self.space) {
-            self.space.raise_element(&window, false);
+            crate::wm::raise_window(&mut self.space, &window, crate::wm::Activation::Inactive);
         }
     }
 
@@ -575,7 +702,12 @@ impl State {
         else {
             return;
         };
-        self.space.map_element(window.clone(), location, false);
+        crate::wm::map_window(
+            &mut self.space,
+            window.clone(),
+            location,
+            crate::wm::Activation::Inactive,
+        );
         if let Some(surface) = window.x11_surface() {
             let mut geometry = surface.last_configure();
             geometry.loc = location - window.geometry().loc;
@@ -595,7 +727,7 @@ impl State {
         let mut window = window;
         if let Some(target) = &window {
             for member in &self.windows.family(&self.space, target) {
-                self.space.raise_element(member, true);
+                crate::wm::raise_window(&mut self.space, member, crate::wm::Activation::Active);
                 if let Some(surface) = member.x11_surface() {
                     self.xwayland.raise(surface);
                 }
@@ -615,7 +747,7 @@ impl State {
             // keyboard focus to stay with it; taking focus closes them.
             if is_override_redirect(window) {
                 self.refresh_pointer_focus();
-                self.dirty = true;
+                self.frame_request.request(crate::FrameRequest::FullRedraw);
                 return;
             }
         }
@@ -639,6 +771,6 @@ impl State {
             );
         }
         self.refresh_toplevel_states();
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
 }

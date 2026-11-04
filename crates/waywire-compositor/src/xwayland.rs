@@ -72,6 +72,13 @@ struct Ready {
     stacking: Option<Vec<u32>>,
 }
 
+#[derive(PartialEq, Eq)]
+enum ScaleUpdate {
+    NotReady,
+    Unchanged,
+    Changed,
+}
+
 impl XWayland {
     fn spawned(&mut self, client: Client) {
         self.client = Some(client);
@@ -190,10 +197,10 @@ impl XWayland {
 
     /// Tell Xwayland and its toolkits the output's `scale`. Returns whether
     /// the client scale changed, so X11 windows need configuring again.
-    fn set_scale(&mut self, scale: f64) -> Result<bool> {
+    fn set_scale(&mut self, scale: f64) -> Result<ScaleUpdate> {
         let (Some(client), Some(Ready { wm, display, .. })) = (&self.client, &mut self.ready)
         else {
-            return Ok(false);
+            return Ok(ScaleUpdate::NotReady);
         };
         let display = *display;
         #[expect(
@@ -218,10 +225,10 @@ impl XWayland {
             .get_data::<XWaylandClientData>()
             .ok_or_else(|| anyhow!("missing Xwayland client data"))?;
         if data.compositor_state.client_scale().to_bits() == scale.to_bits() {
-            return Ok(false);
+            return Ok(ScaleUpdate::Unchanged);
         }
         data.compositor_state.set_client_scale(scale);
-        Ok(true)
+        Ok(ScaleUpdate::Changed)
     }
 }
 
@@ -247,11 +254,24 @@ impl NetWmStateAction {
 
 /// What a `_NET_WM_STATE` `action` on HIDDEN asks of a window that is
 /// `minimized` or not.
-const fn hidden_request(action: NetWmStateAction, minimized: bool) -> Option<WindowAction> {
-    match (action, minimized) {
-        (NetWmStateAction::Remove | NetWmStateAction::Toggle, true) => Some(WindowAction::Restore),
-        (NetWmStateAction::Add | NetWmStateAction::Toggle, false) => Some(WindowAction::Minimize),
-        (NetWmStateAction::Remove, false) | (NetWmStateAction::Add, true) => None,
+const fn hidden_request(
+    action: NetWmStateAction,
+    visibility: crate::wm::Visibility,
+) -> Option<WindowAction> {
+    use waywire_decorations::Visibility::Minimized;
+    use waywire_decorations::Visibility::Shown;
+
+    use crate::wm::Visibility;
+    match (action, visibility) {
+        (NetWmStateAction::Remove | NetWmStateAction::Toggle, Visibility::Mapped(Minimized)) => {
+            Some(WindowAction::Restore)
+        }
+        (
+            NetWmStateAction::Add | NetWmStateAction::Toggle,
+            Visibility::Unmapped | Visibility::Mapped(Shown),
+        ) => Some(WindowAction::Minimize),
+        (NetWmStateAction::Remove, Visibility::Unmapped | Visibility::Mapped(Shown))
+        | (NetWmStateAction::Add, Visibility::Mapped(Minimized)) => None,
     }
 }
 
@@ -271,12 +291,13 @@ pub(crate) fn start(
         Some(&mut previous_mask),
     )
     .map_err(|error| anyhow!("could not unblock signals before Xwayland spawn: {error}"))?;
+    let open_abstract_socket = true;
     let spawned = smithay::xwayland::XWayland::spawn(
         &state.display_handle,
         None,
         [("LIBEI_SOCKET", eis_path.as_os_str())],
         ["-nolisten", "tcp"],
-        true,
+        open_abstract_socket,
         Stdio::null(),
         Stdio::inherit(),
         |_| {},
@@ -347,12 +368,13 @@ pub(crate) fn start(
 fn watch_hidden_requests(handle: &LoopHandle<'static, State>, display: u32) -> Result<()> {
     let (connection, screen) = x11rb::connect(Some(&format!(":{display}")))?;
     let root = connection.setup().roots[screen].root;
+    let only_if_exists = false;
     let net_state = connection
-        .intern_atom(false, b"_NET_WM_STATE")?
+        .intern_atom(only_if_exists, b"_NET_WM_STATE")?
         .reply()?
         .atom;
     let hidden = connection
-        .intern_atom(false, b"_NET_WM_STATE_HIDDEN")?
+        .intern_atom(only_if_exists, b"_NET_WM_STATE_HIDDEN")?
         .reply()?
         .atom;
     connection
@@ -387,12 +409,12 @@ fn watch_hidden_requests(handle: &LoopHandle<'static, State>, display: u32) -> R
                         if (data[1] == hidden || data[2] == hidden)
                             && let Some(window) = window
                         {
-                            let minimized = state
-                                .windows
-                                .get(&window)
-                                .is_some_and(|state| state.minimized);
+                            let visibility = state.windows.get(&window).map_or(
+                                crate::wm::Visibility::Unmapped,
+                                crate::wm::WindowState::visibility,
+                            );
                             if let Some(action) = NetWmStateAction::parse(data[0])
-                                .and_then(|action| hidden_request(action, minimized))
+                                .and_then(|action| hidden_request(action, visibility))
                             {
                                 state.window_action(&window, action);
                             }
@@ -410,8 +432,9 @@ fn update_resources(display: u32, scale: f64) -> Result<()> {
     let (connection, screen) = x11rb::connect(Some(&format!(":{display}")))?;
     let root = connection.setup().roots[screen].root;
     let property = AtomEnum::RESOURCE_MANAGER;
+    let delete = false;
     let reply = connection
-        .get_property(false, root, property, AtomEnum::STRING, 0, u32::MAX)?
+        .get_property(delete, root, property, AtomEnum::STRING, 0, u32::MAX)?
         .reply()?;
     let old = String::from_utf8_lossy(&reply.value);
     let mut resources = old
@@ -452,7 +475,7 @@ impl State {
         // Match cosmic-comp's fractional descaling: retain 1.5 rather than rounding
         // Xwayland to 2, so X11 coordinates and toolkit DPI use the output scale.
         let scale = self.output.current_scale().fractional_scale().max(1.0);
-        if !self.xwayland.set_scale(scale)? {
+        if self.xwayland.set_scale(scale)? != ScaleUpdate::Changed {
             return Ok(());
         }
         self.output.change_current_state(None, None, None, None);
@@ -479,17 +502,24 @@ impl State {
         }
         if let Some(window) = self.x11_window(surface) {
             let location = geometry.loc + window.geometry().loc;
-            self.space.map_element(window, location, false);
+            crate::wm::map_window(
+                &mut self.space,
+                window,
+                location,
+                crate::wm::Activation::Inactive,
+            );
         }
         self.refresh_pointer_focus();
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
 
     #[expect(
         clippy::expect_used,
         reason = "user data is inserted immediately before access"
     )]
-    pub(crate) fn x11_zoom(&mut self, surface: &X11Surface, fullscreen: bool, enabled: bool) {
+    pub(crate) fn x11_zoom(&mut self, surface: &X11Surface, request: crate::wm::ExpandRequest) {
+        let fullscreen = request.mode() == smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen;
+        let enabled = request.enabled();
         surface
             .user_data()
             .insert_if_missing(RestoreGeometry::default);
@@ -518,7 +548,7 @@ impl State {
         if let Some(window) = self.x11_window(surface)
             && let Some(state) = self.windows.get_mut(&window)
         {
-            state.resize = None;
+            *state.resize_mut() = None;
         }
         if enabled && !was_expanded {
             // geometry() is the last committed buffer's local bbox; the WM
@@ -581,7 +611,12 @@ impl XwmHandler for State {
             smithay::utils::Point::<i32, Logical>::from((32 + offset, 32 + offset))
         };
         geometry.loc = location - window.geometry().loc;
-        self.space.map_element(window.clone(), location, true);
+        crate::wm::map_window(
+            &mut self.space,
+            window.clone(),
+            location,
+            crate::wm::Activation::Active,
+        );
         self.windows.add_mapped(&window);
         self.enforce_topmost();
         self.toplevel_list.publish(&window);
@@ -611,10 +646,14 @@ impl XwmHandler for State {
 
     fn mapped_override_redirect_window(&mut self, _: XwmId, surface: X11Surface) {
         let location = surface.last_configure().loc + surface.geometry().loc;
-        self.space
-            .map_element(Window::new_x11_window(surface), location, false);
+        crate::wm::map_window(
+            &mut self.space,
+            Window::new_x11_window(surface),
+            location,
+            crate::wm::Activation::Inactive,
+        );
         self.refresh_pointer_focus();
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
 
     fn unmapped_window(&mut self, _: XwmId, surface: X11Surface) {
@@ -627,7 +666,7 @@ impl XwmHandler for State {
         {
             tracing::debug!(%error, "X11 window disappeared during unmap");
         }
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
 
     fn destroyed_window(&mut self, xwm: XwmId, surface: X11Surface) {
@@ -669,7 +708,7 @@ impl XwmHandler for State {
         if reorder == Some(Reorder::Top)
             && let Some(window) = self.x11_window(&surface)
         {
-            self.space.raise_element(&window, false);
+            crate::wm::raise_window(&mut self.space, &window, crate::wm::Activation::Inactive);
             self.enforce_topmost();
             self.refresh_pointer_focus();
         }
@@ -684,19 +723,29 @@ impl XwmHandler for State {
     ) {
         if let Some(window) = self.x11_window(&surface) {
             let location = geometry.loc + window.geometry().loc;
-            self.space.map_element(window.clone(), location, false);
+            crate::wm::map_window(
+                &mut self.space,
+                window.clone(),
+                location,
+                crate::wm::Activation::Inactive,
+            );
             if let Some(reference) = above.and_then(|id| {
                 self.space
                     .elements()
                     .find(|w| w.x11_surface().is_some_and(|s| s.window_id() == id))
                     .cloned()
             }) {
-                self.space.raise_element_above(&window, &reference, false);
+                crate::wm::raise_window_above(
+                    &mut self.space,
+                    &window,
+                    &reference,
+                    crate::wm::Activation::Inactive,
+                );
                 self.enforce_topmost();
             }
         }
         self.refresh_pointer_focus();
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
 
     fn property_notify(&mut self, _: XwmId, surface: X11Surface, property: WmWindowProperty) {
@@ -706,7 +755,7 @@ impl XwmHandler for State {
             if self.toplevel_list.update(&window) {
                 self.window_changed(&window);
             }
-            self.dirty = true;
+            self.frame_request.request(crate::FrameRequest::FullRedraw);
         }
     }
 
@@ -733,23 +782,23 @@ impl XwmHandler for State {
             && self
                 .windows
                 .get(&window)
-                .is_some_and(|state| state.minimized)
+                .is_some_and(super::wm::WindowState::is_minimized)
         {
             self.window_action(&window, WindowAction::Restore);
         }
     }
 
     fn maximize_request(&mut self, _: XwmId, surface: X11Surface) {
-        self.x11_zoom(&surface, false, true);
+        self.x11_zoom(&surface, crate::wm::ExpandRequest::Maximize);
     }
     fn unmaximize_request(&mut self, _: XwmId, surface: X11Surface) {
-        self.x11_zoom(&surface, false, false);
+        self.x11_zoom(&surface, crate::wm::ExpandRequest::Unmaximize);
     }
     fn fullscreen_request(&mut self, _: XwmId, surface: X11Surface) {
-        self.x11_zoom(&surface, true, true);
+        self.x11_zoom(&surface, crate::wm::ExpandRequest::Fullscreen);
     }
     fn unfullscreen_request(&mut self, _: XwmId, surface: X11Surface) {
-        self.x11_zoom(&surface, true, false);
+        self.x11_zoom(&surface, crate::wm::ExpandRequest::Unfullscreen);
     }
 
     fn active_window_request(

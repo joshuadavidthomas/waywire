@@ -56,7 +56,7 @@ use waywire_protocol::pipe::Event;
 use super::State;
 
 pub(crate) struct ClientState {
-    pub(crate) compositor_state: CompositorClientState,
+    compositor_state: CompositorClientState,
     /// The compositor's own flag for "a client left"; see `Clipboard::client_left`.
     client_left: Arc<AtomicU8>,
 }
@@ -153,7 +153,7 @@ impl CompositorHandler for State {
         if let Some(drag) = &mut self.drag {
             drag.committed(surface);
         }
-        self.frame_pending = crate::FrameRequest::Pending;
+        self.frame_request.request(crate::FrameRequest::Damaged);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -169,7 +169,7 @@ impl CompositorHandler for State {
                 let resizing = self
                     .windows
                     .get(&window)
-                    .is_some_and(|state| state.resize.is_some());
+                    .is_some_and(|state| state.resize().is_some());
                 window.on_commit();
                 self.resize_committed(&window);
                 let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(
@@ -177,8 +177,18 @@ impl CompositorHandler for State {
                     |state| state.buffer().is_some(),
                 )
                 .unwrap_or(false);
-                let previous = self.windows.entry(window.clone()).or_default().mapped;
-                self.windows.entry(window.clone()).or_default().mapped = mapped;
+                let window_state = self.windows.entry(window.clone()).or_default();
+                let previous = window_state.is_mapped();
+                window_state.set_visibility(if mapped {
+                    match window_state.visibility() {
+                        crate::wm::Visibility::Unmapped => {
+                            crate::wm::Visibility::Mapped(waywire_decorations::Visibility::Shown)
+                        }
+                        visibility @ crate::wm::Visibility::Mapped(_) => visibility,
+                    }
+                } else {
+                    crate::wm::Visibility::Unmapped
+                });
                 if mapped {
                     // Announce the handle on map and refresh title and app id
                     // whenever the client re-commits.
@@ -216,7 +226,7 @@ impl CompositorHandler for State {
                     let mode = self
                         .windows
                         .get(&window)
-                        .and_then(|state| state.decoration_mode);
+                        .and_then(crate::wm::WindowState::decoration_mode);
                     top.with_pending_state(|state| state.decoration_mode = mode);
                     let bounds = self.window_output_geometry(&window).map(|area| area.size);
                     top.with_pending_state(|state| state.bounds = bounds);
@@ -330,8 +340,12 @@ impl XdgShellHandler for State {
             surface.with_pending_state(|state| state.bounds = Some(output.size));
         }
         let window = Window::new_wayland_window(surface);
-        self.space
-            .map_element(window, (32 + offset, 32 + offset), false);
+        crate::wm::map_window(
+            &mut self.space,
+            window,
+            (32 + offset, 32 + offset),
+            crate::wm::Activation::Inactive,
+        );
     }
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let window = self
@@ -378,20 +392,20 @@ impl XdgShellHandler for State {
         }
     }
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        self.set_expanded(&surface, xdg_toplevel::State::Maximized, true);
+        self.set_expanded(&surface, crate::wm::ExpandRequest::Maximize);
     }
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
         _: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
-        self.set_expanded(&surface, xdg_toplevel::State::Fullscreen, true);
+        self.set_expanded(&surface, crate::wm::ExpandRequest::Fullscreen);
     }
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        self.set_expanded(&surface, xdg_toplevel::State::Maximized, false);
+        self.set_expanded(&surface, crate::wm::ExpandRequest::Unmaximize);
     }
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        self.set_expanded(&surface, xdg_toplevel::State::Fullscreen, false);
+        self.set_expanded(&surface, crate::wm::ExpandRequest::Unfullscreen);
     }
     fn new_popup(&mut self, surface: PopupSurface, _: PositionerState) {
         self.unconstrain_popup(&surface);
@@ -414,7 +428,7 @@ impl XdgShellHandler for State {
     }
     fn title_changed(&mut self, surface: ToplevelSurface) {
         self.update_toplevel_metadata(&surface);
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         self.update_toplevel_metadata(&surface);
@@ -480,9 +494,8 @@ impl State {
     pub(crate) fn window_unmapped(&mut self, window: &Window) {
         self.end_window_grab(window);
         self.toplevel_list.unpublish(window);
-        if self.chrome.window_unmapped(window) {
-            self.dirty = true;
-        }
+        self.frame_request
+            .request(self.chrome.window_unmapped(window));
         self.windows.unmapped(window);
         let focused = self
             .seat
@@ -522,7 +535,12 @@ impl State {
                 .y
                 .clamp(output.loc.y, output.loc.y + (output.size.h - size.h).max(0)),
         );
-        self.space.map_element(window.clone(), location, false);
+        crate::wm::map_window(
+            &mut self.space,
+            window.clone(),
+            location,
+            crate::wm::Activation::Inactive,
+        );
         if let Some(x11) = window.x11_surface()
             && let Err(error) = x11.configure(smithay::utils::Rectangle::new(
                 smithay::utils::Point::from(location) - window.geometry().loc,
@@ -610,7 +628,12 @@ impl State {
                 false
             };
             if expanded {
-                self.space.map_element(window, geometry.loc, false);
+                crate::wm::map_window(
+                    &mut self.space,
+                    window,
+                    geometry.loc,
+                    crate::wm::Activation::Inactive,
+                );
             } else {
                 self.constrain_window(&window);
             }
@@ -635,8 +658,7 @@ impl State {
     pub(crate) fn set_expanded(
         &mut self,
         surface: &ToplevelSurface,
-        mode: xdg_toplevel::State,
-        enabled: bool,
+        request: crate::wm::ExpandRequest,
     ) {
         let Some(window) = self
             .space
@@ -650,10 +672,10 @@ impl State {
             return;
         };
         let expanded = surface.with_pending_state(|state| {
-            if enabled {
-                state.states.set(mode);
+            if request.enabled() {
+                state.states.set(request.mode());
             } else {
-                state.states.unset(mode);
+                state.states.unset(request.mode());
             }
             state.states.contains(xdg_toplevel::State::Maximized)
                 || state.states.contains(xdg_toplevel::State::Fullscreen)
@@ -662,10 +684,10 @@ impl State {
             return;
         };
         let window_state = self.windows.entry(window.clone()).or_default();
-        window_state.resize = None;
+        *window_state.resize_mut() = None;
         let geometry = if expanded {
             window_state
-                .restore
+                .restore_mut()
                 .get_or_insert(smithay::utils::Rectangle::new(
                     location,
                     window.geometry().size,
@@ -673,7 +695,7 @@ impl State {
             output
         } else {
             window_state
-                .restore
+                .restore_mut()
                 .take()
                 .unwrap_or(smithay::utils::Rectangle::new(
                     location,
@@ -686,11 +708,16 @@ impl State {
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }
-        self.space.map_element(window, geometry.loc, true);
+        crate::wm::map_window(
+            &mut self.space,
+            window,
+            geometry.loc,
+            crate::wm::Activation::Active,
+        );
         self.enforce_topmost();
         self.refresh_pointer_focus();
         self.refresh_toplevel_states();
-        self.dirty = true;
+        self.frame_request.request(crate::FrameRequest::FullRedraw);
     }
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
