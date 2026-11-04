@@ -29,8 +29,8 @@ pub enum WindowAction {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskbarChip {
-    pub title: String,
-    pub target: ChipTarget,
+    title: String,
+    target: ChipTarget,
 }
 
 /// What a taskbar chip stands for: a pin no window matched, or a window,
@@ -73,6 +73,21 @@ pub enum Attention {
 }
 
 impl TaskbarChip {
+    #[must_use]
+    pub fn new(title: String, target: ChipTarget) -> Self {
+        Self { title, target }
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &ChipTarget {
+        &self.target
+    }
+
     #[must_use]
     pub fn window(&self) -> Option<&Window> {
         match &self.target {
@@ -121,8 +136,37 @@ pub enum CloseButton {
 /// The committed window state that shapes its decoration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowFlags {
-    pub role: WindowRole,
-    pub size: SizeMode,
+    role: WindowRole,
+    size: SizeMode,
+}
+
+impl WindowFlags {
+    #[must_use]
+    pub fn new(role: WindowRole, size: SizeMode) -> Self {
+        Self { role, size }
+    }
+
+    #[must_use]
+    pub fn role(self) -> WindowRole {
+        self.role
+    }
+
+    #[must_use]
+    pub fn size(self) -> SizeMode {
+        self.size
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    Active,
+    Inactive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stacking {
+    Normal,
+    AlwaysOnTop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,7 +267,7 @@ enum NodeStyle {
     Titlebar {
         title: String,
         scale: f64,
-        active: bool,
+        active: Activation,
         close: CloseButton,
         window_flags: WindowFlags,
         theme: Theme,
@@ -236,8 +280,20 @@ enum NodeStyle {
 pub struct Node {
     rect: Rectangle<i32, Logical>,
     style: NodeStyle,
-    pub action: Option<DecorationAction>,
-    pub cursor: CursorShape,
+    action: Option<DecorationAction>,
+    cursor: CursorShape,
+}
+
+impl Node {
+    #[must_use]
+    pub fn action(&self) -> Option<DecorationAction> {
+        self.action
+    }
+
+    #[must_use]
+    pub fn cursor(&self) -> CursorShape {
+        self.cursor
+    }
 }
 
 fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec<Node> {
@@ -382,7 +438,7 @@ pub fn node_at(
         title: String::new(),
         width: size.w,
         scale: 1.0,
-        active: false,
+        active: Activation::Inactive,
         window_flags,
         close: CloseButton::Idle,
     };
@@ -396,12 +452,33 @@ fn hit(nodes: &[Node], point: Point<f64, Logical>) -> Option<DecorationAction> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Appearance {
-    pub title: String,
-    pub width: i32,
-    pub scale: f64,
-    pub active: bool,
-    pub window_flags: WindowFlags,
-    pub close: CloseButton,
+    title: String,
+    width: i32,
+    scale: f64,
+    active: Activation,
+    window_flags: WindowFlags,
+    close: CloseButton,
+}
+
+impl Appearance {
+    #[must_use]
+    pub fn new(
+        title: String,
+        width: i32,
+        scale: f64,
+        active: Activation,
+        window_flags: WindowFlags,
+        close: CloseButton,
+    ) -> Self {
+        Self {
+            title,
+            width,
+            scale,
+            active,
+            window_flags,
+            close,
+        }
+    }
 }
 
 pub struct Decoration {
@@ -640,7 +717,10 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         f64::from(pixels.w) / f64::from(size.w),
         f64::from(pixels.h) / f64::from(size.h),
     );
-    let palette = if active { theme.active } else { theme.inactive };
+    let palette = match active {
+        Activation::Active => theme.active,
+        Activation::Inactive => theme.inactive,
+    };
     color(&context, palette.background);
     context.paint()?;
     {
@@ -1009,10 +1089,10 @@ impl MenuItem {
 }
 
 pub struct WindowMenu {
-    pub window: Window,
+    window: Window,
     location: Point<i32, Logical>,
     size: SizeMode,
-    always_on_top: bool,
+    stacking: Stacking,
     /// The hover and output scale the buffer was last painted for.
     painted_for: Option<(Option<MenuItem>, f64)>,
     hover: Option<MenuItem>,
@@ -1021,11 +1101,16 @@ pub struct WindowMenu {
 
 impl WindowMenu {
     #[must_use]
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
+    #[must_use]
     pub fn new(
         window: Window,
         point: Point<f64, Logical>,
         output: Size<i32, Logical>,
-        always_on_top: bool,
+        stacking: Stacking,
     ) -> Self {
         let size = window_flags(&window).size;
         let point = point.to_i32_round::<i32>();
@@ -1037,7 +1122,7 @@ impl WindowMenu {
             )
                 .into(),
             size,
-            always_on_top,
+            stacking,
             painted_for: None,
             hover: None,
             buffer: MemoryRenderBuffer::new(Fourcc::Argb8888, (0, 0), 1, Transform::Normal, None),
@@ -1140,7 +1225,7 @@ impl WindowMenu {
                     theme,
                 )?;
                 context.restore()?;
-                if item == MenuItem::AlwaysOnTop && self.always_on_top {
+                if item == MenuItem::AlwaysOnTop && self.stacking == Stacking::AlwaysOnTop {
                     context.move_to(f64::from(MENU_WIDTH - 20), f64::from(top + 13));
                     context.line_to(f64::from(MENU_WIDTH - 17), f64::from(top + 16));
                     context.line_to(f64::from(MENU_WIDTH - 11), f64::from(top + 9));
@@ -1197,7 +1282,7 @@ mod tests {
             title: "A readable title — العربية".into(),
             width: 501,
             scale,
-            active: true,
+            active: Activation::Active,
             window_flags: WindowFlags {
                 role: WindowRole::Normal,
                 size: SizeMode::Floating,
@@ -1464,7 +1549,7 @@ mod tests {
                         true
                     }
                     5 => {
-                        look.active = false;
+                        look.active = Activation::Inactive;
                         true
                     }
                     _ => {
