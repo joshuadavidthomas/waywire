@@ -103,24 +103,50 @@ fn probe_encoder(ffmpeg: &str) -> Result<Encoder, VideoError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
-    pub raw_width: FrameDimension,
-    pub raw_height: FrameDimension,
-    pub encoded_width: FrameDimension,
-    pub encoded_height: FrameDimension,
-    pub fps: Fps,
-    pub bitrate_kbps: Kbps,
-    pub crf: Crf,
-    pub chroma: Chroma,
+    raw_width: FrameDimension,
+    raw_height: FrameDimension,
+    encoded_width: FrameDimension,
+    encoded_height: FrameDimension,
+    fps: Fps,
+    bitrate_kbps: Kbps,
+    crf: Crf,
+    chroma: Chroma,
 }
 
 impl EncoderConfig {
+    #[must_use]
+    pub fn new(
+        raw: (FrameDimension, FrameDimension),
+        encoded: (FrameDimension, FrameDimension),
+        fps: Fps,
+        bitrate_kbps: Kbps,
+        crf: Crf,
+        chroma: Chroma,
+    ) -> Self {
+        Self {
+            raw_width: raw.0,
+            raw_height: raw.1,
+            encoded_width: encoded.0,
+            encoded_height: encoded.1,
+            fps,
+            bitrate_kbps,
+            crf,
+            chroma,
+        }
+    }
+
+    #[must_use]
+    pub fn encoded_size(self) -> (FrameDimension, FrameDimension) {
+        (self.encoded_width, self.encoded_height)
+    }
+
     pub fn validate(self) -> Result<usize, VideoError> {
         let pixels = u64::from(self.raw_width.get()) * u64::from(self.raw_height.get());
         if pixels > MAX_RAW_PIXELS {
             return Err(VideoError::InvalidFrame);
         }
         usize::try_from(pixels.checked_mul(4).ok_or(VideoError::InvalidFrame)?)
-            .map_err(|_overflow| VideoError::InvalidFrame)
+            .map_err(VideoError::FrameSize)
     }
 }
 
@@ -199,6 +225,12 @@ pub enum SubmitResult {
 pub enum VideoError {
     #[error("raw frame or encoder configuration is invalid")]
     InvalidFrame,
+    #[error("raw frame size does not fit in memory: {0}")]
+    FrameSize(#[source] std::num::TryFromIntError),
+    #[error("invalid video generation: {0}")]
+    Generation(#[source] waywire_protocol::InvalidValue),
+    #[error("could not convert frame pixels: {0}")]
+    Conversion(#[source] yuv::YuvError),
     #[error("video encoder stopped")]
     Stopped,
     #[error("video frame pool exhausted")]
@@ -225,11 +257,17 @@ enum Child {
     Exited(u32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkerState {
+    Running,
+    Stopping,
+}
+
 struct Pool {
     slots: [FrameSlot; SLOT_COUNT],
     next_free: usize,
     generation: Generation,
-    stopping: bool,
+    state: WorkerState,
     notification_failure: Option<String>,
     child: Child,
 }
@@ -297,14 +335,13 @@ impl VideoEncoder {
             + Send
             + 'static,
     {
-        let initial_generation =
-            Generation::new(1).map_err(|_invalid_generation| VideoError::InvalidFrame)?;
+        let initial_generation = Generation::new(1).map_err(VideoError::Generation)?;
         let shared = Arc::new(Shared {
             pool: Mutex::new(Pool {
                 slots: std::array::from_fn(|_| FrameSlot::Free(Vec::new())),
                 next_free: 0,
                 generation: initial_generation,
-                stopping: false,
+                state: WorkerState::Running,
                 notification_failure: None,
                 child: Child::None,
             }),
@@ -361,7 +398,7 @@ impl VideoEncoder {
             .pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if pool.stopping {
+        if pool.state == WorkerState::Stopping {
             return Err(VideoError::Stopped);
         }
         if frame.metadata.generation != pool.generation {
@@ -397,7 +434,7 @@ impl VideoEncoder {
             .pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if pool.stopping {
+        if pool.state == WorkerState::Stopping {
             return Err(VideoError::Stopped);
         }
         if generation.get() > MAX_MEDIA_GENERATION
@@ -449,7 +486,7 @@ impl VideoEncoder {
                     .pool
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if pool.stopping {
+                if pool.state == WorkerState::Stopping {
                     return pool.notification_failure.take().map(Notification::Fatal);
                 }
                 let failure = pool
@@ -472,7 +509,7 @@ impl VideoEncoder {
                 .pool
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            pool.stopping = true;
+            pool.state = WorkerState::Stopping;
             self.shared.work.notify_all();
         }
         if let Some(worker) = self.worker.take()
@@ -944,13 +981,13 @@ impl Worker<'_> {
 fn take_pending_frame(shared: &Shared) -> Option<(usize, RawFrame)> {
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
     let child_exited = |pool: &Pool| matches!(pool.child, Child::Exited(_));
-    while pool.pending().is_none() && !pool.stopping && !child_exited(&pool) {
+    while pool.pending().is_none() && pool.state == WorkerState::Running && !child_exited(&pool) {
         pool = shared
             .work
             .wait(pool)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    if pool.stopping || child_exited(&pool) {
+    if pool.state == WorkerState::Stopping || child_exited(&pool) {
         return None;
     }
     let slot = pool.pending()?;
@@ -974,13 +1011,13 @@ fn request_new_generation(
         Notification::RestartRequired { generation },
     )?;
     let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-    while pool.generation == generation && !pool.stopping {
+    while pool.generation == generation && pool.state == WorkerState::Running {
         pool = shared
             .work
             .wait(pool)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    if pool.stopping {
+    if pool.state == WorkerState::Stopping {
         ControlFlow::Break(())
     } else {
         ControlFlow::Continue(())
@@ -1023,7 +1060,7 @@ fn send_notification_until(
                 notification_wake.ping();
                 notification = returned;
                 let mut pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-                if pool.stopping {
+                if pool.state == WorkerState::Stopping {
                     return ControlFlow::Break(());
                 }
                 if started.elapsed() >= stall_limit {
@@ -1045,7 +1082,7 @@ fn send_notification_until(
 fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> ControlFlow<()> {
     while Instant::now() < deadline {
         let pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        if pool.stopping {
+        if pool.state == WorkerState::Stopping {
             return ControlFlow::Break(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1054,7 +1091,7 @@ fn wait_until_or_stop(shared: &Shared, deadline: Instant) -> ControlFlow<()> {
             .wait_timeout(pool, remaining.min(Duration::from_millis(20)))
             .unwrap_or_else(PoisonError::into_inner)
             .0;
-        if pool.stopping {
+        if pool.state == WorkerState::Stopping {
             return ControlFlow::Break(());
         }
     }
@@ -1066,7 +1103,8 @@ fn is_stopping(shared: &Shared) -> bool {
         .pool
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .stopping
+        .state
+        == WorkerState::Stopping
 }
 
 fn current_generation(shared: &Shared) -> Generation {
@@ -1090,7 +1128,10 @@ fn requeue_after_spawn_failure(shared: &Shared, slot: usize, frame: RawFrame) {
 
     // Any pending frame arrived after this worker took its frame. Keep it,
     // regardless of sequence wraparound; arrival owns the latest-frame policy.
-    if pool.stopping || pool.generation != frame.metadata.generation || pool.pending().is_some() {
+    if pool.state == WorkerState::Stopping
+        || pool.generation != frame.metadata.generation
+        || pool.pending().is_some()
+    {
         pool.slots[slot] = FrameSlot::Free(frame.pixels);
     } else {
         pool.slots[slot] = FrameSlot::Pending(frame);
@@ -1146,7 +1187,7 @@ fn watch_child(shared: Arc<Shared>, wake: Ping, pid: u32) -> io::Result<()> {
                 if let Err(error) = result {
                     pool.notification_failure =
                         Some(format!("ffmpeg exit monitor failed: {error}"));
-                    pool.stopping = true;
+                    pool.state = WorkerState::Stopping;
                     wake.ping();
                 } else {
                     pool.child = Child::Exited(pid);
@@ -1388,7 +1429,7 @@ fn write_frame(
     let mut written = 0;
     while written < bytes.len() {
         let pool = shared.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        if pool.stopping {
+        if pool.state == WorkerState::Stopping {
             return Err(FrameWriteError::Stopping);
         }
         if pool.generation != generation {

@@ -252,15 +252,21 @@ fn build_encoder(qp: u8, fps: f32, cap_bps: Option<u32>) -> Option<Encoder> {
 
 /// Everything one stripe keeps between frames: its planes, its encoder, and the hash
 /// of the content it last encoded.
-pub(crate) struct StripeState {
-    pub(crate) rows: Range<usize>,
-    pub(crate) y: Vec<u8>,
-    pub(crate) u: Vec<u8>,
-    pub(crate) v: Vec<u8>,
+struct StripeState {
+    rows: Range<usize>,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
     /// Set when the planes changed since the stripe was last considered.
-    pub(crate) dirty: bool,
+    hash_state: HashState,
     encoder: Option<StripeEncoder>,
     last_hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashState {
+    Needed,
+    Current,
 }
 
 impl StripeState {
@@ -271,7 +277,7 @@ impl StripeState {
             y: vec![0; pixels],
             u: vec![0; pixels / 4],
             v: vec![0; pixels / 4],
-            dirty: true,
+            hash_state: HashState::Needed,
             encoder: None,
             last_hash: 0,
         }
@@ -288,30 +294,88 @@ impl StripeState {
 
 /// One stripe's encoded access unit.
 pub(crate) struct EncodedStripe {
-    pub(crate) rows: Range<usize>,
-    pub(crate) kind: FrameKind,
-    pub(crate) data: Vec<u8>,
+    rows: Range<usize>,
+    kind: FrameKind,
+    data: Vec<u8>,
+}
+
+impl EncodedStripe {
+    pub(super) fn rows(&self) -> Range<usize> {
+        self.rows.clone()
+    }
+
+    pub(super) fn kind(&self) -> FrameKind {
+        self.kind
+    }
+
+    pub(super) fn data(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Quantizers {
     /// The quantizer a changing stripe is coded at.
-    pub(crate) base: u8,
+    base: u8,
     /// The finer quantizer a still stripe is refreshed at.
-    pub(crate) refresh: u8,
+    refresh: u8,
+}
+
+impl Quantizers {
+    pub(super) fn new(base: u8, refresh: u8) -> Self {
+        Self { base, refresh }
+    }
 }
 
 /// The stripes of one output, each with its own `OpenH264` stream.
 pub(crate) struct Stripes {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    pub(crate) states: Vec<StripeState>,
+    width: usize,
+    height: usize,
+    states: Vec<StripeState>,
     fps: f32,
     /// The whole picture's bitrate target; each stripe gets its share by rows.
-    pub(crate) bitrate_bps: u32,
+    bitrate_bps: u32,
 }
 
 impl Stripes {
+    pub(super) fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    pub(super) fn bitrate_bps(&self) -> u32 {
+        self.bitrate_bps
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Copy the stripes whose rows changed out of the staging picture.
+    pub(super) fn copy_changed(&mut self, staging: &mut super::Staging) {
+        let width = staging.width;
+        for state in &mut self.states {
+            let first = state.rows.start / super::BAND_ROWS;
+            let last = state.rows.end.div_ceil(super::BAND_ROWS);
+            if !staging.bands[first..last].contains(&super::BandChange::Changed)
+                && state.hash_state == HashState::Current
+            {
+                continue;
+            }
+            let rows = state.rows.clone();
+            state
+                .y
+                .copy_from_slice(&staging.y[rows.start * width..rows.end * width]);
+            state
+                .u
+                .copy_from_slice(&staging.u[rows.start * width / 4..rows.end * width / 4]);
+            state
+                .v
+                .copy_from_slice(&staging.v[rows.start * width / 4..rows.end * width / 4]);
+            state.hash_state = HashState::Needed;
+        }
+        staging.bands.fill(super::BandChange::Unchanged);
+    }
+
     pub(crate) fn new(
         width: usize,
         height: usize,
@@ -338,7 +402,7 @@ impl Stripes {
         self.bitrate_bps = bitrate_bps;
         for state in &mut self.states {
             state.encoder = None;
-            state.dirty = true;
+            state.hash_state = HashState::Needed;
         }
     }
 
@@ -362,7 +426,7 @@ impl Stripes {
             .map(|state| match coding {
                 Coding::Changes | Coding::Key => coding,
                 Coding::Refresh => {
-                    let due = !state.dirty
+                    let due = state.hash_state == HashState::Current
                         && state
                             .encoder
                             .as_ref()
@@ -403,8 +467,8 @@ fn encode_stripe(
     cap_bps: u32,
 ) -> Result<Option<EncodedStripe>, String> {
     let mut changed = false;
-    if state.dirty {
-        state.dirty = false;
+    if state.hash_state == HashState::Needed {
+        state.hash_state = HashState::Current;
         let hash = state.content_hash();
         changed = hash != state.last_hash || state.encoder.is_none();
         state.last_hash = hash;
@@ -507,7 +571,7 @@ mod tests {
                 .copy_from_slice(&luma[state.rows.start * WIDTH..state.rows.end * WIDTH]);
             state.u.fill(128);
             state.v.fill(128);
-            state.dirty = true;
+            state.hash_state = HashState::Needed;
         }
     }
 

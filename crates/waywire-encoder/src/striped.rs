@@ -30,6 +30,7 @@ use self::encoder::Coding;
 use self::encoder::Quantizers;
 use self::encoder::Stripes;
 use crate::video::VideoError;
+use crate::video::WorkerState;
 
 /// Rows of the staging picture tracked together as damaged.
 const BAND_ROWS: usize = 16;
@@ -38,6 +39,18 @@ const BAND_ROWS: usize = 16;
 const REFRESH_QP: u8 = 14;
 /// Frames a still screen's refresh is spread over: every stripe gets one.
 pub const REFRESH_FRAMES: usize = encoder::CLEANUP_STAGGER_FRAMES;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BandChange {
+    Unchanged,
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyRequest {
+    None,
+    Requested,
+}
 
 /// The newest output in I420, shared between the event loop, which converts damaged
 /// rows into it, and the worker, which copies the changed stripes out.
@@ -48,14 +61,14 @@ struct Staging {
     u: Vec<u8>,
     v: Vec<u8>,
     /// One flag per `BAND_ROWS` rows changed since the worker last copied them.
-    bands: Vec<bool>,
+    bands: Vec<BandChange>,
     /// Scaled BGRA rows on their way to I420.
     scaled: Vec<u8>,
     pending: Option<Pending>,
     /// Code the next frame's stripes as key frames.
-    key: bool,
+    key: KeyRequest,
     generation: Generation,
-    stopping: bool,
+    state: WorkerState,
 }
 
 struct Pending {
@@ -114,9 +127,9 @@ impl StripedEncoder {
                 bands: Vec::new(),
                 scaled: Vec::new(),
                 pending: None,
-                key: false,
+                key: KeyRequest::None,
                 generation,
-                stopping: false,
+                state: WorkerState::Running,
             }),
             work: Condvar::new(),
         });
@@ -152,7 +165,7 @@ impl StripedEncoder {
             .staging
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if staging.stopping {
+        if staging.state == WorkerState::Stopping {
             return Err(VideoError::Stopped);
         }
         if frame.metadata.generation != staging.generation {
@@ -166,7 +179,7 @@ impl StripedEncoder {
             staging.y = vec![0; pixels];
             staging.u = vec![0; pixels / 4];
             staging.v = vec![0; pixels / 4];
-            staging.bands = vec![false; height.div_ceil(BAND_ROWS)];
+            staging.bands = vec![BandChange::Unchanged; height.div_ceil(BAND_ROWS)];
         }
         let full = 0..i32::try_from(frame.height).unwrap_or(i32::MAX);
         let damage = if resized {
@@ -211,9 +224,9 @@ impl StripedEncoder {
                 &mut staging.u[top * width / 4..bottom * width / 4],
                 &mut staging.v[top * width / 4..bottom * width / 4],
             )
-            .map_err(|_conversion| VideoError::InvalidFrame)?;
+            .map_err(VideoError::Conversion)?;
             for band in &mut staging.bands[top / BAND_ROWS..bottom.div_ceil(BAND_ROWS)] {
-                *band = true;
+                *band = BandChange::Changed;
             }
         }
         crate::latency::trace_frame("converted", frame.metadata.sequence, submitted_ns);
@@ -233,7 +246,7 @@ impl StripedEncoder {
             .staging
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .key = true;
+            .key = KeyRequest::Requested;
     }
 
     pub fn set_generation(&self, generation: Generation) -> Result<(), VideoError> {
@@ -242,7 +255,7 @@ impl StripedEncoder {
             .staging
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if staging.stopping {
+        if staging.state == WorkerState::Stopping {
             return Err(VideoError::Stopped);
         }
         staging.generation = generation;
@@ -266,13 +279,14 @@ impl StripedEncoder {
             Ok(frame) => Some(frame),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
-                let stopping = self
+                let state = self
                     .shared
                     .staging
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .stopping;
-                (!stopping).then(|| Err("video worker stopped unexpectedly".into()))
+                    .state;
+                (state == WorkerState::Running)
+                    .then(|| Err("video worker stopped unexpectedly".into()))
             }
         }
     }
@@ -286,7 +300,7 @@ impl StripedEncoder {
             .staging
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .stopping = true;
+            .state = WorkerState::Stopping;
         self.shared.work.notify_all();
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
@@ -316,33 +330,33 @@ fn run(
                 .staging
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            while staging.pending.is_none() && !staging.stopping {
+            while staging.pending.is_none() && staging.state == WorkerState::Running {
                 staging = shared
                     .work
                     .wait(staging)
                     .unwrap_or_else(PoisonError::into_inner);
             }
-            if staging.stopping {
+            if staging.state == WorkerState::Stopping {
                 return;
             }
             let Some(pending) = staging.pending.take() else {
                 continue;
             };
-            let key = std::mem::take(&mut staging.key);
+            let key = std::mem::replace(&mut staging.key, KeyRequest::None);
             #[expect(clippy::cast_precision_loss, reason = "a frame rate of at most 120")]
             let fps = pending.metadata.fps.get() as f32;
             let bitrate = pending.bitrate.get().saturating_mul(1000);
             let (width, height) = (staging.width, staging.height);
             let current =
                 stripes.get_or_insert_with(|| Stripes::new(width, height, requested, fps, bitrate));
-            if current.width != width || current.height != height {
+            if current.size() != (width, height) {
                 *current = Stripes::new(width, height, requested, fps, bitrate);
             }
-            if generation != Some(pending.metadata.generation) || current.bitrate_bps != bitrate {
+            if generation != Some(pending.metadata.generation) || current.bitrate_bps() != bitrate {
                 generation = Some(pending.metadata.generation);
                 current.reset(fps, bitrate);
             }
-            copy_changed_stripes(&mut staging, current);
+            current.copy_changed(&mut staging);
             (pending, key)
         };
         let taken_ns = crate::latency::monotonic_nanos();
@@ -350,34 +364,32 @@ fn run(
             continue;
         };
         let base = pending.crf.get().saturating_sub(1).clamp(12, 51);
-        let quantizers = Quantizers {
-            base,
-            refresh: REFRESH_QP.min(base),
-        };
+        let quantizers = Quantizers::new(base, REFRESH_QP.min(base));
         // A requested key frame codes every stripe, so it takes the place of a refresh.
         let coding = match (key, pending.cause) {
-            (true, _) => Coding::Key,
-            (false, FrameCause::Damage) => Coding::Changes,
-            (false, FrameCause::StillRefresh) => Coding::Refresh,
+            (KeyRequest::Requested, _) => Coding::Key,
+            (KeyRequest::None, FrameCause::Damage) => Coding::Changes,
+            (KeyRequest::None, FrameCause::StillRefresh) => Coding::Refresh,
         };
         let notification = match current.encode(coding, quantizers) {
             Ok(encoded) => {
-                let count = current.states.len();
+                let count = current.len();
                 let kind = if encoded.len() == count
-                    && encoded.iter().all(|stripe| stripe.kind == FrameKind::Key)
+                    && encoded.iter().all(|stripe| stripe.kind() == FrameKind::Key)
                 {
                     FrameKind::Key
                 } else {
                     FrameKind::Delta
                 };
-                let mut data = Vec::with_capacity(encoded.iter().map(|s| s.data.len() + 16).sum());
+                let mut data =
+                    Vec::with_capacity(encoded.iter().map(|s| s.data().len() + 16).sum());
                 for stripe in &encoded {
                     push_stripe(
                         &mut data,
-                        u16::try_from(stripe.rows.start).unwrap_or(u16::MAX),
-                        u16::try_from(stripe.rows.len()).unwrap_or(u16::MAX),
-                        stripe.kind,
-                        &stripe.data,
+                        u16::try_from(stripe.rows().start).unwrap_or(u16::MAX),
+                        u16::try_from(stripe.rows().len()).unwrap_or(u16::MAX),
+                        stripe.kind(),
+                        stripe.data(),
                     );
                 }
                 let mut metadata = pending.metadata;
@@ -445,30 +457,6 @@ fn downscale_rows(
             }
         }
     }
-}
-
-/// Copy the stripes whose rows changed out of the staging picture.
-fn copy_changed_stripes(staging: &mut Staging, stripes: &mut Stripes) {
-    let width = staging.width;
-    for state in &mut stripes.states {
-        let first = state.rows.start / BAND_ROWS;
-        let last = state.rows.end.div_ceil(BAND_ROWS);
-        if !staging.bands[first..last].iter().any(|band| *band) && !state.dirty {
-            continue;
-        }
-        let rows = state.rows.clone();
-        state
-            .y
-            .copy_from_slice(&staging.y[rows.start * width..rows.end * width]);
-        state
-            .u
-            .copy_from_slice(&staging.u[rows.start * width / 4..rows.end * width / 4]);
-        state
-            .v
-            .copy_from_slice(&staging.v[rows.start * width / 4..rows.end * width / 4]);
-        state.dirty = true;
-    }
-    staging.bands.fill(false);
 }
 
 #[cfg(test)]

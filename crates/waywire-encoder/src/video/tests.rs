@@ -165,7 +165,7 @@ fn shared() -> Arc<Shared> {
             slots: std::array::from_fn(|_| FrameSlot::Free(Vec::new())),
             next_free: 0,
             generation: generation(1),
-            stopping: false,
+            state: WorkerState::Running,
             notification_failure: None,
             child: Child::None,
         }),
@@ -833,7 +833,7 @@ fn generation_change_and_stop_discard_spawn_retry_frame() {
                 .pool
                 .lock()
                 .expect("frame pool mutex should not be poisoned")
-                .stopping = true;
+                .state = WorkerState::Stopping;
         } else {
             shared
                 .pool
@@ -1257,7 +1257,7 @@ fn stop_interrupts_a_blocked_pipe_write_within_the_poll_interval() {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .stopping = true;
+        .state = WorkerState::Stopping;
     let error = worker
         .join()
         .expect("blocked pipe writer thread should finish cleanly")
@@ -1379,7 +1379,7 @@ fn a_full_notification_queue_cannot_block_shutdown() {
         .pool
         .lock()
         .expect("frame pool mutex should not be poisoned")
-        .stopping = true;
+        .state = WorkerState::Stopping;
     let started = Instant::now();
 
     assert!(
