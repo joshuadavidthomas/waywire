@@ -87,6 +87,18 @@ pub(crate) struct MenuPress {
     pub(crate) action: Option<WindowAction>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Key(u32),
+    Button(u32),
+}
+
+struct Consumed {
+    source: KeyboardSource,
+    held: Held,
+    chrome: delivery::Chrome,
+}
+
 pub(crate) struct Chrome {
     taskbar: waywire_decorations::Taskbar,
     window_menu: Option<waywire_decorations::WindowMenu>,
@@ -94,11 +106,7 @@ pub(crate) struct Chrome {
     /// there.
     decoration_press: Option<(KeyboardSource, Window)>,
     /// A press the compositor consumed, so its release is consumed too.
-    menu_button: Option<(KeyboardSource, u32, delivery::Chrome)>,
-    /// The source whose Escape closed the window menu.
-    menu_escape: Option<KeyboardSource>,
-    /// The source whose shortcut restored a minimized window.
-    restore_key_source: Option<KeyboardSource>,
+    consumed: Vec<Consumed>,
     last_titlebar_press: Option<TitlebarPress>,
     /// A press on a maximized window's title bar, which restores the window
     /// once the pointer drags it.
@@ -114,9 +122,7 @@ impl Chrome {
             taskbar: waywire_decorations::Taskbar::default(),
             window_menu: None,
             decoration_press: None,
-            menu_button: None,
-            menu_escape: None,
-            restore_key_source: None,
+            consumed: Vec::new(),
             last_titlebar_press: None,
             pending_restore_drag: None,
             clock: local_clock(SystemTime::now())?,
@@ -135,12 +141,7 @@ impl Chrome {
     /// Forget the presses `source` holds, without acting on them: a source
     /// that disconnects or loses input does not click Close.
     pub(crate) fn release(&mut self, source: KeyboardSource) {
-        if self.restore_key_source == Some(source) {
-            self.restore_key_source = None;
-        }
-        if self.menu_escape == Some(source) {
-            self.menu_escape = None;
-        }
+        self.consumed.retain(|press| press.source != source);
         if self
             .decoration_press
             .as_ref()
@@ -251,36 +252,31 @@ impl Chrome {
     /// open; the matching release is then consumed too.
     pub(crate) fn escape_menu(&mut self, source: KeyboardSource) -> Option<Window> {
         let menu = self.window_menu.take()?;
-        self.menu_escape = Some(source);
+        self.consume(source, Held::Key(1), delivery::Chrome::WindowMenu);
         Some(menu.window().clone())
     }
 
     /// Whether this Escape release belongs to a press that closed the menu.
     pub(crate) fn release_escape(&mut self, source: KeyboardSource) -> bool {
-        if self.menu_escape != Some(source) {
-            return false;
-        }
-        self.menu_escape = None;
-        true
+        self.take_consumed(source, Held::Key(1)).is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn menu_escape(&self) -> Option<KeyboardSource> {
-        self.menu_escape
+        self.consumed
+            .iter()
+            .find(|press| press.held == Held::Key(1))
+            .map(|press| press.source)
     }
 
     /// Record the restore shortcut's press, so its release is consumed too.
     pub(crate) fn press_restore_key(&mut self, source: KeyboardSource) {
-        self.restore_key_source = Some(source);
+        self.consume(source, Held::Key(50), delivery::Chrome::Shortcut);
     }
 
     /// Whether this release belongs to a restore shortcut press.
     pub(crate) fn release_restore_key(&mut self, source: KeyboardSource) -> bool {
-        if self.restore_key_source != Some(source) {
-            return false;
-        }
-        self.restore_key_source = None;
-        true
+        self.take_consumed(source, Held::Key(50)).is_some()
     }
 
     /// Consume `button`'s release from `source`, as its press was.
@@ -290,7 +286,7 @@ impl Chrome {
         button: u32,
         chrome: delivery::Chrome,
     ) {
-        self.menu_button = Some((source, button, chrome));
+        self.consume(source, Held::Button(button), chrome);
     }
 
     /// The chrome a consumed press went to, when this is its release.
@@ -299,12 +295,29 @@ impl Chrome {
         source: KeyboardSource,
         button: u32,
     ) -> Option<delivery::Chrome> {
-        let (owner, held, chrome) = self.menu_button?;
-        if owner != source || held != button {
-            return None;
+        self.take_consumed(source, Held::Button(button))
+    }
+
+    fn consume(&mut self, source: KeyboardSource, held: Held, chrome: delivery::Chrome) {
+        if !self
+            .consumed
+            .iter()
+            .any(|press| press.source == source && press.held == held)
+        {
+            self.consumed.push(Consumed {
+                source,
+                held,
+                chrome,
+            });
         }
-        self.menu_button = None;
-        Some(chrome)
+    }
+
+    fn take_consumed(&mut self, source: KeyboardSource, held: Held) -> Option<delivery::Chrome> {
+        let index = self
+            .consumed
+            .iter()
+            .position(|press| press.source == source && press.held == held)?;
+        Some(self.consumed.remove(index).chrome)
     }
 
     /// The Close button press waiting for its release.
@@ -785,5 +798,45 @@ impl State {
             self.dirty = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consumed_presses_survive_other_presses_and_end_with_their_source() {
+        let mut chrome = Chrome::new(&[]).unwrap();
+        let first = KeyboardSource::new_auxiliary();
+        let second = KeyboardSource::new_auxiliary();
+        chrome.consume_button(first, 0x110, delivery::Chrome::Taskbar);
+        chrome.consume_button(second, 0x111, delivery::Chrome::WindowMenu);
+        assert_eq!(
+            chrome.consumed_release(first, 0x110),
+            Some(delivery::Chrome::Taskbar)
+        );
+        assert_eq!(
+            chrome.consumed_release(second, 0x111),
+            Some(delivery::Chrome::WindowMenu)
+        );
+        assert_eq!(chrome.consumed_release(first, 0x110), None);
+
+        chrome.press_restore_key(first);
+        chrome.press_restore_key(second);
+        assert!(chrome.release_restore_key(first));
+        assert!(chrome.release_restore_key(second));
+        assert!(!chrome.release_restore_key(first));
+
+        chrome.consume_button(first, 0x110, delivery::Chrome::Taskbar);
+        chrome.consume_button(second, 0x111, delivery::Chrome::WindowMenu);
+        chrome.press_restore_key(first);
+        chrome.release(first);
+        assert_eq!(chrome.consumed_release(first, 0x110), None);
+        assert!(!chrome.release_restore_key(first));
+        assert_eq!(
+            chrome.consumed_release(second, 0x111),
+            Some(delivery::Chrome::WindowMenu)
+        );
     }
 }
