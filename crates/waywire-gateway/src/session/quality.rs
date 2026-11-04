@@ -85,15 +85,71 @@ enum Streak {
 }
 
 impl Streak {
-    fn next(self, is_bad: bool, is_good: bool) -> Self {
-        match (is_bad, is_good, self) {
-            (true, _, Self::Bad(count)) => Self::Bad(count.saturating_add(1)),
-            (true, _, Self::None | Self::Good(_)) => Self::Bad(1),
-            (false, true, Self::Good(count)) => Self::Good(count.saturating_add(1)),
-            (false, true, Self::None | Self::Bad(_)) => Self::Good(1),
-            (false, false, _) => Self::None,
+    fn next(self, verdict: SampleVerdict) -> Self {
+        match (verdict, self) {
+            (SampleVerdict::Bad, Self::Bad(count)) => Self::Bad(count.saturating_add(1)),
+            (SampleVerdict::Bad, Self::None | Self::Good(_)) => Self::Bad(1),
+            (SampleVerdict::Good, Self::Good(count)) => Self::Good(count.saturating_add(1)),
+            (SampleVerdict::Good, Self::None | Self::Bad(_)) => Self::Good(1),
+            (SampleVerdict::Neutral, _) => Self::None,
         }
     }
+}
+
+/// What one feedback sample says about quality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleVerdict {
+    /// Something counts against quality.
+    Bad,
+    /// Nothing counts against quality and nothing vetoes recovery.
+    Good,
+    /// Nothing counts against quality, but something vetoes recovery.
+    Neutral,
+}
+
+/// Whether the encoder kept up during a sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncoderHealth {
+    /// At least `ENCODER_MIN_RENDERED` frames, and at least
+    /// `ENCODER_BAD_DROP_PERCENT` of them replaced before submission.
+    Overloaded,
+    /// At most `GOOD_DROP_PERCENT` replaced, including a sample with no frames.
+    Healthy,
+    /// Too few frames to call overloaded, or between the two thresholds.
+    Inconclusive,
+}
+
+/// Frames the encoder attempted and replaced since the last sample.
+#[derive(Clone, Copy, Debug)]
+struct EncoderSample {
+    attempted: u64,
+    replaced: u64,
+}
+
+impl EncoderSample {
+    fn health(self) -> EncoderHealth {
+        let replaced = u128::from(self.replaced) * 100;
+        let attempted = u128::from(self.attempted);
+        if self.attempted >= ENCODER_MIN_RENDERED
+            && replaced >= attempted * u128::from(ENCODER_BAD_DROP_PERCENT)
+        {
+            EncoderHealth::Overloaded
+        } else if replaced <= attempted * u128::from(GOOD_DROP_PERCENT) {
+            EncoderHealth::Healthy
+        } else {
+            EncoderHealth::Inconclusive
+        }
+    }
+}
+
+/// What a submitted frame did to the encoder's baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Baseline {
+    /// The first frame, a new generation or a backwards sequence: earlier samples
+    /// say nothing about this run.
+    Restarted,
+    /// Counted, or still warming up.
+    Continued,
 }
 
 #[derive(Clone, Default)]
@@ -105,7 +161,7 @@ struct EncoderPressure {
 }
 
 impl EncoderPressure {
-    fn observe(&mut self, metadata: &FrameMetadata) -> bool {
+    fn observe(&mut self, metadata: &FrameMetadata) -> Baseline {
         let previous = self.previous.replace((
             metadata.generation,
             metadata.sequence,
@@ -113,36 +169,30 @@ impl EncoderPressure {
         ));
         let Some((generation, sequence, captured)) = previous else {
             self.warmup_until = metadata.capture_nanos.saturating_add(ENCODER_WARMUP_NANOS);
-            return true;
+            return Baseline::Restarted;
         };
         if generation != metadata.generation || metadata.sequence <= sequence {
             self.rendered = 0;
             self.dropped = 0;
             self.warmup_until = metadata.capture_nanos.saturating_add(ENCODER_WARMUP_NANOS);
-            return true;
+            return Baseline::Restarted;
         }
         // The first second can replace frames while ffmpeg starts. Keep moving
         // the baseline, so neither startup nor generation-discarded frames count.
         if captured <= self.warmup_until {
-            return false;
+            return Baseline::Continued;
         }
         let rendered = metadata.sequence - sequence;
         self.rendered = self.rendered.saturating_add(rendered);
         self.dropped = self.dropped.saturating_add(rendered - 1);
-        false
+        Baseline::Continued
     }
 
-    fn take(&mut self) -> (u64, u64, bool, bool) {
-        let attempted = std::mem::take(&mut self.rendered);
-        let replaced = std::mem::take(&mut self.dropped);
-        (
-            attempted,
-            replaced,
-            attempted >= ENCODER_MIN_RENDERED
-                && u128::from(replaced) * 100
-                    >= u128::from(attempted) * u128::from(ENCODER_BAD_DROP_PERCENT),
-            u128::from(replaced) * 100 <= u128::from(attempted) * u128::from(GOOD_DROP_PERCENT),
-        )
+    fn take(&mut self) -> EncoderSample {
+        EncoderSample {
+            attempted: std::mem::take(&mut self.rendered),
+            replaced: std::mem::take(&mut self.dropped),
+        }
     }
 }
 
@@ -352,13 +402,15 @@ fn applying<const N: usize>(candidates: [(bool, Reason); N]) -> Vec<Reason> {
 fn signals(
     feedback: &Feedback,
     link: &LinkSample,
-    encoder_bad: bool,
-    encoder_good: bool,
+    encoder: EncoderHealth,
 ) -> (Vec<Reason>, Vec<Reason>) {
     let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
     let active = matches!(link, LinkSample::Active(_));
     let pressure = applying([
-        (encoder_bad, Reason::EncoderReplacement),
+        (
+            encoder == EncoderHealth::Overloaded,
+            Reason::EncoderReplacement,
+        ),
         (active && queue_pressure >= 0.10, Reason::DecoderBusy),
         (active && feedback.queue_peak() >= 24, Reason::DecoderPeak),
         (active && feedback.rtt() > 250.0, Reason::Rtt),
@@ -371,7 +423,10 @@ fn signals(
     // Feedback excludes newest-due presentation skips. A 60Hz display may
     // legitimately draw half a 120 FPS stream; zero draws cannot recover.
     let recovery_vetoes = applying([
-        (!encoder_good, Reason::EncoderReplacement),
+        (
+            encoder != EncoderHealth::Healthy,
+            Reason::EncoderReplacement,
+        ),
         (queue_pressure >= 0.05, Reason::DecoderBusy),
         (feedback.queue_peak() >= 24, Reason::DecoderPeak),
         (
@@ -399,7 +454,9 @@ pub(super) struct Quality {
     streak: Streak,
     last_change: Option<Instant>,
     encoder: EncoderPressure,
-    encoder_was_bad: bool,
+    /// The encoder's health in the last sample, if one was taken since its
+    /// baseline restarted.
+    last_encoder: Option<EncoderHealth>,
     /// What the viewer received while video backed up behind its link.
     congestion: Option<Delivery>,
     link: Option<LinkLimit>,
@@ -426,7 +483,7 @@ impl Quality {
             streak: Streak::None,
             last_change: None,
             encoder: EncoderPressure::default(),
-            encoder_was_bad: false,
+            last_encoder: None,
             congestion: None,
             link: None,
             produced: 0,
@@ -440,7 +497,7 @@ impl Quality {
 
     pub(super) fn reset_samples(&mut self) {
         self.encoder = EncoderPressure::default();
-        self.encoder_was_bad = false;
+        self.last_encoder = None;
         self.streak = Streak::None;
         // Another viewer's link says nothing about this one.
         self.congestion = None;
@@ -454,9 +511,9 @@ impl Quality {
     }
 
     pub(super) fn submitted(&mut self, metadata: &FrameMetadata) {
-        if self.encoder.observe(metadata) {
+        if self.encoder.observe(metadata) == Baseline::Restarted {
             self.streak = Streak::None;
-            self.encoder_was_bad = false;
+            self.last_encoder = None;
         }
     }
 
@@ -488,10 +545,11 @@ impl Quality {
     }
 
     pub(super) fn update(&mut self, feedback: &Feedback, now: Instant) -> Option<QualityChange> {
-        let (attempted, replaced, encoder_bad, encoder_good) = self.encoder.take();
-        let encoder_was_bad = std::mem::replace(&mut self.encoder_was_bad, encoder_bad);
+        let sample = self.encoder.take();
+        let encoder = sample.health();
+        let last_encoder = self.last_encoder.replace(encoder);
         let link = self.observe_link(feedback);
-        let (pressure, recovery_vetoes) = signals(feedback, &link, encoder_bad, encoder_good);
+        let (pressure, recovery_vetoes) = signals(feedback, &link, encoder);
         let cooldown = self.last_change.map_or(Duration::ZERO, |last| {
             QUALITY_CHANGE_COOLDOWN.saturating_sub(now.saturating_duration_since(last))
         });
@@ -500,10 +558,10 @@ impl Quality {
             generation = ?self.encoder.previous.map(|(generation, _, _)| generation),
             capture_nanos = ?self.encoder.previous.map(|(_, _, captured)| captured),
             warmup_until = self.encoder.warmup_until,
-            attempted,
-            submitted = attempted - replaced,
-            replaced,
-            sufficient_encoder_sample = attempted >= ENCODER_MIN_RENDERED,
+            attempted = sample.attempted,
+            submitted = sample.attempted - sample.replaced,
+            replaced = sample.replaced,
+            sufficient_encoder_sample = sample.attempted >= ENCODER_MIN_RENDERED,
             ?feedback,
             bad_reasons = ?pressure.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
             recovery_vetoes = ?recovery_vetoes.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
@@ -517,8 +575,8 @@ impl Quality {
         .entered();
         // The stream is damage-driven: absence of frames says nothing about its
         // health. Idle feedback preserves recovery, but interrupts producer overload.
-        if matches!(link, LinkSample::Idle { .. }) && !encoder_bad {
-            if encoder_was_bad {
+        if matches!(link, LinkSample::Idle { .. }) && encoder != EncoderHealth::Overloaded {
+            if last_encoder == Some(EncoderHealth::Overloaded) {
                 self.streak = Streak::None;
             }
             debug!(decision = "idle", streak_after = ?self.streak, "quality decision");
@@ -534,15 +592,20 @@ impl Quality {
                     ..
                 })
             )
-            && !encoder_bad
+            && encoder != EncoderHealth::Overloaded
         {
             debug!(decision = "draining", streak_after = ?self.streak, "quality decision");
             return None;
         }
-        let is_bad = !pressure.is_empty();
         let local_pressure = pressure.iter().any(|reason| !reason.is_link());
-        let is_good = recovery_vetoes.is_empty();
-        self.streak = self.streak.next(is_bad, is_good);
+        let verdict = if !pressure.is_empty() {
+            SampleVerdict::Bad
+        } else if recovery_vetoes.is_empty() {
+            SampleVerdict::Good
+        } else {
+            SampleVerdict::Neutral
+        };
+        self.streak = self.streak.next(verdict);
         let streak_lowers =
             matches!(self.streak, Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD);
         let lowering = self.lowering(streak_lowers, &link, local_pressure);
