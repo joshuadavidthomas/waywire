@@ -45,6 +45,29 @@ pub struct TaskbarChip {
 pub const BAR: i32 = Theme::dark().bar;
 pub const TASKBAR: i32 = Theme::dark().taskbar;
 
+/// Whether a window is a dialog: a dialog has no minimize or maximize
+/// buttons and no taskbar chip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRole {
+    Normal,
+    Dialog,
+}
+
+/// Whether a window is maximized: a maximized window shows Restore and has no
+/// resize grips, and its menu disables Move and Resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeMode {
+    Floating,
+    Maximized,
+}
+
+/// The committed window state that shapes its decoration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowFlags {
+    pub role: WindowRole,
+    pub size: SizeMode,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecorationAction {
     Move,
@@ -121,8 +144,7 @@ enum NodeStyle {
         active: bool,
         close_hovered: bool,
         pressed: bool,
-        dialog: bool,
-        maximized: bool,
+        window_flags: WindowFlags,
         theme: Theme,
     },
     Hit,
@@ -152,8 +174,7 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
                 active: appearance.active,
                 close_hovered: appearance.hover == Some(DecorationAction::Close),
                 pressed: appearance.pressed,
-                dialog: appearance.window_flags.0,
-                maximized: appearance.window_flags.1,
+                window_flags: appearance.window_flags,
                 theme,
             },
             action: Some(DecorationAction::Move),
@@ -166,15 +187,14 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
             cursor: CursorShape::Default,
         },
     ];
-    if !appearance.window_flags.0 {
+    if appearance.window_flags.role == WindowRole::Normal {
         for (offset, action) in [
             (3, DecorationAction::Minimize),
             (
                 2,
-                if appearance.window_flags.1 {
-                    DecorationAction::Restore
-                } else {
-                    DecorationAction::Maximize
+                match appearance.window_flags.size {
+                    SizeMode::Maximized => DecorationAction::Restore,
+                    SizeMode::Floating => DecorationAction::Maximize,
                 },
             ),
         ] {
@@ -193,7 +213,7 @@ fn nodes(size: Size<i32, Logical>, appearance: &Appearance, theme: Theme) -> Vec
             }
         }
     }
-    if !appearance.window_flags.1 {
+    if appearance.window_flags.size == SizeMode::Floating {
         result.extend(resize_nodes(size, theme));
     }
     result
@@ -275,7 +295,7 @@ fn hit_test(nodes: &[Node], point: Point<f64, Logical>) -> Option<&Node> {
 #[must_use]
 pub fn node_at(
     size: Size<i32, Logical>,
-    window_flags: (bool, bool),
+    window_flags: WindowFlags,
     point: Point<f64, Logical>,
 ) -> Option<Node> {
     let appearance = Appearance {
@@ -301,7 +321,7 @@ pub struct Appearance {
     pub width: i32,
     pub scale: f64,
     pub active: bool,
-    pub window_flags: (bool, bool),
+    pub window_flags: WindowFlags,
     pub hover: Option<DecorationAction>,
     pub pressed: bool,
 }
@@ -727,7 +747,7 @@ pub fn decorated(window: &Window) -> bool {
 
 #[must_use]
 pub fn taskbar_window(window: &Window) -> bool {
-    if window_flags(window).0 {
+    if window_flags(window).role == WindowRole::Dialog {
         return false;
     }
     if window.toplevel().is_some() {
@@ -755,8 +775,8 @@ pub fn chip_rectangle(width: i32, count: usize, index: usize) -> Option<Rectangl
 }
 
 #[must_use]
-pub fn window_flags(window: &Window) -> (bool, bool) {
-    if let Some(top) = window.toplevel() {
+pub fn window_flags(window: &Window) -> WindowFlags {
+    let (dialog, maximized) = if let Some(top) = window.toplevel() {
         (
             top.parent().is_some(),
             top.with_committed_state(|state| {
@@ -767,6 +787,18 @@ pub fn window_flags(window: &Window) -> (bool, bool) {
         (x11.is_transient_for().is_some(), x11.is_maximized())
     } else {
         (false, false)
+    };
+    WindowFlags {
+        role: if dialog {
+            WindowRole::Dialog
+        } else {
+            WindowRole::Normal
+        },
+        size: if maximized {
+            SizeMode::Maximized
+        } else {
+            SizeMode::Floating
+        },
     }
 }
 
@@ -856,7 +888,7 @@ const MENU_HEIGHT: i32 = MENU_ROW * 6;
 pub struct WindowMenu {
     pub window: Window,
     location: Point<i32, Logical>,
-    maximized: bool,
+    size: SizeMode,
     always_on_top: bool,
     painted: bool,
     hover: Option<usize>,
@@ -871,7 +903,7 @@ impl WindowMenu {
         output: Size<i32, Logical>,
         always_on_top: bool,
     ) -> Self {
-        let maximized = window_flags(&window).1;
+        let size = window_flags(&window).size;
         let point = point.to_i32_round::<i32>();
         Self {
             window,
@@ -880,7 +912,7 @@ impl WindowMenu {
                 point.y.clamp(0, (output.h - MENU_HEIGHT).max(0)),
             )
                 .into(),
-            maximized,
+            size,
             always_on_top,
             painted: false,
             hover: None,
@@ -911,15 +943,16 @@ impl WindowMenu {
 
     fn action(&self, index: usize) -> Option<WindowAction> {
         match index {
-            0 if !window_flags(&self.window).0 => Some(WindowAction::Minimize),
-            1 => Some(if self.maximized {
-                WindowAction::Restore
-            } else {
-                WindowAction::Maximize
+            0 if window_flags(&self.window).role == WindowRole::Normal => {
+                Some(WindowAction::Minimize)
+            }
+            1 => Some(match self.size {
+                SizeMode::Maximized => WindowAction::Restore,
+                SizeMode::Floating => WindowAction::Maximize,
             }),
             2 => Some(WindowAction::ToggleAlwaysOnTop),
-            3 if !self.maximized => Some(WindowAction::Move),
-            4 if !self.maximized => {
+            3 if self.size == SizeMode::Floating => Some(WindowAction::Move),
+            4 if self.size == SizeMode::Floating => {
                 Some(WindowAction::Resize(xdg_toplevel::ResizeEdge::BottomRight))
             }
             5 => Some(WindowAction::Close),
@@ -959,10 +992,9 @@ impl WindowMenu {
             context.paint()?;
             let labels = [
                 "Minimize",
-                if self.maximized {
-                    "Restore"
-                } else {
-                    "Maximize"
+                match self.size {
+                    SizeMode::Maximized => "Restore",
+                    SizeMode::Floating => "Maximize",
                 },
                 "Always on Top",
                 "Move",
@@ -1054,7 +1086,10 @@ mod tests {
             width: 501,
             scale,
             active: true,
-            window_flags: (false, false),
+            window_flags: WindowFlags {
+                role: WindowRole::Normal,
+                size: SizeMode::Floating,
+            },
             hover: None,
             pressed: false,
         }
@@ -1119,7 +1154,7 @@ mod tests {
                 Some(DecorationAction::Close)
             ]
         );
-        look.window_flags.1 = true;
+        look.window_flags.size = SizeMode::Maximized;
         assert_eq!(
             buttons(&look),
             [
@@ -1128,7 +1163,7 @@ mod tests {
                 Some(DecorationAction::Close)
             ]
         );
-        look.window_flags.0 = true;
+        look.window_flags.role = WindowRole::Dialog;
         assert_eq!(
             buttons(&look),
             [
@@ -1142,7 +1177,7 @@ mod tests {
     #[test]
     fn maximized_window_has_no_resize_grip() {
         let mut look = appearance(1.0);
-        look.window_flags.1 = true;
+        look.window_flags.size = SizeMode::Maximized;
         let nodes = nodes((501, 57).into(), &look, Theme::dark());
         assert!(
             !nodes

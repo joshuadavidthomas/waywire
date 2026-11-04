@@ -1481,7 +1481,8 @@ mod tests {
             "pending fullscreen must not hide chrome"
         );
         assert!(
-            !waywire_decorations::window_flags(&window).1,
+            waywire_decorations::window_flags(&window).size
+                == waywire_decorations::SizeMode::Floating,
             "pending maximize must not change chrome"
         );
         assert!(
@@ -1492,7 +1493,10 @@ mod tests {
         surface.commit();
         sync(&mut display, &mut state, &connection, &mut queue, &mut app);
         assert!(!waywire_decorations::decorated(&window));
-        assert!(waywire_decorations::window_flags(&window).1);
+        assert_eq!(
+            waywire_decorations::window_flags(&window).size,
+            waywire_decorations::SizeMode::Maximized
+        );
         assert!(waywire_decorations::above_taskbar(&window));
     }
 

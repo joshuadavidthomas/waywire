@@ -227,7 +227,6 @@ impl State {
             let state = self.windows.entry(window.clone()).or_default();
             let size = window.geometry().size;
             let width = decoration_width(size.w, output_width);
-            let (dialog, maximized) = window_flags(window);
             let decoration = state.decoration.get_or_insert_with(Decoration::default);
             let appearance = Appearance {
                 title: if title.is_empty() {
@@ -238,7 +237,7 @@ impl State {
                 width,
                 scale,
                 active,
-                window_flags: (dialog, maximized),
+                window_flags: window_flags(window),
                 hover: hover
                     .as_ref()
                     .filter(|(target, _)| target == window)
