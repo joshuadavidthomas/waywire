@@ -25,6 +25,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::thread::JoinHandle;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use pipewire as pw;
@@ -337,8 +338,10 @@ impl Sender {
     fn push(&mut self, bytes: &[u8]) {
         self.samples.extend(
             bytes
-                .chunks_exact(4)
-                .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|sample| f32::from_le_bytes(*sample)),
         );
         let mut packet = [0; 12 + MAX_PACKET];
         while self.samples.len() >= FRAME_SAMPLES {
@@ -437,7 +440,7 @@ impl Encoder {
                 i32::try_from(out.len())?,
             )
         };
-        usize::try_from(length).map_err(|_negative| anyhow!("opus_encode_float failed: {length}"))
+        usize::try_from(length).with_context(|| format!("opus_encode_float failed: {length}"))
     }
 }
 
@@ -602,8 +605,8 @@ mod tests {
         assert_eq!(packets.len(), 30, "the sink sends a packet per 20 ms");
         for (index, packet) in packets.iter().enumerate() {
             assert_eq!(packet[..2], [0x80, PAYLOAD_TYPE]);
-            let sequence = u16::from_be_bytes([packet[2], packet[3]]);
-            let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+            let sequence = u16::from_be_bytes(packet[2..4].try_into().expect("sequence bytes"));
+            let timestamp = u32::from_be_bytes(packet[4..8].try_into().expect("timestamp bytes"));
             assert_eq!(sequence, u16::try_from(index).expect("sequence"));
             assert_eq!(timestamp, FRAME * u32::try_from(index).expect("timestamp"));
         }

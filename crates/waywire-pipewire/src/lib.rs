@@ -252,11 +252,17 @@ impl Graph {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Pending,
+    Current,
+}
+
 /// Stream state the `PipeWire` callbacks update.
 struct CastState {
     reply: RefCell<Option<oneshot::Sender<Option<u32>>>>,
     negotiated: Cell<Option<(u32, u32)>>,
-    pending: Cell<bool>,
+    delivery: Cell<Delivery>,
     graph: Rc<RefCell<Graph>>,
 }
 
@@ -271,7 +277,9 @@ impl Cast {
     /// the image's size and holds a buffer free. Otherwise the frame stays
     /// pending.
     fn offer(&self, image: &Frame<'_>) {
-        if !self.state.pending.get() || self.stream.state() != pw::stream::StreamState::Streaming {
+        if self.state.delivery.get() == Delivery::Current
+            || self.stream.state() != pw::stream::StreamState::Streaming
+        {
             return;
         }
         let (Ok(width), Ok(height)) = (u32::try_from(image.width), u32::try_from(image.height))
@@ -306,7 +314,7 @@ impl Cast {
         *chunk.size_mut() = size;
         // Dropping the buffer queues it; the cycle hands it to consumers.
         drop(buffer);
-        self.state.pending.set(false);
+        self.state.delivery.set(Delivery::Current);
         if let Err(error) = self.stream.trigger_process() {
             tracing::debug!(%error, "trigger ScreenCast cycle");
         }
@@ -445,7 +453,7 @@ impl Streams {
         let state = Rc::new(CastState {
             reply: RefCell::new(Some(reply)),
             negotiated: Cell::new(None),
-            pending: Cell::new(true),
+            delivery: Cell::new(Delivery::Pending),
             graph: Rc::clone(&self.graph),
         });
         let listener = stream
@@ -469,7 +477,7 @@ impl Streams {
                     tracing::debug!("ScreenCast requester hung up");
                 }
                 // A consumer that starts or resumes needs the current image.
-                state.pending.set(true);
+                state.delivery.set(Delivery::Pending);
             })
             .param_changed(|stream, state, id, param| {
                 if id != spa::param::ParamType::Format.as_raw() {
@@ -486,7 +494,7 @@ impl Streams {
                 }
                 let size = info.size();
                 state.negotiated.set(Some((size.width, size.height)));
-                state.pending.set(true);
+                state.delivery.set(Delivery::Pending);
                 let buffers = match buffers_param(size.width, size.height) {
                     Ok(buffers) => buffers,
                     Err(error) => {
@@ -546,7 +554,7 @@ impl Streams {
     /// Offer a newly rendered frame to every stream.
     pub fn frame(&self, image: &Frame<'_>) {
         for cast in self.casts.values() {
-            cast.state.pending.set(true);
+            cast.state.delivery.set(Delivery::Pending);
             cast.offer(image);
         }
     }
