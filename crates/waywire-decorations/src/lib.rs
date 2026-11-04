@@ -135,14 +135,23 @@ pub enum DecorationAction {
     Close,
 }
 
+/// The colors of an active or inactive title bar, which the taskbar and the
+/// window menu also use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Palette {
+    background: u32,
+    foreground: u32,
+    border: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Theme {
     bar: i32,
     taskbar: i32,
     resize_band: i32,
     resize_corner: i32,
-    active: (u32, u32, u32),
-    inactive: (u32, u32, u32),
+    active: Palette,
+    inactive: Palette,
     accent: u32,
     attention: u32,
     dim: u32,
@@ -160,8 +169,16 @@ impl Theme {
             taskbar: 32,
             resize_band: 6,
             resize_corner: 12,
-            active: (0x27_2e_39, 0xe7_eb_f0, 0x0046_5164),
-            inactive: (0x20_25_2d, 0x98_a2_b2, 0x30_37_43),
+            active: Palette {
+                background: 0x27_2e_39,
+                foreground: 0xe7_eb_f0,
+                border: 0x0046_5164,
+            },
+            inactive: Palette {
+                background: 0x20_25_2d,
+                foreground: 0x98_a2_b2,
+                border: 0x30_37_43,
+            },
             accent: 0x36_6e_a8,
             attention: 0x008a_5a16,
             dim: 0x60_69_78,
@@ -179,8 +196,16 @@ impl Theme {
     )]
     const fn light() -> Self {
         Self {
-            active: (0xe9_ec_f0, 0x20_25_2d, 0x98_a2_b2),
-            inactive: (0xf4_f5_f7, 0x76_83_99, 0xc8_cf_d8),
+            active: Palette {
+                background: 0xe9_ec_f0,
+                foreground: 0x20_25_2d,
+                border: 0x98_a2_b2,
+            },
+            inactive: Palette {
+                background: 0xf4_f5_f7,
+                foreground: 0x76_83_99,
+                border: 0xc8_cf_d8,
+            },
             ..Self::dark()
         }
     }
@@ -492,9 +517,9 @@ fn paint_taskbar(
         f64::from(pixels.w) / f64::from(size.w),
         f64::from(pixels.h) / f64::from(size.h),
     );
-    color(&context, theme.inactive.0);
+    color(&context, theme.inactive.background);
     context.paint()?;
-    color(&context, theme.inactive.2);
+    color(&context, theme.inactive.border);
     context.rectangle(0.0, 0.0, f64::from(size.w), 1.0);
     context.fill()?;
     for (index, chip) in chips.iter().enumerate() {
@@ -531,7 +556,7 @@ fn paint_taskbar(
         color(
             &context,
             if highlight.is_some() {
-                theme.active.1
+                theme.active.foreground
             } else if matches!(
                 chip.target,
                 ChipTarget::Pin {
@@ -541,7 +566,7 @@ fn paint_taskbar(
             ) {
                 theme.dim
             } else {
-                theme.inactive.1
+                theme.inactive.foreground
             },
         );
         draw_title(
@@ -556,7 +581,7 @@ fn paint_taskbar(
     if pin_count > 0
         && let Some(rect) = chip_rectangle(size.w, chips.len(), pin_count - 1)
     {
-        color(&context, theme.inactive.2);
+        color(&context, theme.inactive.border);
         context.rectangle(
             f64::from(rect.loc.x + rect.size.w - 1),
             5.0,
@@ -567,12 +592,12 @@ fn paint_taskbar(
     }
     context.save()?;
     context.translate(f64::from((size.w - 180).max(0)), 2.0);
-    color(&context, theme.inactive.1);
+    color(&context, theme.inactive.foreground);
     draw_title(&context, control, 110, theme)?;
     context.restore()?;
     context.save()?;
     context.translate(f64::from((size.w - 60).max(0)), 2.0);
-    color(&context, theme.inactive.1);
+    color(&context, theme.inactive.foreground);
     draw_title(&context, clock, 50, theme)?;
     context.restore()?;
     Ok(surface)
@@ -615,8 +640,8 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         f64::from(pixels.w) / f64::from(size.w),
         f64::from(pixels.h) / f64::from(size.h),
     );
-    let (background, foreground, border) = if active { theme.active } else { theme.inactive };
-    color(&context, background);
+    let palette = if active { theme.active } else { theme.inactive };
+    color(&context, palette.background);
     context.paint()?;
     {
         let close = nodes[1].rect;
@@ -637,7 +662,7 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
             );
             context.fill()?;
         }
-        color(&context, foreground);
+        color(&context, palette.foreground);
         let title_end = nodes
             .iter()
             .skip(1)
@@ -668,7 +693,7 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         color(
             &context,
             if close_button == CloseButton::Idle {
-                foreground
+                palette.foreground
             } else {
                 theme.close_hover_foreground
             },
@@ -677,9 +702,9 @@ fn paint_titlebar(nodes: &[Node]) -> Result<cairo::ImageSurface> {
         context.set_line_cap(cairo::LineCap::Round);
         draw_close(&context, x, theme)?;
         context.restore()?;
-        draw_buttons(&context, nodes, foreground, theme)?;
+        draw_buttons(&context, nodes, palette.foreground, theme)?;
     }
-    color(&context, border);
+    color(&context, palette.border);
     context.rectangle(0.0, f64::from(theme.bar - 1), f64::from(width), 1.0);
     context.fill()?;
     context.status()?;
@@ -1047,7 +1072,7 @@ impl WindowMenu {
             let context = cairo::Context::new(&surface)?;
             context.scale(scale, scale);
             let theme = Theme::dark();
-            color(&context, theme.inactive.0);
+            color(&context, theme.inactive.background);
             context.paint()?;
             let labels = [
                 "Minimize",
@@ -1063,7 +1088,7 @@ impl WindowMenu {
             for (index, label) in labels.iter().enumerate() {
                 let disabled = self.action(index).is_none();
                 if self.hover == Some(index) {
-                    color(&context, theme.active.0);
+                    color(&context, theme.active.background);
                     context.rectangle(
                         1.0,
                         f64::from(i32::try_from(index)? * MENU_ROW),
@@ -1075,9 +1100,9 @@ impl WindowMenu {
                 color(
                     &context,
                     if disabled {
-                        theme.inactive.1
+                        theme.inactive.foreground
                     } else {
-                        theme.active.1
+                        theme.active.foreground
                     },
                 );
                 context.save()?;
@@ -1094,7 +1119,7 @@ impl WindowMenu {
                     context.stroke()?;
                 }
             }
-            color(&context, theme.active.2);
+            color(&context, theme.active.border);
             context.set_line_width(1.0);
             context.rectangle(
                 0.5,
