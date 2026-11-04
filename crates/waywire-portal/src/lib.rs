@@ -30,6 +30,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use calloop::channel::Sender;
+use smithay::backend::input::KeyState;
 use smithay::input::keyboard::KeyboardSource;
 use tokio::sync::oneshot;
 use zbus::blocking::Connection;
@@ -63,8 +64,11 @@ pub enum PortalRequest {
         source: KeyboardSource,
     },
     Input(PortalInput),
+    /// Type `keysym`, which the reply refuses when no layout can produce it.
     Keysym {
-        input: PortalInput,
+        source: KeyboardSource,
+        keysym: u32,
+        state: KeyState,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Read the current output's logical dimensions.

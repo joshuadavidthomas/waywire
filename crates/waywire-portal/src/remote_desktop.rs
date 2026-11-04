@@ -73,11 +73,6 @@ pub enum PortalInput {
         key: u32,
         state: KeyState,
     },
-    Keysym {
-        source: KeyboardSource,
-        keysym: u32,
-        state: KeyState,
-    },
 }
 
 fn finite_pair(x: f64, y: f64) -> zbus::fdo::Result<()> {
@@ -382,11 +377,9 @@ impl RemoteDesktop {
         let (reply, wait) = oneshot::channel();
         self.requests
             .send(PortalRequest::Keysym {
-                input: PortalInput::Keysym {
-                    source: session.source,
-                    keysym,
-                    state: key_state(state)?,
-                },
+                source: session.source,
+                keysym,
+                state: key_state(state)?,
                 reply,
             })
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;

@@ -52,13 +52,17 @@ pub(crate) fn start(
                 state.register_agent_source(source);
             }
             PortalRequest::DisconnectSource { source } => state.disconnect_input_source(source),
-            PortalRequest::Input(input) => {
-                if let Err(error) = apply_portal_input(state, input) {
-                    tracing::warn!(%error, "portal input failed");
-                }
-            }
-            PortalRequest::Keysym { input, reply } => {
-                if reply.send(apply_portal_input(state, input)).is_err() {
+            PortalRequest::Input(input) => apply_portal_input(state, input),
+            PortalRequest::Keysym {
+                source,
+                keysym,
+                state: key_state,
+                reply,
+            } => {
+                if reply
+                    .send(apply_keysym(state, source, keysym, key_state))
+                    .is_err()
+                {
                     tracing::debug!("portal requester hung up");
                 }
             }
@@ -126,7 +130,7 @@ pub(crate) fn start(
     clippy::needless_pass_by_value,
     reason = "the request channel hands over each input by value"
 )]
-fn apply_portal_input(state: &mut State, input: PortalInput) -> Result<(), String> {
+fn apply_portal_input(state: &mut State, input: PortalInput) {
     match input {
         PortalInput::Motion { source, dx, dy } => {
             if let Some(pointer) = state.seat.get_pointer() {
@@ -176,13 +180,7 @@ fn apply_portal_input(state: &mut State, input: PortalInput) -> Result<(), Strin
             key,
             state: key_state,
         } => state.keyboard_key(source, key, key_state),
-        PortalInput::Keysym {
-            source,
-            keysym,
-            state: key_state,
-        } => return apply_keysym(state, source, keysym, key_state),
     }
-    Ok(())
 }
 
 fn apply_keysym(
@@ -287,8 +285,7 @@ mod tests {
                 x: 311.0,
                 y: 97.0,
             },
-        )
-        .expect("motion");
+        );
         assert_eq!(pointer.current_location(), (311.0, 97.0).into());
         apply_portal_input(
             &mut state,
@@ -297,8 +294,7 @@ mod tests {
                 x: 5000.0,
                 y: -20.0,
             },
-        )
-        .expect("motion");
+        );
         assert_eq!(pointer.current_location(), (1919.0, 0.0).into());
         apply_portal_input(
             &mut state,
@@ -307,8 +303,7 @@ mod tests {
                 button: 0x110,
                 state: ButtonState::Pressed,
             },
-        )
-        .expect("button");
+        );
         assert!(
             state
                 .input
@@ -323,8 +318,7 @@ mod tests {
                 button: 0x110,
                 state: ButtonState::Pressed,
             },
-        )
-        .expect("button");
+        );
         apply_portal_input(
             &mut state,
             PortalInput::Absolute {
@@ -332,8 +326,7 @@ mod tests {
                 x: 311.0,
                 y: 97.0,
             },
-        )
-        .expect("motion");
+        );
         assert!(
             state
                 .input
@@ -468,8 +461,7 @@ mod tests {
                 key: 30,
                 state: KeyState::Pressed,
             },
-        )
-        .expect("keycode");
+        );
         assert!(keyboard.pressed_keys().contains(&38u32.into()));
         apply_portal_input(
             &mut state,
@@ -478,40 +470,13 @@ mod tests {
                 key: 30,
                 state: KeyState::Released,
             },
-        )
-        .expect("keycode release");
-        apply_portal_input(
-            &mut state,
-            PortalInput::Keysym {
-                source,
-                keysym: 0x41,
-                state: KeyState::Pressed,
-            },
-        )
-        .expect("keysym");
+        );
+        apply_keysym(&mut state, source, 0x41, KeyState::Pressed).expect("keysym");
         assert!(keyboard.pressed_keys().contains(&50u32.into()));
         assert!(keyboard.pressed_keys().contains(&38u32.into()));
-        apply_portal_input(
-            &mut state,
-            PortalInput::Keysym {
-                source,
-                keysym: 0x41,
-                state: KeyState::Released,
-            },
-        )
-        .expect("keysym release");
+        apply_keysym(&mut state, source, 0x41, KeyState::Released).expect("keysym release");
         assert!(keyboard.pressed_keys().is_empty());
-        assert!(
-            apply_portal_input(
-                &mut state,
-                PortalInput::Keysym {
-                    source,
-                    keysym: 0x1fff_ffff,
-                    state: KeyState::Pressed
-                }
-            )
-            .is_err()
-        );
+        assert!(apply_keysym(&mut state, source, 0x1fff_ffff, KeyState::Pressed).is_err());
         state.set_browser_lease(true);
         apply_portal_input(
             &mut state,
@@ -520,17 +485,8 @@ mod tests {
                 key: 30,
                 state: KeyState::Pressed,
             },
-        )
-        .expect("dropped keycode");
-        apply_portal_input(
-            &mut state,
-            PortalInput::Keysym {
-                source,
-                keysym: 0x41,
-                state: KeyState::Pressed,
-            },
-        )
-        .expect("dropped keysym");
+        );
+        apply_keysym(&mut state, source, 0x41, KeyState::Pressed).expect("dropped keysym");
         assert!(keyboard.pressed_keys().is_empty());
     }
 }
