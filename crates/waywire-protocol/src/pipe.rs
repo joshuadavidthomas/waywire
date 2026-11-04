@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::browser::FrameKind;
 use crate::wire::InvalidValue;
 use crate::wire::Reader;
 use crate::wire::Record;
@@ -1669,26 +1670,26 @@ impl Wire for CursorImage {
 /// stripe of the frame is a key frame, so a viewer can start from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedFrame {
-    pub key: bool,
+    pub kind: FrameKind,
     pub metadata: FrameMetadata,
     pub data: Vec<u8>,
 }
 
 impl Wire for EncodedFrame {
     fn write(&self, out: &mut Writer) {
-        out.put(&u8::from(self.key));
+        out.put(&self.kind);
         out.put(&self.metadata);
         out.bytes(&self.data);
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
-        let key = match input.get()? {
-            0_u8 => false,
-            1 => true,
+        let kind = match input.get()? {
+            0_u8 => FrameKind::Delta,
+            1 => FrameKind::Key,
             _ => return Err(InvalidValue("encoded frame key flag must be zero or one")),
         };
         Ok(Self {
-            key,
+            kind,
             metadata: input.get()?,
             data: input.rest().to_vec(),
         })
@@ -2042,7 +2043,7 @@ mod tests {
             (
                 "encoded frame",
                 Event::EncodedFrame(EncodedFrame {
-                    key: true,
+                    kind: FrameKind::Key,
                     metadata: FrameMetadata {
                         generation: value(Generation::new(1)),
                         width: value(FrameDimension::new(1280)),

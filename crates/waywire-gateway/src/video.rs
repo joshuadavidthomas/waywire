@@ -18,7 +18,6 @@ use tokio::time::sleep_until;
 use tracing::debug;
 use tracing::warn;
 use waywire_protocol::browser::Continuity;
-use waywire_protocol::browser::FrameKind;
 use waywire_protocol::browser::Layout;
 use waywire_protocol::browser::MAX_VIDEO_DATA_BYTES;
 use waywire_protocol::browser::VideoSample;
@@ -457,11 +456,7 @@ impl VideoWorker {
                         outcome: CorrelationOutcome::Frames(vec![VideoSample {
                             data: frame.data.into(),
                             layout: Layout::Stripes,
-                            kind: if frame.key {
-                                FrameKind::Key
-                            } else {
-                                FrameKind::Delta
-                            },
+                            kind: frame.kind,
                             continuity: Continuity::Continuous,
                             metadata: frame.metadata,
                         }]),
@@ -533,6 +528,8 @@ impl VideoWorker {
 
 #[cfg(test)]
 mod tests {
+    use waywire_protocol::browser::FrameKind;
+
     use super::*;
     use crate::daemon::test_command_sink;
     use crate::daemon::test_stalled_command_sink;

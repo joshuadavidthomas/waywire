@@ -17,6 +17,7 @@ use calloop::ping::Ping;
 use calloop::ping::PingSource;
 use calloop::ping::make_ping;
 use tracing::error;
+use waywire_protocol::browser::FrameKind;
 use waywire_protocol::browser::push_stripe;
 use waywire_protocol::pipe::Chroma;
 use waywire_protocol::pipe::Crf;
@@ -347,21 +348,27 @@ fn run(
         let notification = match current.encode(key, pending.refresh, quantizers) {
             Ok(encoded) => {
                 let count = current.states.len();
-                let key = encoded.len() == count && encoded.iter().all(|stripe| stripe.key);
+                let kind = if encoded.len() == count
+                    && encoded.iter().all(|stripe| stripe.kind == FrameKind::Key)
+                {
+                    FrameKind::Key
+                } else {
+                    FrameKind::Delta
+                };
                 let mut data = Vec::with_capacity(encoded.iter().map(|s| s.data.len() + 16).sum());
                 for stripe in &encoded {
                     push_stripe(
                         &mut data,
                         u16::try_from(stripe.rows.start).unwrap_or(u16::MAX),
                         u16::try_from(stripe.rows.len()).unwrap_or(u16::MAX),
-                        stripe.key,
+                        stripe.kind,
                         &stripe.data,
                     );
                 }
                 let mut metadata = pending.metadata;
                 metadata.chroma = Chroma::Yuv420;
                 Ok(EncodedFrame {
-                    key,
+                    kind,
                     metadata,
                     data,
                 })
@@ -507,7 +514,7 @@ mod tests {
             assert!(Instant::now() < deadline, "no encoded frame");
             thread::sleep(Duration::from_millis(5));
         };
-        assert!(frame.key);
+        assert_eq!(frame.kind, FrameKind::Key);
         // One stripe: its row, its height, its key flag, its length, then its access unit.
         assert_eq!(&frame.data[..5], &[0, 0, 180, 0, 1]);
         let mut decoder = Decoder::new().expect("decoder");

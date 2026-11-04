@@ -45,6 +45,7 @@ use openh264::encoder::UsageType;
 use openh264::encoder::VuiConfig;
 use openh264::formats::YUVSlices;
 use rayon::prelude::*;
+use waywire_protocol::browser::FrameKind;
 use yuv::BufferStoreMut;
 use yuv::YuvConversionMode;
 use yuv::YuvPlanarImageMut;
@@ -253,7 +254,7 @@ impl StripeState {
 /// One stripe's encoded access unit.
 pub(crate) struct EncodedStripe {
     pub(crate) rows: Range<usize>,
-    pub(crate) key: bool,
+    pub(crate) kind: FrameKind,
     pub(crate) data: Vec<u8>,
 }
 
@@ -415,7 +416,11 @@ fn encode_stripe(
         .encoder
         .encode(&planes)
         .map_err(|error| format!("OpenH264 encode failed: {error}"))?;
-    let key = matches!(bitstream.frame_type(), FrameType::IDR);
+    let kind = if matches!(bitstream.frame_type(), FrameType::IDR) {
+        FrameKind::Key
+    } else {
+        FrameKind::Delta
+    };
     let data = bitstream.to_vec();
     if encoder.qp < quantizers.base {
         encoder.fine_bytes += data.len();
@@ -425,7 +430,7 @@ fn encode_stripe(
     }
     Ok(Some(EncodedStripe {
         rows: state.rows.clone(),
-        key,
+        kind,
         data,
     }))
 }
@@ -499,9 +504,9 @@ mod tests {
         let sent = stripes.encode(false, false, QUANTIZERS).expect("encode");
         assert_eq!(
             sent.iter()
-                .map(|stripe| (stripe.rows.clone(), stripe.key))
+                .map(|stripe| (stripe.rows.clone(), stripe.kind))
                 .collect::<Vec<_>>(),
-            [(0..HALF, true), (HALF..HEIGHT, true)]
+            [(0..HALF, FrameKind::Key), (HALF..HEIGHT, FrameKind::Key)]
         );
         for (decoder, stripe) in decoders.iter_mut().zip(&sent) {
             assert!(luma_error(decoder, stripe, &first) < 3.0);
@@ -513,7 +518,10 @@ mod tests {
         load(&mut stripes, &second);
         let sent = stripes.encode(false, false, QUANTIZERS).expect("encode");
         assert_eq!(sent.len(), 1, "an unchanged stripe was sent");
-        assert_eq!((sent[0].rows.clone(), sent[0].key), (HALF..HEIGHT, false));
+        assert_eq!(
+            (sent[0].rows.clone(), sent[0].kind),
+            (HALF..HEIGHT, FrameKind::Delta)
+        );
         assert!(luma_error(&mut decoders[1], &sent[0], &second) < 3.0);
 
         // A still screen refreshes one stripe a frame here, each once.
@@ -524,7 +532,11 @@ mod tests {
                     .expect("refresh")
                     .into_iter()
                     .map(|stripe| {
-                        assert!(stripe.key, "a refresh moves the quantizer by a key frame");
+                        assert_eq!(
+                            stripe.kind,
+                            FrameKind::Key,
+                            "a refresh moves the quantizer by a key frame"
+                        );
                         let decoder = &mut decoders[stripe.rows.start / HALF];
                         assert!(luma_error(decoder, &stripe, &second) < 1.5);
                         stripe.rows.start

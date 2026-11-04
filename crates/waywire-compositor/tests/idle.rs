@@ -19,6 +19,7 @@ use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use waywire_protocol::Decoder;
 use waywire_protocol::Record;
+use waywire_protocol::browser::FrameKind;
 use waywire_protocol::pipe::Button;
 use waywire_protocol::pipe::ButtonState;
 use waywire_protocol::pipe::Command;
@@ -310,7 +311,7 @@ fn in_process_encoder_starts_with_a_key_frame_whose_stripes_tile_the_output() {
         assert!(Instant::now() < deadline, "first frame deadline");
         thread::sleep(Duration::from_millis(10));
     };
-    assert!(frame.key, "first frame is not a key frame");
+    assert_eq!(frame.kind, FrameKind::Key, "first frame is not a key frame");
     assert_eq!(
         (frame.metadata.width.get(), frame.metadata.height.get()),
         (800, 600)

@@ -434,10 +434,13 @@ pub const STRIPE_HEADER_BYTES: usize = 9;
 /// stripes of the frame, each its own H.264 stream: the stripe's top row and height
 /// (u16 LE each), flags (u8, bit 0 set for a key frame), the access unit's length
 /// (u32 LE), then the Annex-B access unit.
-pub fn push_stripe(out: &mut Vec<u8>, y: u16, height: u16, key: bool, unit: &[u8]) {
+pub fn push_stripe(out: &mut Vec<u8>, y: u16, height: u16, kind: FrameKind, unit: &[u8]) {
     out.extend_from_slice(&y.to_le_bytes());
     out.extend_from_slice(&height.to_le_bytes());
-    out.push(u8::from(key));
+    out.push(match kind {
+        FrameKind::Delta => 0,
+        FrameKind::Key => 1,
+    });
     out.extend_from_slice(&u32::try_from(unit.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(unit);
 }
@@ -949,7 +952,7 @@ mod tests {
     #[test]
     fn stripe_header_is_exact() {
         let mut out = Vec::new();
-        push_stripe(&mut out, 90, 180, true, &[0, 0, 0, 1, 0x65]);
+        push_stripe(&mut out, 90, 180, FrameKind::Key, &[0, 0, 0, 1, 0x65]);
         assert_eq!(out, [90, 0, 180, 0, 1, 5, 0, 0, 0, 0, 0, 0, 1, 0x65]);
         assert_eq!(out.len() - 5, STRIPE_HEADER_BYTES);
     }
