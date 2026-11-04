@@ -214,22 +214,20 @@ pub(crate) fn serve_connection(
 
 /// The EI seats of connected senders, by connection.
 #[derive(Default)]
-pub(crate) struct EisSeats {
-    seats: HashMap<KeyboardSource, EiInputSeat>,
-}
+pub(crate) struct EisSeats(HashMap<KeyboardSource, EiInputSeat>);
 
 impl EisSeats {
     fn insert(&mut self, connection: KeyboardSource, seat: EiInputSeat) {
-        self.seats.insert(connection, seat);
+        self.0.insert(connection, seat);
     }
 
     fn remove(&mut self, connection: KeyboardSource) {
-        self.seats.remove(&connection);
+        self.0.remove(&connection);
     }
 
     /// Advertise new absolute-pointer regions on every seat.
     fn update_regions(&self, regions: &[EiRegion]) {
-        for seat in self.seats.values() {
+        for seat in self.0.values() {
             seat.update_regions(regions);
         }
     }

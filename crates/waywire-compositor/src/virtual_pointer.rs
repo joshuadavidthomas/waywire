@@ -39,27 +39,25 @@ pub(crate) fn install(display_handle: &DisplayHandle) {
 
 /// Virtual pointers connected now, each its own input source.
 #[derive(Default)]
-pub(crate) struct VirtualPointers {
-    sources: HashMap<VirtualPointerDevice, KeyboardSource>,
-}
+pub(crate) struct VirtualPointers(HashMap<VirtualPointerDevice, KeyboardSource>);
 
 impl VirtualPointers {
     /// A new device gets its own source, so its held buttons are tracked and
     /// released independently of other input sources.
     fn add(&mut self, device: VirtualPointerDevice) -> KeyboardSource {
         let source = KeyboardSource::new_auxiliary();
-        self.sources.insert(device, source);
+        self.0.insert(device, source);
         source
     }
 
     fn remove(&mut self, device: &VirtualPointerDevice) -> Option<KeyboardSource> {
-        self.sources.remove(device)
+        self.0.remove(device)
     }
 
     /// The device's source, created for an event from a device never added.
     fn source(&mut self, device: VirtualPointerDevice) -> KeyboardSource {
         *self
-            .sources
+            .0
             .entry(device)
             .or_insert_with(KeyboardSource::new_auxiliary)
     }

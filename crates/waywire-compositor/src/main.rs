@@ -123,18 +123,18 @@ fn main() -> Result<()> {
         .init();
 
     let options = Options::parse();
-    waywire_compositor::run(Config {
-        ffmpeg: options.ffmpeg,
-        encoder: options.encoder,
-        stripes: options.stripes,
-        frame_rate: options.frame_rate,
-        bitrate: options.bitrate,
-        rtp_port: options.rtp_port,
-        xkb_layout: options.xkb_layout,
-        resolution: options.resolution,
-        pins: options.pin.into_iter().map(|pin| pin.0).collect(),
-        session: options.session,
-    })
+    waywire_compositor::run(Config::new(
+        options.ffmpeg,
+        options.encoder,
+        options.stripes,
+        options.frame_rate,
+        options.bitrate,
+        options.rtp_port,
+        options.xkb_layout,
+        options.resolution,
+        options.pin.into_iter().map(|pin| pin.0).collect(),
+        options.session,
+    ))
 }
 
 #[cfg(test)]

@@ -122,18 +122,51 @@ use crate::input::PointerMotionKind;
 /// Startup settings for the compositor and its initial video stream.
 #[derive(Debug)]
 pub struct Config {
-    pub ffmpeg: String,
-    pub encoder: EncoderChoice,
+    ffmpeg: String,
+    encoder: EncoderChoice,
     /// Horizontal stripes for the in-process encoder; 0 picks one a core.
-    pub stripes: usize,
-    pub frame_rate: Fps,
-    pub bitrate: Kbps,
-    pub rtp_port: u16,
-    pub xkb_layout: String,
-    pub resolution: FrameSize,
-    pub pins: Vec<Vec<String>>,
+    stripes: usize,
+    frame_rate: Fps,
+    bitrate: Kbps,
+    rtp_port: u16,
+    xkb_layout: String,
+    resolution: FrameSize,
+    pins: Vec<Vec<String>>,
     /// Application argv. When empty, `WAYWIRE_SESSION` names one executable.
-    pub session: Vec<OsString>,
+    session: Vec<OsString>,
+}
+
+impl Config {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "startup options are assembled once by the CLI"
+    )]
+    #[must_use]
+    pub fn new(
+        ffmpeg: String,
+        encoder: EncoderChoice,
+        stripes: usize,
+        frame_rate: Fps,
+        bitrate: Kbps,
+        rtp_port: u16,
+        xkb_layout: String,
+        resolution: FrameSize,
+        pins: Vec<Vec<String>>,
+        session: Vec<OsString>,
+    ) -> Self {
+        Self {
+            ffmpeg,
+            encoder,
+            stripes,
+            frame_rate,
+            bitrate,
+            rtp_port,
+            xkb_layout,
+            resolution,
+            pins,
+            session,
+        }
+    }
 }
 
 /// Which H.264 encoder produces the stream.
@@ -156,35 +189,35 @@ pub(crate) enum FrameRequest {
     reason = "Smithay protocol state names match their handler methods"
 )]
 pub(crate) struct State {
-    pub(crate) display_handle: DisplayHandle,
-    pub(crate) space: Space<Window>,
-    pub(crate) seat: Seat<Self>,
-    pub(crate) output: Output,
-    pub(crate) compositor_state: CompositorState,
-    pub(crate) surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-    pub(crate) cursor: cursor::Cursor,
-    pub(crate) shm_state: ShmState,
-    pub(crate) xdg_shell_state: XdgShellState,
-    pub(crate) seat_state: SeatState<Self>,
-    pub(crate) data_device_state: DataDeviceState,
-    pub(crate) drag: Option<dnd::Drag>,
-    pub(crate) activation: activation::Activation,
-    pub(crate) popups: PopupManager,
+    display_handle: DisplayHandle,
+    space: Space<Window>,
+    seat: Seat<Self>,
+    output: Output,
+    compositor_state: CompositorState,
+    surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    cursor: cursor::Cursor,
+    shm_state: ShmState,
+    xdg_shell_state: XdgShellState,
+    seat_state: SeatState<Self>,
+    data_device_state: DataDeviceState,
+    drag: Option<dnd::Drag>,
+    activation: activation::Activation,
+    popups: PopupManager,
     /// The popup grab holding the pointer, kept to see when it ends.
     popup_grab: Option<PopupGrab<State>>,
-    pub(crate) xwayland: xwayland::XWayland,
-    pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
-    pub(crate) eis_seats: eis::EisSeats,
-    pub(crate) virtual_pointers: virtual_pointer::VirtualPointers,
-    pub(crate) virtual_keyboards: virtual_keyboard::VirtualKeyboards,
+    xwayland: xwayland::XWayland,
+    xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+    eis_seats: eis::EisSeats,
+    virtual_pointers: virtual_pointer::VirtualPointers,
+    virtual_keyboards: virtual_keyboard::VirtualKeyboards,
     text_keyboard: text_keyboard::TextKeyboard,
     capture: capture::Capture,
     screencopy: screencopy::Screencopy,
     /// `ScreenCast` portal video, present while the private `PipeWire`
     /// daemon is reachable.
     screencast: Option<waywire_pipewire::Streams>,
-    pub(crate) toplevel_list: toplevel_list::ToplevelList,
-    pub(crate) delivery: delivery::Delivery,
+    toplevel_list: toplevel_list::ToplevelList,
+    delivery: delivery::Delivery,
     clipboard: clipboard::Clipboard,
     windows: wm::Windows,
     loop_handle: Option<calloop::LoopHandle<'static, State>>,

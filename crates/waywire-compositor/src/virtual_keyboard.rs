@@ -130,7 +130,8 @@ fn translate_mods(mask: u32, from: &xkb::Keymap, to: &xkb::Keymap) -> u32 {
 fn client_state(device: &VirtualKeyboardDevice) -> Option<xkb::State> {
     let keymap = device.keymap()?;
     let mut text = Vec::new();
-    let read = keymap.with_fd(false, |fd, size| {
+    let supports_sealed_keymap = false;
+    let read = keymap.with_fd(supports_sealed_keymap, |fd, size| {
         text.resize(size, 0);
         if let Err(error) = fd
             .try_clone_to_owned()
@@ -160,15 +161,11 @@ fn client_state(device: &VirtualKeyboardDevice) -> Option<xkb::State> {
 
 /// Virtual keyboards connected now.
 #[derive(Default)]
-pub(crate) struct VirtualKeyboards {
-    devices: Vec<VirtualKeyboard>,
-}
+pub(crate) struct VirtualKeyboards(Vec<VirtualKeyboard>);
 
 impl VirtualKeyboards {
     fn get_mut(&mut self, device: &VirtualKeyboardDevice) -> Option<&mut VirtualKeyboard> {
-        self.devices
-            .iter_mut()
-            .find(|known| known.device == *device)
+        self.0.iter_mut().find(|known| known.device == *device)
     }
 
     /// Track a new device. Its keys are dropped when it uploaded a keymap
@@ -178,7 +175,7 @@ impl VirtualKeyboards {
         if device.keymap().is_some() && client.is_none() {
             tracing::warn!("virtual keyboard keymap does not compile; its keys are dropped");
         }
-        self.devices.push(VirtualKeyboard {
+        self.0.push(VirtualKeyboard {
             device,
             client,
             held: HashMap::new(),
@@ -195,17 +192,11 @@ impl VirtualKeyboards {
         }
     }
 
-    /// Stop tracking the device. Returns whether it had set seat modifiers,
-    /// which no key release will clear.
-    fn remove(&mut self, device: &VirtualKeyboardDevice) -> bool {
-        let Some(index) = self
-            .devices
-            .iter()
-            .position(|known| known.device == *device)
-        else {
-            return false;
-        };
-        self.devices.remove(index).modifiers != [0; 3]
+    /// Stop tracking the device, returning the modifiers its key releases
+    /// will not clear.
+    fn remove(&mut self, device: &VirtualKeyboardDevice) -> Option<VirtualKeyboard> {
+        let index = self.0.iter().position(|known| known.device == *device)?;
+        Some(self.0.remove(index))
     }
 }
 
@@ -229,7 +220,12 @@ impl State {
     /// set, which no key release will clear.
     fn remove_virtual_keyboard(&mut self, device: &VirtualKeyboardDevice) {
         self.disconnect_input_source(device.source());
-        if self.virtual_keyboards.remove(device) && !self.input.browser_holds_input() {
+        if self
+            .virtual_keyboards
+            .remove(device)
+            .is_some_and(|keyboard| keyboard.modifiers != [0; 3])
+            && !self.input.browser_holds_input()
+        {
             self.set_seat_modifiers([0; 3]);
         }
     }
