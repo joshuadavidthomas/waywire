@@ -26,6 +26,7 @@ use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::Kbps;
 
+use self::encoder::Coding;
 use self::encoder::Quantizers;
 use self::encoder::Stripes;
 use crate::video::VideoError;
@@ -61,12 +62,21 @@ struct Pending {
     metadata: FrameMetadata,
     crf: Crf,
     bitrate: Kbps,
-    refresh: bool,
+    cause: FrameCause,
 }
 
 struct Shared {
     staging: Mutex<Staging>,
     work: Condvar,
+}
+
+/// Why the compositor submitted a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameCause {
+    /// Newly rendered damage.
+    Damage,
+    /// The screen held still: refresh stripes at the finer quantizer.
+    StillRefresh,
 }
 
 /// A frame for the in-process encoder: the output's BGRA pixels and the row spans
@@ -82,8 +92,7 @@ pub struct StripedFrame<'a> {
     pub crf: Crf,
     /// The bitrate target the stripes share.
     pub bitrate: Kbps,
-    /// The screen held still: refresh stripes at the finer quantizer.
-    pub refresh: bool,
+    pub cause: FrameCause,
 }
 
 pub struct StripedEncoder {
@@ -212,7 +221,7 @@ impl StripedEncoder {
             metadata: frame.metadata.clone(),
             crf: frame.crf,
             bitrate: frame.bitrate,
-            refresh: frame.refresh,
+            cause: frame.cause,
         });
         self.shared.work.notify_one();
         Ok(())
@@ -345,7 +354,13 @@ fn run(
             base,
             refresh: REFRESH_QP.min(base),
         };
-        let notification = match current.encode(key, pending.refresh, quantizers) {
+        // A requested key frame codes every stripe, so it takes the place of a refresh.
+        let coding = match (key, pending.cause) {
+            (true, _) => Coding::Key,
+            (false, FrameCause::Damage) => Coding::Changes,
+            (false, FrameCause::StillRefresh) => Coding::Refresh,
+        };
+        let notification = match current.encode(coding, quantizers) {
             Ok(encoded) => {
                 let count = current.states.len();
                 let kind = if encoded.len() == count
@@ -503,7 +518,7 @@ mod tests {
                 },
                 crf: Crf::new(27).expect("crf"),
                 bitrate: Kbps::new(12_000).expect("bitrate"),
-                refresh: false,
+                cause: FrameCause::Damage,
             })
             .expect("submit");
         let deadline = Instant::now() + Duration::from_secs(10);

@@ -31,6 +31,7 @@ use smithay::utils::Rectangle;
 use smithay::wayland::text_input::TextInputSeat;
 use waywire_encoder::latency;
 use waywire_encoder::striped;
+use waywire_encoder::striped::FrameCause;
 use waywire_encoder::striped::StripedEncoder;
 use waywire_encoder::striped::StripedFrame;
 use waywire_encoder::video;
@@ -346,7 +347,7 @@ impl Stream {
             return Ok(false);
         }
         latency::trace_frame("render", self.sequence, render_started_ns);
-        self.submit(image, size, damage, false)?;
+        self.submit(image, size, damage, FrameCause::Damage)?;
         self.refresh = Refresh::Due {
             at: Instant::now() + REFRESH_DELAY,
             left: self.video.as_ref().map_or(0, Video::refresh_frames),
@@ -375,7 +376,7 @@ impl Stream {
         if now < at {
             return Ok(());
         }
-        self.submit(image, size, &[], true)?;
+        self.submit(image, size, &[], FrameCause::StillRefresh)?;
         self.refresh = match left.checked_sub(1) {
             Some(left @ 1..) => Refresh::Due {
                 at: now + Duration::from_secs_f64(1.0 / f64::from(self.quality.fps.get())),
@@ -391,7 +392,7 @@ impl Stream {
         image: &Image<'static, 'static>,
         size: FrameSize,
         damage: &[Rectangle<i32, Physical>],
-        refresh: bool,
+        cause: FrameCause,
     ) -> Result<()> {
         let (width, height) = encoded_dimensions(
             size.width(),
@@ -443,7 +444,7 @@ impl Stream {
                     metadata,
                     crf: self.quality.crf,
                     bitrate: self.quality.bitrate_kbps,
-                    refresh,
+                    cause,
                 })?;
             }
             None => {}

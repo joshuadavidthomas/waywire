@@ -137,6 +137,41 @@ pub(crate) fn convert_rows(
     )
 }
 
+/// How a frame, or one stripe of it, is coded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Coding {
+    /// Send what changed since the last frame.
+    Changes,
+    /// Send as a key frame.
+    Key,
+    /// For a frame: the screen holds still, so refresh a staggered share of the
+    /// stripes that changed since their last refresh. For a stripe: code it again at
+    /// the refresh quantizer.
+    Refresh,
+}
+
+/// Whether a stripe was refreshed since its content last changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshDebt {
+    /// It changed after its last refresh.
+    Owed,
+    /// Refreshed since it last changed, or unchanged since its encoder started.
+    Settled,
+}
+
+/// What `StripeEncoder::update_qp` did with a requested quantizer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QpUpdate {
+    /// The encoder already codes at it.
+    Unchanged,
+    /// A coarser quantizer waits out its hysteresis.
+    Deferred,
+    /// The encoder was rebuilt at it, so its next frame is a key frame.
+    Rebuilt,
+    /// `OpenH264` rejected the rebuild; the old session codes on at its old quantizer.
+    Failed,
+}
+
 /// One stripe's `OpenH264` session, kept across frames for inter prediction.
 struct StripeEncoder {
     encoder: Encoder,
@@ -145,6 +180,7 @@ struct StripeEncoder {
     /// Bytes coded since the quantizer last moved, while it was finer than asked for.
     fine_bytes: usize,
     fps: f32,
+    debt: RefreshDebt,
 }
 
 impl StripeEncoder {
@@ -155,6 +191,7 @@ impl StripeEncoder {
             hysteresis: 0,
             fine_bytes: 0,
             fps,
+            debt: RefreshDebt::Settled,
         })
     }
 
@@ -162,17 +199,17 @@ impl StripeEncoder {
     /// `OpenH264` applies a quantizer range only to a new session, so a move rebuilds the
     /// encoder and its next frame is a key frame. A finer quantizer applies at once; a
     /// coarser one only after `QP_HYSTERESIS_LIMIT` consecutive requests, or sooner once
-    /// the finer one has spent a second of `cap_bps`. True when it rebuilt.
-    fn update_qp(&mut self, qp: u8, cap_bps: Option<u32>) -> bool {
+    /// the finer one has spent a second of `cap_bps`.
+    fn update_qp(&mut self, qp: u8, cap_bps: Option<u32>) -> QpUpdate {
         if qp == self.qp {
             self.hysteresis = 0;
-            return false;
+            return QpUpdate::Unchanged;
         }
         if qp > self.qp {
             self.hysteresis += 1;
             let budget = cap_bps.map_or(usize::MAX, |bps| bps as usize / 8);
             if self.hysteresis <= QP_HYSTERESIS_LIMIT && self.fine_bytes <= budget {
-                return false;
+                return QpUpdate::Deferred;
             }
         }
         self.hysteresis = 0;
@@ -181,9 +218,9 @@ impl StripeEncoder {
             Some(encoder) => {
                 self.encoder = encoder;
                 self.qp = qp;
-                true
+                QpUpdate::Rebuilt
             }
-            None => false,
+            None => QpUpdate::Failed,
         }
     }
 }
@@ -213,8 +250,8 @@ fn build_encoder(qp: u8, fps: f32, cap_bps: Option<u32>) -> Option<Encoder> {
     Encoder::with_api_config(OpenH264API::from_source(), config).ok()
 }
 
-/// Everything one stripe keeps between frames: its planes, its encoder, the hash of
-/// the content it last encoded, and whether it was refreshed since it last changed.
+/// Everything one stripe keeps between frames: its planes, its encoder, and the hash
+/// of the content it last encoded.
 pub(crate) struct StripeState {
     pub(crate) rows: Range<usize>,
     pub(crate) y: Vec<u8>,
@@ -224,7 +261,6 @@ pub(crate) struct StripeState {
     pub(crate) dirty: bool,
     encoder: Option<StripeEncoder>,
     last_hash: u64,
-    clean: bool,
 }
 
 impl StripeState {
@@ -238,7 +274,6 @@ impl StripeState {
             dirty: true,
             encoder: None,
             last_hash: 0,
-            clean: true,
         }
     }
 
@@ -303,55 +338,57 @@ impl Stripes {
         self.bitrate_bps = bitrate_bps;
         for state in &mut self.states {
             state.encoder = None;
-            state.clean = true;
             state.dirty = true;
         }
     }
 
     /// Encode the stripes this frame needs, in parallel, top to bottom.
     ///
-    /// A damaged stripe is sent when its content hash changed. With `key` every stripe
-    /// is sent as a key frame. With `refresh` (the screen holds still) up to a
-    /// staggered share of the stripes that changed since their last refresh are coded
-    /// again as a key frame at the refresh quantizer, and stay there until they change.
+    /// A damaged stripe is sent when its content hash changed. With `Coding::Key` every
+    /// stripe is sent as a key frame. With `Coding::Refresh` (the screen holds still) up
+    /// to a staggered share of the stripes that changed since their last refresh are
+    /// coded again as a key frame at the refresh quantizer, and stay there until they
+    /// change.
     pub(crate) fn encode(
         &mut self,
-        key: bool,
-        refresh: bool,
+        coding: Coding,
         quantizers: Quantizers,
     ) -> Result<Vec<EncodedStripe>, String> {
         let per_frame = self.states.len().div_ceil(CLEANUP_STAGGER_FRAMES);
         let mut granted = 0;
-        let refreshing: Vec<bool> = self
+        let codings: Vec<Coding> = self
             .states
             .iter()
-            .map(|state| {
-                let due = refresh
-                    && !key
-                    && !state.dirty
-                    && !state.clean
-                    && state.encoder.is_some()
-                    && granted < per_frame;
-                granted += usize::from(due);
-                due
+            .map(|state| match coding {
+                Coding::Changes | Coding::Key => coding,
+                Coding::Refresh => {
+                    let due = !state.dirty
+                        && state
+                            .encoder
+                            .as_ref()
+                            .is_some_and(|encoder| encoder.debt == RefreshDebt::Owed)
+                        && granted < per_frame;
+                    granted += usize::from(due);
+                    if due {
+                        Coding::Refresh
+                    } else {
+                        Coding::Changes
+                    }
+                }
             })
             .collect();
         let width = self.width;
         let fps = self.fps;
         let (height, bitrate) = (self.height as u64, u64::from(self.bitrate_bps));
-        let body = |(state, refreshing): (&mut StripeState, bool)| {
+        let body = |(state, coding): (&mut StripeState, Coding)| {
             let share = bitrate * state.rows.len() as u64 / height;
             let cap_bps = u32::try_from(share).unwrap_or(u32::MAX).max(1);
-            encode_stripe(state, width, fps, key, refreshing, quantizers, cap_bps)
+            encode_stripe(state, width, fps, coding, quantizers, cap_bps)
         };
         let results: Vec<Result<Option<EncodedStripe>, String>> = if self.states.len() > 1 {
-            self.states
-                .par_iter_mut()
-                .zip(refreshing)
-                .map(body)
-                .collect()
+            self.states.par_iter_mut().zip(codings).map(body).collect()
         } else {
-            self.states.iter_mut().zip(refreshing).map(body).collect()
+            self.states.iter_mut().zip(codings).map(body).collect()
         };
         results.into_iter().filter_map(Result::transpose).collect()
     }
@@ -361,8 +398,7 @@ fn encode_stripe(
     state: &mut StripeState,
     width: usize,
     fps: f32,
-    key: bool,
-    refreshing: bool,
+    coding: Coding,
     quantizers: Quantizers,
     cap_bps: u32,
 ) -> Result<Option<EncodedStripe>, String> {
@@ -373,10 +409,10 @@ fn encode_stripe(
         changed = hash != state.last_hash || state.encoder.is_none();
         state.last_hash = hash;
     }
-    if !(changed || key || refreshing) {
+    if !changed && coding == Coding::Changes {
         return Ok(None);
     }
-    let mut force_key = key;
+    let mut force_key = coding == Coding::Key;
     match state.encoder.as_mut() {
         None => {
             state.encoder = Some(
@@ -386,23 +422,25 @@ fn encode_stripe(
             );
             force_key = true;
         }
-        Some(encoder) if refreshing => {
-            force_key |= encoder.update_qp(quantizers.refresh, None);
+        // A failed rebuild codes on with the old session, as if the quantizer had not
+        // moved.
+        Some(encoder) if coding == Coding::Refresh => {
+            force_key |= encoder.update_qp(quantizers.refresh, None) == QpUpdate::Rebuilt;
         }
         Some(encoder) if changed => {
-            force_key |= encoder.update_qp(quantizers.base, Some(cap_bps));
+            force_key |= encoder.update_qp(quantizers.base, Some(cap_bps)) == QpUpdate::Rebuilt;
         }
         Some(_) => {}
-    }
-    if changed {
-        state.clean = false;
-    }
-    if refreshing {
-        state.clean = true;
     }
     let Some(encoder) = state.encoder.as_mut() else {
         return Ok(None);
     };
+    if changed {
+        encoder.debt = RefreshDebt::Owed;
+    }
+    if coding == Coding::Refresh {
+        encoder.debt = RefreshDebt::Settled;
+    }
     if force_key {
         encoder.encoder.force_intra_frame();
     }
@@ -501,7 +539,7 @@ mod tests {
         ];
         let first = picture(0);
         load(&mut stripes, &first);
-        let sent = stripes.encode(false, false, QUANTIZERS).expect("encode");
+        let sent = stripes.encode(Coding::Changes, QUANTIZERS).expect("encode");
         assert_eq!(
             sent.iter()
                 .map(|stripe| (stripe.rows.clone(), stripe.kind))
@@ -516,7 +554,7 @@ mod tests {
         let mut second = first.clone();
         second[HALF * WIDTH..].copy_from_slice(&picture(5)[HALF * WIDTH..]);
         load(&mut stripes, &second);
-        let sent = stripes.encode(false, false, QUANTIZERS).expect("encode");
+        let sent = stripes.encode(Coding::Changes, QUANTIZERS).expect("encode");
         assert_eq!(sent.len(), 1, "an unchanged stripe was sent");
         assert_eq!(
             (sent[0].rows.clone(), sent[0].kind),
@@ -528,7 +566,7 @@ mod tests {
         let refreshed: Vec<Vec<usize>> = (0..3)
             .map(|_| {
                 stripes
-                    .encode(false, true, QUANTIZERS)
+                    .encode(Coding::Refresh, QUANTIZERS)
                     .expect("refresh")
                     .into_iter()
                     .map(|stripe| {
@@ -561,7 +599,7 @@ mod tests {
                         })
                         .collect();
                     load(&mut stripes, &noise);
-                    let sent = stripes.encode(false, false, QUANTIZERS).expect("encode");
+                    let sent = stripes.encode(Coding::Changes, QUANTIZERS).expect("encode");
                     sent.iter().map(|stripe| stripe.data.len()).sum::<usize>()
                 })
                 .sum::<usize>()
