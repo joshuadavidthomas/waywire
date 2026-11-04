@@ -26,7 +26,7 @@ pub(crate) enum EventWriterError {
     #[error("stdout event queue is full")]
     QueueFull,
     #[error("stdout event writer failed: {0}")]
-    Write(String),
+    Write(#[source] Arc<io::Error>),
     #[error("stdout event writer stopped")]
     Stopped,
 }
@@ -70,8 +70,13 @@ struct QueuedEvent {
 struct Queue {
     records: VecDeque<QueuedEvent>,
     bytes: usize,
-    stopping: bool,
-    failure: Option<String>,
+    state: WriterState,
+}
+
+enum WriterState {
+    Running,
+    Stopping,
+    Failed(Arc<io::Error>),
 }
 
 struct Shared {
@@ -80,9 +85,7 @@ struct Shared {
 }
 
 #[derive(Clone)]
-pub(crate) struct EventSink {
-    shared: Arc<Shared>,
-}
+pub(crate) struct EventSink(Arc<Shared>);
 
 pub(crate) struct EventWriter {
     shared: Arc<Shared>,
@@ -95,8 +98,7 @@ impl EventWriter {
             queue: Mutex::new(Queue {
                 records: VecDeque::new(),
                 bytes: 0,
-                stopping: false,
-                failure: None,
+                state: WriterState::Running,
             }),
             ready: Condvar::new(),
         });
@@ -109,18 +111,20 @@ impl EventWriter {
                 shared: Arc::clone(&shared),
                 thread: Some(thread),
             },
-            EventSink { shared },
+            EventSink(shared),
         ))
     }
 
     pub(crate) fn failure(&self) -> Option<EventWriterError> {
-        self.shared
+        let queue = self
+            .shared
             .queue
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .failure
-            .clone()
-            .map(EventWriterError::Write)
+            .unwrap_or_else(PoisonError::into_inner);
+        match &queue.state {
+            WriterState::Failed(error) => Some(EventWriterError::Write(Arc::clone(error))),
+            WriterState::Running | WriterState::Stopping => None,
+        }
     }
 
     pub(crate) fn stop(mut self) {
@@ -134,7 +138,9 @@ impl EventWriter {
                 .queue
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            queue.stopping = true;
+            if matches!(queue.state, WriterState::Running) {
+                queue.state = WriterState::Stopping;
+            }
             self.shared.ready.notify_one();
         }
         if let Some(thread) = self.thread.take()
@@ -158,16 +164,11 @@ impl EventSink {
     pub(crate) fn send(&self, event: &Event) -> Result<(), EventWriterError> {
         let replacement = Replacement::for_event(event);
         let bytes = event.encode();
-        let mut queue = self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(failure) = &queue.failure {
-            return Err(EventWriterError::Write(failure.clone()));
-        }
-        if queue.stopping {
-            return Err(EventWriterError::Stopped);
+        let mut queue = self.0.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        match &queue.state {
+            WriterState::Failed(error) => return Err(EventWriterError::Write(Arc::clone(error))),
+            WriterState::Stopping => return Err(EventWriterError::Stopped),
+            WriterState::Running => {}
         }
 
         if matches!(event, Event::CursorClick(_))
@@ -209,7 +210,7 @@ impl EventSink {
         }
         queue.bytes += bytes.len();
         queue.records.push_back(QueuedEvent { bytes, replacement });
-        self.shared.ready.notify_one();
+        self.0.ready.notify_one();
         Ok(())
     }
 }
@@ -223,7 +224,7 @@ fn writer_main(shared: &Shared) {
                 .queue
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .failure = Some(error.to_string());
+                .state = WriterState::Failed(Arc::new(error.into()));
             return;
         }
     } else {
@@ -231,14 +232,14 @@ fn writer_main(shared: &Shared) {
             .queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .failure = Some("could not read stdout flags".into());
+            .state = WriterState::Failed(Arc::new(io::Error::other("could not read stdout flags")));
         return;
     }
     let mut output = stdout.lock();
     loop {
         let record = {
             let mut queue = shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            while queue.records.is_empty() && !queue.stopping {
+            while queue.records.is_empty() && matches!(queue.state, WriterState::Running) {
                 queue = shared
                     .ready
                     .wait(queue)
@@ -254,7 +255,7 @@ fn writer_main(shared: &Shared) {
         };
         if let Err(error) = write_with_deadline(&mut output, &record) {
             let mut queue = shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            queue.failure = Some(error.to_string());
+            queue.state = WriterState::Failed(Arc::new(error));
             queue.records.clear();
             queue.bytes = 0;
             return;
@@ -297,21 +298,18 @@ fn write_with_deadline(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> 
 #[cfg(test)]
 impl EventSink {
     pub(crate) fn for_test() -> Self {
-        Self {
-            shared: Arc::new(Shared {
-                queue: Mutex::new(Queue {
-                    records: VecDeque::new(),
-                    bytes: 0,
-                    stopping: false,
-                    failure: None,
-                }),
-                ready: Condvar::new(),
+        Self(Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                records: VecDeque::new(),
+                bytes: 0,
+                state: WriterState::Running,
             }),
-        }
+            ready: Condvar::new(),
+        }))
     }
 
     pub(crate) fn take_events(&self) -> Vec<Event> {
-        let mut queue = self.shared.queue.lock().expect("test event queue");
+        let mut queue = self.0.queue.lock().expect("test event queue");
         queue.bytes = 0;
         queue
             .records
@@ -337,9 +335,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_error_retains_its_source() {
+        let error = EventWriterError::Write(Arc::new(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "pipe closed",
+        )));
+        let source = std::error::Error::source(&error).expect("write error has a source");
+        assert_eq!(source.to_string(), "pipe closed");
+    }
+
+    #[test]
     fn replaceable_cursor_does_not_discard_required_metadata() {
         let sink = EventSink::for_test();
-        let shared = Arc::clone(&sink.shared);
+        let shared = Arc::clone(&sink.0);
         sink.send(&Event::Frame(FrameMetadata::new(
             Generation::new(1).expect("test generation should be valid"),
             FrameDimension::new(2).expect("test frame width should be valid"),
@@ -390,7 +398,7 @@ mod tests {
             .expect("new cursor position should replace old position");
 
         let queue = sink
-            .shared
+            .0
             .queue
             .lock()
             .expect("queue lock should not be poisoned");
@@ -431,7 +439,7 @@ mod tests {
     #[test]
     fn clipboard_updates_replace_only_the_latest_queued_event() {
         let sink = EventSink::for_test();
-        let shared = Arc::clone(&sink.shared);
+        let shared = Arc::clone(&sink.0);
         sink.send(&clipboard("first"))
             .expect("first clipboard should queue");
         sink.send(&Event::Frame(FrameMetadata::new(
@@ -490,7 +498,7 @@ mod tests {
     #[test]
     fn queued_clipboards_stay_within_the_byte_budget() {
         let sink = EventSink::for_test();
-        let shared = Arc::clone(&sink.shared);
+        let shared = Arc::clone(&sink.0);
         let clipboard_bytes = MAX_CLIPBOARD_BYTES - 1;
         let text = "x".repeat(clipboard_bytes);
         for round in 0..6 {
