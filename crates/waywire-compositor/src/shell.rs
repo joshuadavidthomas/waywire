@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
@@ -58,7 +58,7 @@ use super::State;
 pub(crate) struct ClientState {
     pub(crate) compositor_state: CompositorClientState,
     /// The compositor's own flag for "a client left"; see `Clipboard::client_left`.
-    client_left: Arc<AtomicBool>,
+    client_left: Arc<AtomicU8>,
 }
 
 impl ClientState {
@@ -85,7 +85,10 @@ impl Default for ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _: ClientId) {}
     fn disconnected(&self, _: ClientId, _: DisconnectReason) {
-        self.client_left.store(true, Ordering::Relaxed);
+        self.client_left.store(
+            crate::clipboard::ClientActivity::Disconnected as u8,
+            Ordering::Relaxed,
+        );
     }
 }
 

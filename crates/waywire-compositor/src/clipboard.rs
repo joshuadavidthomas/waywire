@@ -19,7 +19,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -72,15 +72,40 @@ pub(crate) enum SelectionData {
 
 /// The client owning a selection and the types it offers.
 #[derive(Default)]
-struct Owner {
-    types: Vec<String>,
-    wayland: bool,
+enum Owner {
+    #[default]
+    None,
+    Wayland(Vec<String>),
+    X11(Vec<String>),
+    Exited,
+}
+
+impl Owner {
+    fn types(&self) -> &[String] {
+        match self {
+            Self::Wayland(types) | Self::X11(types) => types,
+            Self::None | Self::Exited => &[],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Encoding {
+    Utf8,
+    Latin1,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum ClientActivity {
+    Unchanged,
+    Disconnected,
 }
 
 struct Read {
     fd: File,
     bytes: Vec<u8>,
-    latin1: bool,
+    encoding: Encoding,
     deadline: Instant,
     purpose: &'static str,
 }
@@ -108,17 +133,15 @@ pub(super) struct Clipboard {
     /// The viewer's read of the current clipboard selection.
     read: Option<Read>,
     /// Reads converted into another encoding for a requesting client.
-    conversions: Vec<(Read, OwnedFd, bool)>,
+    conversions: Vec<(Read, OwnedFd, Encoding)>,
     writes: Vec<Write>,
     /// Text of the current clipboard selection, kept after its owner exits.
     kept: Option<Arc<str>>,
-    /// The clipboard owner exited; keep its text once the read finishes.
-    orphaned: bool,
     /// Set when a Wayland client disconnects. Smithay drops a dead client's
     /// selection without calling `new_selection`, so the next tick checks.
     /// Each compositor owns its flag, so one compositor's tick never consumes
     /// another's disconnect.
-    client_left: Arc<AtomicBool>,
+    client_left: Arc<AtomicU8>,
 }
 
 /// How a client's request for a selection type is served.
@@ -156,13 +179,12 @@ impl Clipboard {
             conversions: Vec::new(),
             writes: Vec::new(),
             kept: None,
-            orphaned: false,
-            client_left: Arc::default(),
+            client_left: Arc::new(AtomicU8::new(ClientActivity::Unchanged as u8)),
         }
     }
 
     /// The flag each client sets when it disconnects.
-    pub(crate) fn client_left(&self) -> Arc<AtomicBool> {
+    pub(crate) fn client_left(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.client_left)
     }
 
@@ -177,18 +199,16 @@ impl Clipboard {
     pub(super) fn active(&self) -> bool {
         self.pending_offer.is_some()
             || self.read.is_some()
-            || self.orphaned
+            || matches!(self.owners[0], Owner::Exited)
             || !self.conversions.is_empty()
             || !self.writes.is_empty()
     }
 
     /// A client took `target`, offering `types`. A new clipboard owner is
     /// read for the viewer.
-    fn owned(&mut self, target: SelectionTarget, types: Vec<String>, wayland: bool) {
-        *self.owner(target) = Owner {
-            types: types.clone(),
-            wayland,
-        };
+    fn owned(&mut self, target: SelectionTarget, owner: Owner) {
+        let types = owner.types().to_vec();
+        *self.owner(target) = owner;
         if target == SelectionTarget::Clipboard {
             self.offer(types);
         }
@@ -198,31 +218,31 @@ impl Clipboard {
     fn own(&mut self, text: Arc<str>) {
         self.pending_offer = None;
         self.read = None;
-        self.orphaned = false;
         *self.owner(SelectionTarget::Clipboard) = Owner::default();
         self.kept = Some(text);
     }
 
     /// The owner of `target` is gone. The clipboard waits to keep its text.
-    /// Returns whether a Wayland client owned it.
-    fn orphan(&mut self, target: SelectionTarget) -> bool {
+    /// Returns the departed owner.
+    fn orphan(&mut self, target: SelectionTarget) -> Owner {
         let owner = std::mem::take(self.owner(target));
         if target == SelectionTarget::Clipboard {
-            self.orphaned = true;
+            *self.owner(target) = Owner::Exited;
         }
-        owner.wayland
+        owner
     }
 
     /// How to serve `mime` from the owner of `target`.
     fn transfer(&mut self, target: SelectionTarget, mime: &str) -> Transfer {
-        let types = &self.owner(target).types;
+        let types = self.owner(target).types();
         let source = TEXT
             .into_iter()
             .find(|text| types.iter().any(|t| t == text));
         // Wayland sources such as wl-copy offer `STRING` but write UTF-8 for
         // it, so produce ISO 8859-1 from a UTF-8 type whenever there is one.
         let native = types.iter().any(|t| t == mime)
-            && !(latin1(mime) && source.is_some_and(|s| !latin1(s)));
+            && !(encoding(mime) == Encoding::Latin1
+                && source.is_some_and(|s| encoding(s) == Encoding::Utf8));
         if native {
             Transfer::Native
         } else if let Some(source) = source
@@ -251,9 +271,9 @@ impl Clipboard {
     /// into `fd` in the encoding of `mime`.
     fn convert(&mut self, read: File, source: &str, mime: &str, fd: OwnedFd) {
         self.conversions.push((
-            Read::new(read, latin1(source), "type conversion"),
+            Read::new(read, encoding(source), "type conversion"),
             fd,
-            latin1(mime),
+            encoding(mime),
         ));
     }
 
@@ -262,7 +282,7 @@ impl Clipboard {
             tracing::debug!(mime, "compositor selection holds only text");
             return;
         }
-        self.queue_write(fd, encode(text, latin1(mime)));
+        self.queue_write(fd, encode(text, encoding(mime)));
     }
 
     fn queue_write(&mut self, fd: OwnedFd, bytes: Arc<[u8]>) {
@@ -291,7 +311,9 @@ impl Clipboard {
     pub(crate) fn offer(&mut self, types: Vec<String>) {
         self.read = None;
         self.kept = None;
-        self.orphaned = false;
+        if matches!(self.owners[0], Owner::Exited) {
+            self.owners[0] = Owner::None;
+        }
         // Smithay invokes new_selection before installing the seat's selection.
         // Defer the request until dispatch completes, replacing older pending offers.
         self.pending_offer = Some(types);
@@ -305,12 +327,14 @@ impl Clipboard {
 
     /// Read the viewer's copy of the clipboard, in `mime`, from `read`.
     fn begin_read(&mut self, read: File, mime: &str) {
-        self.read = Some(Read::new(read, latin1(mime), "viewer sync"));
+        self.read = Some(Read::new(read, encoding(mime), "viewer sync"));
     }
 
     /// Whether a client disconnected since the last call.
     fn take_client_left(&self) -> bool {
-        self.client_left.swap(false, Ordering::Relaxed)
+        self.client_left
+            .swap(ClientActivity::Unchanged as u8, Ordering::Relaxed)
+            == ClientActivity::Disconnected as u8
     }
 
     fn take_pending_offer(&mut self) -> Option<Vec<String>> {
@@ -348,7 +372,9 @@ impl Clipboard {
     /// Whether the exited owner's text is ready to keep: no offer or read
     /// is still in flight.
     fn ready_to_keep(&self) -> bool {
-        self.orphaned && self.pending_offer.is_none() && self.read.is_none()
+        matches!(self.owners[0], Owner::Exited)
+            && self.pending_offer.is_none()
+            && self.read.is_none()
     }
 
     /// The text to serve after the owner exited, or `None` to empty the
@@ -356,17 +382,17 @@ impl Clipboard {
     fn keep(&mut self) -> Option<Arc<str>> {
         let kept = self.kept.clone();
         if kept.is_none() {
-            self.orphaned = false;
+            self.owners[0] = Owner::None;
         }
         kept
     }
 
     /// Advance conversions and writes.
     fn pump(&mut self) {
-        for (mut read, fd, latin1) in std::mem::take(&mut self.conversions) {
+        for (mut read, fd, encoding) in std::mem::take(&mut self.conversions) {
             match read.poll() {
-                Progress::Pending => self.conversions.push((read, fd, latin1)),
-                Progress::Done(text) => self.queue_write(fd, encode(&text, latin1)),
+                Progress::Pending => self.conversions.push((read, fd, encoding)),
+                Progress::Done(text) => self.queue_write(fd, encode(&text, encoding)),
                 Progress::Failed => {}
             }
         }
@@ -396,12 +422,16 @@ impl Clipboard {
 }
 
 /// X11 `STRING` is ISO 8859-1; every other text type is UTF-8.
-fn latin1(mime: &str) -> bool {
-    mime == "STRING"
+fn encoding(mime: &str) -> Encoding {
+    if mime == "STRING" {
+        Encoding::Latin1
+    } else {
+        Encoding::Utf8
+    }
 }
 
-fn decode(bytes: Vec<u8>, latin1: bool) -> String {
-    if latin1 {
+fn decode(bytes: Vec<u8>, encoding: Encoding) -> String {
+    if encoding == Encoding::Latin1 {
         return bytes.into_iter().map(char::from).collect();
     }
     String::from_utf8(bytes).unwrap_or_else(|error| {
@@ -410,8 +440,8 @@ fn decode(bytes: Vec<u8>, latin1: bool) -> String {
     })
 }
 
-fn encode(text: &str, latin1: bool) -> Arc<[u8]> {
-    if latin1 {
+fn encode(text: &str, encoding: Encoding) -> Arc<[u8]> {
+    if encoding == Encoding::Latin1 {
         text.chars()
             .map(|c| u8::try_from(c).unwrap_or(b'?'))
             .collect()
@@ -444,11 +474,11 @@ fn nonblocking_pipe() -> anyhow::Result<(File, OwnedFd)> {
 }
 
 impl Read {
-    fn new(fd: File, latin1: bool, purpose: &'static str) -> Self {
+    fn new(fd: File, encoding: Encoding, purpose: &'static str) -> Self {
         Self {
             fd,
             bytes: Vec::new(),
-            latin1,
+            encoding,
             deadline: Instant::now() + TIMEOUT,
             purpose,
         }
@@ -467,7 +497,7 @@ impl Read {
         }
         let mut part = vec![0; 65536];
         match self.fd.read(&mut part) {
-            Ok(0) => Progress::Done(decode(std::mem::take(&mut self.bytes), self.latin1)),
+            Ok(0) => Progress::Done(decode(std::mem::take(&mut self.bytes), self.encoding)),
             Ok(n) if self.bytes.len() + n <= MAX_CLIPBOARD_BYTES => {
                 self.bytes.extend_from_slice(&part[..n]);
                 Progress::Pending
@@ -513,9 +543,8 @@ impl SelectionHandler for State {
         ) {
             tracing::warn!(%error, ?target, "forward selection ownership to X11");
         }
-        let wayland = types.is_some();
         self.clipboard
-            .owned(target, types.unwrap_or_default(), wayland);
+            .owned(target, types.map_or(Owner::None, Owner::Wayland));
     }
     fn send_selection(
         &mut self,
@@ -592,7 +621,7 @@ impl State {
                 SelectionData::X11,
             ),
         }
-        self.clipboard.owned(target, types, false);
+        self.clipboard.owned(target, Owner::X11(types));
     }
 
     /// The X11 client owning `target` released it, usually by exiting.
@@ -611,10 +640,10 @@ impl State {
     /// The client owning `target` is gone. The clipboard keeps its text; the
     /// primary selection empties, as it does on X11.
     fn selection_orphaned(&mut self, target: SelectionTarget) {
-        let wayland = self.clipboard.orphan(target);
+        let owner = self.clipboard.orphan(target);
         match target {
             SelectionTarget::Clipboard => {}
-            SelectionTarget::Primary if wayland => {
+            SelectionTarget::Primary if matches!(owner, Owner::Wayland(_)) => {
                 if let Err(error) = self.xwayland.new_selection(target, None) {
                     tracing::warn!(%error, "clear X11 primary selection");
                 }
@@ -671,7 +700,7 @@ impl State {
 
     /// Asks the owner of `target` to write `mime` into `fd`.
     fn fetch(&mut self, target: SelectionTarget, mime: String, fd: OwnedFd) -> anyhow::Result<()> {
-        if self.clipboard.owner(target).wayland {
+        if matches!(self.clipboard.owner(target), Owner::Wayland(_)) {
             match target {
                 SelectionTarget::Clipboard => {
                     request_data_device_client_selection(&self.seat, mime, fd)?;
@@ -720,7 +749,9 @@ impl State {
     pub(super) fn clipboard_tick(&mut self) {
         if self.clipboard.take_client_left() {
             for target in [SelectionTarget::Clipboard, SelectionTarget::Primary] {
-                if self.clipboard.owner(target).wayland && !self.wayland_selection_alive(target) {
+                if matches!(self.clipboard.owner(target), Owner::Wayland(_))
+                    && !self.wayland_selection_alive(target)
+                {
                     self.selection_orphaned(target);
                 }
             }
@@ -775,17 +806,17 @@ mod tests {
     use super::*;
 
     fn offer_read(state: &mut State, text: &str) {
-        offer_bytes(state, text.as_bytes(), false);
+        offer_bytes(state, text.as_bytes(), Encoding::Utf8);
     }
 
     /// Stands in for the owner's reply to the viewer read; tests have no XWM.
-    fn offer_bytes(state: &mut State, bytes: &[u8], latin1: bool) {
+    fn offer_bytes(state: &mut State, bytes: &[u8], encoding: Encoding) {
         let (read, write) =
             nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).expect("clipboard test pipe");
         File::from(write)
             .write_all(bytes)
             .expect("write clipboard offer");
-        state.clipboard.read = Some(Read::new(read.into(), latin1, "test"));
+        state.clipboard.read = Some(Read::new(read.into(), encoding, "test"));
     }
 
     /// Requests `mime` from the clipboard as a client does and returns the reply.
@@ -821,7 +852,7 @@ mod tests {
         let (_display, mut state) = crate::tests::test_state();
         state.x11_selection(SelectionTarget::Clipboard, vec!["STRING".into()]);
         state.clipboard.pending_offer = None;
-        offer_bytes(&mut state, b"na\xefve", true);
+        offer_bytes(&mut state, b"na\xefve", Encoding::Latin1);
         state.clipboard_tick(); // Buffered; the end of the reply is still to come.
         state.x11_selection_cleared(SelectionTarget::Clipboard);
         state.clipboard_tick();
@@ -872,7 +903,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let (_display, mut state) = crate::tests::test_state();
             let (read, write) = nonblocking_pipe().expect("clipboard test pipe");
-            state.clipboard.read = Some(Read::new(read, false, "test"));
+            state.clipboard.read = Some(Read::new(read, Encoding::Utf8, "test"));
             let owner = std::thread::spawn(move || {
                 File::from(write).write_all(&vec![b'x'; 2 * MAX_CLIPBOARD_BYTES])
             });
@@ -929,9 +960,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct DataControlApp {
+        ext: bool,
+        seat: Option<wayland_client::protocol::wl_seat::WlSeat>,
+        ext_manager: Option<wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1>,
+        wlr_manager: Option<wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
+        device: Option<data_control::Device>,
+        mimes: std::collections::HashMap<wayland_client::backend::ObjectId, Vec<String>>,
+        /// The clipboard and primary offers, `None` once a selection is unset.
+        selections: [Option<(data_control::Offer, Vec<String>)>; 2],
+        /// Text each source this client created serves.
+        served: std::collections::HashMap<wayland_client::backend::ObjectId, String>,
+    }
+
     /// A data-control client: a clipboard manager or wl-clipboard.
     mod data_control {
-        use std::collections::HashMap;
         use std::io::Write as _;
 
         use wayland_client::Connection;
@@ -944,6 +988,8 @@ mod tests {
         use wayland_protocols::ext::data_control::v1::client as ext;
         use wayland_protocols_wlr::data_control::v1::client as wlr;
 
+        use super::DataControlApp as App;
+
         pub(super) enum Offer {
             Ext(ext::ext_data_control_offer_v1::ExtDataControlOfferV1),
             Wlr(wlr::zwlr_data_control_offer_v1::ZwlrDataControlOfferV1),
@@ -952,22 +998,6 @@ mod tests {
         pub(super) enum Device {
             Ext(ext::ext_data_control_device_v1::ExtDataControlDeviceV1),
             Wlr(wlr::zwlr_data_control_device_v1::ZwlrDataControlDeviceV1),
-        }
-
-        #[derive(Default)]
-        pub(super) struct App {
-            pub(super) ext: bool,
-            pub(super) seat: Option<WlSeat>,
-            pub(super) ext_manager:
-                Option<ext::ext_data_control_manager_v1::ExtDataControlManagerV1>,
-            pub(super) wlr_manager:
-                Option<wlr::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
-            pub(super) device: Option<Device>,
-            pub(super) mimes: HashMap<ObjectId, Vec<String>>,
-            /// The clipboard and primary offers, `None` once a selection is unset.
-            pub(super) selections: [Option<(Offer, Vec<String>)>; 2],
-            /// Text each source this client created serves.
-            pub(super) served: HashMap<ObjectId, String>,
         }
 
         impl App {
@@ -1116,8 +1146,8 @@ mod tests {
 
     struct Client {
         connection: wayland_client::Connection,
-        queue: wayland_client::EventQueue<data_control::App>,
-        app: data_control::App,
+        queue: wayland_client::EventQueue<DataControlApp>,
+        app: DataControlApp,
     }
 
     impl Client {
@@ -1138,7 +1168,7 @@ mod tests {
             let mut client = Self {
                 connection,
                 queue,
-                app: data_control::App {
+                app: DataControlApp {
                     ext,
                     ..Default::default()
                 },
@@ -1252,7 +1282,7 @@ mod tests {
             data_control::Offer::Wlr(offer) => offer.receive(MIME.into(), write.as_fd()),
         }
         drop(write);
-        let mut read = Read::new(read, false, "test paste");
+        let mut read = Read::new(read, Encoding::Utf8, "test paste");
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             assert!(Instant::now() < deadline, "paste did not finish");
