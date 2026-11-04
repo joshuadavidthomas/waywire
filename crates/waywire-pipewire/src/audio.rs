@@ -207,7 +207,7 @@ fn format_param() -> Result<Vec<u8>> {
 /// A port of an audio node, from its registry properties.
 struct Port {
     node: u32,
-    output: bool,
+    direction: spa::utils::Direction,
     channel: String,
 }
 
@@ -242,7 +242,12 @@ impl Graph {
                 global.id,
                 Port {
                     node,
-                    output: direction == "out",
+                    // PipeWire sets port.direction to "in" or "out".
+                    direction: if direction == "out" {
+                        spa::utils::Direction::Output
+                    } else {
+                        spa::utils::Direction::Input
+                    },
                     channel: channel.to_owned(),
                 },
             );
@@ -264,11 +269,13 @@ impl Graph {
         let inputs: Vec<_> = self
             .ports
             .iter()
-            .filter(|(_, port)| port.node == sink && !port.output)
+            .filter(|(_, port)| port.node == sink && port.direction == spa::utils::Direction::Input)
             .collect();
         let mut wanted = Vec::new();
         for (&output, port) in &self.ports {
-            if !port.output || !self.playback.contains(&port.node) {
+            if port.direction != spa::utils::Direction::Output
+                || !self.playback.contains(&port.node)
+            {
                 continue;
             }
             for &(&input, sink_port) in &inputs {
