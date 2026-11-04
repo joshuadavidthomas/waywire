@@ -454,8 +454,8 @@ impl State {
     /// [`Self::keyboard_repeat`]). A page whose main thread is busy sends a
     /// key's release late, and a client repeating on its own timer would type
     /// that key until the release arrived.
-    pub(crate) fn set_browser_lease(&mut self, held: bool) {
-        let Some(release) = self.input.set_browser_lease(held) else {
+    pub(crate) fn set_input_control(&mut self, control: input::InputControl) {
+        let Some(release) = self.input.set_control(control) else {
             return;
         };
         self.dirty = true;
@@ -464,8 +464,14 @@ impl State {
             self.release_input(source);
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard
-                .change_repeat_info(if held { 0 } else { KEY_REPEAT_RATE }, KEY_REPEAT_DELAY_MS);
+            keyboard.change_repeat_info(
+                if control == input::InputControl::Browser {
+                    0
+                } else {
+                    KEY_REPEAT_RATE
+                },
+                KEY_REPEAT_DELAY_MS,
+            );
         }
         self.toplevel_list.lease_changed();
         if let Some(state) = self.input.publish() {
@@ -1641,7 +1647,7 @@ mod tests {
     }
 
     fn control_text(state: &State) -> &'static str {
-        chrome::control_text(state.input.browser_holds_input())
+        chrome::control_text(state.input.control())
     }
 
     #[test]

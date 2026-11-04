@@ -273,7 +273,7 @@ impl State {
         elements.extend(upper);
         if let Some(output) = self.space.output_geometry(&self.output) {
             let chips = self.taskbar_chips();
-            let control = crate::chrome::control_text(self.input.browser_holds_input());
+            let control = crate::chrome::control_text(self.input.control());
             let clock = self.chrome.clock().to_owned();
             match self
                 .chrome

@@ -26,17 +26,31 @@ pub(crate) enum PointerMotionKind {
     WarpHint,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InputControl {
+    #[default]
+    Agents,
+    Browser,
+}
+
+#[derive(Default)]
+enum Control {
+    #[default]
+    Agents,
+    Browser {
+        dropped_agent_sources: HashSet<KeyboardSource>,
+    },
+}
+
 pub(crate) struct Input {
     buttons: HashMap<KeyboardSource, HashSet<u32>>,
     /// Every connected agent source: EIS devices, virtual pointers and
     /// virtual keyboards. `KeyboardSource::MAIN` is the browser and never
     /// belongs here.
     agent_sources: HashSet<KeyboardSource>,
-    /// Sources already logged as dropped during the current browser lease.
-    dropped_agent_sources: HashSet<KeyboardSource>,
     /// The agent input state last published.
     published: pipe::AgentInputState,
-    browser_lease: bool,
+    control: Control,
     pointer_motion_kind: PointerMotionKind,
     /// The source the cursor position was last reported for.
     cursor_source: pipe::CursorSource,
@@ -50,9 +64,8 @@ impl Default for Input {
         Self {
             buttons: HashMap::new(),
             agent_sources: HashSet::new(),
-            dropped_agent_sources: HashSet::new(),
             published: pipe::AgentInputState::default(),
-            browser_lease: false,
+            control: Control::Agents,
             pointer_motion_kind: PointerMotionKind::Input,
             cursor_source: pipe::CursorSource::Browser,
             focus_refresh_source: None,
@@ -61,8 +74,15 @@ impl Default for Input {
 }
 
 impl Input {
+    pub(crate) fn control(&self) -> InputControl {
+        match self.control {
+            Control::Agents => InputControl::Agents,
+            Control::Browser { .. } => InputControl::Browser,
+        }
+    }
+
     pub(crate) fn browser_holds_input(&self) -> bool {
-        self.browser_lease
+        self.control() == InputControl::Browser
     }
 
     /// Whether `source` may reach the seat. Browser input always passes.
@@ -70,10 +90,16 @@ impl Input {
     /// debug line per source per lease rather than one per event. Register
     /// the source first (see [`Self::register`]) so a takeover can release it.
     pub(crate) fn accepts(&mut self, source: KeyboardSource) -> bool {
-        if source == KeyboardSource::MAIN || !self.browser_lease {
+        if source == KeyboardSource::MAIN {
             return true;
         }
-        if self.dropped_agent_sources.insert(source) {
+        let Control::Browser {
+            dropped_agent_sources,
+        } = &mut self.control
+        else {
+            return true;
+        };
+        if dropped_agent_sources.insert(source) {
             tracing::debug!(
                 ?source,
                 "dropped agent input while a browser holds input control"
@@ -96,7 +122,12 @@ impl Input {
     /// Returns the agent input state to publish when it changed.
     #[must_use]
     pub(crate) fn disconnect(&mut self, source: KeyboardSource) -> Option<pipe::AgentInputState> {
-        self.dropped_agent_sources.remove(&source);
+        if let Control::Browser {
+            dropped_agent_sources,
+        } = &mut self.control
+        {
+            dropped_agent_sources.remove(&source);
+        }
         if self.agent_sources.remove(&source) {
             self.publish()
         } else {
@@ -109,13 +140,17 @@ impl Input {
     /// release, in order: on takeover every agent source, then the browser.
     /// Publish the agent input state once they are released.
     #[must_use]
-    pub(crate) fn set_browser_lease(&mut self, held: bool) -> Option<Vec<KeyboardSource>> {
-        if self.browser_lease == held {
+    pub(crate) fn set_control(&mut self, control: InputControl) -> Option<Vec<KeyboardSource>> {
+        if self.control() == control {
             return None;
         }
-        self.browser_lease = held;
-        self.dropped_agent_sources.clear();
-        let mut release: Vec<_> = if held {
+        self.control = match control {
+            InputControl::Agents => Control::Agents,
+            InputControl::Browser => Control::Browser {
+                dropped_agent_sources: HashSet::new(),
+            },
+        };
+        let mut release: Vec<_> = if control == InputControl::Browser {
             self.agent_sources.iter().copied().collect()
         } else {
             Vec::new()
@@ -128,7 +163,7 @@ impl Input {
     #[must_use]
     pub(crate) fn publish(&mut self) -> Option<pipe::AgentInputState> {
         let connected = !self.agent_sources.is_empty();
-        let dropped = self.browser_lease && (connected || self.published.dropped());
+        let dropped = self.browser_holds_input() && (connected || self.published.dropped());
         let state = match (connected, dropped) {
             (false, false) => pipe::AgentInputState::None,
             (true, false) => pipe::AgentInputState::Driving,

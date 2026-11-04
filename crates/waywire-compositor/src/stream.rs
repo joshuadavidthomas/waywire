@@ -509,7 +509,7 @@ impl crate::State {
                 pipe::KeyState::Repeated => self.keyboard_repeat(source, p.key().get()),
             },
             Command::ReleaseAll(_) => self.release_input(source),
-            Command::InputLease(p) => self.set_browser_lease(p == pipe::InputControl::Browser),
+            Command::InputLease(control) => self.set_input_control(control),
             Command::PointerScroll(p) => {
                 let frame = AxisFrame::new(InputTime::now())
                     .source(AxisSource::Finger)

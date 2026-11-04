@@ -34,6 +34,7 @@ use crate::State;
 use crate::delivery;
 use crate::focus;
 use crate::toplevel_list;
+use crate::input::InputControl;
 use crate::wm::Windows;
 
 /// A title bar press that a drag or a second press can still turn into an
@@ -648,11 +649,10 @@ impl Chrome {
 }
 
 /// The taskbar's input control label.
-pub(crate) fn control_text(browser_holds_input: bool) -> &'static str {
-    if browser_holds_input {
-        "You're driving"
-    } else {
-        "Agent driving"
+pub(crate) fn control_text(control: InputControl) -> &'static str {
+    match control {
+        InputControl::Browser => "You're driving",
+        InputControl::Agents => "Agent driving",
     }
 }
 

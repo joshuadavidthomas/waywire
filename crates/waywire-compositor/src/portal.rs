@@ -311,7 +311,7 @@ mod tests {
                 .buttons(source)
                 .is_some_and(|buttons| buttons.contains(&0x110))
         );
-        state.set_browser_lease(true);
+        state.set_input_control(crate::input::InputControl::Browser);
         apply_portal_input(
             &mut state,
             PortalInput::Button {
@@ -482,7 +482,7 @@ mod tests {
         apply_keysym(&mut state, source, 0x41, KeyState::Released).expect("keysym release");
         assert!(keyboard.pressed_keys().is_empty());
         assert!(apply_keysym(&mut state, source, 0x1fff_ffff, KeyState::Pressed).is_err());
-        state.set_browser_lease(true);
+        state.set_input_control(crate::input::InputControl::Browser);
         apply_portal_input(
             &mut state,
             PortalInput::Keycode {
