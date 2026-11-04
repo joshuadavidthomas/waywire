@@ -34,13 +34,11 @@ use crate::PortalRequest;
 /// is available.
 pub(super) const STREAM_ID: u32 = 1;
 
-pub(crate) struct ScreenCast {
-    requests: Sender<PortalRequest>,
-}
+pub(crate) struct ScreenCast(Sender<PortalRequest>);
 
 impl ScreenCast {
     pub(crate) fn new(requests: Sender<PortalRequest>) -> Self {
-        Self { requests }
+        Self(requests)
     }
 }
 
@@ -100,7 +98,7 @@ impl ScreenCast {
     ) -> (u32, HashMap<String, OwnedValue>) {
         let session = Session {
             path: session_handle.clone(),
-            requests: self.requests.clone(),
+            requests: self.0.clone(),
         };
         if let Err(error) = emitter
             .connection()
@@ -131,7 +129,7 @@ impl ScreenCast {
         _parent_window: String,
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
-        let (_, streams) = streams(&self.requests, &session_handle).await?;
+        let (_, streams) = streams(&self.0, &session_handle).await?;
         Ok((0, HashMap::from([("streams".to_owned(), streams)])))
     }
 

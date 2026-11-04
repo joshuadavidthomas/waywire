@@ -101,11 +101,11 @@ pub enum PortalRequest {
 pub struct PortalDirs {
     /// The compositor's runtime directory, where the private `PipeWire`
     /// daemon's socket lives.
-    pub runtime: PathBuf,
+    runtime: PathBuf,
     /// Prepended to `XDG_DATA_DIRS`.
-    pub data_dir: PathBuf,
+    data_dir: PathBuf,
     /// Set as `XDG_DESKTOP_PORTAL_DIR`.
-    pub portals_dir: PathBuf,
+    portals_dir: PathBuf,
 }
 
 /// Contents of `waywire.portal`, which describes this backend to the frontend.

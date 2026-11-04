@@ -44,13 +44,11 @@ const RESPONSE_CANCELLED: u32 = 2;
 const RESPONSE_OK: u32 = 0;
 
 /// Serves `org.freedesktop.impl.portal.Screenshot` on the session bus.
-pub(crate) struct Screenshot {
-    requests: Sender<PortalRequest>,
-}
+pub(crate) struct Screenshot(Sender<PortalRequest>);
 
 impl Screenshot {
     pub(crate) fn new(requests: Sender<PortalRequest>) -> Self {
-        Self { requests }
+        Self(requests)
     }
 }
 
@@ -68,11 +66,7 @@ impl Screenshot {
     ) -> (u32, HashMap<String, OwnedValue>) {
         tracing::debug!("portal Screenshot requested");
         let (reply, wait) = tokio::sync::oneshot::channel();
-        if self
-            .requests
-            .send(PortalRequest::Screenshot { reply })
-            .is_err()
-        {
+        if self.0.send(PortalRequest::Screenshot { reply }).is_err() {
             tracing::debug!("portal requester gone; refusing screenshot");
             return (RESPONSE_CANCELLED, HashMap::new());
         }
@@ -152,8 +146,8 @@ pub fn write_screenshot(
     std::fs::create_dir_all(directory)?;
     let mut rgb = Vec::with_capacity(width * height * 3);
     for row in pixels.chunks_exact(stride) {
-        for pixel in row[..width * 4].chunks_exact(4) {
-            rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        for &[blue, green, red, _alpha] in row[..width * 4].as_chunks::<4>().0 {
+            rgb.extend_from_slice(&[red, green, blue]);
         }
     }
     let nanos = SystemTime::now()
