@@ -163,11 +163,10 @@ impl Chrome {
     reason = "one short-lived value per input event"
 )]
 pub(crate) enum Target {
-    /// A client surface: the window, and whether the surface was one of its
-    /// popups or child surfaces rather than its main surface.
+    /// A client surface: the window, and which part of it the surface is.
     Client {
         window: Window,
-        popup: bool,
+        part: Part,
     },
     /// An X11 override-redirect window such as a menu, which has no
     /// foreign-toplevel identity.
@@ -178,6 +177,15 @@ pub(crate) enum Target {
     },
     Nowhere,
     Dropped,
+}
+
+/// Which part of a window a surface is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// The window's main surface.
+    Main,
+    /// One of its popups or subsurfaces, or an X11 override-redirect window.
+    Popup,
 }
 
 /// A window as receipts and events name it.
@@ -282,11 +290,7 @@ pub(crate) struct Receipt {
     pub(crate) source: SourceKind,
     pub(crate) source_pid: Option<u32>,
     pub(crate) input: InputKind,
-    pub(crate) delivery: &'static str,
-    pub(crate) window: Option<WindowRecord>,
-    pub(crate) popup: bool,
-    pub(crate) chrome: Option<Chrome>,
-    pub(crate) text_field: Option<TextField>,
+    pub(crate) delivery: Destination,
 }
 
 /// One focus or window event, as sent.
@@ -295,9 +299,8 @@ pub(crate) enum Notice {
     FocusChanged {
         serial: u64,
         time_usec: u64,
-        window: Option<WindowRecord>,
+        window: Option<(WindowRecord, Part)>,
         previous: Option<WindowRecord>,
-        popup: bool,
         cause: FocusCause,
         source: Option<SourceKind>,
         receipt: Option<u64>,
@@ -376,8 +379,12 @@ pub(crate) struct Delivery {
     cause: Option<FocusCause>,
     dispatching: Option<Dispatching>,
     /// The focus last reported, so repeated `focus_changed` calls for the
-    /// same target stay quiet.
-    reported_focus: Option<(Option<WindowRecord>, bool)>,
+    /// same target stay quiet; `None` before the first report.
+    #[expect(
+        clippy::option_option,
+        reason = "no report yet differs from a report of no focus"
+    )]
+    reported_focus: Option<Option<(WindowRecord, Part)>>,
     /// The window list last sent in `WindowsChanged`.
     reported_windows: Option<WindowList>,
     /// Clients that have enabled text input at least once, and the content
@@ -391,12 +398,63 @@ pub(crate) struct Delivery {
 }
 
 /// Where one input went, as its receipt names it.
-#[derive(Clone, Debug)]
-pub(crate) struct Destination {
-    pub(crate) delivery: &'static str,
-    pub(crate) window: Option<WindowRecord>,
-    pub(crate) popup: bool,
-    pub(crate) chrome: Option<Chrome>,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Destination {
+    /// A window's surface, with the text-field state of its client when
+    /// the input is a key or committed text.
+    Window {
+        window: WindowRecord,
+        part: Part,
+        text_field: Option<TextField>,
+    },
+    /// The compositor's own interface, over `window` when there is one.
+    Compositor {
+        window: Option<WindowRecord>,
+        chrome: Chrome,
+    },
+    Nowhere,
+    /// Dropped because a browser holds input control.
+    Dropped,
+}
+
+impl Destination {
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Window { .. } => "window",
+            Self::Compositor { .. } => "compositor",
+            Self::Nowhere => "nowhere",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    pub(crate) const fn window(&self) -> Option<&WindowRecord> {
+        match self {
+            Self::Window { window, .. } => Some(window),
+            Self::Compositor { window, .. } => window.as_ref(),
+            Self::Nowhere | Self::Dropped => None,
+        }
+    }
+
+    pub(crate) const fn part(&self) -> Option<Part> {
+        match self {
+            Self::Window { part, .. } => Some(*part),
+            Self::Compositor { .. } | Self::Nowhere | Self::Dropped => None,
+        }
+    }
+
+    pub(crate) const fn chrome(&self) -> Option<Chrome> {
+        match self {
+            Self::Compositor { chrome, .. } => Some(*chrome),
+            Self::Window { .. } | Self::Nowhere | Self::Dropped => None,
+        }
+    }
+
+    pub(crate) const fn text_field(&self) -> Option<TextField> {
+        match self {
+            Self::Window { text_field, .. } => *text_field,
+            Self::Compositor { .. } | Self::Nowhere | Self::Dropped => None,
+        }
+    }
 }
 
 /// Who receives one input's receipt.
@@ -572,14 +630,13 @@ impl Delivery {
     }
 
     /// The receipt for input `serial` from `source` that went to
-    /// `destination`. Only input that reached a window names its text field.
+    /// `delivery`.
     pub(crate) fn receipt(
         &self,
         source: KeyboardSource,
         serial: u64,
         input: InputKind,
-        destination: Destination,
-        text_field: Option<TextField>,
+        delivery: Destination,
     ) -> Receipt {
         Receipt {
             serial,
@@ -587,15 +644,7 @@ impl Delivery {
             source: self.kind(source).unwrap_or(SourceKind::Viewer),
             source_pid: self.source(source).and_then(|info| info.pid),
             input,
-            text_field: if destination.delivery == "window" {
-                text_field
-            } else {
-                None
-            },
-            delivery: destination.delivery,
-            window: destination.window,
-            popup: destination.popup,
-            chrome: destination.chrome,
+            delivery,
         }
     }
 
@@ -626,18 +675,18 @@ impl Delivery {
         self.deferred.take()
     }
 
-    /// Keyboard focus moved to `window`, or one of its popups. Reported
+    /// Keyboard focus moved to a part of a window, or to none. Reported
     /// unless it is the focus last reported.
-    pub(crate) fn focus_changed(&mut self, window: Option<WindowRecord>, popup: bool) {
+    pub(crate) fn focus_changed(&mut self, focus: Option<(WindowRecord, Part)>) {
         self.deferred = None;
-        let current = (window, popup);
-        if self.reported_focus.as_ref() == Some(&current) {
+        if self.reported_focus.as_ref() == Some(&focus) {
             return;
         }
         let previous = self
             .reported_focus
-            .replace(current)
-            .and_then(|(window, _)| window);
+            .replace(focus)
+            .flatten()
+            .map(|(window, _)| window);
         let everyone = self.everyone();
         if everyone.is_empty() {
             return;
@@ -645,19 +694,15 @@ impl Delivery {
         let (cause, input) = self.focus_cause();
         let source = input.and_then(|input| self.kind(input.source));
         let serial = self.next_serial();
-        let window = self
-            .reported_focus
-            .as_ref()
-            .and_then(|(window, _)| window.as_ref());
+        let focus = self.reported_focus.as_ref().and_then(Option::as_ref);
         for name in everyone {
             // Only the input's owners learn which of their receipts it was.
             let owned = input.is_some_and(|input| self.owners(input.source).contains(&name));
             let notice = Notice::FocusChanged {
                 serial,
                 time_usec: monotonic_usec(),
-                window: window.cloned(),
+                window: focus.cloned(),
                 previous: previous.clone(),
-                popup,
                 cause,
                 source,
                 receipt: owned.then(|| input.map(|input| input.serial)).flatten(),
@@ -777,14 +822,15 @@ impl Delivery {
 impl Receipt {
     /// The receipt as the viewer that sent the input with `sequence` gets it.
     pub(crate) fn for_viewer(&self, sequence: pipe::InputSequence) -> pipe::InputReceipt {
-        let window = self.window.clone().unwrap_or_default();
+        let none = WindowRecord::default();
+        let window = self.delivery.window().unwrap_or(&none);
         pipe::InputReceipt {
             sequence,
             delivery: match self.delivery {
-                "window" => pipe::ReceiptDelivery::Window,
-                "compositor" => pipe::ReceiptDelivery::Compositor,
-                "dropped" => pipe::ReceiptDelivery::Dropped,
-                _ => pipe::ReceiptDelivery::Nowhere,
+                Destination::Window { .. } => pipe::ReceiptDelivery::Window,
+                Destination::Compositor { .. } => pipe::ReceiptDelivery::Compositor,
+                Destination::Nowhere => pipe::ReceiptDelivery::Nowhere,
+                Destination::Dropped => pipe::ReceiptDelivery::Dropped,
             },
             window_id: pipe::ReceiptText::truncated(&window.id),
             app_id: pipe::ReceiptText::truncated(&window.app_id),
@@ -838,40 +884,24 @@ impl State {
             return;
         };
         let destination = match target {
-            Target::Client { window, popup } => Destination {
-                delivery: "window",
-                window: Some(self.window_record(window)),
-                popup: *popup,
-                chrome: None,
+            Target::Client { window, part } => Destination::Window {
+                window: self.window_record(window),
+                part: *part,
+                text_field,
             },
-            Target::X11Popup(surface) => Destination {
-                delivery: "window",
-                window: Some(x11_record(surface)),
-                popup: true,
-                chrome: None,
+            Target::X11Popup(surface) => Destination::Window {
+                window: x11_record(surface),
+                part: Part::Popup,
+                text_field,
             },
-            Target::Compositor { window, chrome } => Destination {
-                delivery: "compositor",
+            Target::Compositor { window, chrome } => Destination::Compositor {
                 window: window.as_ref().map(|window| self.window_record(window)),
-                popup: false,
-                chrome: Some(*chrome),
+                chrome: *chrome,
             },
-            Target::Nowhere => Destination {
-                delivery: "nowhere",
-                window: None,
-                popup: false,
-                chrome: None,
-            },
-            Target::Dropped => Destination {
-                delivery: "dropped",
-                window: None,
-                popup: false,
-                chrome: None,
-            },
+            Target::Nowhere => Destination::Nowhere,
+            Target::Dropped => Destination::Dropped,
         };
-        let receipt = self
-            .delivery
-            .receipt(source, serial, input, destination, text_field);
+        let receipt = self.delivery.receipt(source, serial, input, destination);
         match recipients {
             Recipients::Viewer => {
                 if let Some(sequence) = self.stream.latest_input_sequence() {
@@ -920,7 +950,7 @@ impl State {
             .find(|window| window.x11_surface() == Some(surface))
             .map_or(Target::Nowhere, |window| Target::Client {
                 window: window.clone(),
-                popup: false,
+                part: Part::Main,
             })
     }
 
@@ -950,7 +980,7 @@ impl State {
                 }
                 Target::Client {
                     window: window.clone(),
-                    popup: child,
+                    part: if child { Part::Popup } else { Part::Main },
                 }
             })
     }
@@ -999,11 +1029,9 @@ impl State {
         if !self.delivery.has_subscribers() {
             return;
         }
-        let window = surface.and_then(|surface| match self.surface_target(&surface) {
-            Target::Client { window, .. } => Some(self.window_record(&window)),
-            Target::X11Popup(x11) => Some(x11_record(&x11)),
-            Target::Compositor { .. } | Target::Nowhere | Target::Dropped => None,
-        });
+        let window = surface
+            .and_then(|surface| self.focused_part(self.surface_target(&surface)))
+            .map(|(window, _)| window);
         let text_field = self.text_field();
         self.delivery.text_field_changed(window, text_field);
     }
@@ -1024,12 +1052,18 @@ impl State {
             self.delivery.defer_focus();
             return;
         }
-        let (window, popup) = match target {
-            Target::Client { window, popup } => (Some(self.window_record(&window)), popup),
-            Target::X11Popup(surface) => (Some(x11_record(&surface)), true),
-            Target::Compositor { .. } | Target::Nowhere | Target::Dropped => (None, false),
-        };
-        self.delivery.focus_changed(window, popup);
+        let focus = self.focused_part(target);
+        self.delivery.focus_changed(focus);
+    }
+
+    /// The window and part of it that `target` names, for focus reports;
+    /// `None` for anything but a window.
+    fn focused_part(&self, target: Target) -> Option<(WindowRecord, Part)> {
+        match target {
+            Target::Client { window, part } => Some((self.window_record(&window), part)),
+            Target::X11Popup(surface) => Some((x11_record(&surface), Part::Popup)),
+            Target::Compositor { .. } | Target::Nowhere | Target::Dropped => None,
+        }
     }
 
     /// Describe a Wayland client's input device for receipts.
@@ -1083,16 +1117,11 @@ impl State {
     }
 
     /// The current focus, for the bus's `GetFocus` method.
-    pub(crate) fn focus_report(&self) -> (Option<WindowRecord>, bool, TextField) {
+    pub(crate) fn focus_report(&self) -> (Option<(WindowRecord, Part)>, TextField) {
         let (target, text_field) = self.keyboard_target();
-        match target {
-            Target::Client { window, popup } => {
-                (Some(self.window_record(&window)), popup, text_field)
-            }
-            Target::X11Popup(surface) => (Some(x11_record(&surface)), true, text_field),
-            Target::Compositor { .. } | Target::Nowhere | Target::Dropped => {
-                (None, false, TextField::Unknown)
-            }
+        match self.focused_part(target) {
+            Some(focus) => (Some(focus), text_field),
+            None => (None, TextField::Unknown),
         }
     }
 }

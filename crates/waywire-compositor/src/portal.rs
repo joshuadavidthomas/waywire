@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(to, &["owner".to_owned()]);
         assert_eq!(receipt.source, SourceKind::PortalEis);
         assert_eq!(receipt.source_pid, Some(std::process::id()));
-        assert_eq!(receipt.delivery, "nowhere", "no window has focus");
+        assert_eq!(receipt.delivery.as_str(), "nowhere", "no window has focus");
         server
             .shutdown(std::net::Shutdown::Both)
             .expect("shut down EI connection");

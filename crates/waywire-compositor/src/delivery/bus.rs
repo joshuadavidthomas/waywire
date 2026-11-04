@@ -25,6 +25,7 @@ use super::InputKind;
 use super::Message;
 use super::Notice;
 use super::Outgoing;
+use super::Part;
 use super::Receipt;
 use super::Signal;
 use super::TextField;
@@ -141,10 +142,18 @@ impl State {
             }
             Request::Unsubscribe { name } => self.delivery.unsubscribe(&name),
             Request::Focus { reply } => {
-                let (window, popup, text_field) = self.focus_report();
+                let (window, text_field) = self.focus_report();
                 let mut focus = HashMap::new();
-                insert(&mut focus, "window", window_dict(window.as_ref()));
-                insert(&mut focus, "popup", popup);
+                insert(
+                    &mut focus,
+                    "window",
+                    window_dict(window.as_ref().map(|(w, _)| w)),
+                );
+                insert(
+                    &mut focus,
+                    "popup",
+                    popup(window.as_ref().map(|&(_, part)| part)),
+                );
                 insert_text_field(&mut focus, text_field);
                 insert(&mut focus, "serial", self.delivery.last_serial());
                 let focus = owned(focus);
@@ -394,6 +403,12 @@ fn list_dict(list: &WindowList) -> HashMap<String, Value<'static>> {
     dict
 }
 
+/// The `popup` key: whether the input or focus is in one of a window's
+/// popups rather than its main surface.
+fn popup(part: Option<Part>) -> bool {
+    part == Some(Part::Popup)
+}
+
 fn insert_text_field(dict: &mut HashMap<String, Value<'_>>, text_field: TextField) {
     insert(dict, "text_field", text_field.as_str());
     if let Some(purpose) = text_field.purpose() {
@@ -420,13 +435,13 @@ pub(crate) fn receipt_dict(receipt: &Receipt) -> HashMap<String, Value<'static>>
     if let Some(button) = button {
         insert(&mut dict, "button", button);
     }
-    insert(&mut dict, "delivery", receipt.delivery);
-    insert(&mut dict, "window", window_dict(receipt.window.as_ref()));
-    insert(&mut dict, "popup", receipt.popup);
-    if let Some(chrome) = receipt.chrome {
+    insert(&mut dict, "delivery", receipt.delivery.as_str());
+    insert(&mut dict, "window", window_dict(receipt.delivery.window()));
+    insert(&mut dict, "popup", popup(receipt.delivery.part()));
+    if let Some(chrome) = receipt.delivery.chrome() {
         insert(&mut dict, "chrome", chrome.as_str());
     }
-    if let Some(text_field) = receipt.text_field {
+    if let Some(text_field) = receipt.delivery.text_field() {
         insert_text_field(&mut dict, text_field);
     }
     dict
@@ -440,16 +455,23 @@ pub(crate) fn notice_dict(notice: &Notice) -> (&'static str, HashMap<String, Val
             time_usec,
             window,
             previous,
-            popup,
             cause,
             source,
             receipt,
         } => {
             insert(&mut dict, "serial", *serial);
             insert(&mut dict, "time_usec", *time_usec);
-            insert(&mut dict, "window", window_dict(window.as_ref()));
+            insert(
+                &mut dict,
+                "window",
+                window_dict(window.as_ref().map(|(w, _)| w)),
+            );
             insert(&mut dict, "previous", window_dict(previous.as_ref()));
-            insert(&mut dict, "popup", *popup);
+            insert(
+                &mut dict,
+                "popup",
+                popup(window.as_ref().map(|&(_, part)| part)),
+            );
             insert(&mut dict, "cause", cause.as_str());
             if let Some(source) = source {
                 insert(&mut dict, "source", source.as_str());

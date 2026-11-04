@@ -4426,13 +4426,13 @@ mod tests {
         assert_eq!(down.source, SourceKind::VirtualKeyboard);
         assert_eq!(down.source_pid, Some(std::process::id()));
         assert_eq!(down.input, InputKind::Key { pressed: true });
-        assert_eq!(down.delivery, "window");
-        let window = down.window.clone().expect("receiving window");
+        assert_eq!(down.delivery.as_str(), "window");
+        let window = down.delivery.window().cloned().expect("receiving window");
         assert_eq!(window.id, identifier, "the id lswt and lswt-like tools see");
         assert_eq!(window.title, "Registration form");
         assert_eq!(window.app_id, "chromium");
         assert_eq!(window.pid, Some(std::process::id()));
-        assert_eq!(down.text_field, Some(TextField::Unknown));
+        assert_eq!(down.delivery.text_field(), Some(TextField::Unknown));
         assert!(receipts[1].serial > down.serial);
         assert!(
             self::receipts(&delivered(&received, "observer")).is_empty(),
@@ -4443,17 +4443,23 @@ mod tests {
         press(&mut state, source);
         let dropped = self::receipts(&delivered(&received, "agent"));
         assert_eq!(
-            dropped.iter().map(|r| r.delivery).collect::<Vec<_>>(),
+            dropped
+                .iter()
+                .map(|r| r.delivery.as_str())
+                .collect::<Vec<_>>(),
             ["dropped", "dropped"]
         );
-        assert_eq!(dropped[0].window, None);
+        assert_eq!(dropped[0].delivery.window(), None);
 
         state.set_browser_lease(false);
         state.focus_window(None);
         press(&mut state, source);
         let nowhere = self::receipts(&delivered(&received, "agent"));
         assert_eq!(
-            nowhere.iter().map(|r| r.delivery).collect::<Vec<_>>(),
+            nowhere
+                .iter()
+                .map(|r| r.delivery.as_str())
+                .collect::<Vec<_>>(),
             ["nowhere", "nowhere"]
         );
     }
@@ -4627,10 +4633,10 @@ mod tests {
         );
         assert!(receipts.iter().all(|receipt| {
             receipt.source == SourceKind::VirtualKeyboard
-                && receipt.delivery == "window"
+                && receipt.delivery.as_str() == "window"
                 && receipt
-                    .window
-                    .as_ref()
+                    .delivery
+                    .window()
                     .is_some_and(|window| window.id == identifier)
         }));
         assert_eq!(receipts[0].input, InputKind::Key { pressed: true });
@@ -4687,7 +4693,7 @@ mod tests {
         let received = delivery_subscribers(&mut state, source);
         press(&mut state, source);
         let before = receipts(&delivered(&received, "agent"));
-        let form_id = before[0].window.clone().expect("form").id;
+        let form_id = before[0].delivery.window().cloned().expect("form").id;
 
         let qh = queue.handle();
         let surface = app
@@ -4728,7 +4734,7 @@ mod tests {
                     ..
                 },
                 Notice::FocusChanged {
-                    window: Some(focused),
+                    window: Some((focused, _)),
                     previous: Some(previous),
                     cause,
                     receipt,
@@ -4750,7 +4756,7 @@ mod tests {
         }
         press(&mut state, source);
         let after = receipts(&delivered(&received, "agent"));
-        let window = after[0].window.clone().expect("dialog");
+        let window = after[0].delivery.window().cloned().expect("dialog");
         assert_eq!(window.title, "Session expiring");
         assert_ne!(
             window.id, form_id,
@@ -4822,7 +4828,7 @@ mod tests {
         let [
             Notice::WindowMapped { window: mapped, .. },
             Notice::FocusChanged {
-                window: Some(focused),
+                window: Some((focused, _)),
                 cause,
                 ..
             },
@@ -4910,7 +4916,9 @@ mod tests {
         let received = delivery_subscribers(&mut state, source);
         let text_field = |received: &std::sync::mpsc::Receiver<_>, state: &mut crate::State| {
             press(state, source);
-            receipts(&delivered(received, "agent"))[0].text_field
+            receipts(&delivered(received, "agent"))[0]
+                .delivery
+                .text_field()
         };
         assert_eq!(text_field(&received, &mut state), Some(TextField::Unknown));
 
@@ -5295,13 +5303,17 @@ mod tests {
             );
             click(&mut state, source, centre);
             let receipts = receipts(&delivered(&received, "agent"));
-            let landed = receipts[0].window.clone().expect("a window took the click");
+            let landed = receipts[0]
+                .delivery
+                .window()
+                .cloned()
+                .expect("a window took the click");
             assert_eq!(&landed.id, expected, "click at {centre:?}");
         }
         // The editor's old centre is bare desktop.
         click(&mut state, source, (300.0, 250.0));
         let receipts = receipts(&delivered(&received, "agent"));
-        assert_eq!(receipts[0].delivery, "nowhere");
+        assert_eq!(receipts[0].delivery.as_str(), "nowhere");
     }
 
     #[test]
