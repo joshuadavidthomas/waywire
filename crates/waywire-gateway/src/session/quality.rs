@@ -297,8 +297,17 @@ enum Lowering {
     ToLink(Kbps),
     /// One step down the ladder, for pressure the link does not explain.
     Step,
-    /// Wait until the link is measured.
-    Measuring,
+}
+
+/// What a sample's pressure asks of quality.
+#[derive(Clone, Copy)]
+enum Pressure {
+    /// Nothing lowers quality.
+    None,
+    /// The link alone explains a streak of pressure, but it is not measured yet:
+    /// hold until it is.
+    AwaitMeasurement,
+    Lower(Lowering),
 }
 
 /// What the viewer's link carried when it last limited the stream.
@@ -549,7 +558,7 @@ impl Quality {
         let encoder = sample.health();
         let last_encoder = self.last_encoder.replace(encoder);
         let link = self.observe_link(feedback);
-        let (pressure, recovery_vetoes) = signals(feedback, &link, encoder);
+        let (bad_reasons, recovery_vetoes) = signals(feedback, &link, encoder);
         let cooldown = self.last_change.map_or(Duration::ZERO, |last| {
             QUALITY_CHANGE_COOLDOWN.saturating_sub(now.saturating_duration_since(last))
         });
@@ -563,7 +572,7 @@ impl Quality {
             replaced = sample.replaced,
             sufficient_encoder_sample = sample.attempted >= ENCODER_MIN_RENDERED,
             ?feedback,
-            bad_reasons = ?pressure.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
+            bad_reasons = ?bad_reasons.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
             recovery_vetoes = ?recovery_vetoes.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
             streak_before = ?self.streak,
             delivered = link.delivered(),
@@ -597,8 +606,7 @@ impl Quality {
             debug!(decision = "draining", streak_after = ?self.streak, "quality decision");
             return None;
         }
-        let local_pressure = pressure.iter().any(|reason| !reason.is_link());
-        let verdict = if !pressure.is_empty() {
+        let verdict = if !bad_reasons.is_empty() {
             SampleVerdict::Bad
         } else if recovery_vetoes.is_empty() {
             SampleVerdict::Good
@@ -606,33 +614,34 @@ impl Quality {
             SampleVerdict::Neutral
         };
         self.streak = self.streak.next(verdict);
-        let streak_lowers =
-            matches!(self.streak, Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD);
-        let lowering = self.lowering(streak_lowers, &link, local_pressure);
+        let pressure = self.pressure(&link, &bad_reasons);
         // A link measured too slow is met at once, and so is a failed probe: waiting
         // out the cooldown would only queue more video behind it.
-        let link_jump = matches!(lowering, Some(Lowering::FailedProbe | Lowering::ToLink(_)));
+        let link_jump = matches!(
+            pressure,
+            Pressure::Lower(Lowering::FailedProbe | Lowering::ToLink(_))
+        );
         if !cooldown.is_zero() && !link_jump {
             debug!(decision = "cooldown", streak_after = ?self.streak, "quality decision");
             return None;
         }
         let old = self.levels;
         let old_chroma = self.chroma;
-        let direction = match (lowering, self.streak) {
-            (Some(Lowering::Measuring), _) => {
+        let direction = match (pressure, self.streak) {
+            (Pressure::AwaitMeasurement, _) => {
                 debug!(decision = "measuring", streak_after = ?self.streak, "quality decision");
                 return None;
             }
-            (Some(lowering), _) => {
+            (Pressure::Lower(lowering), _) => {
                 self.lower(lowering);
                 "lower"
             }
-            (None, Streak::Good(count)) if count >= self.raise_patience() => {
+            (Pressure::None, Streak::Good(count)) if count >= self.raise_patience() => {
                 self.raise_one_level();
                 self.streak = Streak::None;
                 "raise"
             }
-            (None, Streak::None | Streak::Bad(_) | Streak::Good(_)) => {
+            (Pressure::None, Streak::None | Streak::Bad(_) | Streak::Good(_)) => {
                 debug!(decision = "hold", streak_after = ?self.streak, "quality decision");
                 return None;
             }
@@ -728,27 +737,25 @@ impl Quality {
         })
     }
 
-    fn lowering(
-        &self,
-        streak_lowers: bool,
-        sample: &LinkSample,
-        local_pressure: bool,
-    ) -> Option<Lowering> {
+    fn pressure(&self, sample: &LinkSample, bad_reasons: &[Reason]) -> Pressure {
+        let streak_lowers =
+            matches!(self.streak, Streak::Bad(count) if count >= BAD_STREAK_THRESHOLD);
+        let local_pressure = bad_reasons.iter().any(|reason| !reason.is_link());
         // A restart's key frame alone can back the link up for a second, but the
         // gateway discards video only when the link cannot keep up.
         if self.probing() && !local_pressure && (streak_lowers || sample.loss() == Loss::Link) {
-            return Some(Lowering::FailedProbe);
+            return Pressure::Lower(Lowering::FailedProbe);
         }
         if !streak_lowers {
-            return None;
+            return Pressure::None;
         }
         // Congestion that lasts while it is measured shows the link carries less
         // than the encoder produces, whatever the target says.
-        Some(match sample.measured() {
-            Some(delivered) => Lowering::ToLink(delivered),
-            None if local_pressure => Lowering::Step,
-            None => Lowering::Measuring,
-        })
+        match sample.measured() {
+            Some(delivered) => Pressure::Lower(Lowering::ToLink(delivered)),
+            None if local_pressure => Pressure::Lower(Lowering::Step),
+            None => Pressure::AwaitMeasurement,
+        }
     }
 
     fn probing(&self) -> bool {
@@ -760,7 +767,7 @@ impl Quality {
         match lowering {
             Lowering::FailedProbe => self.fail_probe(),
             Lowering::ToLink(delivered) => self.lower_to_link(delivered),
-            Lowering::Step | Lowering::Measuring => self.lower_one_level(),
+            Lowering::Step => self.lower_one_level(),
         }
         // Video at the new levels is measured afresh.
         self.congestion = None;
