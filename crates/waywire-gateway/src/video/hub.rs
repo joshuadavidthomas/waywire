@@ -265,14 +265,19 @@ impl VideoHub {
     // per-viewer ordering depends on that caller broadcasting each frame in sequence.
     pub(super) fn broadcast(&self, sample: &VideoSample) -> GopState {
         let generation = sample.metadata.generation;
-        let (handles, state, stream_reset) = {
+        let (handles, state, continuity) = {
             let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            let stream_reset = sample.continuity == Continuity::AfterGap
+            let continuity = if sample.continuity == Continuity::AfterGap
                 || hub
                     .generation
-                    .is_some_and(|current| current != sample.metadata.generation);
+                    .is_some_and(|current| current != sample.metadata.generation)
+            {
+                Continuity::AfterGap
+            } else {
+                Continuity::Continuous
+            };
             hub.generation = Some(sample.metadata.generation);
-            if stream_reset {
+            if continuity == Continuity::AfterGap {
                 hub.gop.clear();
                 hub.gop_bytes = 0;
             }
@@ -301,15 +306,13 @@ impl VideoHub {
             (
                 hub.subscribers.values().cloned().collect::<Vec<_>>(),
                 state,
-                stream_reset,
+                continuity,
             )
         };
 
         for handle in handles {
             let mut outgoing = sample.clone();
-            if stream_reset {
-                outgoing.continuity = Continuity::AfterGap;
-            }
+            outgoing.continuity = continuity;
             let pushed = handle
                 .queue
                 .lock()
