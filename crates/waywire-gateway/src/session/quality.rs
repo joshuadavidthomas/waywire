@@ -171,24 +171,71 @@ impl Delivery {
     }
 }
 
+/// Frames the viewer lost in a sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Loss {
+    /// Less than `BROWSER_BAD_DROP_PERCENT`.
+    None,
+    /// At least `BROWSER_BAD_DROP_PERCENT` while little or no video waited for
+    /// the link.
+    Browser,
+    /// At least `BROWSER_BAD_DROP_PERCENT` while video waited for the link: the
+    /// gateway discarded what the link could not carry.
+    Link,
+}
+
+/// What the viewer received against what the encoder produced in a sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    /// More arrived than was produced: the link is emptying its queue.
+    Draining,
+    Balanced,
+    /// More was produced than arrived.
+    Saturated,
+}
+
 /// One feedback sample's view of the viewer's link.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent signals of one sample"
-)]
-struct LinkSample {
+enum LinkSample {
+    /// No video arrived and none waits for the link.
+    Idle { delivered: u64 },
     /// Video arrived, or some waited for the link.
-    active: bool,
+    Active(ActiveLink),
+}
+
+struct ActiveLink {
     /// More than `LINK_BACKLOG_MILLIS` of video waits for the link.
     backlog: bool,
-    /// Frames were lost while video waited for the link: the gateway discarded
-    /// what the link could not carry.
-    loss: bool,
-    /// More arrived than was produced: the link is emptying its queue.
-    draining: bool,
+    loss: Loss,
+    flow: Flow,
     delivered: u64,
     /// What the link carries, once congestion has lasted long enough to tell.
     measured: Option<Kbps>,
+}
+
+impl LinkSample {
+    fn delivered(&self) -> u64 {
+        match self {
+            Self::Idle { delivered } | Self::Active(ActiveLink { delivered, .. }) => *delivered,
+        }
+    }
+
+    fn backlog(&self) -> bool {
+        matches!(self, Self::Active(ActiveLink { backlog: true, .. }))
+    }
+
+    fn loss(&self) -> Loss {
+        match self {
+            Self::Idle { .. } => Loss::None,
+            Self::Active(link) => link.loss,
+        }
+    }
+
+    fn measured(&self) -> Option<Kbps> {
+        match self {
+            Self::Idle { .. } => None,
+            Self::Active(link) => link.measured,
+        }
+    }
 }
 
 /// How a streak of pressure lowers quality.
@@ -305,20 +352,19 @@ fn applying<const N: usize>(candidates: [(bool, Reason); N]) -> Vec<Reason> {
 fn signals(
     feedback: &Feedback,
     link: &LinkSample,
-    lossy: bool,
     encoder_bad: bool,
     encoder_good: bool,
 ) -> (Vec<Reason>, Vec<Reason>) {
     let queue_pressure = feedback.queue_busy_ms() / feedback.sample_ms();
-    let active = link.active;
+    let active = matches!(link, LinkSample::Active(_));
     let pressure = applying([
         (encoder_bad, Reason::EncoderReplacement),
         (active && queue_pressure >= 0.10, Reason::DecoderBusy),
         (active && feedback.queue_peak() >= 24, Reason::DecoderPeak),
         (active && feedback.rtt() > 250.0, Reason::Rtt),
-        (lossy && !link.loss, Reason::BrowserLoss),
-        (link.loss, Reason::LinkLoss),
-        (link.backlog, Reason::LinkBacklog),
+        (link.loss() == Loss::Browser, Reason::BrowserLoss),
+        (link.loss() == Loss::Link, Reason::LinkLoss),
+        (link.backlog(), Reason::LinkBacklog),
     ]);
     // An isolated drop need not mean ongoing congestion. Allow up to 2% loss
     // so one dropped frame does not erase an otherwise healthy recovery streak.
@@ -334,7 +380,7 @@ fn signals(
             Reason::BrowserLoss,
         ),
         (feedback.rtt() >= 120.0, Reason::Rtt),
-        (link.backlog, Reason::LinkBacklog),
+        (link.backlog(), Reason::LinkBacklog),
         (feedback.presented() == 0, Reason::NoPresentation),
     ]);
     (pressure, recovery_vetoes)
@@ -444,12 +490,8 @@ impl Quality {
     pub(super) fn update(&mut self, feedback: &Feedback, now: Instant) -> Option<QualityChange> {
         let (attempted, replaced, encoder_bad, encoder_good) = self.encoder.take();
         let encoder_was_bad = std::mem::replace(&mut self.encoder_was_bad, encoder_bad);
-        let lossy = feedback.received() > 0
-            && u64::from(feedback.dropped()) * 100
-                >= u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT;
-        let link = self.observe_link(feedback, lossy);
-        let (pressure, recovery_vetoes) =
-            signals(feedback, &link, lossy, encoder_bad, encoder_good);
+        let link = self.observe_link(feedback);
+        let (pressure, recovery_vetoes) = signals(feedback, &link, encoder_bad, encoder_good);
         let cooldown = self.last_change.map_or(Duration::ZERO, |last| {
             QUALITY_CHANGE_COOLDOWN.saturating_sub(now.saturating_duration_since(last))
         });
@@ -466,7 +508,7 @@ impl Quality {
             bad_reasons = ?pressure.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
             recovery_vetoes = ?recovery_vetoes.iter().copied().map(Reason::as_str).collect::<Vec<_>>(),
             streak_before = ?self.streak,
-            delivered = link.delivered,
+            delivered = link.delivered(),
             queued = self.queued,
             link = ?self.link,
             levels = ?self.levels,
@@ -475,7 +517,7 @@ impl Quality {
         .entered();
         // The stream is damage-driven: absence of frames says nothing about its
         // health. Idle feedback preserves recovery, but interrupts producer overload.
-        if !link.active && !encoder_bad {
+        if matches!(link, LinkSample::Idle { .. }) && !encoder_bad {
             if encoder_was_bad {
                 self.streak = Streak::None;
             }
@@ -484,7 +526,16 @@ impl Quality {
         }
         // After a jump the link still carries video queued before it. Its late and
         // lost frames say nothing about the new levels, so wait until it empties.
-        if self.link.is_some() && link.draining && !encoder_bad {
+        if self.link.is_some()
+            && matches!(
+                link,
+                LinkSample::Active(ActiveLink {
+                    flow: Flow::Draining,
+                    ..
+                })
+            )
+            && !encoder_bad
+        {
             debug!(decision = "draining", streak_after = ?self.streak, "quality decision");
             return None;
         }
@@ -541,7 +592,7 @@ impl Quality {
 
     /// Account for what the encoder produced and the viewer received since the last
     /// sample.
-    fn observe_link(&mut self, feedback: &Feedback, lossy: bool) -> LinkSample {
+    fn observe_link(&mut self, feedback: &Feedback) -> LinkSample {
         let produced = std::mem::take(&mut self.produced);
         #[expect(
             clippy::cast_possible_truncation,
@@ -556,12 +607,21 @@ impl Quality {
         // Frames the gateway discards for a slow link will never arrive; the viewer
         // reports them as lost.
         self.queued = if feedback.dropped() > 0 { 0 } else { queued };
-        // Once congested, a link stays congested while less arrives than was
-        // produced, even after the gateway discards its queue.
-        let saturated = produced >= delivered.bytes.saturating_add(LINK_BACKLOG_MIN_BYTES);
         // A second without video is idle only when none is waiting: otherwise the
         // link stalled.
-        let active = feedback.received() > 0 || self.queued >= LINK_BACKLOG_MIN_BYTES;
+        if feedback.received() == 0 && self.queued < LINK_BACKLOG_MIN_BYTES {
+            self.congestion = None;
+            return LinkSample::Idle {
+                delivered: delivered.bytes,
+            };
+        }
+        let flow = if delivered.bytes >= produced.saturating_add(LINK_BACKLOG_MIN_BYTES) {
+            Flow::Draining
+        } else if produced >= delivered.bytes.saturating_add(LINK_BACKLOG_MIN_BYTES) {
+            Flow::Saturated
+        } else {
+            Flow::Balanced
+        };
         // A probe tests a link already measured, by a small overshoot that queues
         // slowly; waiting for half a second of backlog would let it build for many
         // seconds. Any steady queue past the byte minimum fails it.
@@ -570,29 +630,39 @@ impl Quality {
         } else {
             LINK_BACKLOG_MIN_BYTES.max(delivered.bytes * LINK_BACKLOG_MILLIS / delivered.millis)
         };
+        // Once congested, a link stays congested while less arrives than was
+        // produced, even after the gateway discards its queue.
         let backlog =
-            active && (self.queued >= backlog_bytes || self.congestion.is_some() && saturated);
-        let loss = lossy && queued >= LINK_BACKLOG_MIN_BYTES;
+            self.queued >= backlog_bytes || self.congestion.is_some() && flow == Flow::Saturated;
+        let loss = if feedback.received() == 0
+            || u64::from(feedback.dropped()) * 100
+                < u64::from(feedback.received()) * BROWSER_BAD_DROP_PERCENT
+        {
+            Loss::None
+        } else if queued >= LINK_BACKLOG_MIN_BYTES {
+            Loss::Link
+        } else {
+            Loss::Browser
+        };
         // Congestion means the link, not the encoder or decoder, sets the rate, and
         // what arrives while it lasts measures the link, more exactly the longer it
         // lasts: the viewer counts each message when its last byte arrives. The
         // first second can include video sent before the link slowed, so it only
         // starts the measurement.
-        self.congestion = (backlog || loss).then(|| {
+        self.congestion = (backlog || loss == Loss::Link).then(|| {
             self.congestion
                 .map_or(Delivery::default(), |congestion| Delivery {
                     bytes: congestion.bytes + delivered.bytes,
                     millis: congestion.millis + delivered.millis,
                 })
         });
-        LinkSample {
-            active,
+        LinkSample::Active(ActiveLink {
             backlog,
             loss,
-            draining: delivered.bytes >= produced.saturating_add(LINK_BACKLOG_MIN_BYTES),
+            flow,
             delivered: delivered.bytes,
             measured: self.congestion.and_then(Delivery::kbps),
-        }
+        })
     }
 
     fn lowering(
@@ -603,7 +673,7 @@ impl Quality {
     ) -> Option<Lowering> {
         // A restart's key frame alone can back the link up for a second, but the
         // gateway discards video only when the link cannot keep up.
-        if self.probing() && !local_pressure && (streak_lowers || sample.loss) {
+        if self.probing() && !local_pressure && (streak_lowers || sample.loss() == Loss::Link) {
             return Some(Lowering::FailedProbe);
         }
         if !streak_lowers {
@@ -611,7 +681,7 @@ impl Quality {
         }
         // Congestion that lasts while it is measured shows the link carries less
         // than the encoder produces, whatever the target says.
-        Some(match sample.measured {
+        Some(match sample.measured() {
             Some(delivered) => Lowering::ToLink(delivered),
             None if local_pressure => Lowering::Step,
             None => Lowering::Measuring,
