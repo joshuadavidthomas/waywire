@@ -4,8 +4,8 @@
 //! manager and the image copy capture manager, create a session from an output
 //! source, and request frames into `wl_shm` buffers. Pending frames queue here
 //! and are completed at the next render tick by copying pixels out of the
-//! rendered Pixman image, so captures never trigger an extra render or change
-//! video frame pacing. The cursor is never drawn into frames, so captures are
+//! rendered Pixman image. Pending captures demand current pixels at the normal
+//! frame tick, without changing video frame pacing. The cursor is never drawn into frames, so captures are
 //! always cursor-free.
 
 use std::time::Duration;
@@ -91,6 +91,10 @@ impl Capture {
 
     fn abort(&mut self, frame: &FrameRef) {
         self.pending.retain(|pending| pending != frame);
+    }
+
+    pub(crate) fn needs_pixels(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Complete queued frames by copying the rendered image into the

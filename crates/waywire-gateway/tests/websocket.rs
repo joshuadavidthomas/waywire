@@ -21,6 +21,7 @@ use std::time::Instant;
 use waywire_protocol::Decoder;
 use waywire_protocol::pipe::Command;
 use waywire_protocol::pipe::InputControl;
+use waywire_protocol::pipe::VideoDemand;
 
 /// The gateway gives up on a compositor that sends no video for 15 seconds,
 /// so each test finishes well inside that.
@@ -268,8 +269,8 @@ fn upgrades_past_the_connection_limit_are_unavailable_until_one_closes() {
 #[test]
 fn disconnecting_the_input_owner_hands_input_to_a_waiting_socket() {
     let gateway = Gateway::start();
-    // The gateway starts by telling the compositor no browser holds input.
-    let mut expected = vec![lease(false)];
+    // Control sockets alone need neither input ownership nor encoded video.
+    let mut expected = vec![lease(false), Command::VideoDemand(VideoDemand::Suspended)];
     gateway.assert_commands(&expected);
     // An abrupt TCP close and a WebSocket close frame both end the session.
     for close_frame in [false, true] {
@@ -308,6 +309,34 @@ fn disconnecting_the_input_owner_hands_input_to_a_waiting_socket() {
         expected.push(lease(false));
         gateway.assert_commands(&expected);
     }
+}
+
+#[test]
+fn video_demand_follows_the_first_and_last_stream_socket() {
+    let gateway = Gateway::start();
+    let mut expected = vec![lease(false), Command::VideoDemand(VideoDemand::Suspended)];
+    gateway.assert_commands(&expected);
+    let (first, head) = gateway.upgrade("/stream", Some("https://viewer.test"));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+    expected.push(Command::VideoDemand(VideoDemand::Wanted));
+    gateway.assert_commands(&expected);
+    let (mut second, head) = gateway.upgrade("/stream", Some("https://viewer.test"));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+    second
+        .write_all(&[0x89, 0x80, 0, 0, 0, 0])
+        .expect("ping second viewer");
+    assert_eq!(read_frame(&mut second), (10, Vec::new()));
+    drop(first);
+    drop(second);
+    expected.push(Command::VideoDemand(VideoDemand::Suspended));
+    gateway.assert_commands(&expected);
+    let (replacement, head) = gateway.upgrade("/stream", Some("https://viewer.test"));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+    expected.push(Command::VideoDemand(VideoDemand::Wanted));
+    gateway.assert_commands(&expected);
+    drop(replacement);
+    expected.push(Command::VideoDemand(VideoDemand::Suspended));
+    gateway.assert_commands(&expected);
 }
 
 /// An Opus packet the compositor sends in RTP payload type 111 reaches every

@@ -364,7 +364,7 @@ progress at once; more are refused with `LimitsExceeded`.
 ### What counts as damage
 
 Damage is a change to the pixels that a full-screen screenshot shows, as the
-compositor's output damage tracker reports it for each frame it draws:
+compositor's output damage tracker reports it for each scene frame it observes:
 
 - Committed surface damage from any client, including X11 windows through
   Xwayland, that reaches the output. Damage hidden behind an opaque window or
@@ -388,14 +388,18 @@ compositor's output damage tracker reports it for each frame it draws:
   quiet for 300 ms after a click. Changes larger than the caret still count,
   such as a typed character together with the caret it moved.
 
-A frame is timed when the compositor renders it, at most once per output
-frame interval, which is also when screenshots start to show it. While a
-client's commit waits for the next frame, the compositor does not answer
-`settled`: it waits for that frame, then decides.
+A frame is timed when the compositor observes its scene, at most once per
+output frame interval. Scene observation and application frame callbacks
+continue without a video viewer or capture consumer. Painting can wait until
+pixels are needed, except when caret classification needs pixel comparison.
+Screenshot requests paint stale pixels before completing, so a screenshot
+after `settled` shows the current scene. Catch-up painting does not count as
+new scene damage. While a client's commit waits for its observation tick,
+the compositor does not answer `settled`: it waits for that tick, then decides.
 
 With `window`, a frame counts when its damage overlaps the window's frame (its
-content and titlebar) or its popups. A frame drawn during the wait is checked
-against where the window is then; one drawn between the input and the call,
+content and titlebar) or its popups. A frame observed during the wait is checked
+against where the window is then; one observed between the input and the call,
 against where the window is when the call arrives. Another window drawn over that area counts too, because it changes
 what a screenshot of the area shows. X11 override-redirect menus are separate
 surfaces, not popups of a window; they count only where they overlap it.

@@ -26,12 +26,10 @@ mod virtual_pointer;
 mod wm;
 mod xwayland;
 
-use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::process::Child;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -192,6 +190,12 @@ impl FrameRequest {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedImage {
+    Current,
+    Stale,
+}
+
 enum Run {
     Running,
     Stopping,
@@ -227,6 +231,7 @@ pub(crate) struct State {
     text_keyboard: text_keyboard::TextKeyboard,
     capture: capture::Capture,
     screencopy: screencopy::Screencopy,
+    portal_screenshots: Vec<portal::Screenshot>,
     /// `ScreenCast` portal video, present while the private `PipeWire`
     /// daemon is reachable.
     screencast: Option<waywire_pipewire::Streams>,
@@ -243,6 +248,8 @@ pub(crate) struct State {
     size: FrameSize,
     input: input::Input,
     frame_request: FrameRequest,
+    /// Scene observation has advanced beyond the cached output pixels.
+    image_state: CachedImage,
 }
 
 /// The seat's key repeat, in keys per second after a delay in milliseconds,
@@ -356,6 +363,7 @@ impl State {
             text_keyboard: text_keyboard::TextKeyboard::default(),
             capture,
             screencopy,
+            portal_screenshots: Vec::new(),
             screencast: None,
             toplevel_list,
             delivery: delivery::Delivery::default(),
@@ -369,6 +377,7 @@ impl State {
             size: options.resolution,
             input: input::Input::default(),
             frame_request: FrameRequest::FullRedraw,
+            image_state: CachedImage::Stale,
         })
     }
 
@@ -1078,6 +1087,10 @@ impl State {
         self.input.forget_buttons(source);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one frame tick orders scene observation, pixel consumers and callbacks"
+    )]
     fn render(
         &mut self,
         renderer: &mut PixmanRenderer,
@@ -1095,6 +1108,7 @@ impl State {
         {
             *image = renderer.create_buffer(Fourcc::Argb8888, size)?;
             *tracker = OutputDamageTracker::from_output(&self.output);
+            self.image_state = CachedImage::Stale;
         }
         self.space.refresh();
         self.windows.retain_alive();
@@ -1112,49 +1126,87 @@ impl State {
             });
         }
         let elements = self.scene_elements(renderer);
-        let forced = self.frame_request == FrameRequest::FullRedraw || !self.stream.acknowledged();
-        let clear = [0.08, 0.09, 0.12, 1.0];
-        let (damage, changed) = {
-            let mut target = renderer.bind(image)?;
-            if forced {
-                // A forced redraw repaints everything, but settle waits need
-                // what changed since the last frame.
-                let (changed, states) = tracker.damage_output(1, &elements)?;
-                let changed = changed.cloned().unwrap_or_default();
-                let damage = tracker
-                    .render_output_with_states(renderer, &mut target, 0, &elements, clear, states)?
-                    .damage
-                    .cloned();
-                (damage, changed)
-            } else {
-                let damage = tracker
-                    .render_output(renderer, &mut target, 1, &elements, clear)?
-                    .damage
-                    .cloned();
-                let changed = damage.clone().unwrap_or_default();
-                (damage, changed)
+        let needs_pixels = self.stream.needs_pixels()
+            || self.capture.needs_pixels()
+            || self.screencopy.needs_pixels()
+            || !self.portal_screenshots.is_empty()
+            || self
+                .screencast
+                .as_ref()
+                .is_some_and(waywire_pipewire::Streams::needs_pixels)
+            || self.caret().is_some();
+        if needs_pixels {
+            let forced = self.image_state == CachedImage::Stale
+                || self.frame_request == FrameRequest::FullRedraw
+                || !self.stream.acknowledged();
+            let clear = [0.08, 0.09, 0.12, 1.0];
+            let (damage, changed) = {
+                let mut target = renderer.bind(image)?;
+                if forced {
+                    // Observation advances the tracker's history even without
+                    // painting. Catch up every pixel, but do not count that
+                    // full repaint as new scene damage for settle waits.
+                    let (changed, states) = tracker.damage_output(1, &elements)?;
+                    let changed = changed.cloned().unwrap_or_default();
+                    let damage = tracker
+                        .render_output_with_states(
+                            renderer,
+                            &mut target,
+                            0,
+                            &elements,
+                            clear,
+                            states,
+                        )?
+                        .damage
+                        .cloned();
+                    (damage, changed)
+                } else {
+                    let damage = tracker
+                        .render_output(renderer, &mut target, 1, &elements, clear)?
+                        .damage
+                        .cloned();
+                    let changed = damage.clone().unwrap_or_default();
+                    (damage, changed)
+                }
+            };
+            self.image_state = CachedImage::Current;
+            let drawn = (!forced).then(|| damage.as_deref().unwrap_or_default());
+            self.frame_rendered(delivery::monotonic_usec(), &changed, image, drawn);
+            self.stream.rendered(
+                image,
+                self.size,
+                if forced {
+                    stream::FrameDamage::Full
+                } else {
+                    damage
+                        .as_deref()
+                        .map_or(stream::FrameDamage::Unchanged, stream::FrameDamage::Regions)
+                },
+                render_started_ns,
+            )?;
+            if damage.as_ref().is_some_and(|regions| !regions.is_empty()) {
+                tracing::debug!(target: "waywire_latency", stage = "paint", at_ns = latency::monotonic_nanos());
+                if let Some(screencast) = &self.screencast {
+                    screencast.frame(&cast_frame(image));
+                }
             }
-        };
-        let drawn = (!forced).then(|| damage.as_deref().unwrap_or_default());
-        self.frame_rendered(delivery::monotonic_usec(), &changed, image, drawn);
-        if self.stream.rendered(
-            image,
-            self.size,
-            if forced {
-                stream::FrameDamage::Full
-            } else {
-                damage
-                    .as_deref()
-                    .map_or(stream::FrameDamage::Unchanged, stream::FrameDamage::Regions)
-            },
-            render_started_ns,
-        )? == stream::Rendered::Submitted
-            && let Some(screencast) = &self.screencast
-        {
-            screencast.frame(&cast_frame(image));
+            if let Some(screencast) = &self.screencast {
+                screencast.offer_pending(&cast_frame(image));
+            }
+            self.capture.serve_pending(image);
+            self.screencopy.serve_pending(image);
+            for screenshot in std::mem::take(&mut self.portal_screenshots) {
+                screenshot.complete(image);
+            }
+        } else {
+            let (changed, _) = tracker.damage_output(1, &elements)?;
+            let changed = changed.cloned().unwrap_or_default();
+            if !changed.is_empty() || self.frame_request == FrameRequest::FullRedraw {
+                self.image_state = CachedImage::Stale;
+            }
+            self.frame_observed(delivery::monotonic_usec(), changed);
         }
-        self.capture.serve_pending(image);
-        self.screencopy.serve_pending(image);
+        tracing::debug!(target: "waywire_latency", stage = "scene", at_ns = latency::monotonic_nanos());
         self.frame_request = FrameRequest::Idle;
         self.send_cursor_frame();
         for window in self.space.elements() {
@@ -1323,18 +1375,15 @@ pub fn run(mut options: Config) -> Result<()> {
         wake_on_exit(&handle, pid)?;
     }
     let mut renderer = PixmanRenderer::new()?;
-    // The portal backends read the most recently rendered frame from the
-    // calloop loop, which is the only writer.
-    let image = Rc::new(RefCell::new(
-        renderer.create_buffer(
-            Fourcc::Argb8888,
-            (
-                i32::try_from(state.size.width())?,
-                i32::try_from(state.size.height())?,
-            )
-                .into(),
-        )?,
-    ));
+    // Capture consumers read this image only after a frame tick makes it current.
+    let mut image = renderer.create_buffer(
+        Fourcc::Argb8888,
+        (
+            i32::try_from(state.size.width())?,
+            i32::try_from(state.size.height())?,
+        )
+            .into(),
+    )?;
     if let Some(bus) = &bus {
         match crate::delivery::start(&handle, bus.address(), State::apply_delivery_request) {
             Ok(outgoing) => state.delivery.set_outgoing(outgoing),
@@ -1346,7 +1395,6 @@ pub fn run(mut options: Config) -> Result<()> {
             &handle,
             runtime.path(),
             bus.address(),
-            Rc::clone(&image),
             options.xkb_layout.clone(),
         )?,
         None => None,
@@ -1365,7 +1413,7 @@ pub fn run(mut options: Config) -> Result<()> {
         ));
     state.loop_handle = Some(handle.clone());
     if let Some(daemon) = &pipewire_daemon {
-        state.screencast = start_screencast(&handle, daemon, Rc::clone(&image));
+        state.screencast = start_screencast(&handle, daemon);
     }
     let mut tracker = OutputDamageTracker::from_output(&state.output);
     let mut next_frame = Instant::now();
@@ -1418,7 +1466,7 @@ pub fn run(mut options: Config) -> Result<()> {
         state.publish_window_list();
         if (state.frame_request != FrameRequest::Idle) && Instant::now() >= next_frame {
             let started = Instant::now();
-            if let Err(error) = state.render(&mut renderer, &mut image.borrow_mut(), &mut tracker) {
+            if let Err(error) = state.render(&mut renderer, &mut image, &mut tracker) {
                 state.fail(error);
             }
             next_frame = frame_deadline(
@@ -1428,7 +1476,7 @@ pub fn run(mut options: Config) -> Result<()> {
             );
         }
         state.poll_settled(delivery::monotonic_usec());
-        if let Err(error) = state.stream.refresh(&image.borrow(), state.size) {
+        if let Err(error) = state.stream.refresh(&image, state.size) {
             state.fail(error);
         }
         if Instant::now() >= next_housekeeping {
@@ -1475,13 +1523,12 @@ pub fn run(mut options: Config) -> Result<()> {
 }
 
 /// Connect to the private `PipeWire` daemon and dispatch its events on the
-/// calloop loop. A consumer that frees a buffer wakes the loop, which retries
-/// the latest rendered frame. Returns `None`, leaving `ScreenCast` metadata
+/// calloop loop. A consumer that starts or frees a buffer requests a frame
+/// tick, which makes the output current before delivery. Returns `None`, leaving `ScreenCast` metadata
 /// only, when the connection fails.
 fn start_screencast(
     handle: &calloop::LoopHandle<'static, State>,
     daemon: &waywire_pipewire::Daemon,
-    image: Rc<RefCell<Image<'static, 'static>>>,
 ) -> Option<waywire_pipewire::Streams> {
     let streams = match waywire_pipewire::Streams::connect(daemon.socket()) {
         Ok(streams) => streams,
@@ -1502,7 +1549,9 @@ fn start_screencast(
         move |_, _, state| {
             if let Some(streams) = &state.screencast {
                 streams.dispatch();
-                streams.offer_pending(&cast_frame(&image.borrow()));
+                if streams.needs_frame() {
+                    state.frame_request.request(FrameRequest::Damaged);
+                }
             }
             Ok(PostAction::Continue)
         },

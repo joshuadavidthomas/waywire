@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::debug;
 use waywire_protocol::browser::Continuity;
 use waywire_protocol::browser::FrameKind;
@@ -12,6 +13,7 @@ use waywire_protocol::browser::Layout;
 use waywire_protocol::browser::VideoSample;
 use waywire_protocol::pipe::Fps;
 use waywire_protocol::pipe::Generation;
+use waywire_protocol::pipe::VideoDemand;
 
 use super::GopState;
 
@@ -27,6 +29,7 @@ pub(crate) struct VideoHub {
     /// A striped stream has no periodic key frames, so a viewer that starts or falls
     /// behind mid-GOP asks the video worker for one.
     key_wanted: Arc<Notify>,
+    demand: watch::Sender<VideoDemand>,
 }
 
 struct Hub {
@@ -35,6 +38,8 @@ struct Hub {
     gop: Vec<VideoSample>,
     gop_bytes: usize,
     generation: Option<Generation>,
+    /// Frames captured before the current watching interval cannot bootstrap it.
+    resume_at: u64,
     viewer_bounds: ViewerBounds,
 }
 
@@ -192,10 +197,16 @@ impl VideoHub {
                 gop: Vec::new(),
                 gop_bytes: 0,
                 generation: None,
+                resume_at: 0,
                 viewer_bounds: ViewerBounds::for_max_fps(max_fps),
             })),
             key_wanted: Arc::new(Notify::new()),
+            demand: watch::channel(VideoDemand::Suspended).0,
         }
+    }
+
+    pub(crate) fn demand(&self) -> watch::Receiver<VideoDemand> {
+        self.demand.subscribe()
     }
 
     /// Notified when a viewer of a striped stream waits for a key frame.
@@ -210,6 +221,12 @@ impl VideoHub {
 
     pub(crate) fn subscribe(&self) -> VideoSubscription {
         let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if hub.subscribers.is_empty() {
+            hub.gop.clear();
+            hub.gop_bytes = 0;
+            hub.resume_at = super::monotonic_nanos();
+            self.demand.send_replace(VideoDemand::Wanted);
+        }
         let id = SubscriberId(hub.next_subscriber);
         hub.next_subscriber = hub.next_subscriber.wrapping_add(1);
         let bounds = hub.viewer_bounds;
@@ -254,11 +271,13 @@ impl VideoHub {
     }
 
     fn unsubscribe(&self, id: SubscriberId) {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .subscribers
-            .remove(&id);
+        let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        hub.subscribers.remove(&id);
+        if hub.subscribers.is_empty() {
+            hub.gop.clear();
+            hub.gop_bytes = 0;
+            self.demand.send_replace(VideoDemand::Suspended);
+        }
     }
 
     // VideoWorker::run is the sole production caller. Fan-out happens without the hub lock, so
@@ -267,6 +286,9 @@ impl VideoHub {
         let generation = sample.metadata().generation();
         let (handles, state, continuity) = {
             let mut hub = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            if sample.metadata().capture_nanos() < hub.resume_at {
+                return GopState::Recovering;
+            }
             let continuity = if sample.continuity() == Continuity::AfterGap
                 || hub
                     .generation
@@ -346,8 +368,8 @@ mod tests {
     async fn viewer_queue_delivers_every_frame_up_to_its_bound() {
         for (max_fps, frame_bound) in [(10, 6_u64), (30, 16), (60, 31), (120, 61)] {
             let hub = VideoHub::new(fps(max_fps));
-            let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             let mut frames = hub.subscribe();
+            let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             assert_eq!(frames.next().await.metadata().sequence(), 0);
 
             for sequence in 1..=frame_bound {
@@ -366,8 +388,8 @@ mod tests {
     async fn viewer_queue_clears_on_the_first_frame_past_its_bound() {
         for (max_fps, frame_bound) in [(10, 6_u64), (30, 16), (60, 31), (120, 61)] {
             let hub = VideoHub::new(fps(max_fps));
-            let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             let mut frames = hub.subscribe();
+            let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
             assert_eq!(frames.next().await.metadata().sequence(), 0);
 
             for sequence in 1..=frame_bound {
@@ -411,9 +433,9 @@ mod tests {
     #[tokio::test]
     async fn overflow_keeps_arriving_keyframe_and_discards_delta() {
         let hub = video_hub();
-        let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
         let mut slow = hub.subscribe();
         let mut independent = hub.subscribe();
+        let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
         let _ = slow.next().await;
         let _ = independent.next().await;
         for sequence in 1..=ViewerBounds::for_max_fps(fps(60)).frames {
@@ -453,8 +475,8 @@ mod tests {
     #[tokio::test]
     async fn generation_reset_discards_queued_deltas_until_a_new_keyframe() {
         let hub = video_hub();
-        let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
         let mut subscription = hub.subscribe();
+        let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
         let _ = subscription.next().await;
 
         let _ = hub.broadcast(&sample(1, 1, FrameKind::Delta));
@@ -482,14 +504,24 @@ mod tests {
         drop(subscription);
 
         let _ = hub.broadcast(&sample(1, 1, FrameKind::Key));
+        let in_flight = sample(2, 1, FrameKind::Key);
         let mut replacement = hub.subscribe();
-        assert_eq!(replacement.next().await.metadata().sequence(), 1);
+        let _ = hub.broadcast(&in_flight);
+        let _ = hub.broadcast(&sample(3, 1, FrameKind::Delta));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), replacement.next())
+                .await
+                .is_err()
+        );
+        let _ = hub.broadcast(&sample(4, 1, FrameKind::Key));
+        assert_eq!(replacement.next().await.metadata().sequence(), 4);
     }
 
     #[tokio::test]
     async fn oversized_cached_gop_is_not_bootstrapped() {
         let bounds = ViewerBounds::for_max_fps(fps(60));
         let hub = video_hub();
+        let _watching = hub.subscribe();
         let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
         for sequence in 1..=bounds.frames {
             let _ = hub.broadcast(&sample(
@@ -518,6 +550,7 @@ mod tests {
     #[tokio::test]
     async fn fitting_cached_gop_is_delivered_before_live_frames() {
         let hub = video_hub();
+        let _watching = hub.subscribe();
         let _ = hub.broadcast(&sample(0, 1, FrameKind::Key));
         let _ = hub.broadcast(&sample(1, 1, FrameKind::Delta));
         let mut subscription = hub.subscribe();

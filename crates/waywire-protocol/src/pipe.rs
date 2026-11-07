@@ -1140,6 +1140,27 @@ impl Wire for InputControl {
     }
 }
 
+/// Whether browser viewers need video beyond the generation's bootstrap frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoDemand {
+    Suspended,
+    Wanted,
+}
+
+impl Wire for VideoDemand {
+    fn write(&self, out: &mut Writer) {
+        out.put(&u8::from(matches!(self, Self::Wanted)));
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, InvalidValue> {
+        match input.get()? {
+            0_u8 => Ok(Self::Suspended),
+            1 => Ok(Self::Wanted),
+            _ => Err(InvalidValue::new("video demand must be zero or one")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResetVideo;
 
@@ -1442,6 +1463,7 @@ pub enum CommandKind {
     InputLease = 13,
     PointerWheel = 14,
     PointerScrollStop = 15,
+    VideoDemand = 16,
 }
 
 impl CommandKind {
@@ -1480,6 +1502,7 @@ impl RecordKind for CommandKind {
             Self::InputLease => 13,
             Self::PointerWheel => 14,
             Self::PointerScrollStop => 15,
+            Self::VideoDemand => 16,
         }
     }
 
@@ -1500,6 +1523,7 @@ impl RecordKind for CommandKind {
             13 => Some(Self::InputLease),
             14 => Some(Self::PointerWheel),
             15 => Some(Self::PointerScrollStop),
+            16 => Some(Self::VideoDemand),
             _ => None,
         }
     }
@@ -1515,7 +1539,7 @@ impl RecordKind for CommandKind {
             Self::Quality => 14,
             Self::PointerButton | Self::KeyboardKey => 9,
             Self::ReleaseAll | Self::ResetVideo => 0,
-            Self::InputLease => 1,
+            Self::InputLease | Self::VideoDemand => 1,
             Self::Clipboard => MAX_CLIPBOARD_BYTES,
             Self::Text => MAX_TEXT_BYTES + 5,
             Self::KeyframeReadiness => 5,
@@ -1540,6 +1564,7 @@ pub enum Command {
     KeyframeReadiness(KeyframeReadiness),
     ResetVideo(ResetVideo),
     InputLease(InputControl),
+    VideoDemand(VideoDemand),
 }
 
 impl Command {
@@ -1561,7 +1586,8 @@ impl Command {
             | Self::Quality(_)
             | Self::KeyframeReadiness(_)
             | Self::ResetVideo(_)
-            | Self::InputLease(_) => None,
+            | Self::InputLease(_)
+            | Self::VideoDemand(_) => None,
         }
     }
 
@@ -1583,6 +1609,7 @@ impl Command {
             Self::KeyframeReadiness(_) => CommandKind::KeyframeReadiness,
             Self::ResetVideo(_) => CommandKind::ResetVideo,
             Self::InputLease(_) => CommandKind::InputLease,
+            Self::VideoDemand(_) => CommandKind::VideoDemand,
         }
     }
 }
@@ -1611,6 +1638,7 @@ impl Record for Command {
             Self::KeyframeReadiness(payload) => out.put(payload),
             Self::ResetVideo(payload) => out.put(payload),
             Self::InputLease(payload) => out.put(payload),
+            Self::VideoDemand(payload) => out.put(payload),
         }
     }
 
@@ -1631,6 +1659,7 @@ impl Record for Command {
             CommandKind::KeyframeReadiness => Ok(Self::KeyframeReadiness(input.get()?)),
             CommandKind::ResetVideo => Ok(Self::ResetVideo(input.get()?)),
             CommandKind::InputLease => Ok(Self::InputLease(input.get()?)),
+            CommandKind::VideoDemand => Ok(Self::VideoDemand(input.get()?)),
         }
     }
 }
@@ -2503,6 +2532,16 @@ mod tests {
                 Command::InputLease(InputControl::Agents),
                 vec![13, 13, 0, 0, 1, 0, 0, 0, 0],
             ),
+            (
+                "video suspended",
+                Command::VideoDemand(VideoDemand::Suspended),
+                vec![13, 16, 0, 0, 1, 0, 0, 0, 0],
+            ),
+            (
+                "video wanted",
+                Command::VideoDemand(VideoDemand::Wanted),
+                vec![13, 16, 0, 0, 1, 0, 0, 0, 1],
+            ),
         ]
     }
 
@@ -2746,6 +2785,17 @@ mod tests {
             Command::decode(&record),
             Err(ProtocolError::InvalidPayload { kind: 9, .. })
         ));
+    }
+
+    #[test]
+    fn video_demand_rejects_unknown_states() {
+        for state in 2..=u8::MAX {
+            let record = [13, 16, 0, 0, 1, 0, 0, 0, state];
+            assert!(matches!(
+                Command::decode(&record),
+                Err(ProtocolError::InvalidPayload { kind: 16, .. })
+            ));
+        }
     }
 
     #[test]
@@ -3033,7 +3083,7 @@ mod tests {
     /// layouts: fixed kinds carry exactly their fields, text carries up to 4000
     /// bytes after its one-byte action and four-byte sequence, and a clipboard
     /// up to 1 MiB.
-    const COMMAND_LIMITS: [(u8, u32); 15] = [
+    const COMMAND_LIMITS: [(u8, u32); 16] = [
         (1, 12),      // pointer absolute: x, y, sequence
         (2, 9),       // pointer button: button, state, sequence
         (3, 12),      // pointer scroll: dx, dy, sequence
@@ -3049,6 +3099,7 @@ mod tests {
         (13, 1),      // input lease
         (14, 12),     // pointer wheel
         (15, 12),     // pointer scroll stop
+        (16, 1),      // video demand
     ];
 
     /// The same for events. A cursor image is a six-byte header and a PNG of

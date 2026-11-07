@@ -551,6 +551,23 @@ impl Streams {
         }
     }
 
+    /// Whether a consumer is running, rather than just owning a session/node.
+    #[must_use]
+    pub fn needs_pixels(&self) -> bool {
+        self.casts
+            .values()
+            .any(|cast| cast.stream.state() == pw::stream::StreamState::Streaming)
+    }
+
+    /// Whether a running consumer needs its first frame or a delivery retry.
+    #[must_use]
+    pub fn needs_frame(&self) -> bool {
+        self.casts.values().any(|cast| {
+            cast.stream.state() == pw::stream::StreamState::Streaming
+                && cast.state.delivery.get() == Delivery::Pending
+        })
+    }
+
     /// Offer a newly rendered frame to every stream.
     pub fn frame(&self, image: &Frame<'_>) {
         for cast in self.casts.values() {

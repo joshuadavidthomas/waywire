@@ -2146,6 +2146,367 @@ impl Desktop {
     }
 }
 
+/// A callback-paced native client with exactly two reusable SHM buffers.
+mod demand_client {
+    use std::fs::File;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::net::UnixStream;
+
+    use wayland_client::Connection;
+    use wayland_client::Dispatch;
+    use wayland_client::EventQueue;
+    use wayland_client::QueueHandle;
+    use wayland_client::protocol::wl_buffer;
+    use wayland_client::protocol::wl_callback;
+    use wayland_client::protocol::wl_compositor::WlCompositor;
+    use wayland_client::protocol::wl_registry;
+    use wayland_client::protocol::wl_shm::Format;
+    use wayland_client::protocol::wl_shm::WlShm;
+    use wayland_client::protocol::wl_shm_pool::WlShmPool;
+    use wayland_client::protocol::wl_surface::WlSurface;
+    use wayland_protocols::xdg::shell::client::xdg_surface;
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
+    use wayland_protocols::xdg::shell::client::xdg_wm_base;
+
+    use super::Desktop;
+    use super::Duration;
+    use super::Instant;
+    use super::thread;
+
+    #[derive(Default)]
+    struct App {
+        compositor: Option<WlCompositor>,
+        shm: Option<WlShm>,
+        shell: Option<xdg_wm_base::XdgWmBase>,
+        configured: bool,
+        callbacks: usize,
+        released: [bool; 2],
+        releases: usize,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for App {
+        fn event(
+            app: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            (): &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        app.compositor = Some(registry.bind(name, version.min(4), qh, ()));
+                    }
+                    "wl_shm" => app.shm = Some(registry.bind(name, 1, qh, ())),
+                    "xdg_wm_base" => app.shell = Some(registry.bind(name, 1, qh, ())),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl Dispatch<xdg_wm_base::XdgWmBase, ()> for App {
+        fn event(
+            _: &mut Self,
+            shell: &xdg_wm_base::XdgWmBase,
+            event: xdg_wm_base::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_wm_base::Event::Ping { serial } = event {
+                shell.pong(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_surface::XdgSurface, ()> for App {
+        fn event(
+            app: &mut Self,
+            surface: &xdg_surface::XdgSurface,
+            event: xdg_surface::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_surface::Event::Configure { serial } = event {
+                surface.ack_configure(serial);
+                app.configured = true;
+            }
+        }
+    }
+
+    impl Dispatch<wl_callback::WlCallback, ()> for App {
+        fn event(
+            app: &mut Self,
+            _: &wl_callback::WlCallback,
+            event: wl_callback::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_callback::Event::Done { .. } = event {
+                app.callbacks += 1;
+            }
+        }
+    }
+
+    impl Dispatch<wl_buffer::WlBuffer, usize> for App {
+        fn event(
+            app: &mut Self,
+            _: &wl_buffer::WlBuffer,
+            event: wl_buffer::Event,
+            index: &usize,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_buffer::Event::Release = event {
+                app.released[*index] = true;
+                app.releases += 1;
+            }
+        }
+    }
+
+    wayland_client::delegate_noop!(App: ignore WlCompositor);
+    wayland_client::delegate_noop!(App: ignore WlShm);
+    wayland_client::delegate_noop!(App: WlShmPool);
+    wayland_client::delegate_noop!(App: ignore WlSurface);
+    wayland_client::delegate_noop!(App: ignore XdgToplevel);
+
+    pub(super) struct Client {
+        queue: EventQueue<App>,
+        app: App,
+        surface: WlSurface,
+        buffers: [(File, wl_buffer::WlBuffer); 2],
+        frames: usize,
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "the native client requires its Wayland objects"
+    )]
+    impl Client {
+        pub(super) fn new(desktop: &Desktop) -> Self {
+            let socket = UnixStream::connect(desktop.runtime.path().join(&desktop.wayland))
+                .expect("native client socket");
+            let connection = Connection::from_socket(socket).expect("native connection");
+            let mut queue = connection.new_event_queue();
+            let qh = queue.handle();
+            let mut app = App::default();
+            connection.display().get_registry(&qh, ());
+            queue.roundtrip(&mut app).expect("native globals");
+            let surface = app
+                .compositor
+                .as_ref()
+                .expect("compositor global")
+                .create_surface(&qh, ());
+            let xdg_surface =
+                app.shell
+                    .as_ref()
+                    .expect("shell global")
+                    .get_xdg_surface(&surface, &qh, ());
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            toplevel.set_title("unwatched callback client".into());
+            toplevel.set_fullscreen(None);
+            surface.commit();
+            let buffers = std::array::from_fn(|index| {
+                let file = tempfile::tempfile().expect("native SHM file");
+                file.set_len(800 * 600 * 4).expect("native SHM size");
+                let pool = app.shm.as_ref().expect("SHM global").create_pool(
+                    file.as_fd(),
+                    800 * 600 * 4,
+                    &qh,
+                    (),
+                );
+                let buffer = pool.create_buffer(0, 800, 600, 800 * 4, Format::Xrgb8888, &qh, index);
+                pool.destroy();
+                (file, buffer)
+            });
+            app.released = [true; 2];
+            let mut client = Self {
+                queue,
+                app,
+                surface,
+                buffers,
+                frames: 0,
+            };
+            client.wait(|app| app.configured, "initial fullscreen configure");
+            client
+        }
+
+        fn wait(&mut self, ready: impl Fn(&App) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready(&self.app) {
+                assert!(
+                    Instant::now() < deadline,
+                    "native client stalled waiting for {what}"
+                );
+                // Syncs dispatch protocol events, but never substitute for frame callbacks.
+                self.queue
+                    .roundtrip(&mut self.app)
+                    .expect("native dispatch");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        pub(super) fn commit(&mut self, stage: u8) {
+            let index = self.frames % 2;
+            let previous = self.frames;
+            self.wait(
+                |app| app.callbacks == previous && app.released[index],
+                "frame callback and reusable buffer",
+            );
+            let mut pixels = vec![0_u8; 800 * 600 * 4];
+            for (enabled, x, y, color) in [
+                (stage >= 1, 160, 160, 0x00ff_0000_u32),
+                (stage >= 2, 560, 360, 0x0000_00ff_u32),
+            ] {
+                if enabled {
+                    for row in y..y + 80 {
+                        for col in x..x + 80 {
+                            let offset = (row * 800 + col) * 4;
+                            pixels[offset..offset + 4].copy_from_slice(&color.to_ne_bytes());
+                        }
+                    }
+                }
+            }
+            self.buffers[index]
+                .0
+                .write_all_at(&pixels, 0)
+                .expect("write released SHM buffer");
+            self.app.released[index] = false;
+            self.surface.attach(Some(&self.buffers[index].1), 0, 0);
+            match stage {
+                0 => self.surface.damage_buffer(0, 0, 800, 600),
+                1 => self.surface.damage_buffer(160, 160, 80, 80),
+                _ => self.surface.damage_buffer(560, 360, 80, 80),
+            }
+            self.surface.frame(&self.queue.handle(), ());
+            self.surface.commit();
+            self.frames += 1;
+            let expected = self.frames;
+            self.wait(|app| app.callbacks == expected, "committed frame callback");
+        }
+
+        pub(super) fn releases(&self) -> usize {
+            self.app.releases
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg, Xwayland and grim"]
+fn unwatched_native_callbacks_reuse_buffers_and_capture_repaints_all_damage() {
+    let mut desktop = desktop();
+    let mut decoder = Decoder::<Event>::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let generation = loop {
+        if let Some(generation) = events(&mut desktop.compositor.0, &mut decoder)
+            .into_iter()
+            .find_map(|event| {
+                if let Event::Frame(frame) = event {
+                    Some(frame.generation())
+                } else if let Event::EncodedFrame(frame) = event {
+                    Some(frame.metadata().generation())
+                } else {
+                    None
+                }
+            })
+        {
+            break generation;
+        }
+        assert!(Instant::now() < deadline, "bootstrap frame deadline");
+        thread::sleep(Duration::from_millis(10));
+    };
+    desktop
+        .compositor
+        .0
+        .stdin
+        .as_mut()
+        .expect("command pipe")
+        .write_all(
+            &Command::KeyframeReadiness(KeyframeReadiness::new(generation, KeyframeState::Cached))
+                .encode(),
+        )
+        .expect("acknowledge bootstrap");
+
+    let capture = |desktop: &Desktop| {
+        let output = desktop
+            .command(&["timeout", "5", "grim", "-t", "ppm", "-"])
+            .output()
+            .expect("capture native client");
+        assert!(output.status.success(), "capture failed: {}", output.status);
+        let pixels = output
+            .stdout
+            .strip_prefix(b"P6\n800 600\n255\n")
+            .expect("800x600 PPM header");
+        assert_eq!(pixels.len(), 800 * 600 * 3, "RGB capture length");
+        pixels.to_vec()
+    };
+    let pixel = |pixels: &[u8], x: usize, y: usize| {
+        let offset = (y * 800 + x) * 3;
+        <[u8; 3]>::try_from(&pixels[offset..offset + 3]).expect("RGB pixel")
+    };
+    let mut client = demand_client::Client::new(&desktop);
+    client.commit(0);
+    // Prime the retained framebuffer with a known scene, then let grim exit
+    // and destroy its capture objects before removing the last consumer.
+    let baseline = capture(&desktop);
+    assert_eq!(pixel(&baseline, 200, 200), [0, 0, 0]);
+    assert_eq!(pixel(&baseline, 600, 400), [0, 0, 0]);
+    desktop
+        .compositor
+        .0
+        .stdin
+        .as_mut()
+        .expect("command pipe")
+        .write_all(&Command::VideoDemand(waywire_protocol::pipe::VideoDemand::Suspended).encode())
+        .expect("disable video demand");
+    thread::sleep(Duration::from_millis(100));
+    events(&mut desktop.compositor.0, &mut decoder);
+
+    let releases_before = client.releases();
+    // Each commit waits for its own callback. Two buffers cannot sustain this
+    // many ticks unless the compositor also releases old buffers unwatched.
+    // The second stage damages only the blue square, not the earlier red one.
+    for stage in [1, 2] {
+        for _ in 0..12 {
+            client.commit(stage);
+        }
+    }
+    assert!(
+        client.releases() >= releases_before + 22,
+        "unwatched buffers were not released"
+    );
+    assert!(
+        !events(&mut desktop.compositor.0, &mut decoder)
+            .iter()
+            .any(|event| matches!(event, Event::Frame(_) | Event::EncodedFrame(_))),
+        "unwatched client unexpectedly emitted video frames"
+    );
+    // One capture must repair every unwatched change, not only the latest
+    // damage region. Do not retry: a second capture could hide a stale first.
+    let captured = capture(&desktop);
+    assert_eq!(
+        pixel(&captured, 200, 200),
+        [255, 0, 0],
+        "earlier red damage"
+    );
+    assert_eq!(pixel(&captured, 600, 400), [0, 0, 255], "later blue damage");
+    assert_eq!(
+        pixel(&captured, 400, 300),
+        [0, 0, 0],
+        "unchanged background"
+    );
+}
+
 #[test]
 #[ignore = "requires FFmpeg, Xwayland, wl-clipboard and xclip"]
 fn primary_selection_crosses_wayland_and_x11() {

@@ -2,11 +2,10 @@
 //! serves on the private session bus: portal calls that need the seat, the
 //! EIS server or the rendered frame arrive here as `PortalRequest`s.
 
-use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::rc::Rc;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use calloop::LoopHandle;
@@ -19,6 +18,7 @@ use smithay::input::keyboard::Layout;
 use smithay::input::keyboard::xkb;
 use smithay::input::pointer::AxisFrame;
 use smithay::reexports::pixman::Image;
+use tokio::sync::oneshot;
 use waywire_portal::PortalDirs;
 use waywire_portal::PortalInput;
 use waywire_portal::PortalRequest;
@@ -30,6 +30,27 @@ use crate::capture::image_pixels;
 use crate::delivery::SourceInfo;
 use crate::delivery::SourceKind;
 
+/// A portal screenshot waiting for current output pixels.
+pub(crate) struct Screenshot {
+    directory: PathBuf,
+    reply: oneshot::Sender<Result<PathBuf>>,
+}
+
+impl Screenshot {
+    pub(crate) fn complete(self, image: &Image<'static, 'static>) {
+        let screenshot = waywire_portal::write_screenshot(
+            image_pixels(image),
+            image.width(),
+            image.height(),
+            image.stride(),
+            &self.directory,
+        );
+        if let Err(error) = self.reply.send(screenshot) {
+            tracing::debug!(?error, "portal requester hung up");
+        }
+    }
+}
+
 /// Serve the portal backends on `bus_address` for the lifetime of the
 /// compositor. Returns the published directories, or `None` when the backends
 /// could not be started; the desktop itself still runs.
@@ -37,7 +58,6 @@ pub(crate) fn start(
     handle: &LoopHandle<'static, State>,
     runtime_path: &Path,
     bus_address: &str,
-    image: Rc<RefCell<Image<'static, 'static>>>,
     layout: String,
 ) -> Result<Option<PortalDirs>> {
     let dirs = write_portal_files(runtime_path)?;
@@ -99,17 +119,11 @@ pub(crate) fn start(
                 }
             }
             PortalRequest::Screenshot { reply } => {
-                let image = image.borrow();
-                let screenshot = waywire_portal::write_screenshot(
-                    image_pixels(&image),
-                    image.width(),
-                    image.height(),
-                    image.stride(),
-                    &screenshots_dir,
-                );
-                if let Err(error) = reply.send(screenshot) {
-                    tracing::debug!(?error, "portal requester hung up");
-                }
+                state.portal_screenshots.push(Screenshot {
+                    directory: screenshots_dir.clone(),
+                    reply,
+                });
+                state.frame_request.request(crate::FrameRequest::Damaged);
             }
         },
         Event::Closed => {

@@ -11,7 +11,9 @@ checks that:
   through the viewer's scaling and letterboxing;
 - text typed in the viewer reaches foot exactly;
 - with Remote input switched off, clicks and keys reach nothing, and switching
-  it back on gives the viewer control again.
+  it back on gives the viewer control again;
+- an unwatched desktop still updates without encoding browser video, and a
+  reconnecting viewer receives the current static picture.
 
 usage: viewer.py [BIN_DIR]   (default target/release; CI passes target/debug)
 Requires the gateway's built web assets, agent-browser, Node.js and foot.
@@ -43,6 +45,7 @@ TYPED = "Hi, World! ~<|>_2"
 PROGRAM = (
     f"for i in 1 2 3 4 5 6; do echo {shlex.quote(BANNER)}; done; "
     "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?1016h'; "
+    'cat "$1" & '
     'exec cat > "$0"'
 )
 # The desktop pixel to click. At the viewport's 0.8 scale, the nearest page
@@ -161,10 +164,13 @@ def press_report(pixel):
 
 def run(bin_dir, directory):
     received = directory / "received"
+    scene = directory / "scene"
+    os.mkfifo(scene)
     env = os.environ.copy()
     for name in ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
         env.pop(name, None)
     env["XDG_RUNTIME_DIR"] = str(directory)
+    env["RUST_LOG"] = "info,waywire_latency=debug"
     command = [
         str(bin_dir / "waywire-gateway"),
         "--listen",
@@ -187,6 +193,7 @@ def run(bin_dir, directory):
         "-c",
         PROGRAM,
         str(received),
+        str(scene),
     ]
     log = directory / "desktop.log"
     with log.open("w") as output:
@@ -200,7 +207,7 @@ def run(bin_dir, directory):
     try:
         wait_for(http_ready, "gateway did not serve the viewer")
         wait_for(received.exists, "foot did not start its program")
-        browser("set", "viewport", str(VIEWPORT[0]), str(VIEWPORT[1]))
+        browser("set", "viewport", str(VIEWPORT[0]), str(VIEWPORT[1]), "2")
         browser("open", URL)
 
         wait_for(
@@ -232,6 +239,41 @@ def run(bin_dir, directory):
         type_text(RESUMED_TEXT)
         expected += press_report(pixel) + RESUMED_TEXT.encode()
         check(received, expected, "turning Remote input on gave back control")
+
+        browser("open", "about:blank")
+        time.sleep(1)
+        before = log.read_text()
+        descriptor = os.open(scene, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(descriptor, b"\033[48;2;32;224;64m\033[2J")
+        finally:
+            os.close(descriptor)
+        wait_for(
+            lambda: 'stage="commit"' in log.read_text()[len(before) :],
+            "foot did not commit its unwatched update",
+        )
+        time.sleep(1)
+        assert log.read_text().count('stage="encoder_output"') == before.count(
+            'stage="encoder_output"'
+        ), "unwatched update still encoded browser video"
+        print("ok: unwatched update does not encode browser video", flush=True)
+
+        browser("open", URL)
+        wait_for(
+            lambda: evaluate("""(() => {
+              const video = document.querySelector('#stage video');
+              const source = video?.videoWidth ? video : document.querySelector('#display');
+              if (!source) return false;
+              const canvas = document.createElement('canvas');
+              canvas.width = canvas.height = 1;
+              const context = canvas.getContext('2d');
+              try { context.drawImage(source, 0, 0, 1, 1); } catch { return false; }
+              const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+              return Math.abs(r - 32) < 32 && Math.abs(g - 224) < 32 && Math.abs(b - 64) < 32;
+            })()"""),
+            "reconnecting viewer did not show the current static green picture",
+        )
+        print("ok: reconnect shows the current static picture", flush=True)
     except BaseException:
         print(log.read_text(errors="replace")[-20000:], file=sys.stderr, flush=True)
         raise

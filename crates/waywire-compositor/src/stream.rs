@@ -51,6 +51,7 @@ use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::InputSequence;
 use waywire_protocol::pipe::Kbps;
 use waywire_protocol::pipe::Quality;
+use waywire_protocol::pipe::VideoDemand;
 
 use crate::FrameRequest;
 use crate::delivery;
@@ -141,12 +142,6 @@ pub(crate) enum FrameDamage<'a> {
     Unchanged,
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) enum Rendered {
-    Submitted,
-    Unchanged,
-}
-
 pub(crate) struct Stream {
     video: Option<Video>,
     event_sink: EventSink,
@@ -161,6 +156,7 @@ pub(crate) struct Stream {
     /// The content hash of the last submitted frame when that frame was a forced full
     /// redraw, which reports the whole output damaged whether or not a pixel changed.
     forced_frame_hash: Option<u64>,
+    demand: VideoDemand,
     refresh: Refresh,
 }
 
@@ -186,6 +182,8 @@ impl Stream {
             sequence: 0,
             latest_input_sequence: None,
             forced_frame_hash: None,
+            // Standalone compositors stream by default; the gateway sets subscriber demand.
+            demand: VideoDemand::Wanted,
             refresh: Refresh::Idle,
         })
     }
@@ -208,6 +206,11 @@ impl Stream {
     /// Until it has, every frame is a forced full redraw.
     pub(crate) fn acknowledged(&self) -> bool {
         self.acknowledged == Some(self.generation)
+    }
+
+    /// Browser video or the current generation's bootstrap needs pixels.
+    pub(crate) fn needs_pixels(&self) -> bool {
+        self.demand == VideoDemand::Wanted || !self.acknowledged()
     }
 
     pub(crate) const fn latest_input_sequence(&self) -> Option<InputSequence> {
@@ -281,6 +284,9 @@ impl Stream {
             }
         };
         self.acknowledged = acknowledged;
+        if self.demand == VideoDemand::Suspended && self.acknowledged() {
+            self.refresh = Refresh::Idle;
+        }
         lost
     }
 
@@ -331,17 +337,19 @@ impl Stream {
 
     /// Encode a rendered frame of an output `size` pixels large. `damage` is
     /// what the renderer redrew, or `None` when nothing changed. A `forced`
-    /// redraw reports the whole output damaged. Returns whether the frame went
-    /// to the encoder.
+    /// redraw reports the whole output damaged. Without viewers, only bootstrap
+    /// frames needed for gateway readiness are encoded.
     pub(crate) fn rendered(
         &mut self,
         image: &Image<'static, 'static>,
         size: FrameSize,
         damage: FrameDamage<'_>,
         render_started_ns: u64,
-    ) -> Result<Rendered> {
-        if matches!(damage, FrameDamage::Unchanged) {
-            return Ok(Rendered::Unchanged);
+    ) -> Result<()> {
+        if (self.demand == VideoDemand::Suspended && self.acknowledged())
+            || matches!(damage, FrameDamage::Unchanged)
+        {
+            return Ok(());
         }
         let full = [Rectangle::<i32, Physical>::from_size(
             (i32::try_from(size.width())?, i32::try_from(size.height())?).into(),
@@ -350,7 +358,7 @@ impl Stream {
         let damage = match damage {
             FrameDamage::Full => &full[..],
             FrameDamage::Regions(regions) => regions,
-            FrameDamage::Unchanged => return Ok(Rendered::Unchanged),
+            FrameDamage::Unchanged => return Ok(()),
         };
         // A forced redraw reports the whole output damaged. Hash only those, so
         // a redraw that changed no pixel is not encoded again.
@@ -358,7 +366,7 @@ impl Stream {
         let unchanged = hash.is_some() && hash == self.forced_frame_hash && self.acknowledged();
         self.forced_frame_hash = hash;
         if unchanged {
-            return Ok(Rendered::Unchanged);
+            return Ok(());
         }
         latency::trace_frame("render", self.sequence, render_started_ns);
         self.submit(image, size, damage, FrameCause::Damage)?;
@@ -366,7 +374,7 @@ impl Stream {
             at: Instant::now() + REFRESH_DELAY,
             left: self.video.as_ref().map_or(0, Video::refresh_frames),
         };
-        Ok(Rendered::Submitted)
+        Ok(())
     }
 
     /// When the screen has held still long enough to refresh it.
@@ -611,6 +619,13 @@ impl crate::State {
                 }
             }
             Command::ResetVideo(_) => self.advance_generation()?,
+            Command::VideoDemand(demand) => {
+                self.stream.demand = demand;
+                self.stream.refresh = Refresh::Idle;
+                if demand == VideoDemand::Wanted {
+                    self.advance_generation()?;
+                }
+            }
             Command::KeyframeReadiness(p) => {
                 self.frame_request
                     .request(self.stream.keyframe_readiness(p));

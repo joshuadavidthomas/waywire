@@ -30,6 +30,8 @@ use waywire_protocol::pipe::FrameMetadata;
 use waywire_protocol::pipe::Generation;
 use waywire_protocol::pipe::KeyframeReadiness;
 use waywire_protocol::pipe::KeyframeState;
+#[cfg(test)]
+use waywire_protocol::pipe::VideoDemand;
 
 use self::assembler::Assembler;
 #[cfg(test)]
@@ -60,6 +62,7 @@ use self::rtp::decode_packet;
 use crate::audio::AudioHub;
 use crate::audio::RtpClaim;
 use crate::daemon::CommandSink;
+use crate::daemon::CommandSinkError;
 use crate::daemon::Enqueued;
 use crate::session::Sessions;
 
@@ -394,11 +397,37 @@ impl VideoWorker {
         }
     }
 
+    pub(crate) async fn run(self) -> Result<(), PipelineClosed> {
+        let mut demand = self.hub.demand();
+        let commands = self.commands.clone();
+        let forward_demand = async move {
+            loop {
+                let wanted = *demand.borrow_and_update();
+                match commands.system(Command::VideoDemand(wanted)).await {
+                    Ok(()) => {}
+                    Err(
+                        CommandSinkError::ByteBudgetStalled | CommandSinkError::CountBudgetStalled,
+                    ) => {
+                        continue;
+                    }
+                    Err(_) => return Err(PipelineClosed),
+                }
+                if demand.changed().await.is_err() {
+                    return Err(PipelineClosed);
+                }
+            }
+        };
+        tokio::select! {
+            result = forward_demand => result,
+            result = self.run_video() => result,
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one worker loop keeps timer priority, resync recovery, and frame broadcasts ordered"
     )]
-    pub(crate) async fn run(mut self) -> Result<(), PipelineClosed> {
+    async fn run_video(mut self) -> Result<(), PipelineClosed> {
         let mut correlator = Correlator::new();
         let mut metadata_summary = MetadataDropSummary::new();
         let mut ready_generation = None;
@@ -574,7 +603,7 @@ mod tests {
                 .expect("test frame width should be valid"),
             waywire_protocol::pipe::FrameDimension::new(720)
                 .expect("test frame height should be valid"),
-            sequence,
+            monotonic_nanos(),
             sequence,
             None,
             fps(30),
@@ -696,6 +725,7 @@ mod tests {
                 .expect("healthy browser feedback");
             let mut frame = metadata(1, 1);
             frame.set_chroma(Chroma::Yuv420);
+            frame.set_capture_nanos(1);
             pipeline.metadata(frame.clone()).await.expect("baseline");
             frame.set_sequence(frame.sequence() + 1);
             frame.set_capture_nanos(2_000_000_000);
@@ -745,7 +775,7 @@ mod tests {
     async fn full_command_queue_does_not_block_video_delivery() {
         use waywire_protocol::pipe::ReleaseAll;
 
-        let (commands, _command_events, mut fatal, readiness) = test_stalled_command_sink();
+        let (commands, mut command_events, mut fatal, readiness) = test_stalled_command_sink();
         commands
             .browser_system(Command::ReleaseAll(ReleaseAll))
             .await
@@ -763,8 +793,8 @@ mod tests {
             readiness.clone(),
             sessions,
         );
-        let worker_task = tokio::spawn(worker.run());
         let mut viewer = hub.subscribe();
+        let worker_task = tokio::spawn(worker.run());
         pipeline.metadata(metadata(1, 1)).await.expect("metadata");
         pipeline.unit(unit(1, 1)).await.expect("keyframe");
         let frame = tokio::time::timeout(Duration::from_secs(1), viewer.next())
@@ -773,6 +803,39 @@ mod tests {
         assert_eq!(frame.metadata().sequence(), 1);
         assert_eq!(readiness.state(), ReadinessState::Ready);
         assert!(fatal.try_recv().is_err());
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::ReleaseAll(ReleaseAll))
+        );
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::VideoDemand(VideoDemand::Wanted))
+        );
+        let mut second = hub.subscribe();
+        assert_eq!(second.next().await.metadata().sequence(), 1);
+        drop(viewer);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), command_events.recv())
+                .await
+                .is_err()
+        );
+        drop(second);
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::VideoDemand(VideoDemand::Suspended))
+        );
+        let transient = hub.subscribe();
+        drop(transient);
+        let replacement = hub.subscribe();
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::VideoDemand(VideoDemand::Wanted))
+        );
+        drop(replacement);
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::VideoDemand(VideoDemand::Suspended))
+        );
         drop(pipeline);
         assert!(worker_task.await.expect("worker task").is_err());
     }
@@ -794,7 +857,12 @@ mod tests {
             readiness.clone(),
             sessions,
         );
+        let mut viewer = hub.subscribe();
         let worker_task = tokio::spawn(worker.run());
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::VideoDemand(VideoDemand::Wanted))
+        );
 
         pipeline
             .metadata(metadata(1, 1))
@@ -809,7 +877,6 @@ mod tests {
             Some(Command::KeyframeReadiness(readiness)) if readiness.state() == KeyframeState::Cached
         ));
         assert_eq!(readiness.state(), ReadinessState::Ready);
-        let mut viewer = hub.subscribe();
         assert_eq!(viewer.next().await.metadata().sequence(), 1);
 
         for sequence in 2..=(PENDING_RECORD_CAPACITY as u64 + 2) {
@@ -906,6 +973,10 @@ mod tests {
             sessions,
         );
         let worker_task = tokio::spawn(worker.run());
+        assert_eq!(
+            command_events.recv().await,
+            Some(Command::VideoDemand(VideoDemand::Suspended))
+        );
 
         let gateway = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await

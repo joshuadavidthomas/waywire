@@ -1,12 +1,12 @@
 //! `WaitSettled`: wait until the screen, or one window's part of it, has
 //! had no damage for a quiet window since an input.
 //!
-//! Damage is what the output damage tracker reports for each rendered frame:
+//! Damage is what the output damage tracker reports for each observed frame:
 //! committed client damage, Xwayland included, and the compositor's own
 //! chrome and drag icon, after occlusion. The cursor is never drawn into
 //! frames or screenshots, so it never counts, and neither does a change no
 //! larger than the focused text field's caret, which blinks on a timer. A frame is timed
-//! when it is rendered, which is when screenshots start to show it.
+//! when its scene is observed. Capture requests paint stale pixels before replying.
 //!
 //! Serials name inputs. Each serial is remembered with its time and with who
 //! may see its receipt, so a caller can wait on its own input but cannot
@@ -245,9 +245,8 @@ pub(crate) struct Settle {
     /// The newest frame dropped from `frames`: damage may have happened up
     /// to then without a record.
     forgotten: u64,
-    /// When the latest frame was rendered, damaged or not. Commits before
-    /// it are on screen.
-    rendered: u64,
+    /// When the latest scene frame was observed, damaged or not.
+    observed: u64,
     waiters: Vec<Waiter>,
 }
 
@@ -444,6 +443,17 @@ impl Delivery {
         true
     }
 
+    /// Record scene damage without painting. No caret comparison needs pixels.
+    pub(crate) fn frame_observed(
+        &mut self,
+        now: u64,
+        damage: Vec<Rectangle<i32, Physical>>,
+        region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
+    ) {
+        self.settle.last = None;
+        self.record_frame(now, damage, region);
+    }
+
     /// Record a frame rendered at `now`: its damage in output pixels, the
     /// packed pixels it was rendered to, `width` to a row, and the parts of
     /// them that were drawn, `None` when all of them were. `caret` is where
@@ -464,7 +474,6 @@ impl Delivery {
         region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
     ) {
         let settle = &mut self.settle;
-        settle.rendered = now;
         let pixels = Pixels { data, width };
         // A blinking caret changes its pixels on a timer, not in answer to
         // input, so a change no larger than the caret in the field's window
@@ -502,6 +511,17 @@ impl Delivery {
             }
             (None, _) => pixels.data.to_vec(),
         });
+        self.record_frame(now, damage, region);
+    }
+
+    fn record_frame(
+        &mut self,
+        now: u64,
+        damage: Vec<Rectangle<i32, Physical>>,
+        region: impl Fn(&str) -> Option<Rectangle<i32, Physical>>,
+    ) {
+        let settle = &mut self.settle;
+        settle.observed = now;
         if damage.is_empty() {
             return;
         }
@@ -529,8 +549,8 @@ impl Delivery {
     }
 
     /// Take every wait that settled, timed out or lost its window by `now`,
-    /// in the order to answer them. `pending` says a frame is owed: commits
-    /// since the last frame are not on screen yet and may damage it.
+    /// in the order to answer them. `pending` says scene changes have not
+    /// reached their observation tick yet and may damage the output.
     /// `region` finds a watched window's area, as in [`Self::wait_settled`].
     pub(crate) fn poll_settled(
         &mut self,
@@ -547,7 +567,7 @@ impl Delivery {
         let quiet_until = if pending == FrameRequest::Idle {
             now
         } else {
-            settle.rendered
+            settle.observed
         };
         let mut index = 0;
         while let Some(waiter) = settle.waiters.get(index) {
@@ -695,15 +715,14 @@ fn touches(damage: &[Rectangle<i32, Physical>], region: Option<Rectangle<i32, Ph
 }
 
 impl State {
-    /// Whether a frame is owed: commits since the last frame are not on
-    /// screen yet.
+    /// Whether scene changes are waiting for their observation tick.
     fn frame_owed(&self) -> FrameRequest {
         self.frame_request
     }
 
     /// The focused text field's caret, in output pixels. `None` unless the
     /// field is in a window's main surface.
-    fn caret(&self) -> Option<CaretArea> {
+    pub(crate) fn caret(&self) -> Option<CaretArea> {
         let mut active = None;
         self.seat
             .text_input()
@@ -737,6 +756,14 @@ impl State {
         ) {
             self.poll_settled(now);
         }
+    }
+
+    /// Record an unpainted frame's visible damage for current and later waits.
+    pub(crate) fn frame_observed(&mut self, now: u64, damage: Vec<Rectangle<i32, Physical>>) {
+        let (space, toplevel_list, output) = (&self.space, &self.toplevel_list, &self.output);
+        self.delivery.frame_observed(now, damage, |id| {
+            settle_region(space, toplevel_list, output, id)
+        });
     }
 
     /// Record a rendered frame: its damage in output pixels, the image it

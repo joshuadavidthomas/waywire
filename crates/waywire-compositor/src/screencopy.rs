@@ -5,8 +5,8 @@
 //! are implemented here. The design follows niri's
 //! `src/protocols/screencopy.rs`: capture requests resolve to a physical output
 //! rectangle, clients copy into buffers matching the advertised parameters, and
-//! copies complete from the next already-rendered frame instead of triggering a
-//! render, so captures never change video frame pacing. Unlike niri there is no
+//! copies demand current pixels at the next normal frame tick, without changing
+//! video frame pacing. Unlike niri there is no
 //! damage tracking, per-manager queueing or dmabuf: waywire has one output,
 //! accepts only `wl_shm` buffers, and completes `copy_with_damage` at the next
 //! render tick like `copy`, reporting the full region as damage. The cursor is
@@ -66,6 +66,10 @@ impl Screencopy {
 
     fn forget(&mut self, frame: &ZwlrScreencopyFrameV1) {
         self.0.retain(|pending| pending.frame != *frame);
+    }
+
+    pub(crate) fn needs_pixels(&self) -> bool {
+        !self.0.is_empty()
     }
 
     /// Complete queued copies by copying the rendered image into the
