@@ -821,6 +821,15 @@ upstream code to local copies of it.
   first buffer commit, so `xwayland.rs` replays that commit once the surface
   is associated. Drop the `[patch]`, but not the replay, when the Smithay
   change is upstream.
+- **OpenH264.** `Cargo.toml` patches only `openh264-sys2` 0.9.9 through
+  `joshuadavidthomas/openh264-rs`, branch `waywire-lazy-downsample`, pinned at
+  [c1534c0](https://github.com/joshuadavidthomas/openh264-rs/commit/c1534c0a74fd91178dbb753ba949d4c84223bdd6).
+  The fork starts from the published 0.9.9 Rust source and carries
+  [Cisco PR #4054](https://github.com/cisco/openh264/pull/4054), which defers
+  about 6 MiB of downsampling scratch per encoder until needed. Stripe encoders
+  receive already-sized pictures and do not use those buffers. The high-level
+  crate and source-built integration stay unchanged. Drop the patch when a
+  published sys crate includes the fix, not merely when Cisco merges it.
 - **Crates.** Dependabot opens weekly grouped PRs for crates, npm packages,
   GitHub Actions and prek hooks. It ignores Smithay: the latest crates.io
   release, 0.7.0 (June 2025), lacks `backend_libei`, the virtual-pointer and

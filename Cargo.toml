@@ -86,3 +86,8 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # the change is upstream. See ROADMAP.md, Dependency currency.
 [patch."https://github.com/Smithay/smithay"]
 smithay = { git = "https://github.com/joshuadavidthomas/smithay", rev = "50f58bbe45ea96d1abba5814670c361c550676b1" }
+
+# Defer unused downsampling scratch allocation (Cisco OpenH264 PR #4054).
+# Drop this patch when a published sys crate includes the fix.
+[patch.crates-io]
+openh264-sys2 = { git = "https://github.com/joshuadavidthomas/openh264-rs", rev = "c1534c0a74fd91178dbb753ba949d4c84223bdd6" }

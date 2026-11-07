@@ -17,7 +17,7 @@
 //!   paint-over quantizer once it holds still, spread over several frames.
 //!
 //! waywire's changes: compositor damage, not a per-frame capture loop, says which rows
-//! changed, and the content hash only confirms that a damaged stripe really changed. The
+//! changed, and dirty-band comparisons confirm that a damaged stripe really changed. The
 //! compositor decides when the screen is still by wall-clock time and submits refresh
 //! frames, so this module never counts idle frames. Every stripe uses `OpenH264`'s camera
 //! usage, which encoded recorded desktop frames three times faster than its
@@ -51,6 +51,8 @@ use yuv::YuvConversionMode;
 use yuv::YuvPlanarImageMut;
 use yuv::YuvRange;
 use yuv::YuvStandardMatrix;
+
+use super::BandChange;
 
 /// Most stripes a frame is cut into: the browser decodes one stream per stripe.
 pub(crate) const MAX_STRIPES: usize = 8;
@@ -250,23 +252,15 @@ fn build_encoder(qp: u8, fps: f32, cap_bps: Option<u32>) -> Option<Encoder> {
     Encoder::with_api_config(OpenH264API::from_source(), config).ok()
 }
 
-/// Everything one stripe keeps between frames: its planes, its encoder, and the hash
-/// of the content it last encoded.
+/// Everything one stripe keeps between frames: its planes, its encoder, and whether
+/// its content changed since it was last encoded.
 struct StripeState {
     rows: Range<usize>,
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
-    /// Set when the planes changed since the stripe was last considered.
-    hash_state: HashState,
+    change: BandChange,
     encoder: Option<StripeEncoder>,
-    last_hash: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HashState {
-    Needed,
-    Current,
 }
 
 impl StripeState {
@@ -277,18 +271,9 @@ impl StripeState {
             y: vec![0; pixels],
             u: vec![0; pixels / 4],
             v: vec![0; pixels / 4],
-            hash_state: HashState::Needed,
+            change: BandChange::Changed,
             encoder: None,
-            last_hash: 0,
         }
-    }
-
-    fn content_hash(&self) -> u64 {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-        hasher.update(&self.y);
-        hasher.update(&self.u);
-        hasher.update(&self.v);
-        hasher.digest()
     }
 }
 
@@ -350,28 +335,36 @@ impl Stripes {
         self.states.len()
     }
 
-    /// Copy the stripes whose rows changed out of the staging picture.
+    /// Compare and copy dirty bands, clipped to each stripe. Unchanged rows stay in
+    /// the encoder's planes, so neither copying nor change detection scans them.
     pub(super) fn copy_changed(&mut self, staging: &mut super::Staging) {
         let width = staging.width;
         for state in &mut self.states {
             let first = state.rows.start / super::BAND_ROWS;
             let last = state.rows.end.div_ceil(super::BAND_ROWS);
-            if !staging.bands[first..last].contains(&super::BandChange::Changed)
-                && state.hash_state == HashState::Current
-            {
-                continue;
+            let initial = state.encoder.is_none();
+            for band in first..last {
+                if !initial && staging.bands[band] == super::BandChange::Unchanged {
+                    continue;
+                }
+                let top = (band * super::BAND_ROWS).max(state.rows.start);
+                let bottom = ((band + 1) * super::BAND_ROWS).min(state.rows.end);
+                let source = top * width..bottom * width;
+                let target = (top - state.rows.start) * width..(bottom - state.rows.start) * width;
+                let y = &staging.y[source.clone()];
+                let u = &staging.u[source.start / 4..source.end / 4];
+                let v = &staging.v[source.start / 4..source.end / 4];
+                let target_uv = target.start / 4..target.end / 4;
+                if state.y[target.clone()] != *y
+                    || state.u[target_uv.clone()] != *u
+                    || state.v[target_uv.clone()] != *v
+                {
+                    state.y[target].copy_from_slice(y);
+                    state.u[target_uv.clone()].copy_from_slice(u);
+                    state.v[target_uv].copy_from_slice(v);
+                    state.change = BandChange::Changed;
+                }
             }
-            let rows = state.rows.clone();
-            state
-                .y
-                .copy_from_slice(&staging.y[rows.start * width..rows.end * width]);
-            state
-                .u
-                .copy_from_slice(&staging.u[rows.start * width / 4..rows.end * width / 4]);
-            state
-                .v
-                .copy_from_slice(&staging.v[rows.start * width / 4..rows.end * width / 4]);
-            state.hash_state = HashState::Needed;
         }
         staging.bands.fill(super::BandChange::Unchanged);
     }
@@ -402,45 +395,41 @@ impl Stripes {
         self.bitrate_bps = bitrate_bps;
         for state in &mut self.states {
             state.encoder = None;
-            state.hash_state = HashState::Needed;
+            state.change = BandChange::Changed;
         }
     }
 
     /// Encode the stripes this frame needs, in parallel, top to bottom.
     ///
-    /// A damaged stripe is sent when its content hash changed. With `Coding::Key` every
+    /// A damaged stripe is sent when its pixels changed. With `Coding::Key` every
     /// stripe is sent as a key frame. With `Coding::Refresh` (the screen holds still) up
     /// to a staggered share of the stripes that changed since their last refresh are
-    /// coded again as a key frame at the refresh quantizer, and stay there until they
-    /// change.
+    /// coded again at the refresh quantizer, prioritizing coarser configured quantizers
+    /// before already-fine ones. Output stays top to bottom regardless of priority.
     pub(crate) fn encode(
         &mut self,
         coding: Coding,
         quantizers: Quantizers,
     ) -> Result<Vec<EncodedStripe>, String> {
-        let per_frame = self.states.len().div_ceil(CLEANUP_STAGGER_FRAMES);
-        let mut granted = 0;
-        let codings: Vec<Coding> = self
-            .states
-            .iter()
-            .map(|state| match coding {
-                Coding::Changes | Coding::Key => coding,
-                Coding::Refresh => {
-                    let due = state.hash_state == HashState::Current
-                        && state
-                            .encoder
-                            .as_ref()
-                            .is_some_and(|encoder| encoder.debt == RefreshDebt::Owed)
-                        && granted < per_frame;
-                    granted += usize::from(due);
-                    if due {
-                        Coding::Refresh
-                    } else {
-                        Coding::Changes
+        let mut codings = [coding; MAX_STRIPES];
+        if coding == Coding::Refresh {
+            codings.fill(Coding::Changes);
+            let mut remaining = self.states.len().div_ceil(CLEANUP_STAGGER_FRAMES);
+            for coarse in [true, false] {
+                for (state, coding) in self.states.iter().zip(&mut codings) {
+                    if remaining != 0
+                        && state.change == BandChange::Unchanged
+                        && state.encoder.as_ref().is_some_and(|encoder| {
+                            encoder.debt == RefreshDebt::Owed
+                                && (encoder.qp > quantizers.refresh) == coarse
+                        })
+                    {
+                        *coding = Coding::Refresh;
+                        remaining -= 1;
                     }
                 }
-            })
-            .collect();
+            }
+        }
         let width = self.width;
         let fps = self.fps;
         let (height, bitrate) = (self.height as u64, u64::from(self.bitrate_bps));
@@ -466,13 +455,9 @@ fn encode_stripe(
     quantizers: Quantizers,
     cap_bps: u32,
 ) -> Result<Option<EncodedStripe>, String> {
-    let mut changed = false;
-    if state.hash_state == HashState::Needed {
-        state.hash_state = HashState::Current;
-        let hash = state.content_hash();
-        changed = hash != state.last_hash || state.encoder.is_none();
-        state.last_hash = hash;
-    }
+    let changed = std::mem::replace(&mut state.change, BandChange::Unchanged)
+        == BandChange::Changed
+        || state.encoder.is_none();
     if !changed && coding == Coding::Changes {
         return Ok(None);
     }
@@ -562,17 +547,25 @@ mod tests {
             .collect()
     }
 
-    /// Load `luma` into the stripes as the compositor's damage copy would, every
-    /// stripe marked as possibly changed.
+    /// Submit a fully damaged staging picture, including unchanged pixels.
     fn load(stripes: &mut Stripes, luma: &[u8]) {
-        for state in &mut stripes.states {
-            state
-                .y
-                .copy_from_slice(&luma[state.rows.start * WIDTH..state.rows.end * WIDTH]);
-            state.u.fill(128);
-            state.v.fill(128);
-            state.hash_state = HashState::Needed;
-        }
+        let mut staging = super::super::Staging {
+            width: WIDTH,
+            height: HEIGHT,
+            y: luma.to_vec(),
+            u: vec![128; WIDTH * HEIGHT / 4],
+            v: vec![128; WIDTH * HEIGHT / 4],
+            bands: vec![
+                super::super::BandChange::Changed;
+                HEIGHT.div_ceil(super::super::BAND_ROWS)
+            ],
+            scaled: Vec::new(),
+            pending: None,
+            key: super::super::KeyRequest::None,
+            generation: waywire_protocol::pipe::Generation::new(1).expect("generation"),
+            state: crate::video::WorkerState::Running,
+        };
+        stripes.copy_changed(&mut staging);
     }
 
     /// Decode `stripe` with the stripe's own decoder and return the mean absolute
@@ -647,6 +640,53 @@ mod tests {
             })
             .collect();
         assert_eq!(refreshed, [vec![0], vec![HALF], vec![]]);
+    }
+
+    #[test]
+    fn cleanup_refreshes_a_coarse_stripe_before_an_already_fine_stripe() {
+        let mut stripes = Stripes::new(WIDTH, HEIGHT, 2, 30.0, 100_000_000);
+        let mut decoders = [
+            Decoder::new().expect("decoder"),
+            Decoder::new().expect("decoder"),
+        ];
+        let first = picture(0);
+        load(&mut stripes, &first);
+        for stripe in stripes.encode(Coding::Changes, QUANTIZERS).expect("encode") {
+            luma_error(&mut decoders[stripe.rows.start / HALF], &stripe, &first);
+        }
+        let fine = stripes
+            .encode(Coding::Refresh, QUANTIZERS)
+            .expect("refresh");
+        assert_eq!(fine.len(), 1);
+        assert_eq!(fine[0].rows, 0..HALF);
+        assert!(luma_error(&mut decoders[0], &fine[0], &first) < 1.5);
+
+        // Both change, but hysteresis keeps the upper stripe at the fine quantizer.
+        let second = picture(5);
+        load(&mut stripes, &second);
+        for stripe in stripes.encode(Coding::Changes, QUANTIZERS).expect("encode") {
+            luma_error(&mut decoders[stripe.rows.start / HALF], &stripe, &second);
+        }
+        let coarse = stripes
+            .encode(Coding::Refresh, QUANTIZERS)
+            .expect("refresh");
+        assert_eq!(coarse.len(), 1, "cleanup must keep its per-frame quota");
+        assert_eq!(coarse[0].rows, HALF..HEIGHT);
+        assert_eq!(coarse[0].kind, FrameKind::Key);
+        assert!(luma_error(&mut decoders[1], &coarse[0], &second) < 1.5);
+
+        let fine = stripes
+            .encode(Coding::Refresh, QUANTIZERS)
+            .expect("refresh");
+        assert_eq!(fine.len(), 1, "fine stripes still discharge their debt");
+        assert_eq!(fine[0].rows, 0..HALF);
+        assert!(luma_error(&mut decoders[0], &fine[0], &second) < 1.5);
+        assert!(
+            stripes
+                .encode(Coding::Refresh, QUANTIZERS)
+                .expect("refresh")
+                .is_empty()
+        );
     }
 
     #[test]

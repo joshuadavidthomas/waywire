@@ -469,6 +469,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partial_damage_keeps_untouched_pixels_across_stripe_and_chroma_boundaries() {
+        let (width, height) = (64, 388);
+        // The two stripes meet at row 194, inside the 192..208 damage band.
+        let generation = Generation::new(1).expect("generation");
+        let encoder = StripedEncoder::start(2, generation).expect("start");
+        let mut pixels = [80, 80, 80, 255].repeat(width * height);
+        let mut decoders = [
+            Decoder::new().expect("decoder"),
+            Decoder::new().expect("decoder"),
+        ];
+        let mut sequence = 0;
+        let mut submit = |pixels: &[u8], damage: &[Range<i32>]| {
+            sequence += 1;
+            encoder
+                .submit(&StripedFrame {
+                    pixels,
+                    width,
+                    height,
+                    damage,
+                    metadata: FrameMetadata::new(
+                        generation,
+                        FrameDimension::new(64).expect("width"),
+                        FrameDimension::new(388).expect("height"),
+                        sequence,
+                        sequence,
+                        None,
+                        Fps::new(30).expect("fps"),
+                        Chroma::Yuv420,
+                    ),
+                    crf: Crf::new(13).expect("crf"),
+                    bitrate: Kbps::new(12_000).expect("bitrate"),
+                    cause: FrameCause::Damage,
+                })
+                .expect("submit");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(frame) = encoder.try_frame() {
+                    break frame.expect("encode");
+                }
+                assert!(Instant::now() < deadline, "no encoded frame");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let rows = 190..198;
+        let damaged = std::slice::from_ref(&rows);
+        for (color, damage, expected) in [
+            (None, &[][..], [80, 128, 128]),
+            (Some([0, 0, 180, 255]), damaged, [38, 107, 218]),
+            // Identical quantized luma, different chroma: checking Y alone loses this update.
+            (Some([255, 28, 0, 255]), damaged, [38, 245, 104]),
+        ] {
+            if let Some(color) = color {
+                for pixel in pixels[190 * width * 4..198 * width * 4].chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&color);
+                }
+            }
+            let frame = submit(&pixels, damage);
+            let mut bytes = frame.data().as_slice();
+            for (index, decoder) in decoders.iter_mut().enumerate() {
+                assert!(bytes.len() >= 9, "stripe {index} missing after {damage:?}");
+                let top = usize::from(u16::from_le_bytes(bytes[..2].try_into().expect("top")));
+                assert_eq!(top, index * 194);
+                let length = u32::from_le_bytes(bytes[5..9].try_into().expect("length")) as usize;
+                let picture = decoder
+                    .decode(&bytes[9..9 + length])
+                    .expect("decode")
+                    .expect("picture");
+                assert_eq!(picture.dimensions(), (64, 194));
+                let (sy, su, sv) = picture.strides();
+                for row in 0..194 {
+                    let target = if (190..198).contains(&(top + row)) {
+                        expected
+                    } else {
+                        [80, 128, 128]
+                    };
+                    let observed = [
+                        picture.y()[row * sy + 32],
+                        picture.u()[row / 2 * su + 16],
+                        picture.v()[row / 2 * sv + 16],
+                    ];
+                    for (actual, expected) in observed.into_iter().zip(target) {
+                        assert!(
+                            actual.abs_diff(expected) <= 4,
+                            "row {}: {observed:?} vs {target:?}",
+                            top + row
+                        );
+                    }
+                }
+                bytes = &bytes[9 + length..];
+            }
+            assert!(bytes.is_empty());
+        }
+        assert!(
+            submit(&pixels, damaged).data().is_empty(),
+            "unchanged damage emitted a stripe"
+        );
+        encoder.stop();
+    }
+
+    #[test]
     fn a_scaled_frame_is_encoded_at_its_encoded_size_from_averaged_pixels() {
         // A one-pixel checkerboard: point sampling at half size keeps only black or only
         // white; averaging each 2x2 box gives mid grey.

@@ -19,7 +19,6 @@ openh264 = "0.9.9"
 rayon = "1.11.0"
 thiserror = { workspace = true }
 tracing = { workspace = true }
-xxhash-rust = { workspace = true }
 yuv = { version = "0.8.20", features = ["fast_mode"] }
 
 [lints]
