@@ -2917,6 +2917,7 @@ dependencies = [
  "calloop",
  "nix",
  "openh264",
+ "openh264-sys2",
  "rayon",
  "thiserror 2.0.21",
  "tracing",

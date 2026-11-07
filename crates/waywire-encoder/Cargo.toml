@@ -21,5 +21,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 yuv = { version = "0.8.20", features = ["fast_mode"] }
 
+[dev-dependencies]
+# The offline codec profiler checks native effective settings and RC-Off layer QP.
+openh264-sys2 = "0.9.9"
+
 [lints]
 workspace = true
