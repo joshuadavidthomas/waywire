@@ -86,6 +86,16 @@ PROFILE
   fi
   export PATH="$HOME/.local/share/waywire-node/node_modules/.bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
+  local xwayland_marker='# waywire orb Xwayland'
+  if ! grep -Fqx "$xwayland_marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<'PROFILE'
+
+# waywire orb Xwayland
+export PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH"
+PROFILE
+  fi
+  export PATH="${WAYWIRE_XWAYLAND_PREFIX:-$HOME/.local/share/waywire-xwayland}/bin:$PATH"
+
   if ! command -v rustup >/dev/null; then
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | bash -s -- -y --no-modify-path --default-toolchain none
   fi

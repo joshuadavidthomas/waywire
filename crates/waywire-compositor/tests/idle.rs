@@ -111,7 +111,10 @@ fn written_contents(path: &std::path::Path, deadline: Instant, what: &str) -> St
 fn idle_window_delay(now: Duration) -> Duration {
     let elapsed = Duration::new(now.as_secs() % 60, now.subsec_nanos());
     let remaining = Duration::from_mins(1).saturating_sub(elapsed);
-    if remaining < Duration::from_secs(3) {
+    // The clock's redraw and refinements can outlast the minute boundary.
+    if elapsed < Duration::from_secs(1) {
+        Duration::from_secs(1).saturating_sub(elapsed)
+    } else if remaining < Duration::from_secs(3) {
         remaining + Duration::from_secs(1)
     } else {
         Duration::ZERO
@@ -120,6 +123,13 @@ fn idle_window_delay(now: Duration) -> Duration {
 
 #[test]
 fn idle_window_waits_only_near_minute_boundary() {
+    for (now_ms, delay_ms) in [(0, 1000), (462, 538), (999, 1), (1000, 0), (60_462, 538)] {
+        assert_eq!(
+            idle_window_delay(Duration::from_millis(now_ms)),
+            Duration::from_millis(delay_ms),
+            "idle sample at {now_ms} ms"
+        );
+    }
     assert_eq!(idle_window_delay(Duration::from_secs(57)), Duration::ZERO);
     assert_eq!(
         idle_window_delay(Duration::from_millis(57_500)),
@@ -1408,6 +1418,8 @@ fn text_reaches_terminal(wayland: bool) {
             .env("GTK_IM_MODULE", "xim")
             .arg(&shell);
     } else {
+        // Xterm's Unicode keysym conversion needs a UTF-8 locale even with -u8.
+        cmd.env("LC_ALL", "C.UTF-8");
         cmd.args(["xterm", "-u8", "-e"]).arg(&shell);
     }
     let mut compositor = Compositor(
@@ -1459,7 +1471,8 @@ fn text_reaches_terminal(wayland: bool) {
         while fs::read(&output).expect("read client input") != expected.as_bytes() {
             assert!(
                 Instant::now() < deadline,
-                "client did not receive {expected}"
+                "client received {:?}, expected {expected}",
+                String::from_utf8_lossy(&fs::read(&output).expect("read client input"))
             );
             thread::sleep(Duration::from_millis(20));
         }

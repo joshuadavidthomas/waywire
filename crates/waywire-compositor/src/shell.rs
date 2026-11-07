@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::desktop::PopupKind;
 use smithay::desktop::Window;
 use smithay::desktop::find_popup_root_surface;
@@ -172,11 +173,14 @@ impl CompositorHandler for State {
                     .is_some_and(|state| state.resize().is_some());
                 window.on_commit();
                 self.resize_committed(&window);
-                let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(
-                    &root,
-                    |state| state.buffer().is_some(),
-                )
-                .unwrap_or(false);
+                // X11 map/unmap events own the window's lifetime. Xwayland can
+                // commit without a buffer before its first frame arrives.
+                let mapped = if let Some(surface) = window.x11_surface() {
+                    surface.is_mapped()
+                } else {
+                    with_renderer_surface_state(&root, |state| state.buffer().is_some())
+                        .unwrap_or(false)
+                };
                 let window_state = self.windows.entry(window.clone()).or_default();
                 let previous = window_state.is_mapped();
                 window_state.set_visibility(if mapped {
