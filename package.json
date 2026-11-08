@@ -8,6 +8,6 @@
     "node": ">=26"
   },
   "devDependencies": {
-    "prettier": "3.6.2"
+    "prettier": "3.9.10"
   }
 }
