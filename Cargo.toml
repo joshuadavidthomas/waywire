@@ -53,7 +53,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = "0.3.34"
 # Pin the tested syscall wrappers: both binaries rely on their FD, polling,
 # signal and process-control behavior for backpressure and child cleanup.
-nix = { version = "=0.31.3", features = ["fs", "mman", "poll", "process", "signal", "socket", "time"] }
+nix = { version = "=0.32.0", features = ["fs", "mman", "poll", "process", "signal", "socket", "time"] }
 pangocairo = "0.22.9"
 # ScreenCast video. Built against the system libpipewire-0.3 through bindgen;
 # 0.3.34 is the oldest API the stream code uses (pw_stream_trigger_process).
